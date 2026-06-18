@@ -142,6 +142,9 @@ export type RunRecord = {
   timeoutMs?: number;
   sessionId?: string;
   sessionFile?: string;
+  sourceRunId?: string;
+  resumeDepth?: number;
+  startLeafId?: string;
   reconciled?: boolean;
   reconciledAt?: string;
 };
@@ -158,6 +161,7 @@ type LiveRun = Omit<RunRecord, "progress"> & {
 const liveRuns = new Map<string, LiveRun>();
 const settlingExternalRunIds = new Set<string>();
 const pendingDispatchRunIds = new Set<string>();
+const resumingSourceRunIds = new Set<string>();
 let lastCtx: ExtensionContext | undefined;
 let cooldownUntil = 0;
 let widgetTimer: ReturnType<typeof setInterval> | undefined;
@@ -964,28 +968,51 @@ export function extractFinalAssistantTextFromSessionJsonl(content: string): stri
   return "";
 }
 
+// Final-output recovery for a resumed run: only the assistant output produced after the
+// continuation start leaf belongs to this run; earlier assistant text is the source run's output.
+export function extractFinalAssistantTextFromSessionJsonlAfter(content: string, afterLeafId?: string): string {
+  if (!afterLeafId) return extractFinalAssistantTextFromSessionJsonl(content);
+  const entries = parseJsonlEntries(content);
+  const pivot = entries.findIndex((entry) => entry?.id === afterLeafId);
+  const start = pivot >= 0 ? pivot + 1 : 0;
+  for (let i = entries.length - 1; i >= start; i--) {
+    const entry = entries[i];
+    if (entry?.type !== "message" || entry.message?.role !== "assistant") continue;
+    return assistantMessageText(entry.message);
+  }
+  return "";
+}
+
+export function readSessionHeaderFromSessionJsonl(content: string): { type: "session"; id: string; cwd?: string; version?: number; parentSession?: string } | undefined {
+  for (const entry of parseJsonlEntries(content)) {
+    if (entry?.type === "session" && typeof entry.id === "string") return entry;
+  }
+  return undefined;
+}
+
 function resolveSessionFile(root: string, sessionFile?: string): string | undefined {
   if (!sessionFile) return undefined;
   if (path.isAbsolute(sessionFile)) return sessionFile;
   return path.join(root, sessionFile);
 }
 
-export function recoverFinalOutputFromSessionFile(root: string, sessionFile?: string): { text: string; error?: string } {
+export function recoverFinalOutputFromSessionFile(root: string, sessionFile?: string, startLeafId?: string): { text: string; error?: string } {
   const file = resolveSessionFile(root, sessionFile);
   if (!file) return { text: "", error: "child session file was not recorded" };
   try {
-    return { text: extractFinalAssistantTextFromSessionJsonl(fs.readFileSync(file, "utf8")) };
+    const content = fs.readFileSync(file, "utf8");
+    return { text: startLeafId ? extractFinalAssistantTextFromSessionJsonlAfter(content, startLeafId) : extractFinalAssistantTextFromSessionJsonl(content) };
   } catch (err: any) {
     return { text: "", error: `could not read child session file ${sessionFile}: ${String(err?.message || err)}` };
   }
 }
 
-export function resolveRunFinalOutput(root: string, run: Pick<RunRecord, "sessionFile">, session?: any, liveOutput?: string): { text: string; source?: string; reason?: string } {
+export function resolveRunFinalOutput(root: string, run: Pick<RunRecord, "sessionFile" | "startLeafId">, session?: any, liveOutput?: string): { text: string; source?: string; reason?: string } {
   const stateText = finalAssistantText(session);
   if (stateText) return { text: stateText, source: "live-state" };
   const eventText = String(liveOutput || "").trim();
   if (eventText) return { text: eventText, source: "live-event" };
-  const recovered = recoverFinalOutputFromSessionFile(root, run.sessionFile);
+  const recovered = recoverFinalOutputFromSessionFile(root, run.sessionFile, run.startLeafId);
   if (recovered.text) return { text: recovered.text, source: "session-file" };
   return { text: "", reason: recovered.error || "live capture and child session-file fallback were empty" };
 }
@@ -1714,6 +1741,157 @@ function makeThreadPatchTool(root: string, runId: string, thread?: string): Tool
   };
 }
 
+function wireLiveRunSession(live: LiveRun, session: any) {
+  live.unsubscribe = session.subscribe((event: any) => {
+    live.updatedAt = new Date().toISOString();
+    if (event.type === "message_start" && event.message?.role === "assistant") live.currentAssistantText = "";
+    if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") live.currentAssistantText = `${live.currentAssistantText || ""}${event.assistantMessageEvent.delta || ""}`;
+    if (event.type === "message_end" && event.message?.role === "assistant") {
+      const endedText = assistantMessageText(event.message) || String(live.currentAssistantText || "").trim();
+      if (endedText) {
+        live.output = endedText;
+        live.finalOutputSource = "live-event";
+      }
+      live.currentAssistantText = undefined;
+    }
+  });
+}
+
+export function buildResumeTask(sourceRunId: string, sessionFile: string | undefined, message: string): string {
+  return [
+    `Continuation of Fray source run ${sourceRunId}${sessionFile ? ` (recorded session ${sessionFile})` : ""}.`,
+    "You are resuming that child's exact recorded session with full prior context; continue the same work rather than restarting from scratch.",
+    "Re-read your owning fray thread for any changes since the source run paused, then address the steering message below.",
+    "Your final assistant response remains the mandatory orchestration-ready handoff: verdict/status, what you changed, changed paths/artifacts, verification commands and results, caveats/risks, and one concrete next action.",
+    "",
+    "## Steering message",
+    "",
+    message,
+  ].join("\n");
+}
+
+// Reload-safe fray_steer fallback: when no live SDK handle exists for runId (e.g. after a parent
+// reload or session replacement) but the child's session file was recorded, resume that exact
+// session as a fresh continuation run instead of silently relaunching or failing.
+async function resumeRun(pi: ExtensionAPI, ctx: ExtensionContext, sourceRunId: string, message: string) {
+  const root = frayRoot(ctx.cwd);
+  const cfg = loadConfig(root);
+  if (!cfg.enabled) throw new Error("fray is disabled in .fray/config.yml");
+
+  const known = readRuns(root).find((run) => run.id === sourceRunId);
+  if (!known) throw new Error(`unknown fray run ${sourceRunId}; no live child handle or ledger record exists`);
+  if (known.external) throw new Error(`fray run ${sourceRunId} is an external runner result; resume is only supported for Pi child sessions, so relaunch the external work instead.`);
+  if (!known.sessionFile) throw new Error(`fray run ${sourceRunId} has no recorded sessionFile; cannot resume exactly, so relaunch the work instead.`);
+
+  if (resumingSourceRunIds.has(sourceRunId)) throw new Error(`fray run ${sourceRunId} is already being resumed; wait for the in-flight resume to register its live handle before steering again.`);
+
+  const sessionFileAbs = resolveSessionFile(root, known.sessionFile);
+  if (!sessionFileAbs || !fs.existsSync(sessionFileAbs)) throw new Error(`fray run ${sourceRunId} session file ${known.sessionFile} is missing on disk; cannot resume exactly, so relaunch the work instead.`);
+  let header: ReturnType<typeof readSessionHeaderFromSessionJsonl>;
+  try {
+    header = readSessionHeaderFromSessionJsonl(fs.readFileSync(sessionFileAbs, "utf8"));
+  } catch (err: any) {
+    throw new Error(`could not read session file ${known.sessionFile} for resume of ${sourceRunId}: ${String(err?.message || err)}`);
+  }
+  if (!header?.id) throw new Error(`session file ${known.sessionFile} has no valid Pi session header; cannot resume exactly, so relaunch the work instead.`);
+  if (known.sessionId && header.id !== known.sessionId) throw new Error(`session file ${known.sessionFile} header id ${header.id} does not match recorded session ${known.sessionId} for ${sourceRunId}; refusing to resume a mismatched session.`);
+
+  if (Date.now() < cooldownUntil) throw new Error(`fray dispatch is cooling down after provider rate-limit until ${new Date(cooldownUntil).toISOString()}`);
+  const liveCount = liveChildRuns(root).length;
+  if (liveCount >= cfg.maxChildren) throw new Error(`fray has ${liveCount} live children; max_children is ${cfg.maxChildren}`);
+
+  const intent: Intent = known.intent || "custom";
+  const resumeDepth = (known.resumeDepth || 0) + 1;
+  const runId = `fray-${new Date().toISOString().replace(/[-:.TZ]/g, "")}-${randomUUID().slice(0, 8)}`;
+  resumingSourceRunIds.add(sourceRunId);
+  pendingDispatchRunIds.add(runId);
+
+  try {
+    const cwd = header.cwd && fs.existsSync(header.cwd) ? header.cwd : (known.cwd || ctx.cwd);
+    const sessionManager = SessionManager.open(sessionFileAbs, undefined, cwd);
+    const startLeafId = sessionManager.getLeafId() || undefined;
+    const model = chooseModel(ctx, "current", known.model);
+    const thinking = defaultThinking(intent, known.thinking);
+    const tools = defaultTools(intent, true);
+    const thread = known.thread || BACKLOG_THREAD;
+    const now = new Date().toISOString();
+    const record: RunRecord = {
+      id: runId,
+      thread,
+      label: known.label || intent,
+      intent,
+      status: "starting",
+      model: model ? `${model.provider}/${model.id}` : undefined,
+      thinking,
+      cwd,
+      startedAt: now,
+      updatedAt: now,
+      reconciled: false,
+      sessionId: sessionManager.getSessionId(),
+      sessionFile: known.sessionFile,
+      sourceRunId,
+      resumeDepth,
+      startLeafId,
+    };
+    appendRunEvent(root, record);
+    upsertThreadRunCard(root, record);
+
+    const loader = new DefaultResourceLoader({
+      cwd: record.cwd,
+      agentDir: getAgentDir(),
+      noExtensions: true,
+      noPromptTemplates: true,
+      noThemes: true,
+      appendSystemPrompt: ["You are a background child agent managed by pi-fray, resuming a recorded session. Keep final output concise and factual."],
+    });
+    await loader.reload();
+
+    const runUpdateTool = makeRunUpdateTool(root, runId, thread);
+    const threadPatchTool = makeThreadPatchTool(root, runId, thread);
+    const { session } = await createAgentSession({
+      cwd: record.cwd,
+      authStorage: ctx.modelRegistry.authStorage,
+      modelRegistry: ctx.modelRegistry,
+      model,
+      thinkingLevel: thinking,
+      noTools: "builtin",
+      tools,
+      customTools: childToolDefinitions(root, record.cwd, tools, runUpdateTool, threadPatchTool),
+      resourceLoader: loader,
+      sessionManager,
+    });
+
+    const live: LiveRun = { ...record, status: "running", session, output: "", progress: [] };
+    wireLiveRunSession(live, session);
+    liveRuns.set(runId, live);
+    pendingDispatchRunIds.delete(runId);
+    appendRunEvent(root, { id: runId, status: "running", updatedAt: live.updatedAt, sessionId: record.sessionId, sessionFile: record.sessionFile, sourceRunId, resumeDepth, startLeafId });
+    upsertThreadRunCard(root, live);
+    ensureWidgetTimer(ctx);
+    updateWidget(ctx);
+    if (ctx.hasUI) ctx.ui.notify(`Fray resumed ${sourceRunId} as ${runId}: ${record.label}`, "info");
+
+    const prompt = buildResumeTask(sourceRunId, known.sessionFile, message);
+    void session.prompt(prompt).then(() => {
+      completeRun(pi, root, runId, "completed");
+    }).catch((err: any) => {
+      completeRun(pi, root, runId, "failed", String(err?.message || err));
+    });
+
+    appendRunEvent(root, { id: sourceRunId, updatedAt: now, resumedAs: runId, resumeDepth });
+    return {
+      content: [{ type: "text", text: `resumed ${sourceRunId} as ${runId} (no live handle was registered; continued from recorded session ${known.sessionFile})` }],
+      details: { mode: "resumed", runId, sourceRunId, resumeDepth, startLeafId, sessionId: record.sessionId, sessionFile: record.sessionFile },
+    };
+  } catch (err: any) {
+    pendingDispatchRunIds.delete(runId);
+    appendRunEvent(root, { id: runId, status: "failed", updatedAt: new Date().toISOString(), completedAt: new Date().toISOString(), error: `resume of ${sourceRunId} failed: ${String(err?.message || err)}`, sourceRunId, resumeDepth, reconciled: false });
+    throw err;
+  } finally {
+    resumingSourceRunIds.delete(sourceRunId);
+  }
+}
+
 async function dispatchChild(pi: ExtensionAPI, ctx: ExtensionContext, args: DispatchArgs) {
   const root = frayRoot(ctx.cwd);
   const cfg = loadConfig(root);
@@ -1764,19 +1942,7 @@ async function dispatchChild(pi: ExtensionAPI, ctx: ExtensionContext, args: Disp
   });
 
   const live: LiveRun = { ...record, status: "running", session, output: "", progress: [] };
-  live.unsubscribe = session.subscribe((event: any) => {
-    live.updatedAt = new Date().toISOString();
-    if (event.type === "message_start" && event.message?.role === "assistant") live.currentAssistantText = "";
-    if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") live.currentAssistantText = `${live.currentAssistantText || ""}${event.assistantMessageEvent.delta || ""}`;
-    if (event.type === "message_end" && event.message?.role === "assistant") {
-      const endedText = assistantMessageText(event.message) || String(live.currentAssistantText || "").trim();
-      if (endedText) {
-        live.output = endedText;
-        live.finalOutputSource = "live-event";
-      }
-      live.currentAssistantText = undefined;
-    }
-  });
+  wireLiveRunSession(live, session);
   liveRuns.set(runId, live);
   pendingDispatchRunIds.delete(runId);
   appendRunEvent(root, { id: runId, status: "running", updatedAt: live.updatedAt, sessionId: record.sessionId, sessionFile: record.sessionFile });
@@ -2130,15 +2296,18 @@ export default function FrayExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "fray_steer",
     label: "Fray Steer",
-    description: "Send a steering message into a running fray child agent.",
+    description: "Steer a fray child agent. If the child is live, send a steering message into it; if no live handle exists (e.g. after a parent reload) but its session was recorded, resume that exact session as a continuation run.",
     parameters: Type.Object({ runId: Type.String(), message: Type.String() }),
     async execute(_id, params: any, _signal, _update, ctx) {
       remember(ctx);
       const root = frayRoot(ctx.cwd);
-      const run = requireLiveRunForAction(root, params.runId, "steer");
-      await run.session.steer(params.message);
-      appendRunEvent(root, { id: params.runId, updatedAt: new Date().toISOString(), steered: true });
-      return { content: [{ type: "text", text: `steered ${params.runId}` }], details: {} };
+      const live = liveRuns.get(params.runId);
+      if (live) {
+        await live.session.steer(params.message);
+        appendRunEvent(root, { id: params.runId, updatedAt: new Date().toISOString(), steered: true });
+        return { content: [{ type: "text", text: `steered ${params.runId}` }], details: { mode: "live", runId: params.runId } };
+      }
+      return await resumeRun(pi, ctx, params.runId, params.message);
     },
   });
 

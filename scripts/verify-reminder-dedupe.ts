@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import FrayExtension, { classifySettledRunStatus, completionQueueFromRuns, extractFinalAssistantTextFromSessionJsonl, foldRunEvents, formatRunDisplayTitle, isSlugLikeLabel, nextCompletionReminderRun, parseCompletionReminderRunId, readableTitleFromSlug, resolveRunFinalOutput, SPINNER_FRAME_MS, spinnerFrameAt, stableRunTitleText, staleLedgerLiveRuns } from "../extensions/fray/index.ts";
+import FrayExtension, { buildResumeTask, classifySettledRunStatus, completionQueueFromRuns, extractFinalAssistantTextFromSessionJsonl, extractFinalAssistantTextFromSessionJsonlAfter, foldRunEvents, formatRunDisplayTitle, isSlugLikeLabel, nextCompletionReminderRun, parseCompletionReminderRunId, readableTitleFromSlug, readSessionHeaderFromSessionJsonl, resolveRunFinalOutput, SPINNER_FRAME_MS, spinnerFrameAt, stableRunTitleText, staleLedgerLiveRuns } from "../extensions/fray/index.ts";
 
 const base = "2026-06-18T15:00:00.000Z";
 const events = [
@@ -127,6 +127,7 @@ function makeHarness(root: string, entries: any[] = []) {
     hasUI: false,
     mode: "print",
     sessionManager: { getEntries: () => entries },
+    modelRegistry: { authStorage: undefined, find: () => undefined, hasConfiguredAuth: () => false, getAvailable: async () => [], getApiKeyAndHeaders: async () => ({ ok: false, error: "test model registry has no credentials" }) },
     ui: { theme: { fg: (_name: string, value: string) => value }, setWidget() {}, setStatus() {}, notify() {} },
     hasPendingMessages: () => pending,
   };
@@ -203,6 +204,38 @@ assert.deepEqual(
   { status: "incomplete", incompleteReason: "no child final output could be captured or recovered (test fixture empty)" },
   "completed-without-final-output is reclassified as incomplete",
 );
+
+const resumeOutputRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fray-resume-output-"));
+writeSessionJsonl(resumeOutputRoot, ".pi/sessions/fray-resume-output.jsonl", [
+  { role: "user", content: [{ type: "text", text: "original task" }] },
+  { role: "assistant", content: [{ type: "text", text: "OLD FINAL OUTPUT" }], stopReason: "end" },
+  { role: "user", content: [{ type: "text", text: "continuation" }] },
+  { role: "assistant", content: [{ type: "text", text: "RESUMED FINAL OUTPUT" }], stopReason: "end" },
+]);
+const resumeSessionText = fs.readFileSync(path.join(resumeOutputRoot, ".pi/sessions/fray-resume-output.jsonl"), "utf8");
+assert.equal(readSessionHeaderFromSessionJsonl(resumeSessionText)?.id, "fray-resume-output", "resume validation can read the Pi session header");
+assert.equal(extractFinalAssistantTextFromSessionJsonlAfter(resumeSessionText, "m1"), "RESUMED FINAL OUTPUT", "resume final-output recovery ignores assistant output before the continuation start leaf");
+assert.deepEqual(resolveRunFinalOutput(resumeOutputRoot, { sessionFile: ".pi/sessions/fray-resume-output.jsonl", startLeafId: "m1" }, undefined, ""), { text: "RESUMED FINAL OUTPUT", source: "session-file" }, "resumed runs recover only assistant output after their recorded startLeafId");
+assert.match(buildResumeTask("fray-source", ".pi/sessions/fray-source.jsonl", "continue now"), /Continuation of Fray source run fray-source[\s\S]*continue now/, "resume task preserves source lineage and the steering message");
+
+const resumeErrorRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fray-resume-error-"));
+appendRun(resumeErrorRoot, { id: "fray-no-session", thread: "backlog", label: "no session", intent: "verify", status: "aborted", cwd: resumeErrorRoot, startedAt: base, updatedAt: base, completedAt: base, reconciled: false });
+const hResumeError = makeHarness(resumeErrorRoot);
+await assert.rejects(() => hResumeError.tool("fray_steer", { runId: "fray-no-session", message: "continue" }), /no recorded sessionFile; cannot resume exactly, so relaunch the work instead/, "fray_steer refuses to silently relaunch when no session file exists");
+
+const resumeSteerRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fray-resume-steer-"));
+writeSessionJsonl(resumeSteerRoot, ".pi/sessions/fray-resume-source.jsonl", [
+  { role: "user", content: [{ type: "text", text: "original task" }] },
+  { role: "assistant", content: [{ type: "text", text: "OLD FINAL OUTPUT" }], stopReason: "end" },
+]);
+appendRun(resumeSteerRoot, { id: "fray-resume-source", thread: "backlog", label: "resume source", intent: "verify", status: "aborted", cwd: resumeSteerRoot, startedAt: base, updatedAt: base, completedAt: base, sessionId: "fray-resume-source", sessionFile: ".pi/sessions/fray-resume-source.jsonl", reconciled: false });
+const hResumeSteer = makeHarness(resumeSteerRoot);
+const resumedSteer = await hResumeSteer.tool("fray_steer", { runId: "fray-resume-source", message: "continue from saved context" });
+assert.equal(resumedSteer.details.mode, "resumed", "fray_steer falls back to resume when no live handle exists");
+assert.equal(resumedSteer.details.sourceRunId, "fray-resume-source", "resumed steer records source lineage");
+assert.equal(resumedSteer.details.resumeDepth, 1, "first resumed steer records depth 1");
+assert.ok(resumedSteer.details.startLeafId, "resumed steer records the pre-continuation session leaf for final-output recovery");
+assert.match(resumedSteer.content[0].text, /resumed fray-resume-source as fray-/, "fray_steer reports the continuation run id");
 
 const reminderRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fray-reminder-native-"));
 appendRun(reminderRoot, { id: "fray-native-a", thread: "backlog", label: "native follow-up", intent: "verify", status: "completed", startedAt: base, updatedAt: "2026-06-18T15:10:00.000Z", completedAt: "2026-06-18T15:10:00.000Z", reconciled: false, findingsPath: ".fray/backlog.findings/fray-native-a.md", sessionFile: ".pi/sessions/fray-native-a.jsonl" });
