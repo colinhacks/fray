@@ -21,6 +21,7 @@ import {
 import type { Model } from "@earendil-works/pi-ai";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { Text } from "@earendil-works/pi-tui";
+import { patchThreadFile } from "./thread-patch.ts";
 
 const Type = {
   String: (opts: Record<string, unknown> = {}) => ({ type: "string", ...opts }),
@@ -49,12 +50,13 @@ const LEGACY_HELPER_KEY = "fray-threads";
 export const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
 export const SPINNER_FRAME_MS = 250;
 const LIVE_RUN_STATUSES = new Set<string>(["starting", "running"]);
-const SETTLED_RUN_STATUSES = new Set<string>(["completed", "failed", "aborted", "error"]);
+const SETTLED_RUN_STATUSES = new Set<string>(["completed", "failed", "aborted", "incomplete", "error"]);
 const COMPLETION_REMINDER_PREFIX = "Child agent complete";
 const LEGACY_COMPLETION_REMINDER_PREFIX = "FRAY COMPLETION TASK";
 const REMINDER_STATE_ENTRY = "fray-completion-reminder-state";
+const BACKLOG_THREAD = "backlog";
 
-type RunStatus = "starting" | "running" | "completed" | "failed" | "aborted";
+type RunStatus = "starting" | "running" | "completed" | "failed" | "aborted" | "incomplete";
 type Intent = "harvest" | "investigate" | "implement" | "review" | "verify" | "design" | "custom";
 type ModelHint = "current" | "cheap" | "balanced" | "strong" | "strongest";
 
@@ -104,6 +106,9 @@ export type RunRecord = {
   findingsPath?: string;
   error?: string;
   progress?: string;
+  finalOutput?: string;
+  finalOutputSource?: string;
+  incompleteReason?: string;
   sessionId?: string;
   sessionFile?: string;
   reconciled?: boolean;
@@ -113,6 +118,7 @@ export type RunRecord = {
 type LiveRun = Omit<RunRecord, "progress"> & {
   session: any;
   output: string;
+  currentAssistantText?: string;
   progress: string[];
   unsubscribe?: () => void;
   abort?: AbortController;
@@ -233,7 +239,7 @@ function readThreads(root: string): Thread[] {
 function formatBoard(root: string, only?: string): string {
   const cfg = loadConfig(root);
   const threads = readThreads(root);
-  const unhandled = readRuns(root).filter((r) => ["completed", "failed", "aborted"].includes(r.status) && !r.reconciled);
+  const unhandled = readRuns(root).filter((r) => SETTLED_RUN_STATUSES.has(r.status || "") && !r.reconciled);
   const live = Array.from(liveRuns.values()).filter((r) => r.cwd.startsWith(root));
   const out = [`fray board - autonomous_mode: ${cfg.autonomousMode ? "on" : "off"} - live:${live.length} unhandled:${unhandled.length}`];
   const errors = threads.flatMap((t) => t.errors.map((e) => `${t.id}.md: ${e}`));
@@ -253,10 +259,56 @@ function threadPath(root: string, thread: string): string {
   return path.join(root, ".fray", `${thread}.md`);
 }
 
+function ensureBacklogThread(root: string) {
+  ensureDir(path.join(root, ".fray"));
+  const file = threadPath(root, BACKLOG_THREAD);
+  if (fs.existsSync(file)) return;
+  const text = `---\ntitle: "Backlog"\nstatus: active\nlast_update: ${new Date().toISOString().slice(0, 10)}\n---\n\n## Goal\nCentral control surface for child runs that were dispatched without a more specific fray thread.\n\n## Status\nBacklog thread initialized automatically. Reconcile child final outputs here when no narrower thread owns the work.\n\n## Decisions\nnone yet\n\n## Open questions\nnone\n\n## Steps / follow-up queue\n- [ ] Reconcile unthreaded child results into this backlog instead of leaving raw findings as the only record.\n\n## Next step\nRun fray_next, synthesize accepted child results here, report in chat, then mark handled.\n`;
+  fs.writeFileSync(file, text);
+}
+
 function assertThread(root: string, thread?: string) {
   if (!thread) return;
   if (!/^[a-z0-9][a-z0-9-]*$/.test(thread)) throw new Error(`invalid fray thread slug: ${thread}`);
+  if (thread === BACKLOG_THREAD) ensureBacklogThread(root);
   if (!fs.existsSync(threadPath(root, thread))) throw new Error(`.fray/${thread}.md does not exist; create the thread before dispatching.`);
+}
+
+function effectiveThread(root: string, thread?: string): string {
+  if (thread) {
+    assertThread(root, thread);
+    return thread;
+  }
+  ensureBacklogThread(root);
+  return BACKLOG_THREAD;
+}
+
+function upsertThreadRunCard(root: string, run: Pick<RunRecord, "id" | "thread" | "label" | "intent" | "status" | "findingsPath" | "completedAt" | "reconciled" | "incompleteReason">) {
+  const thread = run.thread || BACKLOG_THREAD;
+  if (thread === BACKLOG_THREAD) ensureBacklogThread(root);
+  const file = threadPath(root, thread);
+  if (!fs.existsSync(file)) return;
+  let src = fs.readFileSync(file, "utf8");
+  const checked = run.reconciled ? "x" : " ";
+  const status = run.reconciled ? "handled" : run.status || "running";
+  const suffix = run.reconciled
+    ? `reconciled ${new Date().toISOString().slice(0, 10)}`
+    : run.status === "incomplete"
+      ? `incomplete/needs retry${run.incompleteReason ? `: ${run.incompleteReason}` : ""}${run.findingsPath ? `; raw sidecar ${run.findingsPath}` : ""}`
+      : SETTLED_RUN_STATUSES.has(String(run.status || ""))
+        ? `awaiting synthesis via fray_next${run.findingsPath ? `; raw sidecar ${run.findingsPath}` : ""}`
+        : `intent ${run.intent || "custom"}`;
+  const line = `- [${checked}] ${run.id} [${status}] ${run.label || run.intent || "child"} — ${suffix}`;
+  const lines = src.split("\n");
+  const existing = lines.findIndex((candidate) => candidate.includes(run.id));
+  if (existing !== -1) {
+    lines[existing] = line;
+    fs.writeFileSync(file, lines.join("\n"));
+    return;
+  }
+  if (!/^## Child runs$/m.test(src)) src = `${src.replace(/\s*$/, "")}\n\n## Child runs\n`;
+  src = `${src.replace(/\s*$/, "")}\n${line}\n`;
+  fs.writeFileSync(file, src);
 }
 
 function appendRunEvent(root: string, event: Record<string, unknown>) {
@@ -369,7 +421,7 @@ function runTitle(root: string, threads: Map<string, Thread>, run: RunRecord): {
 }
 
 function liveRunRecord(live: LiveRun): RunRecord {
-  const { session: _session, unsubscribe: _unsubscribe, abort: _abort, output: _output, progress: _progress, ...record } = live;
+  const { session: _session, unsubscribe: _unsubscribe, abort: _abort, output: _output, currentAssistantText: _currentAssistantText, progress: _progress, ...record } = live;
   return record;
 }
 
@@ -410,17 +462,85 @@ function markLostLiveHandles(root: string): RunRecord[] {
   if (!stale.length) return [];
   const now = new Date().toISOString();
   for (const run of stale) {
-    appendRunEvent(root, {
-      id: run.id,
-      status: "aborted",
+    const resolution = resolveRunFinalOutput(root, run);
+    const classification = classifySettledRunStatus("aborted", resolution.text, resolution.reason);
+    const settled: RunRecord = {
+      ...run,
+      status: classification.status,
       updatedAt: now,
       completedAt: now,
-      error: "live child handle missing after reload or parent session replacement",
+      finalOutput: resolution.text || undefined,
+      finalOutputSource: resolution.source,
+      incompleteReason: classification.incompleteReason,
+      error: classification.incompleteReason || "live child handle missing after reload or parent session replacement",
+      reconciled: false,
+    };
+    settled.findingsPath = writeRunFindings(root, settled, resolution.text);
+    appendRunEvent(root, {
+      id: run.id,
+      status: settled.status,
+      updatedAt: now,
+      completedAt: now,
+      findingsPath: settled.findingsPath,
+      finalOutput: resolution.text || undefined,
+      finalOutputSource: resolution.source,
+      incompleteReason: settled.incompleteReason,
+      error: settled.error,
       previousStatus: run.status,
       reconciled: false,
+      sessionId: run.sessionId,
+      sessionFile: run.sessionFile,
     });
+    upsertThreadRunCard(root, settled);
   }
   return stale;
+}
+
+function repairCompletedRunsMissingFinalOutput(root: string): number {
+  const runs = readRuns(root).filter((run) => run.status === "completed" && !run.reconciled && !String(run.finalOutput || "").trim() && !run.incompleteReason);
+  let repaired = 0;
+  for (const run of runs) {
+    const now = new Date().toISOString();
+    const resolution = resolveRunFinalOutput(root, run);
+    if (resolution.text) {
+      appendRunEvent(root, {
+        id: run.id,
+        updatedAt: now,
+        finalOutput: resolution.text,
+        finalOutputSource: resolution.source,
+        recoveredFinalOutput: true,
+      });
+      repaired++;
+      continue;
+    }
+    const classification = classifySettledRunStatus("completed", "", resolution.reason);
+    const settled: RunRecord = {
+      ...run,
+      status: classification.status,
+      updatedAt: now,
+      completedAt: run.completedAt || now,
+      incompleteReason: classification.incompleteReason,
+      error: classification.incompleteReason,
+      reconciled: false,
+    };
+    settled.findingsPath = run.findingsPath || writeRunFindings(root, settled, "");
+    appendRunEvent(root, {
+      id: run.id,
+      status: settled.status,
+      previousStatus: "completed",
+      updatedAt: now,
+      completedAt: settled.completedAt,
+      findingsPath: settled.findingsPath,
+      incompleteReason: settled.incompleteReason,
+      error: settled.error,
+      reconciled: false,
+      sessionId: run.sessionId,
+      sessionFile: run.sessionFile,
+    });
+    upsertThreadRunCard(root, settled);
+    repaired++;
+  }
+  return repaired;
 }
 
 function liveChildRuns(root: string): RunRecord[] {
@@ -448,11 +568,101 @@ function readRunFindings(root: string, run: RunRecord): string {
   }
 }
 
+function formatFallbackRecords(run: RunRecord): string[] {
+  return [
+    run.findingsPath ? `- Findings sidecar: ${run.findingsPath}` : "- Findings sidecar: not recorded",
+    run.sessionFile ? `- Child session file: ${run.sessionFile}` : "- Child session file: not recorded",
+  ];
+}
+
+function formatRunResult(root: string, run: RunRecord): string {
+  const header = `next unhandled: ${run.id} [${run.status}] ${run.thread || "-"}: ${run.label}${run.findingsPath ? ` -> ${run.findingsPath}` : ""}`;
+  const finalOutput = String(run.finalOutput || "").trim();
+  const needsRetry = run.status !== "completed" || !!run.incompleteReason || !finalOutput;
+  const records = formatFallbackRecords(run).join("\n");
+  if (finalOutput) {
+    const title = run.status === "completed" ? "Child final output" : "Recovered child output";
+    const caution = needsRetry ? `\n\n## Status\n\nThis run is ${run.status}; treat the output as fallback evidence, not a successful completed handoff.${run.incompleteReason ? `\n\nReason: ${run.incompleteReason}` : ""}` : "";
+    return `${header}${caution}\n\n## ${title}\n\n${finalOutput}\n\n${run.findingsPath ? `Raw sidecar: ${run.findingsPath}` : ""}`.trim();
+  }
+  const reason = run.incompleteReason || run.error || missingFinalOutputReason();
+  const findings = readRunFindings(root, run).trim();
+  return `${header}\n\n## Incomplete Fray handoff\n\nNo child final output could be captured or recovered. Treat this run as incomplete/needs-retry, not as a successful completion.\n\nReason: ${reason}\n\nFallback records:\n${records}${findings ? `\n\n## Findings sidecar\n\n${findings}` : `\n\n${JSON.stringify(run, null, 2)}`}`;
+}
+
+function formatRunMetadata(run: RunRecord): string[] {
+  const thread = run.thread || BACKLOG_THREAD;
+  return [
+    `- Run ID: ${run.id}`,
+    `- Thread: .fray/${thread}.md`,
+    `- Label/purpose: ${run.label || "-"}`,
+    `- Intent: ${run.intent || "custom"}`,
+    `- Status: ${run.status || "unknown"}`,
+    run.error ? `- Error: ${run.error}` : "",
+    run.startedAt ? `- Started: ${run.startedAt}` : "",
+    run.completedAt ? `- Completed: ${run.completedAt}` : "",
+    run.model ? `- Model: ${run.model}` : "",
+    run.thinking ? `- Thinking: ${run.thinking}` : "",
+    run.finalOutputSource ? `- Final output source: ${run.finalOutputSource}` : "",
+    run.incompleteReason ? `- Incomplete reason: ${run.incompleteReason}` : "",
+    run.findingsPath ? `- Findings sidecar: ${run.findingsPath}` : "",
+    run.sessionFile ? `- Child session file: ${run.sessionFile}` : "",
+  ].filter(Boolean);
+}
+
 function formatCompletionQueueReminder(root: string): string | undefined {
   const queue = completionQueue(root);
   const run = queue[0];
   if (!run) return undefined;
-  return `${COMPLETION_REMINDER_PREFIX} [${run.id}].`;
+  const childFinalOutput = String(run.finalOutput ?? "");
+  const hasFinalOutput = childFinalOutput.trim().length > 0;
+  const needsRetry = run.status !== "completed" || !!run.incompleteReason || !hasFinalOutput;
+  const targetThreadPath = `.fray/${run.thread || BACKLOG_THREAD}.md`;
+  const lines = [
+    `${COMPLETION_REMINDER_PREFIX} [${run.id}].`,
+    "",
+    needsRetry
+      ? "Handle this Fray child result now. This is an incomplete/failed/aborted handoff; do not treat it as a successful completed child result."
+      : "Handle this Fray child result now. This is the oldest unhandled child result; do not batch other completions into this response.",
+    "",
+    "## Run metadata",
+    "",
+    ...formatRunMetadata(run),
+    "",
+    hasFinalOutput ? "## Child final output" : "## Incomplete handoff",
+    "",
+    hasFinalOutput ? childFinalOutput : "INCOMPLETE HANDOFF — no child final output could be captured or recovered.",
+  ];
+  if (needsRetry) {
+    lines.push(
+      "",
+      "## Incomplete/needs-retry handling",
+      "",
+      `Reason: ${run.incompleteReason || run.error || missingFinalOutputReason()}`,
+      "Do not mark this as a normal successful completion. Missing/empty final output is an incomplete handoff/bug; reconcile it as incomplete, relaunch/retry the child if the work is still needed, or record why no retry is needed before marking handled.",
+      "",
+      "Fallback records:",
+      ...formatFallbackRecords(run),
+      "Use fallback records only as evidence; they are not a substitute for a child final handoff.",
+    );
+  } else if (run.findingsPath || run.sessionFile) {
+    lines.push("", "Reference records:");
+    if (run.findingsPath) lines.push(`- Raw sidecar: ${run.findingsPath}`);
+    if (run.sessionFile) lines.push(`- Child session file: ${run.sessionFile}`);
+  }
+  lines.push(
+    "",
+    "## Required handling",
+    "",
+    `Synthesize accepted facts for ${run.id} into ${targetThreadPath} before marking it handled.`,
+    hasFinalOutput
+      ? "Report in chat with purpose, result, changed files/actions, verification, caveats, and next action, using the embedded child final output above for those fields when present."
+      : "Report in chat that the handoff is incomplete/needs-retry, include fallback references, and do not present the child as done.",
+    "If this result identifies a clear blocker, known required fix, or reload blocker, start or steer the follow-up after the chat report unless a human-owned decision blocks it.",
+    `Then call fray_reconcile with runId=${run.id} and markHandled=true only after the incomplete/successful handling is recorded.`,
+    "After marking handled, call fray_next to check for the next unhandled child result.",
+  );
+  return lines.join("\n").trimEnd();
 }
 
 export function parseCompletionReminderRunId(text: string): string | undefined {
@@ -471,21 +681,10 @@ function reminderState(root: string) {
   return state;
 }
 
-function restoreReminderState(ctx: ExtensionContext) {
+function restoreReminderState(_ctx: ExtensionContext) {
   if (reminderStateRestored) return;
   reminderStateRestored = true;
-  const entries = (ctx.sessionManager as any)?.getEntries?.() || [];
-  for (const entry of entries) {
-    if (entry?.type !== "custom" || entry?.customType !== REMINDER_STATE_ENTRY) continue;
-    const data = entry.data || {};
-    if (typeof data.root !== "string" || typeof data.runId !== "string") continue;
-    const state = reminderState(data.root);
-    if (data.action === "scheduled") state.scheduledRunIds.add(data.runId);
-    if (data.action === "delivered") {
-      state.scheduledRunIds.add(data.runId);
-      state.deliveredRunIds.add(data.runId);
-    }
-  }
+  // Native Pi follow-up queues are process-local. Persisted reminder entries are audit/recovery breadcrumbs only; restoring them as suppression state would make an unhandled run disappear after reload if the queued native follow-up was lost.
 }
 
 function appendReminderState(pi: ExtensionAPI, root: string, runId: string, action: "scheduled" | "delivered" | "suppressed") {
@@ -507,16 +706,52 @@ function handleCompletionReminderInput(pi: ExtensionAPI, root: string, text: str
     return { action: "handled" };
   }
 
+  return { action: "continue" };
+}
+
+function handleCompletionReminderMessage(pi: ExtensionAPI, root: string, text: string) {
+  const runId = parseCompletionReminderRunId(text);
+  if (!runId) return;
+  const current = completionQueue(root)[0];
+  if (current?.id !== runId) return;
+  const state = reminderState(root);
   state.scheduledRunIds.add(runId);
+  if (state.deliveredRunIds.has(runId)) return;
   state.deliveredRunIds.add(runId);
   appendReminderState(pi, root, runId, "delivered");
-  return { action: "continue" };
+}
+
+function formatOrchestrationGuardrail(root: string, prompt: string): string | undefined {
+  const queue = completionQueue(root);
+  const run = queue[0];
+  if (!run) return undefined;
+  const reminderRunId = parseCompletionReminderRunId(prompt);
+  const target = `${run.id} [${run.status}] ${run.thread || "-"}: ${run.label}`;
+  const needsRetry = run.status !== "completed" || !!run.incompleteReason || !String(run.finalOutput || "").trim();
+  return [
+    "Fray orchestration guardrail:",
+    `- ${queue.length} unhandled child result${queue.length === 1 ? "" : "s"}; oldest is ${target}.`,
+    reminderRunId
+      ? needsRetry
+        ? `- The current prompt is the native Pi follow-up for ${reminderRunId}; it is incomplete/failed/aborted. Treat it as retryable unless you explicitly record why no retry is needed.`
+        : `- The current prompt is the native Pi follow-up for ${reminderRunId}; its embedded child final output is the primary handoff. Use fray_next or fray_reconcile only if you need to verify/fill missing data.`
+      : "- Before unrelated work or more dispatches, reconcile the oldest child result unless the user asked a higher-priority direct question.",
+    "- Required handling: synthesize accepted facts into the owning thread or .fray/backlog.md, report purpose/result/changed files/actions/verification/caveats/next action in chat, start or steer any clear follow-up/blocker fix after reporting, mark handled only after reporting, then call fray_next again.",
+  ].join("\n");
 }
 
 export function nextCompletionReminderRun(runs: RunRecord[], scheduledRunIds: Set<string>): RunRecord | undefined {
   const run = completionQueueFromRuns(runs)[0];
   if (!run?.id || scheduledRunIds.has(run.id)) return undefined;
   return run;
+}
+
+function clearUndeliveredReminderSchedules(root: string) {
+  const state = reminderState(root);
+  const queuedIds = new Set(completionQueue(root).map((run) => run.id));
+  for (const runId of Array.from(state.scheduledRunIds)) {
+    if (queuedIds.has(runId) && !state.deliveredRunIds.has(runId)) state.scheduledRunIds.delete(runId);
+  }
 }
 
 function queueCompletionReminder(pi: ExtensionAPI, root: string): boolean {
@@ -527,13 +762,14 @@ function queueCompletionReminder(pi: ExtensionAPI, root: string): boolean {
   const message = formatCompletionQueueReminder(root);
   if (!message || parseCompletionReminderRunId(message) !== run.id) return false;
 
+  state.scheduledRunIds.add(run.id);
+  appendReminderState(pi, root, run.id, "scheduled");
   try {
     pi.sendUserMessage(message, { deliverAs: "followUp" });
   } catch {
-    try { pi.sendUserMessage(message); } catch { return false; }
+    state.scheduledRunIds.delete(run.id);
+    return false;
   }
-  state.scheduledRunIds.add(run.id);
-  appendReminderState(pi, root, run.id, "scheduled");
   return true;
 }
 
@@ -608,17 +844,15 @@ function updateWidget(ctx?: ExtensionContext, nowMs = Date.now()) {
   }
 
   const live = liveChildRuns(root);
+  const unhandledCount = completionQueue(root).length;
   const lines = renderChildBoard(root, ctx, live, nowMs).filter((line) => line.trim().length > 0);
   setWidgetIfChanged(ctx, CHILD_WIDGET_KEY, lines.length ? lines : undefined, { placement: "aboveEditor" });
 
-  if (!live.length) {
-    setStatusIfChanged(ctx, STATUS_KEY, undefined);
-    return;
-  }
-
   const mode = cfg.autonomousMode ? theme.fg("thinkingHigh", "auto") : theme.fg("success", "on");
-  const running = `${live.length} child${live.length === 1 ? "" : "ren"} running`;
-  setStatusIfChanged(ctx, STATUS_KEY, `${theme.fg("dim", "fray:")} ${mode} · ${running}`);
+  const statusParts = [mode];
+  if (live.length) statusParts.push(`${live.length} child${live.length === 1 ? "" : "ren"} running`);
+  if (unhandledCount) statusParts.push(theme.fg("warning", `${unhandledCount} unhandled`));
+  setStatusIfChanged(ctx, STATUS_KEY, `${theme.fg("dim", "fray:")} ${statusParts.join(" · ")}`);
 }
 
 function extractText(value: any): string {
@@ -626,6 +860,7 @@ function extractText(value: any): string {
   if (typeof value === "string") return value;
   if (Array.isArray(value)) return value.map(extractText).filter(Boolean).join("\n");
   if (typeof value === "object") {
+    if (value.type === "text" && typeof value.text === "string") return value.text;
     if (typeof value.text === "string") return value.text;
     if (typeof value.content === "string") return value.content;
     if (Array.isArray(value.content)) return extractText(value.content);
@@ -634,12 +869,77 @@ function extractText(value: any): string {
   return "";
 }
 
+function assistantMessageText(message: any): string {
+  if (!message || message.role !== "assistant") return "";
+  return extractText(message.content).trim();
+}
+
 function finalAssistantText(session: any): string {
   const messages = session?.messages || session?.agent?.state?.messages || [];
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]?.role === "assistant") return extractText(messages[i].content || messages[i]);
+    if (messages[i]?.role !== "assistant") continue;
+    return assistantMessageText(messages[i]);
   }
   return "";
+}
+
+function parseJsonlEntries(content: string): any[] {
+  const entries: any[] = [];
+  for (const line of content.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      entries.push(JSON.parse(line));
+    } catch {
+      // Ignore torn/truncated JSONL lines; session files are append-only and may be read mid-write.
+    }
+  }
+  return entries;
+}
+
+export function extractFinalAssistantTextFromSessionJsonl(content: string): string {
+  const entries = parseJsonlEntries(content);
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry?.type !== "message" || entry.message?.role !== "assistant") continue;
+    return assistantMessageText(entry.message);
+  }
+  return "";
+}
+
+function resolveSessionFile(root: string, sessionFile?: string): string | undefined {
+  if (!sessionFile) return undefined;
+  if (path.isAbsolute(sessionFile)) return sessionFile;
+  return path.join(root, sessionFile);
+}
+
+export function recoverFinalOutputFromSessionFile(root: string, sessionFile?: string): { text: string; error?: string } {
+  const file = resolveSessionFile(root, sessionFile);
+  if (!file) return { text: "", error: "child session file was not recorded" };
+  try {
+    return { text: extractFinalAssistantTextFromSessionJsonl(fs.readFileSync(file, "utf8")) };
+  } catch (err: any) {
+    return { text: "", error: `could not read child session file ${sessionFile}: ${String(err?.message || err)}` };
+  }
+}
+
+export function resolveRunFinalOutput(root: string, run: Pick<RunRecord, "sessionFile">, session?: any, liveOutput?: string): { text: string; source?: string; reason?: string } {
+  const stateText = finalAssistantText(session);
+  if (stateText) return { text: stateText, source: "live-state" };
+  const eventText = String(liveOutput || "").trim();
+  if (eventText) return { text: eventText, source: "live-event" };
+  const recovered = recoverFinalOutputFromSessionFile(root, run.sessionFile);
+  if (recovered.text) return { text: recovered.text, source: "session-file" };
+  return { text: "", reason: recovered.error || "live capture and child session-file fallback were empty" };
+}
+
+function missingFinalOutputReason(reason?: string): string {
+  return `no child final output could be captured or recovered${reason ? ` (${reason})` : ""}`;
+}
+
+export function classifySettledRunStatus(status: RunStatus, finalOutput: string, reason?: string): { status: RunStatus; incompleteReason?: string } {
+  if (status === "completed" && !finalOutput.trim()) return { status: "incomplete", incompleteReason: missingFinalOutputReason(reason) };
+  if (["failed", "aborted", "incomplete"].includes(status) && !finalOutput.trim()) return { status, incompleteReason: missingFinalOutputReason(reason) };
+  return { status };
 }
 
 function getToolResultText(result: any): string {
@@ -674,6 +974,11 @@ function compactCallSummary(name: string, args: any): string {
     const count = Array.isArray(args?.edits) ? args.edits.length : 0;
     const plural = count === 1 ? "replacement" : "replacements";
     return args?.path ? `${args.path} (${count} ${plural})` : `${count} ${plural}`;
+  }
+  if (name === "fray_thread_patch") {
+    const replacements = Array.isArray(args?.replacements) ? args.replacements.length : 0;
+    const appends = Array.isArray(args?.appendSections) ? args.appendSections.length : 0;
+    return `${replacements} replacement${replacements === 1 ? "" : "s"}, ${appends} append${appends === 1 ? "" : "s"}`;
   }
   if (name === "bash") return args?.command ? ellipsize(String(args.command)) : "";
   if (name === "grep") return [args?.pattern ? `/${ellipsize(String(args.pattern), 40)}/` : "", args?.path, args?.glob].filter(Boolean).join(" ");
@@ -740,9 +1045,9 @@ function defaultThinking(intent: Intent, hint?: string): ThinkingLevel {
 }
 
 function defaultTools(intent: Intent, write?: boolean, requested?: string[]): string[] {
-  if (requested?.length) return Array.from(new Set([...requested, "fray_run_update"]));
+  if (requested?.length) return Array.from(new Set([...requested, "fray_run_update", "fray_thread_patch"]));
   const base = write ?? ["implement", "custom"].includes(intent) ? DEFAULT_TOOLS : READ_ONLY_TOOLS;
-  return Array.from(new Set([...base, "grep", "find", "ls", "fray_run_update"]));
+  return Array.from(new Set([...base, "grep", "find", "ls", "fray_run_update", "fray_thread_patch"]));
 }
 
 function dispatchArgSchema(includeThread = true) {
@@ -762,8 +1067,11 @@ function dispatchArgSchema(includeThread = true) {
 }
 
 function childContract(args: any, runId: string): string {
-  const threadLine = args.thread ? `You are working for fray thread .fray/${args.thread}.md. Read it as authoritative context, but do not edit it or .fray/config.yml directly.` : "This is a one-shot fray child run with no owning thread.";
-  return `You are a pi fray child agent. Run id: ${runId}.\n\n${threadLine}\n\nYou have broad normal coding-agent permissions. Use read/write/edit/bash as needed for the assigned work. The only standing restrictions are coordination restrictions: do not run destructive git commands such as git reset, git checkout --, git stash, branch switches, or worktree creation in the shared tree; do not recursively copy the repo; do not edit canonical .fray thread/config/run files directly. Use the fray_run_update tool for live status. If you need durable output, write a findings sidecar only under .fray/${args.thread || "backlog"}.findings/${runId}.md.\n\nSub-agents are instruments, not deciders. Surface default/security/product/brand/API/config decisions as questions unless the prompt says they are already decided.\n\nEnd your final response with a ## Follow-ups section. Include concrete follow-ups, whether an independent review is needed, verification run, changed paths, and the single most important next step.\n\nTask:\n${args.task || args.prompt || ""}`;
+  const thread = args.thread || BACKLOG_THREAD;
+  const threadLine = `You are working for fray thread .fray/${thread}.md. Read it as authoritative context and keep it current as part of your task. Use fray_thread_patch for owning-thread updates; do not use generic write/edit/bash for canonical .fray thread/config/run files.`;
+  return `You are a pi fray child agent. Run id: ${runId}.\n\n${threadLine}\n\nThread-doc updates are expected child work. Eagerly patch your owning thread when facts become durable: frontmatter status/last_update, Status, Decisions, Open questions, Steps/checklists, Next step, Child runs rows, and body synthesis. fray_thread_patch can update frontmatter and body in one atomic exact-replacement/append call. You may update only .fray/${thread}.md unless explicitly assigned otherwise; never edit unrelated threads, .fray/config.yml, or .fray/runs.jsonl.\n\nYour final assistant response is mandatory and remains the primary completion report the orchestrator will read through fray_next/fray_reconcile. Make it orchestration-ready: verdict/status, what you did or changed, changed paths/artifacts, verification commands and results, blockers/caveats/risks, and one concrete next action. Empty or missing final output is an incomplete handoff/bug, not normal success; keep working, recover evidence, or report a blocker rather than ending silently. Use .fray/${thread}.findings/${runId}.md only for long raw artifacts or bulky evidence that does not fit cleanly in the final response; do not make a sidecar the main handoff.\n\nYou have broad normal coding-agent permissions. Use read/write/edit/bash as needed for the assigned work. The standing restrictions are coordination restrictions: do not run destructive git commands such as git reset, git checkout --, git stash, branch switches, or worktree creation in the shared tree; do not recursively copy the repo; do not edit canonical .fray thread/config/run files with generic tools. Use fray_run_update for live status. Use fray_thread_patch for atomic exact-replacement/append updates to your owning thread doc. fray_reconcile remains orchestrator-owned: final result handling, chat reporting, and durable handled/ledger state are not delegated to children.\n\nFor substantive implementation, operate as a mini-orchestrator within this assigned task: plan briefly, implement, run local verification, self-review the diff, evaluate/integrate, and for landing work commit and push to main by default unless the task/repo specifies a PR flow or forbids pushing. If CI applies and credentials are available, wait for CI and fix in-scope failures. When a blocker/P0/known required fix is found, start or steer the fix immediately unless a human-owned decision blocks it; do not only describe the next action.
+
+Sub-agents are instruments, not deciders. Surface default/security/product/brand/API/config decisions as questions unless the prompt says they are already decided. For any GitHub issue or PR task, use the gh CLI before proposing or landing work: run gh issue view for issues, inspect linked/open PRs with relevant gh pr list / gh pr view checks, and include the GH commands and results in the final report. After context is known, drive the outcome: fix, push, comment, close, or verify when safe instead of stopping at a diagnosis.\n\nEnd your final response with a ## Follow-ups section. Include concrete follow-ups, whether an independent review is needed, verification run, changed paths, and the single most important next step.\n\nTask:\n${args.task || args.prompt || ""}`;
 }
 
 function isProtectedFrayPath(root: string, absolutePath: string): boolean {
@@ -771,7 +1079,7 @@ function isProtectedFrayPath(root: string, absolutePath: string): boolean {
   return /^\.fray\/(config\.yml|runs\.jsonl|[^/]+\.md)$/.test(rel);
 }
 
-function childToolDefinitions(root: string, cwd: string, enabled: string[], runUpdateTool: ToolDefinition<any>): ToolDefinition<any>[] {
+function childToolDefinitions(root: string, cwd: string, enabled: string[], runUpdateTool: ToolDefinition<any>, threadPatchTool: ToolDefinition<any>): ToolDefinition<any>[] {
   const out: ToolDefinition<any>[] = [];
   const want = new Set(enabled);
   if (want.has("read")) out.push(createReadToolDefinition(cwd));
@@ -788,7 +1096,7 @@ function childToolDefinitions(root: string, cwd: string, enabled: string[], runU
     operations: {
       async mkdir(dir) { await fs.promises.mkdir(dir, { recursive: true }); },
       async writeFile(file, content) {
-        if (isProtectedFrayPath(root, file)) throw new Error("canonical .fray thread/config/run files are orchestrator-owned; write a findings sidecar or use fray_run_update");
+        if (isProtectedFrayPath(root, file)) throw new Error("canonical .fray thread/config/run files are protected from generic writes; write a findings sidecar, use fray_run_update for live progress, or use fray_thread_patch for your owning thread doc");
         await fs.promises.writeFile(file, content);
       },
     },
@@ -798,12 +1106,12 @@ function childToolDefinitions(root: string, cwd: string, enabled: string[], runU
       async readFile(file) { return fs.promises.readFile(file); },
       async access(file) { await fs.promises.access(file, fs.constants.R_OK | fs.constants.W_OK); },
       async writeFile(file, content) {
-        if (isProtectedFrayPath(root, file)) throw new Error("canonical .fray thread/config/run files are orchestrator-owned; write a findings sidecar or use fray_run_update");
+        if (isProtectedFrayPath(root, file)) throw new Error("canonical .fray thread/config/run files are protected from generic writes; write a findings sidecar, use fray_run_update for live progress, or use fray_thread_patch for your owning thread doc");
         await fs.promises.writeFile(file, content);
       },
     },
   }));
-  out.push(runUpdateTool);
+  out.push(runUpdateTool, threadPatchTool);
   return out;
 }
 
@@ -811,7 +1119,7 @@ function makeRunUpdateTool(root: string, runId: string, thread?: string): ToolDe
   return {
     name: "fray_run_update",
     label: "Fray Run Update",
-    description: "Update live fray child-run progress without editing the canonical thread doc.",
+    description: "Update transient live fray child-run progress; use fray_thread_patch for durable owning-thread doc updates.",
     parameters: Type.Object({
       status: Type.Optional(Type.String({ description: "Short phase such as probing, editing, testing, finalizing, blocked." })),
       summary: Type.String({ description: "One concise current-state update." }),
@@ -838,13 +1146,59 @@ function makeRunUpdateTool(root: string, runId: string, thread?: string): ToolDe
   };
 }
 
+function makeThreadPatchTool(root: string, runId: string, thread?: string): ToolDefinition<any> {
+  return {
+    name: "fray_thread_patch",
+    label: "Fray Thread Patch",
+    description: "Atomically patch this child run's owning .fray/<thread>.md only, using multiple exact replacements and optional appended sections.",
+    parameters: Type.Object({
+      replacements: Type.Optional(Type.Array(Type.Object({
+        oldText: Type.String({ description: "Exact text to replace. It must match exactly once in the current owning thread doc." }),
+        newText: Type.String({ description: "Replacement text." }),
+      }), { description: "Zero or more exact replacements, all matched against the original thread doc before any changes are written." })),
+      appendSections: Type.Optional(Type.Array(Type.Object({
+        heading: Type.String({ description: "Level-2 Markdown heading text to append, without leading ##." }),
+        content: Type.String({ description: "Section body to append under the heading." }),
+      }), { description: "Optional level-2 sections appended to the end of the owning thread doc in the same atomic patch." })),
+      expectedSha256: Type.Optional(Type.String({ description: "Optional SHA-256 of the thread doc content read earlier; rejects if the file changed before patching." })),
+    }),
+    renderCall(args: any, theme: any, context: any) {
+      return compactCall("fray_thread_patch", args, theme, context);
+    },
+    renderResult: compactRender("fray_thread_patch"),
+    async execute(_toolCallId: string, params: any) {
+      const owningThread = thread || BACKLOG_THREAD;
+      if (owningThread === BACKLOG_THREAD) ensureBacklogThread(root);
+      else assertThread(root, owningThread);
+      const file = threadPath(root, owningThread);
+      const result = await patchThreadFile(file, {
+        replacements: params.replacements || [],
+        appendSections: params.appendSections || [],
+        expectedSha256: params.expectedSha256,
+      }, { lockId: runId });
+      const summary = `patched .fray/${owningThread}.md (${result.replacementCount} replacement${result.replacementCount === 1 ? "" : "s"}, ${result.appendedSectionCount} appended section${result.appendedSectionCount === 1 ? "" : "s"})`;
+      const now = new Date().toISOString();
+      const run = liveRuns.get(runId);
+      if (run) {
+        run.progress.push(`thread-patch: ${summary}`);
+        run.updatedAt = now;
+        appendRunEvent(root, { id: runId, status: "running", updatedAt: now, progress: summary });
+      } else {
+        appendRunEvent(root, { id: runId, updatedAt: now, progress: summary, warning: "thread patch received but no live child handle is registered" });
+      }
+      return { content: [{ type: "text", text: `${summary}\nsha256: ${result.sha256Before} -> ${result.sha256After}` }], details: { thread: owningThread, path: path.relative(root, file), ...result } };
+    },
+  };
+}
+
 async function dispatchChild(pi: ExtensionAPI, ctx: ExtensionContext, args: DispatchArgs) {
   const root = frayRoot(ctx.cwd);
   const cfg = loadConfig(root);
   if (!cfg.enabled) throw new Error("fray is disabled in .fray/config.yml");
   if (Date.now() < cooldownUntil) throw new Error(`fray dispatch is cooling down after provider rate-limit until ${new Date(cooldownUntil).toISOString()}`);
   if (liveRuns.size >= cfg.maxChildren) throw new Error(`fray has ${liveRuns.size} live children; max_children is ${cfg.maxChildren}`);
-  if (args.thread) assertThread(root, args.thread);
+  const thread = effectiveThread(root, args.thread);
+  const childArgs = { ...args, thread };
 
   const runId = `fray-${new Date().toISOString().replace(/[-:.TZ]/g, "")}-${randomUUID().slice(0, 8)}`;
   pendingDispatchRunIds.add(runId);
@@ -855,8 +1209,9 @@ async function dispatchChild(pi: ExtensionAPI, ctx: ExtensionContext, args: Disp
   const cwd = args.cwd || ctx.cwd;
   const childSessionManager = SessionManager.create(cwd, undefined, { id: runId });
   const now = new Date().toISOString();
-  const record: RunRecord = { id: runId, thread: args.thread, label: args.label || intent, intent, status: "starting", model: model ? `${model.provider}/${model.id}` : undefined, thinking, cwd, startedAt: now, updatedAt: now, reconciled: false, sessionId: childSessionManager.getSessionId(), sessionFile: childSessionManager.getSessionFile() };
+  const record: RunRecord = { id: runId, thread, label: args.label || intent, intent, status: "starting", model: model ? `${model.provider}/${model.id}` : undefined, thinking, cwd, startedAt: now, updatedAt: now, reconciled: false, sessionId: childSessionManager.getSessionId(), sessionFile: childSessionManager.getSessionFile() };
   appendRunEvent(root, record);
+  upsertThreadRunCard(root, record);
 
   try {
   const loader = new DefaultResourceLoader({
@@ -869,7 +1224,8 @@ async function dispatchChild(pi: ExtensionAPI, ctx: ExtensionContext, args: Disp
   });
   await loader.reload();
 
-  const runUpdateTool = makeRunUpdateTool(root, runId, args.thread);
+  const runUpdateTool = makeRunUpdateTool(root, runId, thread);
+  const threadPatchTool = makeThreadPatchTool(root, runId, thread);
   const { session } = await createAgentSession({
     cwd: record.cwd,
     authStorage: ctx.modelRegistry.authStorage,
@@ -878,7 +1234,7 @@ async function dispatchChild(pi: ExtensionAPI, ctx: ExtensionContext, args: Disp
     thinkingLevel: thinking,
     noTools: "builtin",
     tools,
-    customTools: childToolDefinitions(root, record.cwd, tools, runUpdateTool),
+    customTools: childToolDefinitions(root, record.cwd, tools, runUpdateTool, threadPatchTool),
     resourceLoader: loader,
     sessionManager: childSessionManager,
   });
@@ -886,22 +1242,33 @@ async function dispatchChild(pi: ExtensionAPI, ctx: ExtensionContext, args: Disp
   const live: LiveRun = { ...record, status: "running", session, output: "", progress: [] };
   live.unsubscribe = session.subscribe((event: any) => {
     live.updatedAt = new Date().toISOString();
-    if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") live.output += event.assistantMessageEvent.delta;
+    if (event.type === "message_start" && event.message?.role === "assistant") live.currentAssistantText = "";
+    if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") live.currentAssistantText = `${live.currentAssistantText || ""}${event.assistantMessageEvent.delta || ""}`;
+    if (event.type === "message_end" && event.message?.role === "assistant") {
+      const endedText = assistantMessageText(event.message) || String(live.currentAssistantText || "").trim();
+      if (endedText) {
+        live.output = endedText;
+        live.finalOutputSource = "live-event";
+      }
+      live.currentAssistantText = undefined;
+    }
   });
   liveRuns.set(runId, live);
   pendingDispatchRunIds.delete(runId);
   appendRunEvent(root, { id: runId, status: "running", updatedAt: live.updatedAt, sessionId: record.sessionId, sessionFile: record.sessionFile });
+  upsertThreadRunCard(root, live);
   ensureWidgetTimer(ctx);
   updateWidget(ctx);
+  if (ctx.hasUI) ctx.ui.notify(`Fray dispatched ${runId}: ${record.label}`, "info");
 
-  const prompt = childContract(args, runId);
+  const prompt = childContract(childArgs, runId);
   void session.prompt(prompt).then(() => {
     completeRun(pi, root, runId, "completed");
   }).catch((err: any) => {
     completeRun(pi, root, runId, "failed", String(err?.message || err));
   });
 
-  return { runId, thread: args.thread, status: "running", model: record.model, thinking, tools, sessionId: record.sessionId, sessionFile: record.sessionFile };
+  return { runId, thread, status: "running", model: record.model, thinking, tools, sessionId: record.sessionId, sessionFile: record.sessionFile };
   } catch (err: any) {
     pendingDispatchRunIds.delete(runId);
     appendRunEvent(root, { id: runId, status: "failed", updatedAt: new Date().toISOString(), completedAt: new Date().toISOString(), error: String(err?.message || err), reconciled: false, sessionId: record.sessionId, sessionFile: record.sessionFile });
@@ -910,28 +1277,84 @@ async function dispatchChild(pi: ExtensionAPI, ctx: ExtensionContext, args: Disp
   }
 }
 
+function runProgressLines(run: { progress?: string | string[] }): string[] {
+  const progress = (run as any).progress;
+  if (Array.isArray(progress)) return progress.length ? progress : ["none recorded"];
+  return progress ? [String(progress)] : ["none recorded"];
+}
+
+function writeRunFindings(root: string, run: Omit<RunRecord, "progress"> & { progress?: string | string[] }, finalOutput: string): string {
+  const dir = path.join(root, ".fray", `${run.thread || BACKLOG_THREAD}.findings`);
+  ensureDir(dir);
+  const findingsPath = path.join(dir, `${run.id}.md`);
+  const relFindings = path.relative(root, findingsPath);
+  const body = [
+    `# ${run.label}`,
+    "",
+    `Run: \`${run.id}\``,
+    `Status: ${run.status}`,
+    `Intent: ${run.intent}`,
+    run.model ? `Model: ${run.model}` : "",
+    run.thinking ? `Thinking: ${run.thinking}` : "",
+    run.finalOutputSource ? `Final output source: ${run.finalOutputSource}` : "",
+    run.incompleteReason ? `Incomplete reason: ${run.incompleteReason}` : "",
+    run.error ? `Error: ${run.error}` : "",
+    "",
+    "## Progress",
+    "",
+    ...runProgressLines(run).map((p) => `- ${p}`),
+    "",
+    finalOutput ? "## Captured child final output" : "## Incomplete handoff",
+    "",
+    finalOutput || "No child final output could be captured or recovered. Treat this run as incomplete/needs-retry; use progress, sidecar metadata, and the child session file only as fallback evidence.",
+    "",
+  ].filter(Boolean).join("\n");
+  fs.writeFileSync(findingsPath, body);
+  return relFindings;
+}
+
+function finishLiveRun(pi: ExtensionAPI, root: string, run: LiveRun, status: RunStatus, error?: string, options: { notify?: boolean; queueReminder?: boolean } = {}) {
+  const completedAt = new Date().toISOString();
+  const resolution = resolveRunFinalOutput(root, run, run.session, run.output || run.currentAssistantText);
+  const classification = classifySettledRunStatus(status, resolution.text, resolution.reason);
+  run.status = classification.status;
+  run.completedAt = completedAt;
+  run.updatedAt = completedAt;
+  run.output = resolution.text;
+  run.finalOutput = resolution.text;
+  run.finalOutputSource = resolution.source;
+  run.incompleteReason = classification.incompleteReason;
+  run.error = error || classification.incompleteReason;
+  run.unsubscribe?.();
+  run.findingsPath = writeRunFindings(root, run, resolution.text);
+  appendRunEvent(root, {
+    id: run.id,
+    status: run.status,
+    previousStatus: run.status !== status ? status : undefined,
+    updatedAt: run.updatedAt,
+    completedAt: run.completedAt,
+    findingsPath: run.findingsPath,
+    finalOutput: resolution.text || undefined,
+    finalOutputSource: resolution.source,
+    incompleteReason: run.incompleteReason,
+    error: run.error,
+    reconciled: false,
+    sessionId: run.sessionId,
+    sessionFile: run.sessionFile,
+  });
+  upsertThreadRunCard(root, run);
+  try { run.session.dispose?.(); } catch { /* ignore cleanup failure */ }
+  liveRuns.delete(run.id);
+  syncWidgetTimer(lastCtx);
+  updateWidget(lastCtx);
+  if (options.notify !== false && lastCtx?.hasUI) lastCtx.ui.notify(`Fray child ${run.status}: ${run.id}`, run.status === "completed" ? "info" : "warning");
+  if (options.queueReminder !== false) queueCompletionReminder(pi, root);
+}
+
 function completeRun(pi: ExtensionAPI, root: string, runId: string, status: RunStatus, error?: string) {
   const run = liveRuns.get(runId);
   if (!run) return;
-  run.status = status;
-  run.completedAt = new Date().toISOString();
-  run.updatedAt = run.completedAt;
-  run.error = error;
-  run.output = finalAssistantText(run.session) || run.output || "";
-  run.unsubscribe?.();
-  const dir = path.join(root, ".fray", `${run.thread || "backlog"}.findings`);
-  ensureDir(dir);
-  const findingsPath = path.join(dir, `${runId}.md`);
-  const relFindings = path.relative(root, findingsPath);
-  run.findingsPath = relFindings;
-  const body = [`# ${run.label}`, "", `Run: \`${runId}\``, `Status: ${status}`, `Intent: ${run.intent}`, run.model ? `Model: ${run.model}` : "", run.thinking ? `Thinking: ${run.thinking}` : "", error ? `Error: ${error}` : "", "", "## Progress", "", ...(run.progress.length ? run.progress.map((p) => `- ${p}`) : ["none recorded"]), "", "## Final output", "", run.output || "(no final output captured)", ""].filter(Boolean).join("\n");
-  fs.writeFileSync(findingsPath, body);
-  appendRunEvent(root, { id: runId, status, updatedAt: run.updatedAt, completedAt: run.completedAt, findingsPath: relFindings, error, reconciled: false, sessionId: run.sessionId, sessionFile: run.sessionFile });
-  try { run.session.dispose?.(); } catch { /* ignore cleanup failure */ }
-  liveRuns.delete(runId);
-  syncWidgetTimer(lastCtx);
-  updateWidget(lastCtx);
-  queueCompletionReminder(pi, root);
+  finishLiveRun(pi, root, run, status, error);
 }
 
 function markHandled(root: string, runId: string) {
@@ -939,6 +1362,7 @@ function markHandled(root: string, runId: string) {
   if (current?.reconciled) return;
   const now = new Date().toISOString();
   appendRunEvent(root, { id: runId, updatedAt: now, reconciled: true, reconciledAt: now });
+  if (current) upsertThreadRunCard(root, { ...current, reconciled: true });
 }
 
 function requireLiveRunForAction(root: string, runId: string, action: string): LiveRun {
@@ -981,7 +1405,9 @@ export default function FrayExtension(pi: ExtensionAPI) {
   function remember(ctx: ExtensionContext) {
     lastCtx = ctx;
     restoreReminderState(ctx);
-    markLostLiveHandles(frayRoot(ctx.cwd));
+    const root = frayRoot(ctx.cwd);
+    markLostLiveHandles(root);
+    repairCompletedRunsMissingFinalOutput(root);
     syncWidgetTimer(ctx);
     updateWidget(ctx);
   }
@@ -1069,7 +1495,8 @@ export default function FrayExtension(pi: ExtensionAPI) {
       const dispatches = [];
       for (const child of initialDispatches) dispatches.push(await dispatchChild(pi, ctx, { ...child, thread: params.slug }));
       const suffix = dispatches.length ? ` and dispatched ${dispatches.map((run) => run.runId).join(", ")}` : "";
-      return { content: [{ type: "text", text: `created .fray/${params.slug}.md${suffix}` }], details: { path: path.relative(root, file), dispatches } };
+      const report = dispatches.length ? "\nReport each dispatch in chat with purpose and run ID." : "";
+      return { content: [{ type: "text", text: `created .fray/${params.slug}.md${suffix}${report}` }], details: { path: path.relative(root, file), dispatches } };
     },
   });
 
@@ -1081,7 +1508,7 @@ export default function FrayExtension(pi: ExtensionAPI) {
     async execute(_id, params: any, _signal, _update, ctx) {
       remember(ctx);
       const result = await dispatchChild(pi, ctx, params);
-      return { content: [{ type: "text", text: `dispatched ${result.runId}${result.thread ? ` for .fray/${result.thread}.md` : ""} (${result.model || "default model"}, ${result.thinking})` }], details: result };
+      return { content: [{ type: "text", text: `dispatched ${result.runId}${result.thread ? ` for .fray/${result.thread}.md` : ""} (${result.model || "default model"}, ${result.thinking})\nReport this dispatch in chat with purpose and run ID.` }], details: result };
     },
   });
 
@@ -1103,7 +1530,7 @@ export default function FrayExtension(pi: ExtensionAPI) {
       for (const agent of agents) assertThread(root, agent.thread || params.thread);
       const dispatches = [];
       for (const agent of agents) dispatches.push(await dispatchChild(pi, ctx, { ...agent, thread: agent.thread || params.thread }));
-      return { content: [{ type: "text", text: `dispatched ${dispatches.map((run) => run.runId).join(", ")}` }], details: { dispatches } };
+      return { content: [{ type: "text", text: `dispatched ${dispatches.map((run) => run.runId).join(", ")}\nReport each dispatch in chat with purpose and run ID.` }], details: { dispatches } };
     },
   });
 
@@ -1135,9 +1562,7 @@ export default function FrayExtension(pi: ExtensionAPI) {
       const queue = completionQueue(root, params.thread);
       const run = queue[0];
       if (!run) return { content: [{ type: "text", text: "fray result queue empty" }], details: { queue: [] } };
-      const findings = readRunFindings(root, run);
-      const header = `next unhandled: ${run.id} [${run.status}] ${run.thread || "-"}: ${run.label}${run.findingsPath ? ` -> ${run.findingsPath}` : ""}`;
-      return { content: [{ type: "text", text: findings ? `${header}\n\n${findings}` : `${header}\n\n${JSON.stringify(run, null, 2)}` }], details: { run, remaining: queue.length } };
+      return { content: [{ type: "text", text: formatRunResult(root, run) }], details: { run, remaining: queue.length } };
     },
   });
 
@@ -1197,11 +1622,14 @@ export default function FrayExtension(pi: ExtensionAPI) {
       const root = frayRoot(ctx.cwd);
       const run = currentRuns(root).find((r) => r.id === params.runId);
       if (!run) throw new Error(`unknown fray run ${params.runId}`);
-      const findings = readRunFindings(root, run);
+      const resultText = formatRunResult(root, run);
       const shouldMarkHandled = !!(params.markHandled || params.markReconciled);
-      if (shouldMarkHandled) markHandled(root, params.runId);
+      if (shouldMarkHandled) {
+        markHandled(root, params.runId);
+        queueCompletionReminder(pi, root);
+      }
       updateWidget(ctx);
-      return { content: [{ type: "text", text: findings || JSON.stringify(run, null, 2) }], details: { run, markedHandled: shouldMarkHandled } };
+      return { content: [{ type: "text", text: resultText }], details: { run, markedHandled: shouldMarkHandled } };
     },
   });
 
@@ -1286,13 +1714,14 @@ export default function FrayExtension(pi: ExtensionAPI) {
     reminderStates.clear();
     reminderStateRestored = false;
     remember(ctx);
+    queueCompletionReminder(pi, frayRoot(ctx.cwd));
   });
   pi.on("session_shutdown", async (_event, ctx) => {
     const root = frayRoot(ctx.cwd);
-    for (const run of liveRuns.values()) {
-      appendRunEvent(root, { id: run.id, status: "aborted", updatedAt: new Date().toISOString(), completedAt: new Date().toISOString(), error: "parent pi session shut down before child completed", reconciled: false, sessionId: run.sessionId, sessionFile: run.sessionFile });
+    for (const run of Array.from(liveRuns.values())) {
+      liveRuns.delete(run.id);
       try { await run.session.abort(); } catch { /* ignore */ }
-      try { run.session.dispose?.(); } catch { /* ignore */ }
+      finishLiveRun(pi, root, run, "aborted", "parent pi session shut down before child completed", { notify: false, queueReminder: false });
     }
     liveRuns.clear();
     pendingDispatchRunIds.clear();
@@ -1307,6 +1736,24 @@ export default function FrayExtension(pi: ExtensionAPI) {
     }
     if (lastCtx === ctx) lastCtx = undefined;
   });
+  pi.on("before_agent_start", async (event, ctx) => {
+    remember(ctx);
+    const root = frayRoot(ctx.cwd);
+    const content = formatOrchestrationGuardrail(root, event.prompt);
+    if (!content) return;
+    return { message: { customType: "fray-orchestration-guardrail", content, display: false, details: { root } } };
+  });
+  pi.on("message_start", async (event, ctx) => {
+    remember(ctx);
+    if (event.message?.role !== "user") return;
+    handleCompletionReminderMessage(pi, frayRoot(ctx.cwd), extractText(event.message.content));
+  });
+  pi.on("agent_end", async (_event, ctx) => {
+    remember(ctx);
+    const root = frayRoot(ctx.cwd);
+    if (!(ctx as any).hasPendingMessages?.()) clearUndeliveredReminderSchedules(root);
+    queueCompletionReminder(pi, root);
+  });
   pi.on("turn_end", async (_event, ctx) => {
     remember(ctx);
     queueCompletionReminder(pi, frayRoot(ctx.cwd));
@@ -1317,7 +1764,7 @@ export default function FrayExtension(pi: ExtensionAPI) {
   pi.on("session_before_compact", async (_event, ctx) => {
     remember(ctx);
     // Pi's compaction hook can cancel or replace the summary, but it does not expose a simple append-only context slot.
-    // Completed child runs are durable in .fray/runs.jsonl and findings sidecars; compact reminders are delivered only as follow-up messages.
+    // Completed child runs are durable in .fray/runs.jsonl and findings sidecars; embedded result reminders are delivered only as follow-up messages.
   });
   pi.on("after_provider_response", async (event, ctx) => {
     remember(ctx);
