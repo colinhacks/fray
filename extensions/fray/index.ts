@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -25,6 +26,7 @@ import { patchThreadFile } from "./thread-patch.ts";
 
 const Type = {
   String: (opts: Record<string, unknown> = {}) => ({ type: "string", ...opts }),
+  Number: (opts: Record<string, unknown> = {}) => ({ type: "number", ...opts }),
   Boolean: (opts: Record<string, unknown> = {}) => ({ type: "boolean", ...opts }),
   Array: (items: Record<string, unknown>, opts: Record<string, unknown> = {}) => ({ type: "array", items, ...opts }),
   Optional: (schema: Record<string, unknown>) => ({ ...schema, __optional: true }),
@@ -54,11 +56,27 @@ const SETTLED_RUN_STATUSES = new Set<string>(["completed", "failed", "aborted", 
 const COMPLETION_REMINDER_PREFIX = "Child agent complete";
 const LEGACY_COMPLETION_REMINDER_PREFIX = "FRAY COMPLETION TASK";
 const REMINDER_STATE_ENTRY = "fray-completion-reminder-state";
+const EXTERNAL_STATUS_SUFFIX = ".external-status.json";
+const EXTERNAL_LOG_TAIL_CHARS = 24000;
 const BACKLOG_THREAD = "backlog";
 
 type RunStatus = "starting" | "running" | "completed" | "failed" | "aborted" | "incomplete";
 type Intent = "harvest" | "investigate" | "implement" | "review" | "verify" | "design" | "custom";
 type ModelHint = "current" | "cheap" | "balanced" | "strong" | "strongest";
+type ExternalRunner = "codex" | "claude" | "custom";
+
+type LaunchExternalArgs = {
+  thread?: string;
+  label: string;
+  runner: ExternalRunner;
+  prompt?: string;
+  command?: string;
+  args?: string[];
+  cwd?: string;
+  timeoutMs?: number;
+  env?: Record<string, string>;
+  finalOutputPath?: string;
+};
 
 type DispatchArgs = {
   thread?: string;
@@ -72,6 +90,7 @@ type DispatchArgs = {
   cwd?: string;
   capabilities?: { write?: boolean };
 };
+
 
 type FrayConfig = {
   enabled: boolean;
@@ -109,6 +128,18 @@ export type RunRecord = {
   finalOutput?: string;
   finalOutputSource?: string;
   incompleteReason?: string;
+  external?: boolean;
+  externalRunner?: ExternalRunner;
+  externalStatusPath?: string;
+  externalLogFallbackFinal?: boolean;
+  pid?: number;
+  command?: string;
+  args?: string[];
+  logPath?: string;
+  finalOutputPath?: string;
+  exitCode?: number | null;
+  exitSignal?: string | null;
+  timeoutMs?: number;
   sessionId?: string;
   sessionFile?: string;
   reconciled?: boolean;
@@ -125,6 +156,7 @@ type LiveRun = Omit<RunRecord, "progress"> & {
 };
 
 const liveRuns = new Map<string, LiveRun>();
+const settlingExternalRunIds = new Set<string>();
 const pendingDispatchRunIds = new Set<string>();
 let lastCtx: ExtensionContext | undefined;
 let cooldownUntil = 0;
@@ -240,7 +272,7 @@ function formatBoard(root: string, only?: string): string {
   const cfg = loadConfig(root);
   const threads = readThreads(root);
   const unhandled = readRuns(root).filter((r) => SETTLED_RUN_STATUSES.has(r.status || "") && !r.reconciled);
-  const live = Array.from(liveRuns.values()).filter((r) => r.cwd.startsWith(root));
+  const live = liveChildRuns(root);
   const out = [`fray board - autonomous_mode: ${cfg.autonomousMode ? "on" : "off"} - live:${live.length} unhandled:${unhandled.length}`];
   const errors = threads.flatMap((t) => t.errors.map((e) => `${t.id}.md: ${e}`));
   if (errors.length) out.push(`\nVALIDATION ERRORS:\n${errors.map((e) => `  ${e}`).join("\n")}`);
@@ -449,7 +481,7 @@ function ageKey(run: RunRecord, primary: "started" | "completed"): string {
 }
 
 export function staleLedgerLiveRuns(runs: RunRecord[], liveRunIds: Set<string>, pendingRunIds: Set<string> = new Set()): RunRecord[] {
-  return runs.filter((run) => !!run.id && LIVE_RUN_STATUSES.has(run.status || "") && !liveRunIds.has(run.id) && !pendingRunIds.has(run.id));
+  return runs.filter((run) => !!run.id && !run.external && LIVE_RUN_STATUSES.has(run.status || "") && !liveRunIds.has(run.id) && !pendingRunIds.has(run.id));
 }
 
 function staleChildRuns(root: string): RunRecord[] {
@@ -543,10 +575,17 @@ function repairCompletedRunsMissingFinalOutput(root: string): number {
   return repaired;
 }
 
-function liveChildRuns(root: string): RunRecord[] {
-  return liveRunRecords(root)
-    .filter((run) => !!run.id && LIVE_RUN_STATUSES.has(run.status || ""))
+function runningExternalRuns(root: string): RunRecord[] {
+  return readRuns(root)
+    .filter((run) => !!run.id && !!run.external && LIVE_RUN_STATUSES.has(run.status || ""))
     .sort((a, b) => ageKey(a, "started").localeCompare(ageKey(b, "started")));
+}
+
+function liveChildRuns(root: string): RunRecord[] {
+  return [
+    ...liveRunRecords(root).filter((run) => !!run.id && LIVE_RUN_STATUSES.has(run.status || "")),
+    ...runningExternalRuns(root),
+  ].sort((a, b) => ageKey(a, "started").localeCompare(ageKey(b, "started")));
 }
 
 export function completionQueueFromRuns(runs: RunRecord[], thread?: string): RunRecord[] {
@@ -571,8 +610,11 @@ function readRunFindings(root: string, run: RunRecord): string {
 function formatFallbackRecords(run: RunRecord): string[] {
   return [
     run.findingsPath ? `- Findings sidecar: ${run.findingsPath}` : "- Findings sidecar: not recorded",
-    run.sessionFile ? `- Child session file: ${run.sessionFile}` : "- Child session file: not recorded",
-  ];
+    run.finalOutputPath ? `- Final output file: ${run.finalOutputPath}` : "",
+    run.logPath ? `- External log: ${run.logPath}` : "",
+    run.sessionFile ? `- Child session file: ${run.sessionFile}` : run.external ? "" : "- Child session file: not recorded",
+    !run.external && run.sessionFile ? `- Resume: use fray_steer with runId=${run.id} to continue from the recorded child session file` : "",
+  ].filter(Boolean);
 }
 
 function formatRunResult(root: string, run: RunRecord): string {
@@ -582,8 +624,9 @@ function formatRunResult(root: string, run: RunRecord): string {
   const records = formatFallbackRecords(run).join("\n");
   if (finalOutput) {
     const title = run.status === "completed" ? "Child final output" : "Recovered child output";
+    const metadata = run.external ? `\n\n## Run metadata\n\n${formatRunMetadata(run).join("\n")}` : "";
     const caution = needsRetry ? `\n\n## Status\n\nThis run is ${run.status}; treat the output as fallback evidence, not a successful completed handoff.${run.incompleteReason ? `\n\nReason: ${run.incompleteReason}` : ""}` : "";
-    return `${header}${caution}\n\n## ${title}\n\n${finalOutput}\n\n${run.findingsPath ? `Raw sidecar: ${run.findingsPath}` : ""}`.trim();
+    return `${header}${metadata}${caution}\n\n## ${title}\n\n${finalOutput}\n\n${run.findingsPath ? `Raw sidecar: ${run.findingsPath}` : ""}`.trim();
   }
   const reason = run.incompleteReason || run.error || missingFinalOutputReason();
   const findings = readRunFindings(root, run).trim();
@@ -603,11 +646,25 @@ function formatRunMetadata(run: RunRecord): string[] {
     run.completedAt ? `- Completed: ${run.completedAt}` : "",
     run.model ? `- Model: ${run.model}` : "",
     run.thinking ? `- Thinking: ${run.thinking}` : "",
+    run.external ? `- External runner: ${run.externalRunner || "custom"}` : "",
+    run.pid ? `- External PID: ${run.pid}` : "",
+    run.command ? `- External command: ${[run.command, ...(run.args || [])].join(" ")}` : "",
+    run.exitCode !== undefined ? `- Exit code: ${run.exitCode === null ? "null" : run.exitCode}` : "",
+    run.exitSignal ? `- Exit signal: ${run.exitSignal}` : "",
+    run.logPath ? `- External log: ${run.logPath}` : "",
+    run.finalOutputPath ? `- Final output file: ${run.finalOutputPath}` : "",
     run.finalOutputSource ? `- Final output source: ${run.finalOutputSource}` : "",
     run.incompleteReason ? `- Incomplete reason: ${run.incompleteReason}` : "",
     run.findingsPath ? `- Findings sidecar: ${run.findingsPath}` : "",
     run.sessionFile ? `- Child session file: ${run.sessionFile}` : "",
   ].filter(Boolean);
+}
+
+function completionReminderHeadline(root: string, run: RunRecord): string {
+  const threads = threadMetaBySlug(root);
+  const { title, indicator } = runTitle(root, threads, run);
+  const summary = [title || run.label || run.id, indicator].filter(Boolean).join(" ").trim();
+  return `[${run.status || "settled"}] ${summary || run.id}`;
 }
 
 function formatCompletionQueueReminder(root: string): string | undefined {
@@ -619,7 +676,7 @@ function formatCompletionQueueReminder(root: string): string | undefined {
   const needsRetry = run.status !== "completed" || !!run.incompleteReason || !hasFinalOutput;
   const targetThreadPath = `.fray/${run.thread || BACKLOG_THREAD}.md`;
   const lines = [
-    `${COMPLETION_REMINDER_PREFIX} [${run.id}].`,
+    completionReminderHeadline(root, run),
     "",
     needsRetry
       ? "Handle this Fray child result now. This is an incomplete/failed/aborted handoff; do not treat it as a successful completed child result."
@@ -639,7 +696,7 @@ function formatCompletionQueueReminder(root: string): string | undefined {
       "## Incomplete/needs-retry handling",
       "",
       `Reason: ${run.incompleteReason || run.error || missingFinalOutputReason()}`,
-      "Do not mark this as a normal successful completion. Missing/empty final output is an incomplete handoff/bug; reconcile it as incomplete, relaunch/retry the child if the work is still needed, or record why no retry is needed before marking handled.",
+      "Do not mark this as a normal successful completion. Missing/empty final output is an incomplete handoff/bug; relaunch the child if the work is still needed, or record why no retry is needed before marking handled.",
       "",
       "Fallback records:",
       ...formatFallbackRecords(run),
@@ -669,6 +726,7 @@ export function parseCompletionReminderRunId(text: string): string | undefined {
   if (text.startsWith(COMPLETION_REMINDER_PREFIX)) return text.match(/^Child agent complete\s+\[([^\]]+)\]/)?.[1];
   if (text.startsWith("[child complete]")) return text.match(/\[([^\]]+)\]\s*$/)?.[1];
   if (text.startsWith(LEGACY_COMPLETION_REMINDER_PREFIX)) return text.match(/Oldest unhandled child result:\s+(\S+)/)?.[1];
+  if (/^\[(?:completed|failed|aborted|incomplete|error)\]\s+/i.test(text)) return text.match(/(?:^|\n)- Run ID:\s*(\S+)/)?.[1];
   return undefined;
 }
 
@@ -980,6 +1038,7 @@ function compactCallSummary(name: string, args: any): string {
     const appends = Array.isArray(args?.appendSections) ? args.appendSections.length : 0;
     return `${replacements} replacement${replacements === 1 ? "" : "s"}, ${appends} append${appends === 1 ? "" : "s"}`;
   }
+  if (name === "fray_launch_external") return [args?.runner, args?.label].filter(Boolean).join(" ");
   if (name === "bash") return args?.command ? ellipsize(String(args.command)) : "";
   if (name === "grep") return [args?.pattern ? `/${ellipsize(String(args.pattern), 40)}/` : "", args?.path, args?.glob].filter(Boolean).join(" ");
   if (name === "find") return [args?.pattern, args?.path].filter(Boolean).join(" in ");
@@ -1077,6 +1136,470 @@ Sub-agents are instruments, not deciders. Surface default/security/product/brand
 function isProtectedFrayPath(root: string, absolutePath: string): boolean {
   const rel = path.relative(root, absolutePath).replace(/\\/g, "/");
   return /^\.fray\/(config\.yml|runs\.jsonl|[^/]+\.md)$/.test(rel);
+}
+
+function relOrAbs(root: string, absolutePath: string): string {
+  const rel = path.relative(root, absolutePath).replace(/\\/g, "/");
+  return rel && !rel.startsWith("..") && !path.isAbsolute(rel) ? rel : absolutePath;
+}
+
+function recordedPath(root: string, value?: string): string | undefined {
+  if (!value) return undefined;
+  return path.isAbsolute(value) ? value : path.join(root, value);
+}
+
+function normalizeExternalRunner(value: unknown): ExternalRunner {
+  if (value === "codex" || value === "claude" || value === "custom") return value;
+  throw new Error("runner must be one of: codex, claude, custom");
+}
+
+function normalizeStringArray(value: unknown, name: string): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw new Error(`${name} must be an array of strings`);
+  return value.map((entry, index) => {
+    if (typeof entry !== "string") throw new Error(`${name}[${index}] must be a string`);
+    return entry;
+  });
+}
+
+function normalizeExternalEnv(value: unknown): Record<string, string> | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("env must be an object whose values are strings");
+  const out: Record<string, string> = {};
+  for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) throw new Error(`env key ${JSON.stringify(key)} is not a valid environment variable name`);
+    if (typeof raw !== "string") throw new Error(`env.${key} must be a string`);
+    out[key] = raw;
+  }
+  return out;
+}
+
+function normalizeTimeoutMs(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  const timeout = Number(value);
+  if (!Number.isFinite(timeout) || timeout < 1) throw new Error("timeoutMs must be a positive number of milliseconds when provided");
+  return Math.floor(timeout);
+}
+
+function resolveLaunchCwd(baseCwd: string, value?: string): string {
+  const cwd = value ? path.resolve(baseCwd, value) : baseCwd;
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(cwd);
+  } catch (err: any) {
+    throw new Error(`cwd does not exist: ${cwd} (${String(err?.message || err)})`);
+  }
+  if (!stat.isDirectory()) throw new Error(`cwd is not a directory: ${cwd}`);
+  return cwd;
+}
+
+function ensureExternalFileAllowed(root: string, absolutePath: string, label: string) {
+  if (isProtectedFrayPath(root, absolutePath)) throw new Error(`${label} cannot be a canonical .fray thread/config/run file; use a findings sidecar path instead`);
+  ensureDir(path.dirname(absolutePath));
+}
+
+function defaultExternalPaths(root: string, cwd: string, thread: string, runId: string, finalOutputPath?: string) {
+  const findingsDir = path.join(root, ".fray", `${thread}.findings`);
+  ensureDir(findingsDir);
+  const findingsAbs = path.join(findingsDir, `${runId}.md`);
+  const logAbs = path.join(findingsDir, `${runId}.log`);
+  const statusAbs = path.join(findingsDir, `${runId}${EXTERNAL_STATUS_SUFFIX}`);
+  const finalAbs = finalOutputPath ? path.resolve(cwd, finalOutputPath) : path.join(findingsDir, `${runId}.final.md`);
+  ensureExternalFileAllowed(root, finalAbs, "finalOutputPath");
+  for (const [label, candidate] of [["findingsPath", findingsAbs], ["logPath", logAbs], ["externalStatusPath", statusAbs]] as const) ensureExternalFileAllowed(root, candidate, label);
+  if (new Set([findingsAbs, logAbs, statusAbs, finalAbs]).size !== 4) throw new Error("external run output paths must be distinct");
+  return {
+    findingsAbs,
+    logAbs,
+    statusAbs,
+    finalAbs,
+    findingsPath: relOrAbs(root, findingsAbs),
+    logPath: relOrAbs(root, logAbs),
+    externalStatusPath: relOrAbs(root, statusAbs),
+    finalOutputPath: relOrAbs(root, finalAbs),
+  };
+}
+
+function buildExternalInvocation(params: LaunchExternalArgs, cwd: string, finalOutputPath: string): { runner: ExternalRunner; command: string; args: string[]; externalLogFallbackFinal: boolean } {
+  const runner = normalizeExternalRunner(params.runner);
+  const suppliedArgs = normalizeStringArray(params.args, "args");
+  const prompt = typeof params.prompt === "string" ? params.prompt : "";
+  const commandOverride = typeof params.command === "string" ? params.command.trim() : "";
+
+  if (runner === "codex") {
+    if (!suppliedArgs && !prompt.trim()) throw new Error("prompt is required for the default codex invocation");
+    return {
+      runner,
+      command: commandOverride || "codex",
+      args: suppliedArgs || ["exec", "--cd", cwd, "--color", "never", "--output-last-message", finalOutputPath, prompt],
+      externalLogFallbackFinal: false,
+    };
+  }
+
+  if (runner === "claude") {
+    if (!suppliedArgs && !prompt.trim()) throw new Error("prompt is required for the default claude invocation");
+    return {
+      runner,
+      command: commandOverride || "claude",
+      args: suppliedArgs || ["--print", "--output-format", "text", prompt],
+      externalLogFallbackFinal: !params.finalOutputPath && !suppliedArgs,
+    };
+  }
+
+  if (!commandOverride) throw new Error("command is required when runner is custom");
+  return {
+    runner,
+    command: commandOverride,
+    args: suppliedArgs || [],
+    externalLogFallbackFinal: !params.finalOutputPath,
+  };
+}
+
+function shellQuote(value: string): string {
+  return /^[A-Za-z0-9_/:=.,@%+-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function commandLine(command: string, args: string[]): string {
+  return [command, ...args].map(shellQuote).join(" ");
+}
+
+function readUtf8IfPresent(file?: string): { text: string; error?: string } {
+  if (!file) return { text: "", error: "path was not recorded" };
+  try {
+    return { text: fs.readFileSync(file, "utf8") };
+  } catch (err: any) {
+    return { text: "", error: `${file}: ${String(err?.message || err)}` };
+  }
+}
+
+function stripExternalLogHeader(text: string): string {
+  return text.replace(/^# Fray external run [^\n]*\n(?:# [^\n]*\n)*\n/, "");
+}
+
+function readFileTail(file?: string, maxChars = EXTERNAL_LOG_TAIL_CHARS): { text: string; error?: string } {
+  if (!file) return { text: "", error: "path was not recorded" };
+  let fd: number | undefined;
+  try {
+    const stat = fs.statSync(file);
+    const maxBytes = Math.max(1, maxChars * 4);
+    const start = Math.max(0, stat.size - maxBytes);
+    const length = stat.size - start;
+    const buffer = Buffer.alloc(length);
+    fd = fs.openSync(file, "r");
+    fs.readSync(fd, buffer, 0, length, start);
+    const text = buffer.toString("utf8");
+    return { text: text.length > maxChars ? text.slice(-maxChars) : text };
+  } catch (err: any) {
+    return { text: "", error: `${file}: ${String(err?.message || err)}` };
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch { /* ignore */ }
+  }
+}
+
+function resolveExternalFinalOutput(root: string, run: RunRecord): { text: string; source?: string; reason?: string } {
+  const finalAbs = recordedPath(root, run.finalOutputPath);
+  const finalRead = readUtf8IfPresent(finalAbs);
+  if (finalRead.text.trim()) return { text: finalRead.text, source: "final-output-file" };
+
+  const logRead = readFileTail(recordedPath(root, run.logPath));
+  const logText = stripExternalLogHeader(logRead.text);
+  if (logText.trim()) {
+    const reason = `external final output file was missing or empty${finalRead.error ? ` (${finalRead.error})` : ""}; using log tail fallback`;
+    if (run.externalLogFallbackFinal) {
+      if (finalAbs) {
+        try {
+          ensureExternalFileAllowed(root, finalAbs, "finalOutputPath");
+          fs.writeFileSync(finalAbs, logText);
+        } catch {
+          // The log remains the durable fallback even if mirroring it into finalOutputPath fails.
+        }
+      }
+      return { text: logText, source: "log" };
+    }
+    return { text: logText, source: "log-tail", reason };
+  }
+
+  const reasons = [finalRead.error ? `final output: ${finalRead.error}` : "final output file was empty", logRead.error ? `log: ${logRead.error}` : "log was empty"];
+  return { text: "", reason: reasons.join("; ") };
+}
+
+function classifyExternalSettledRunStatus(status: RunStatus, resolution: { text: string; source?: string; reason?: string }): { status: RunStatus; incompleteReason?: string } {
+  if (status === "completed") {
+    if (!resolution.text.trim()) return { status: "incomplete", incompleteReason: missingFinalOutputReason(resolution.reason) };
+    if (resolution.source === "log-tail") return { status: "incomplete", incompleteReason: resolution.reason || "external runner did not write its final output file; using log tail fallback" };
+    return { status };
+  }
+  if (["failed", "aborted", "incomplete"].includes(status) && !resolution.text.trim()) return { status, incompleteReason: missingFinalOutputReason(resolution.reason) };
+  if (resolution.source === "log-tail") return { status, incompleteReason: resolution.reason || "external runner did not write its final output file; using log tail fallback" };
+  return { status };
+}
+
+function writeExternalStatusFile(root: string, run: RunRecord, extra: Record<string, unknown> = {}) {
+  const statusAbs = recordedPath(root, run.externalStatusPath);
+  if (!statusAbs) return;
+  try {
+    ensureExternalFileAllowed(root, statusAbs, "externalStatusPath");
+    fs.writeFileSync(statusAbs, `${JSON.stringify({
+      id: run.id,
+      thread: run.thread,
+      label: run.label,
+      runner: run.externalRunner,
+      status: run.status,
+      pid: run.pid,
+      command: run.command,
+      args: run.args,
+      cwd: run.cwd,
+      logPath: run.logPath,
+      finalOutputPath: run.finalOutputPath,
+      findingsPath: run.findingsPath,
+      startedAt: run.startedAt,
+      updatedAt: run.updatedAt,
+      completedAt: run.completedAt,
+      exitCode: run.exitCode,
+      exitSignal: run.exitSignal,
+      finalOutputSource: run.finalOutputSource,
+      incompleteReason: run.incompleteReason,
+      error: run.error,
+      ...extra,
+    }, null, 2)}\n`);
+  } catch {
+    // Status files are recovery aids; the JSONL ledger remains authoritative.
+  }
+}
+
+function readExternalStatusFile(root: string, run: RunRecord): Record<string, any> | undefined {
+  const statusAbs = recordedPath(root, run.externalStatusPath);
+  if (!statusAbs) return undefined;
+  try {
+    return JSON.parse(fs.readFileSync(statusAbs, "utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
+function isProcessRunning(pid?: number): boolean {
+  if (!Number.isInteger(pid) || !pid || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err: any) {
+    return err?.code === "EPERM";
+  }
+}
+
+function signalExternalProcess(pid: number, signal: NodeJS.Signals | number = "SIGTERM") {
+  try {
+    if (process.platform !== "win32") process.kill(-pid, signal);
+    else process.kill(pid, signal);
+  } catch {
+    try { process.kill(pid, signal); } catch { /* process may already be gone */ }
+  }
+}
+
+function settleExternalRun(pi: ExtensionAPI, root: string, run: RunRecord, status: RunStatus, details: { exitCode?: number | null; exitSignal?: string | null; error?: string; recovered?: boolean } = {}): RunRecord | undefined {
+  if (!run.external || !run.id) return undefined;
+  if (settlingExternalRunIds.has(run.id)) return readRuns(root).find((candidate) => candidate.id === run.id);
+  const current = readRuns(root).find((candidate) => candidate.id === run.id) || run;
+  if (SETTLED_RUN_STATUSES.has(current.status || "")) return current;
+
+  settlingExternalRunIds.add(run.id);
+  try {
+    const completedAt = new Date().toISOString();
+    const resolution = resolveExternalFinalOutput(root, current);
+    const classification = classifyExternalSettledRunStatus(status, resolution);
+    const exitCode = details.exitCode !== undefined ? details.exitCode : current.exitCode;
+    const exitSignal = details.exitSignal !== undefined ? details.exitSignal : current.exitSignal;
+    const error = details.error || classification.incompleteReason;
+    const settled: RunRecord = {
+      ...current,
+      status: classification.status,
+      updatedAt: completedAt,
+      completedAt,
+      finalOutput: resolution.text || undefined,
+      finalOutputSource: resolution.source,
+      incompleteReason: classification.incompleteReason,
+      error,
+      exitCode,
+      exitSignal,
+      reconciled: false,
+    };
+    settled.findingsPath = writeRunFindings(root, settled, resolution.text);
+    writeExternalStatusFile(root, settled, { recovered: !!details.recovered });
+    appendRunEvent(root, {
+      id: settled.id,
+      external: true,
+      externalRunner: settled.externalRunner,
+      status: settled.status,
+      previousStatus: current.status !== settled.status ? current.status : undefined,
+      updatedAt: settled.updatedAt,
+      completedAt: settled.completedAt,
+      findingsPath: settled.findingsPath,
+      finalOutput: resolution.text || undefined,
+      finalOutputSource: resolution.source,
+      incompleteReason: settled.incompleteReason,
+      error: settled.error,
+      exitCode: settled.exitCode,
+      exitSignal: settled.exitSignal,
+      reconciled: false,
+      recoveredExternal: !!details.recovered,
+    });
+    upsertThreadRunCard(root, settled);
+    syncWidgetTimer(lastCtx);
+    updateWidget(lastCtx);
+    if (lastCtx?.hasUI) lastCtx.ui.notify(`Fray external child ${settled.status}: ${settled.id}`, settled.status === "completed" ? "info" : "warning");
+    queueCompletionReminder(pi, root);
+    return settled;
+  } finally {
+    settlingExternalRunIds.delete(run.id);
+  }
+}
+
+function recoverExternalRuns(pi: ExtensionAPI, root: string): RunRecord[] {
+  const recovered: RunRecord[] = [];
+  for (const run of readRuns(root).filter((candidate) => candidate.external && LIVE_RUN_STATUSES.has(candidate.status || ""))) {
+    if (settlingExternalRunIds.has(run.id)) continue;
+    const statusFile = readExternalStatusFile(root, run);
+    const statusFromFile = String(statusFile?.status || "");
+    if (SETTLED_RUN_STATUSES.has(statusFromFile)) {
+      const settled = settleExternalRun(pi, root, { ...run, exitCode: statusFile?.exitCode, exitSignal: statusFile?.exitSignal }, statusFromFile as RunStatus, { exitCode: statusFile?.exitCode, exitSignal: statusFile?.exitSignal, error: statusFile?.error, recovered: true });
+      if (settled) recovered.push(settled);
+      continue;
+    }
+
+    const resolution = resolveExternalFinalOutput(root, run);
+    if (resolution.source === "final-output-file" && resolution.text.trim()) {
+      const settled = settleExternalRun(pi, root, run, "completed", { recovered: true });
+      if (settled) recovered.push(settled);
+      continue;
+    }
+
+    if (isProcessRunning(run.pid)) continue;
+
+    const settled = settleExternalRun(pi, root, run, "completed", {
+      error: run.pid ? "external process is no longer running; exit code unavailable after recovery" : "external process pid was not recorded; recovered from output files",
+      recovered: true,
+    });
+    if (settled) recovered.push(settled);
+  }
+  return recovered;
+}
+
+async function launchExternalRun(pi: ExtensionAPI, ctx: ExtensionContext, params: LaunchExternalArgs) {
+  const root = frayRoot(ctx.cwd);
+  const cfg = loadConfig(root);
+  if (!cfg.enabled) throw new Error("fray is disabled in .fray/config.yml");
+  const liveCount = liveChildRuns(root).length;
+  if (liveCount >= cfg.maxChildren) throw new Error(`fray has ${liveCount} live children; max_children is ${cfg.maxChildren}`);
+  if (!params?.label || typeof params.label !== "string") throw new Error("label is required");
+  const thread = effectiveThread(root, params.thread);
+  const cwd = resolveLaunchCwd(ctx.cwd, params.cwd);
+  const runId = `fray-${new Date().toISOString().replace(/[-:.TZ]/g, "")}-${randomUUID().slice(0, 8)}`;
+  const paths = defaultExternalPaths(root, cwd, thread, runId, params.finalOutputPath);
+  const invocation = buildExternalInvocation(params, cwd, recordedPath(root, paths.finalOutputPath) || paths.finalOutputPath);
+  const env = normalizeExternalEnv(params.env);
+  const timeoutMs = normalizeTimeoutMs(params.timeoutMs);
+  const now = new Date().toISOString();
+  const record: RunRecord = {
+    id: runId,
+    thread,
+    label: params.label,
+    intent: "custom",
+    status: "starting",
+    cwd,
+    startedAt: now,
+    updatedAt: now,
+    findingsPath: paths.findingsPath,
+    reconciled: false,
+    external: true,
+    externalRunner: invocation.runner,
+    externalStatusPath: paths.externalStatusPath,
+    externalLogFallbackFinal: invocation.externalLogFallbackFinal,
+    command: invocation.command,
+    args: invocation.args,
+    logPath: paths.logPath,
+    finalOutputPath: paths.finalOutputPath,
+    timeoutMs,
+  };
+  appendRunEvent(root, record);
+  upsertThreadRunCard(root, record);
+  writeExternalStatusFile(root, record);
+
+  let logFd: number | undefined;
+  let child: ReturnType<typeof spawn> | undefined;
+  try {
+    logFd = fs.openSync(paths.logAbs, "a");
+    fs.writeSync(logFd, `# Fray external run ${runId}\n# ${now}\n# cwd: ${cwd}\n# command: ${commandLine(invocation.command, invocation.args)}\n\n`);
+    child = spawn(invocation.command, invocation.args, {
+      cwd,
+      detached: true,
+      env: env ? { ...process.env, ...env } : process.env,
+      stdio: ["ignore", logFd, logFd],
+    });
+    child.once("error", (err: any) => {
+      settleExternalRun(pi, root, { ...record, pid: child?.pid, status: "running" }, "failed", { error: String(err?.message || err) });
+    });
+    if (!child.pid) throw new Error(`external runner did not start: ${invocation.command}`);
+  } catch (err: any) {
+    if (logFd !== undefined) try { fs.closeSync(logFd); } catch { /* ignore */ }
+    const failed: RunRecord = { ...record, status: "failed", updatedAt: new Date().toISOString(), completedAt: new Date().toISOString(), error: String(err?.message || err), reconciled: false };
+    failed.findingsPath = writeRunFindings(root, failed, "");
+    appendRunEvent(root, { id: runId, status: "failed", updatedAt: failed.updatedAt, completedAt: failed.completedAt, findingsPath: failed.findingsPath, error: failed.error, reconciled: false });
+    upsertThreadRunCard(root, failed);
+    writeExternalStatusFile(root, failed);
+    queueCompletionReminder(pi, root);
+    throw err;
+  }
+
+  if (logFd !== undefined) try { fs.closeSync(logFd); } catch { /* ignore */ }
+  const running: RunRecord = { ...record, status: "running", pid: child.pid, updatedAt: new Date().toISOString() };
+  appendRunEvent(root, { id: runId, status: "running", updatedAt: running.updatedAt, pid: running.pid });
+  upsertThreadRunCard(root, running);
+  writeExternalStatusFile(root, running);
+
+  let timedOut = false;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  if (timeoutMs) {
+    timeout = setTimeout(() => {
+      timedOut = true;
+      appendRunEvent(root, { id: runId, status: "running", updatedAt: new Date().toISOString(), progress: `external runner timed out after ${timeoutMs}ms; sent SIGTERM` });
+      writeExternalStatusFile(root, { ...running, updatedAt: new Date().toISOString(), error: `external runner timed out after ${timeoutMs}ms` }, { timeoutAt: new Date().toISOString() });
+      signalExternalProcess(child!.pid!, "SIGTERM");
+      const killTimer = setTimeout(() => signalExternalProcess(child!.pid!, "SIGKILL"), 5000);
+      killTimer.unref?.();
+    }, timeoutMs);
+    timeout.unref?.();
+  }
+
+  child.once("exit", (code, signal) => {
+    if (timeout) clearTimeout(timeout);
+    const baseStatus: RunStatus = timedOut ? "aborted" : code === 0 ? "completed" : signal ? "aborted" : "failed";
+    const error = timedOut
+      ? `external runner timed out after ${timeoutMs}ms`
+      : code && code !== 0
+        ? `external runner exited with code ${code}`
+        : signal
+          ? `external runner exited from signal ${signal}`
+          : undefined;
+    settleExternalRun(pi, root, running, baseStatus, { exitCode: code, exitSignal: signal, error });
+  });
+  child.unref();
+  syncWidgetTimer(ctx);
+  updateWidget(ctx);
+  if (ctx.hasUI) ctx.ui.notify(`Fray launched external ${runId}: ${params.label}`, "info");
+
+  return {
+    runId,
+    thread,
+    runner: invocation.runner,
+    pid: running.pid,
+    status: "running",
+    command: invocation.command,
+    args: invocation.args,
+    cwd,
+    logPath: paths.logPath,
+    finalOutputPath: paths.finalOutputPath,
+    findingsPath: paths.findingsPath,
+  };
 }
 
 function childToolDefinitions(root: string, cwd: string, enabled: string[], runUpdateTool: ToolDefinition<any>, threadPatchTool: ToolDefinition<any>): ToolDefinition<any>[] {
@@ -1196,7 +1719,8 @@ async function dispatchChild(pi: ExtensionAPI, ctx: ExtensionContext, args: Disp
   const cfg = loadConfig(root);
   if (!cfg.enabled) throw new Error("fray is disabled in .fray/config.yml");
   if (Date.now() < cooldownUntil) throw new Error(`fray dispatch is cooling down after provider rate-limit until ${new Date(cooldownUntil).toISOString()}`);
-  if (liveRuns.size >= cfg.maxChildren) throw new Error(`fray has ${liveRuns.size} live children; max_children is ${cfg.maxChildren}`);
+  const liveCount = liveChildRuns(root).length;
+  if (liveCount >= cfg.maxChildren) throw new Error(`fray has ${liveCount} live children; max_children is ${cfg.maxChildren}`);
   const thread = effectiveThread(root, args.thread);
   const childArgs = { ...args, thread };
 
@@ -1296,6 +1820,13 @@ function writeRunFindings(root: string, run: Omit<RunRecord, "progress"> & { pro
     `Intent: ${run.intent}`,
     run.model ? `Model: ${run.model}` : "",
     run.thinking ? `Thinking: ${run.thinking}` : "",
+    run.external ? `External runner: ${run.externalRunner || "custom"}` : "",
+    run.pid ? `PID: ${run.pid}` : "",
+    run.command ? `Command: ${commandLine(run.command, run.args || [])}` : "",
+    run.exitCode !== undefined ? `Exit code: ${run.exitCode === null ? "null" : run.exitCode}` : "",
+    run.exitSignal ? `Exit signal: ${run.exitSignal}` : "",
+    run.logPath ? `Log: ${run.logPath}` : "",
+    run.finalOutputPath ? `Final output file: ${run.finalOutputPath}` : "",
     run.finalOutputSource ? `Final output source: ${run.finalOutputSource}` : "",
     run.incompleteReason ? `Incomplete reason: ${run.incompleteReason}` : "",
     run.error ? `Error: ${run.error}` : "",
@@ -1368,7 +1899,7 @@ function markHandled(root: string, runId: string): boolean {
 
 function requireLiveRunForAction(root: string, runId: string, action: string): LiveRun {
   const run = liveRuns.get(runId);
-  if (run && isWithin(root, run.cwd)) return run;
+  if (run) return run;
   const known = readRuns(root).find((candidate) => candidate.id === runId);
   if (!known) throw new Error(`unknown fray run ${runId}; no live child handle or ledger record exists`);
   if (LIVE_RUN_STATUSES.has(known.status || "")) {
@@ -1407,6 +1938,7 @@ export default function FrayExtension(pi: ExtensionAPI) {
     lastCtx = ctx;
     restoreReminderState(ctx);
     const root = frayRoot(ctx.cwd);
+    recoverExternalRuns(pi, root);
     markLostLiveHandles(root);
     repairCompletedRunsMissingFinalOutput(root);
     syncWidgetTimer(ctx);
@@ -1514,6 +2046,33 @@ export default function FrayExtension(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "fray_launch_external",
+    label: "Fray Launch External",
+    description: "Launch a detached external/ad hoc agent process, capture its log/final output, and surface completion through the Fray result queue.",
+    parameters: Type.Object({
+      thread: Type.Optional(Type.String({ description: "Optional fray thread slug; defaults to backlog." })),
+      label: Type.String({ description: "Short purpose label for this external run." }),
+      runner: Type.String({ enum: ["codex", "claude", "custom"], description: "Built-in runner defaults or custom argv mode." }),
+      prompt: Type.Optional(Type.String({ description: "Prompt passed to the default codex/claude invocation." })),
+      command: Type.Optional(Type.String({ description: "Command/binary override. Required for runner=custom." })),
+      args: Type.Optional(Type.Array(Type.String(), { description: "Explicit argv. When provided, runner defaults do not add prompt/final-output flags." })),
+      cwd: Type.Optional(Type.String({ description: "Working directory for the external process; defaults to the current Pi cwd." })),
+      timeoutMs: Type.Optional(Type.Number({ description: "Optional timeout in milliseconds; sends SIGTERM then best-effort SIGKILL." })),
+      env: Type.Optional({ type: "object", additionalProperties: { type: "string" }, description: "Extra environment variables for the external process." }),
+      finalOutputPath: Type.Optional(Type.String({ description: "Optional path where the runner writes its final answer; defaults under the thread findings directory." })),
+    }),
+    renderCall(args: any, theme: any, context: any) {
+      return compactCall("fray_launch_external", args, theme, context);
+    },
+    renderResult: compactRender("fray_launch_external"),
+    async execute(_id, params: any, _signal, _update, ctx) {
+      remember(ctx);
+      const result = await launchExternalRun(pi, ctx, params);
+      return { content: [{ type: "text", text: `launched external ${result.runId}${result.thread ? ` for .fray/${result.thread}.md` : ""} (pid ${result.pid})\nlog: ${result.logPath}\nfinal: ${result.finalOutputPath}\nfindings: ${result.findingsPath}\nReport this launch in chat with purpose and run ID.` }], details: result };
+    },
+  });
+
+  pi.registerTool({
     name: "fray_dispatch_many",
     label: "Fray Dispatch Many",
     description: "Dispatch multiple independent fray children and record them in the structured run ledger.",
@@ -1527,7 +2086,8 @@ export default function FrayExtension(pi: ExtensionAPI) {
       const agents = (params.agents || []) as DispatchArgs[];
       if (!agents.length) throw new Error("agents must contain at least one dispatch");
       const cfg = loadConfig(root);
-      if (liveRuns.size + agents.length > cfg.maxChildren) throw new Error(`fray has ${liveRuns.size} live children; dispatching ${agents.length} would exceed max_children ${cfg.maxChildren}`);
+      const liveCount = liveChildRuns(root).length;
+      if (liveCount + agents.length > cfg.maxChildren) throw new Error(`fray has ${liveCount} live children; dispatching ${agents.length} would exceed max_children ${cfg.maxChildren}`);
       for (const agent of agents) assertThread(root, agent.thread || params.thread);
       const dispatches = [];
       for (const agent of agents) dispatches.push(await dispatchChild(pi, ctx, { ...agent, thread: agent.thread || params.thread }));

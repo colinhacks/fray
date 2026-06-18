@@ -28,6 +28,13 @@ assert.equal(
   0,
   "pending dispatches are not marked stale before their live handle is registered",
 );
+assert.deepEqual(
+  staleLedgerLiveRuns(foldRunEvents([
+    { id: "fray-external", label: "detached", intent: "custom", status: "running", external: true, startedAt: base, updatedAt: base },
+  ]), new Set()).map((run) => run.id),
+  [],
+  "detached external runs are recovered by the external-run path instead of being marked lost as SDK children",
+);
 
 const scheduled = new Set<string>();
 assert.equal(nextCompletionReminderRun(runs, scheduled)?.id, "fray-a", "oldest unhandled run should be reminded first");
@@ -206,7 +213,7 @@ await h1.emit("turn_end", {});
 assert.equal(h1.sent.length, 1, "oldest unhandled completion schedules one native Pi follow-up");
 assert.deepEqual(h1.sent[0].options, { deliverAs: "followUp" }, "completion reminders use native follow-up delivery");
 assert.equal(parseCompletionReminderRunId(h1.sent[0].text), "fray-native-a", "native follow-up still parses when it embeds child output");
-assert.match(h1.sent[0].text, /^Child agent complete \[fray-native-a\]\./, "embedded reminder keeps the compact parseable prefix");
+assert.match(h1.sent[0].text, /^\[incomplete\] native follow-up #backlog/, "embedded reminder uses a human-readable native follow-up headline");
 assert.match(h1.sent[0].text, /## Run metadata/, "embedded reminder includes run metadata");
 assert.match(h1.sent[0].text, /- Thread: \.fray\/backlog\.md/, "embedded reminder includes thread metadata");
 assert.match(h1.sent[0].text, /- Label\/purpose: native follow-up/, "embedded reminder includes purpose metadata");
@@ -287,6 +294,43 @@ assert.equal(parseCompletionReminderRunId(h3.sent.at(-1)!.text), "fray-final-b",
 const staleInteractive = await h3.emit("input", { source: "interactive", text: h3.sent[0].text });
 assert.deepEqual(staleInteractive, [{ action: "handled" }], "stale handled follow-ups are suppressed even when delivered as non-extension input");
 assertOnlyFollowUpDelivery(h3.sent, "final-output reminder scheduling");
+
+const externalRecoveryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fray-external-recovery-"));
+const externalRecoveryFinal = ".fray/backlog.findings/fray-ext-recover.final.md";
+fs.mkdirSync(path.join(externalRecoveryRoot, ".fray", "backlog.findings"), { recursive: true });
+fs.writeFileSync(path.join(externalRecoveryRoot, externalRecoveryFinal), "RECOVERED EXTERNAL FINAL");
+appendRun(externalRecoveryRoot, { id: "fray-ext-recover", thread: "backlog", label: "recover external", intent: "custom", status: "running", external: true, externalRunner: "custom", cwd: externalRecoveryRoot, startedAt: base, updatedAt: base, reconciled: false, findingsPath: ".fray/backlog.findings/fray-ext-recover.md", logPath: ".fray/backlog.findings/fray-ext-recover.log", finalOutputPath: externalRecoveryFinal });
+const hExtRecovery = makeHarness(externalRecoveryRoot);
+await hExtRecovery.tool("fray_status", {});
+const recoveredExternal = await hExtRecovery.tool("fray_next", {});
+assert.match(recoveredExternal.content[0].text, /fray-ext-recover \[completed\]/, "fray_status recovers completed external runs from final output files");
+assert.match(recoveredExternal.content[0].text, /RECOVERED EXTERNAL FINAL/, "recovered external final output is surfaced through fray_next");
+assert.equal(hExtRecovery.sent.length, 1, "recovered external completion queues a native follow-up reminder");
+assertOnlyFollowUpDelivery(hExtRecovery.sent, "external recovery reminder scheduling");
+
+const externalLaunchRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fray-external-launch-"));
+const hExtLaunch = makeHarness(externalLaunchRoot);
+const explicitExternalFinal = path.join(externalLaunchRoot, ".fray", "backlog.findings", "explicit-external-final.md");
+const launchedExternal = await hExtLaunch.tool("fray_launch_external", {
+  label: "custom external final",
+  runner: "custom",
+  command: process.execPath,
+  args: ["-e", "require('node:fs').writeFileSync(process.argv[process.argv.length - 1], 'EXTERNAL FINAL OUTPUT')", explicitExternalFinal],
+  finalOutputPath: explicitExternalFinal,
+});
+assert.ok(launchedExternal.details.runId, "fray_launch_external returns a run id");
+assert.ok(launchedExternal.details.pid > 0, "fray_launch_external returns the detached pid");
+assert.ok(launchedExternal.details.logPath, "fray_launch_external returns a log path");
+assert.ok(launchedExternal.details.finalOutputPath, "fray_launch_external returns a final output path");
+assert.ok(launchedExternal.details.findingsPath, "fray_launch_external returns a findings path");
+await new Promise((resolve) => setTimeout(resolve, 250));
+await hExtLaunch.tool("fray_status", {});
+const launchedNext = await hExtLaunch.tool("fray_next", {});
+assert.match(launchedNext.content[0].text, /EXTERNAL FINAL OUTPUT/, "launched external final output is captured in the Fray queue");
+assert.match(launchedNext.content[0].text, /- External runner: custom/, "external run metadata is included in reminders/results");
+assert.ok(fs.existsSync(path.join(externalLaunchRoot, launchedExternal.details.findingsPath)), "external launch writes a findings sidecar");
+assert.ok(hExtLaunch.sent.length >= 1, "settled external launches queue native follow-up reminders");
+assertOnlyFollowUpDelivery(hExtLaunch.sent, "external launch reminder scheduling");
 
 const guard = await h3.emit("before_agent_start", { prompt: "Unrelated work", images: undefined, systemPrompt: "", systemPromptOptions: {} });
 assert.ok(guard.some((result: any) => /Fray orchestration guardrail/.test(result?.message?.content || "")), "unhandled results inject an orchestration guardrail before agent start");

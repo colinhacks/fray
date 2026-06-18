@@ -46,6 +46,7 @@ fray_search
 fray_create_thread
 fray_dispatch
 fray_dispatch_many
+fray_launch_external
 fray_next
 fray_children
 fray_steer
@@ -74,7 +75,7 @@ Unthreaded dispatches attach to `.fray/backlog.md`. Treat backlog as a real cont
 
 ## Dispatch
 
-For a new effort, prefer `fray_create_thread` with `initialDispatches`: create the thread doc and start the first child/children in one call. Do not use the older two-step `fray_create_thread` then `fray_dispatch` pattern unless you intentionally need to create a thread without starting work. Use `fray_dispatch` for child work on an existing thread. Use `fray_dispatch_many` only for independent siblings on an existing thread that should start together. If no thread is supplied, Fray attaches the run to `.fray/backlog.md`; immediately after each dispatch tool returns, tell the user what was dispatched, why, and the run ID; do not silently accumulate children.
+For a new effort, prefer `fray_create_thread` with `initialDispatches`: create the thread doc and start the first child/children in one call. Do not use the older two-step `fray_create_thread` then `fray_dispatch` pattern unless you intentionally need to create a thread without starting work. Use `fray_dispatch` for SDK-backed Fray children on an existing thread. Use `fray_launch_external` for detached ad hoc runners such as Codex, Claude, or a custom command; it records logs/final output under the thread findings directory, writes a durable ledger record, and surfaces completion through the same native follow-up/result queue. Use `fray_dispatch_many` only for independent SDK-backed siblings on an existing thread that should start together. If no thread is supplied, Fray attaches the run to `.fray/backlog.md`; immediately after each dispatch or external launch tool returns, tell the user what was started, why, and the run ID; do not silently accumulate children.
 
 Every child prompt must require an orchestration-ready final assistant response. That final response is embedded in native completion follow-ups and remains the primary report; `fray_next` is fallback/recovery/manual-drain evidence, and `fray_reconcile` is the handled-state ack. Sidecars are only for long raw artifacts. The final output must include: verdict/status; what was done; changed files, artifacts, clone path, and commit SHA when applicable; verification commands and results; blockers, caveats, and remaining risks; and one concrete next action. Empty or missing final output is an incomplete handoff/bug, not normal success: Fray first recovers from the child `sessionFile`, then marks the handoff incomplete/needs-retry if no final text exists. No silent completion, progress-only final state, or "done" without usable result data.
 
