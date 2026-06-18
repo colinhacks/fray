@@ -158,7 +158,9 @@ type LiveRun = Omit<RunRecord, "progress"> & {
   abort?: AbortController;
 };
 
-const liveRuns = new Map<string, LiveRun>();
+// Exported for tests: lets verification harnesses inspect/seed live child handles (e.g. to
+// exercise the stale-source -> live-continuation steer redirect without a real SDK session).
+export const liveRuns = new Map<string, LiveRun>();
 const settlingExternalRunIds = new Set<string>();
 const pendingDispatchRunIds = new Set<string>();
 const resumingSourceRunIds = new Set<string>();

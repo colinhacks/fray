@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import FrayExtension, { buildResumeTask, classifySettledRunStatus, completionQueueFromRuns, extractFinalAssistantTextFromSessionJsonl, extractFinalAssistantTextFromSessionJsonlAfter, findLiveContinuationId, foldRunEvents, formatRunDisplayTitle, isSlugLikeLabel, nextCompletionReminderRun, parseCompletionReminderRunId, readableTitleFromSlug, readSessionHeaderFromSessionJsonl, resolveRunFinalOutput, SPINNER_FRAME_MS, spinnerFrameAt, stableRunTitleText, staleLedgerLiveRuns } from "../extensions/fray/index.ts";
+import FrayExtension, { buildResumeTask, classifySettledRunStatus, completionQueueFromRuns, extractFinalAssistantTextFromSessionJsonl, extractFinalAssistantTextFromSessionJsonlAfter, findLiveContinuationId, foldRunEvents, formatRunDisplayTitle, isSlugLikeLabel, liveRuns, nextCompletionReminderRun, parseCompletionReminderRunId, readableTitleFromSlug, readSessionHeaderFromSessionJsonl, resolveRunFinalOutput, SPINNER_FRAME_MS, spinnerFrameAt, stableRunTitleText, staleLedgerLiveRuns } from "../extensions/fray/index.ts";
 
 const base = "2026-06-18T15:00:00.000Z";
 const events = [
@@ -236,6 +236,25 @@ assert.equal(resumedSteer.details.sourceRunId, "fray-resume-source", "resumed st
 assert.equal(resumedSteer.details.resumeDepth, 1, "first resumed steer records depth 1");
 assert.ok(resumedSteer.details.startLeafId, "resumed steer records the pre-continuation session leaf for final-output recovery");
 assert.match(resumedSteer.content[0].text, /resumed fray-resume-source as fray-/, "fray_steer reports the continuation run id");
+
+// Steering the stale source again must redirect into the live continuation opened by the first
+// steer, not open a second resume against the same recorded session file. The harness has no
+// model credentials, so the first continuation's prompt settles immediately and is dropped from
+// liveRuns; re-seed it as a live handle to stand in for a still-running real continuation.
+const firstContinuationId = resumedSteer.details.runId as string;
+let redirectedSteerMessage: string | undefined;
+liveRuns.set(firstContinuationId, {
+  id: firstContinuationId,
+  status: "running",
+  sourceRunId: "fray-resume-source",
+  startedAt: base,
+  session: { steer: async (message: string) => { redirectedSteerMessage = message; } },
+} as any);
+const redirectedSteer = await hResumeSteer.tool("fray_steer", { runId: "fray-resume-source", message: "steer again from stale source" });
+assert.equal(redirectedSteer.details.mode, "live-continuation", "a second steer on the stale source redirects into its live continuation");
+assert.equal(redirectedSteer.details.runId, firstContinuationId, "the redirected steer targets the first continuation rather than opening a new one");
+assert.equal(redirectedSteerMessage, "steer again from stale source", "the redirected steer delivers the new message into the live continuation");
+liveRuns.delete(firstContinuationId);
 
 // Repeated fray_steer on an already-resumed stale source must steer the existing live
 // continuation instead of opening a second continuation against the same session file.
