@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import FrayExtension, { buildResumeTask, classifySettledRunStatus, completionQueueFromRuns, extractFinalAssistantTextFromSessionJsonl, extractFinalAssistantTextFromSessionJsonlAfter, foldRunEvents, formatRunDisplayTitle, isSlugLikeLabel, nextCompletionReminderRun, parseCompletionReminderRunId, readableTitleFromSlug, readSessionHeaderFromSessionJsonl, resolveRunFinalOutput, SPINNER_FRAME_MS, spinnerFrameAt, stableRunTitleText, staleLedgerLiveRuns } from "../extensions/fray/index.ts";
+import FrayExtension, { buildResumeTask, classifySettledRunStatus, completionQueueFromRuns, extractFinalAssistantTextFromSessionJsonl, extractFinalAssistantTextFromSessionJsonlAfter, findLiveContinuationId, foldRunEvents, formatRunDisplayTitle, isSlugLikeLabel, nextCompletionReminderRun, parseCompletionReminderRunId, readableTitleFromSlug, readSessionHeaderFromSessionJsonl, resolveRunFinalOutput, SPINNER_FRAME_MS, spinnerFrameAt, stableRunTitleText, staleLedgerLiveRuns } from "../extensions/fray/index.ts";
 
 const base = "2026-06-18T15:00:00.000Z";
 const events = [
@@ -236,6 +236,57 @@ assert.equal(resumedSteer.details.sourceRunId, "fray-resume-source", "resumed st
 assert.equal(resumedSteer.details.resumeDepth, 1, "first resumed steer records depth 1");
 assert.ok(resumedSteer.details.startLeafId, "resumed steer records the pre-continuation session leaf for final-output recovery");
 assert.match(resumedSteer.content[0].text, /resumed fray-resume-source as fray-/, "fray_steer reports the continuation run id");
+
+// Repeated fray_steer on an already-resumed stale source must steer the existing live
+// continuation instead of opening a second continuation against the same session file.
+assert.equal(
+  findLiveContinuationId(
+    [{ id: "fray-cont", status: "running", sourceRunId: "fray-stale-src", startedAt: base }],
+    [{ id: "fray-stale-src", sourceRunId: undefined }],
+    "fray-stale-src",
+  ),
+  "fray-cont",
+  "a live continuation of the stale source is found so steering is redirected to it",
+);
+assert.equal(
+  findLiveContinuationId(
+    [{ id: "fray-cont", status: "running", sourceRunId: "fray-other-src", startedAt: base }],
+    [],
+    "fray-stale-src",
+  ),
+  undefined,
+  "no live descendant means there is nothing to redirect to (a fresh resume is correct)",
+);
+assert.equal(
+  findLiveContinuationId(
+    [{ id: "fray-c", status: "running", sourceRunId: "fray-b", startedAt: base }],
+    [{ id: "fray-b", sourceRunId: "fray-stale-src" }],
+    "fray-stale-src",
+  ),
+  "fray-c",
+  "deeper resume chains (A->B->C) resolve to the live leaf continuation C",
+);
+assert.equal(
+  findLiveContinuationId(
+    [{ id: "fray-cont", status: "completed", sourceRunId: "fray-stale-src", startedAt: base }],
+    [],
+    "fray-stale-src",
+  ),
+  undefined,
+  "a finished continuation is not steerable, so the source can be resumed fresh",
+);
+assert.equal(
+  findLiveContinuationId(
+    [
+      { id: "fray-cont-1", status: "running", sourceRunId: "fray-stale-src", startedAt: "2026-06-18T15:00:00.000Z" },
+      { id: "fray-cont-2", status: "running", sourceRunId: "fray-stale-src", startedAt: "2026-06-18T15:05:00.000Z" },
+    ],
+    [],
+    "fray-stale-src",
+  ),
+  "fray-cont-2",
+  "when duplicate continuations already exist, steering converges on the most recent live one",
+);
 
 const reminderRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fray-reminder-native-"));
 appendRun(reminderRoot, { id: "fray-native-a", thread: "backlog", label: "native follow-up", intent: "verify", status: "completed", startedAt: base, updatedAt: "2026-06-18T15:10:00.000Z", completedAt: "2026-06-18T15:10:00.000Z", reconciled: false, findingsPath: ".fray/backlog.findings/fray-native-a.md", sessionFile: ".pi/sessions/fray-native-a.jsonl" });

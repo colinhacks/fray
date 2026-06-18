@@ -1770,6 +1770,38 @@ export function buildResumeTask(sourceRunId: string, sessionFile: string | undef
   ].join("\n");
 }
 
+// Find a live continuation descended from a (possibly stale) source run, if one exists.
+// Repeated fray_steer on an already-resumed stale source must steer the existing live
+// continuation, never open a second continuation writing to the same recorded session file.
+// `liveRecords` are the in-memory live runs (only running/starting ones are steerable);
+// `ancestry` supplies sourceRunId links so deeper resume chains (A→B→C) still resolve to C.
+export function findLiveContinuationId(
+  liveRecords: Array<Pick<RunRecord, "id" | "status" | "sourceRunId" | "startedAt">>,
+  ancestry: Array<Pick<RunRecord, "id" | "sourceRunId">>,
+  sourceRunId: string,
+): string | undefined {
+  const parent = new Map<string, string>();
+  for (const r of ancestry) if (r.sourceRunId) parent.set(r.id, r.sourceRunId);
+  for (const r of liveRecords) if (r.sourceRunId) parent.set(r.id, r.sourceRunId);
+  let best: { id: string; startedAt: string } | undefined;
+  for (const live of liveRecords) {
+    if (live.status !== "running" && live.status !== "starting") continue;
+    let cur: string | undefined = live.id;
+    const seen = new Set<string>();
+    while (cur && !seen.has(cur)) {
+      seen.add(cur);
+      const next = parent.get(cur);
+      if (next === sourceRunId) {
+        const startedAt = live.startedAt || "";
+        if (!best || startedAt >= best.startedAt) best = { id: live.id, startedAt };
+        break;
+      }
+      cur = next;
+    }
+  }
+  return best?.id;
+}
+
 // Reload-safe fray_steer fallback: when no live SDK handle exists for runId (e.g. after a parent
 // reload or session replacement) but the child's session file was recorded, resume that exact
 // session as a fresh continuation run instead of silently relaunching or failing.
@@ -2306,6 +2338,19 @@ export default function FrayExtension(pi: ExtensionAPI) {
         await live.session.steer(params.message);
         appendRunEvent(root, { id: params.runId, updatedAt: new Date().toISOString(), steered: true });
         return { content: [{ type: "text", text: `steered ${params.runId}` }], details: { mode: "live", runId: params.runId } };
+      }
+      // The stale source itself has no live handle, but if it was already resumed and that
+      // continuation is still live, steer the continuation. Opening a second resume here would
+      // attach a second SDK session to the same recorded session file and corrupt it.
+      const continuationId = findLiveContinuationId([...liveRuns.values()], readRuns(root), params.runId);
+      if (continuationId) {
+        const continuation = liveRuns.get(continuationId)!;
+        await continuation.session.steer(params.message);
+        appendRunEvent(root, { id: continuationId, updatedAt: new Date().toISOString(), steered: true, steeredVia: params.runId });
+        return {
+          content: [{ type: "text", text: `steered live continuation ${continuationId} of ${params.runId} (the stale source was already resumed; steering its live continuation instead of opening a second one against the same session file)` }],
+          details: { mode: "live-continuation", runId: continuationId, sourceRunId: params.runId },
+        };
       }
       return await resumeRun(pi, ctx, params.runId, params.message);
     },
