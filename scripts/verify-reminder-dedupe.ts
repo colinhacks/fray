@@ -217,7 +217,7 @@ assert.match(h1.sent[0].text, /Do not mark this as a normal successful completio
 assert.match(h1.sent[0].text, /incomplete handoff\/bug/, "empty final output is described as an incomplete handoff bug");
 assert.match(h1.sent[0].text, /Fallback records:\n- Findings sidecar: \.fray\/backlog\.findings\/fray-native-a\.md\n- Child session file: \.pi\/sessions\/fray-native-a\.jsonl/, "empty final output points at fallback records");
 assert.match(h1.sent[0].text, /fray_reconcile with runId=fray-native-a and markHandled=true/, "embedded reminder tells the orchestrator how to advance the ledger");
-assert.match(h1.sent[0].text, /After marking handled, call fray_next/, "embedded reminder instructs the orchestrator to check the next result");
+assert.match(h1.sent[0].text, /Do not call fray_next in normal completion handling/, "embedded reminder keeps fray_next out of the normal follow-up flow");
 assert.doesNotMatch(h1.sent[0].text, /SHOULD_NOT_APPEAR_IN_FIRST_REMINDER/, "native reminder embeds only the oldest unhandled child");
 assert.equal(h1.entries.filter((entry) => entry.data?.action === "delivered").length, 0, "queue-time input interception is not treated as actual delivery");
 await h1.emit("turn_end", {});
@@ -277,6 +277,15 @@ assert.match(h3.sent[0].text, /Caveats: none/, "embedded final output surfaces c
 assert.match(h3.sent[0].text, /Next action: reload Pi/, "embedded final output surfaces next action when the child reported it");
 assert.match(h3.sent[0].text, /Reference records:\n- Raw sidecar: \.fray\/backlog\.findings\/fray-final-a\.md\n- Child session file: \.pi\/sessions\/fray-final-a\.jsonl/, "embedded final-output prompt keeps raw record references");
 assert.doesNotMatch(h3.sent[0].text, /SECOND CHILD SHOULD NOT BE EMBEDDED/, "embedded native follow-up still includes only one result at a time");
+const handledAck = await h3.tool("fray_reconcile", { runId: "fray-final-a", markHandled: true });
+assert.match(handledAck.content[0].text, /handled fray-final-a/, "markHandled returns a concise handled ack");
+assert.match(handledAck.content[0].text, /next unhandled: fray-final-b/, "handled ack points at the next queued run without manual fray_next polling");
+assert.match(handledAck.content[0].text, /No child output echoed/, "handled ack does not echo the just-handled child output");
+assert.doesNotMatch(handledAck.content[0].text, /VERDICT: done/, "markHandled does not duplicate the embedded final output");
+assert.match(handledAck.content[0].text, /Do not call fray_next unless/, "handled ack documents fray_next as recovery/debug/manual drain only");
+assert.equal(parseCompletionReminderRunId(h3.sent.at(-1)!.text), "fray-final-b", "markHandled queues the next native follow-up automatically");
+const staleInteractive = await h3.emit("input", { source: "interactive", text: h3.sent[0].text });
+assert.deepEqual(staleInteractive, [{ action: "handled" }], "stale handled follow-ups are suppressed even when delivered as non-extension input");
 assertOnlyFollowUpDelivery(h3.sent, "final-output reminder scheduling");
 
 const guard = await h3.emit("before_agent_start", { prompt: "Unrelated work", images: undefined, systemPrompt: "", systemPromptOptions: {} });

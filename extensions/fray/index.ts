@@ -296,7 +296,7 @@ function upsertThreadRunCard(root: string, run: Pick<RunRecord, "id" | "thread" 
     : run.status === "incomplete"
       ? `incomplete/needs retry${run.incompleteReason ? `: ${run.incompleteReason}` : ""}${run.findingsPath ? `; raw sidecar ${run.findingsPath}` : ""}`
       : SETTLED_RUN_STATUSES.has(String(run.status || ""))
-        ? `awaiting synthesis via fray_next${run.findingsPath ? `; raw sidecar ${run.findingsPath}` : ""}`
+        ? `awaiting native follow-up synthesis${run.findingsPath ? `; raw sidecar ${run.findingsPath}` : ""}`
         : `intent ${run.intent || "custom"}`;
   const line = `- [${checked}] ${run.id} [${status}] ${run.label || run.intent || "child"} — ${suffix}`;
   const lines = src.split("\n");
@@ -659,8 +659,8 @@ function formatCompletionQueueReminder(root: string): string | undefined {
       ? "Report in chat with purpose, result, changed files/actions, verification, caveats, and next action, using the embedded child final output above for those fields when present."
       : "Report in chat that the handoff is incomplete/needs-retry, include fallback references, and do not present the child as done.",
     "If this result identifies a clear blocker, known required fix, or reload blocker, start or steer the follow-up after the chat report unless a human-owned decision blocks it.",
-    `Then call fray_reconcile with runId=${run.id} and markHandled=true only after the incomplete/successful handling is recorded.`,
-    "After marking handled, call fray_next to check for the next unhandled child result.",
+    `Then call fray_reconcile with runId=${run.id} and markHandled=true only after the incomplete/successful handling is recorded; this is the handled-state ack and should not echo the child output.`,
+    "Do not call fray_next in normal completion handling. If another result is queued, Fray will schedule the next native follow-up; use fray_next only for recovery, debugging, or a deliberate manual drain.",
   );
   return lines.join("\n").trimEnd();
 }
@@ -734,9 +734,9 @@ function formatOrchestrationGuardrail(root: string, prompt: string): string | un
     reminderRunId
       ? needsRetry
         ? `- The current prompt is the native Pi follow-up for ${reminderRunId}; it is incomplete/failed/aborted. Treat it as retryable unless you explicitly record why no retry is needed.`
-        : `- The current prompt is the native Pi follow-up for ${reminderRunId}; its embedded child final output is the primary handoff. Use fray_next or fray_reconcile only if you need to verify/fill missing data.`
-      : "- Before unrelated work or more dispatches, reconcile the oldest child result unless the user asked a higher-priority direct question.",
-    "- Required handling: synthesize accepted facts into the owning thread or .fray/backlog.md, report purpose/result/changed files/actions/verification/caveats/next action in chat, start or steer any clear follow-up/blocker fix after reporting, mark handled only after reporting, then call fray_next again.",
+        : `- The current prompt is the native Pi follow-up for ${reminderRunId}; its embedded child final output is the primary handoff. Use fray_next only for recovery/debug/manual drain, or fray_reconcile without markHandled only if you need to re-read missing data.`
+      : "- Before unrelated work or more dispatches, handle the oldest child result unless the user asked a higher-priority direct question.",
+    "- Required handling: synthesize accepted facts into the owning thread or .fray/backlog.md, report purpose/result/changed files/actions/verification/caveats/next action in chat, start or steer any clear follow-up/blocker fix after reporting, then mark handled with fray_reconcile. Do not call fray_next in normal flow; Fray will queue the next native follow-up automatically.",
   ].join("\n");
 }
 
@@ -1357,12 +1357,13 @@ function completeRun(pi: ExtensionAPI, root: string, runId: string, status: RunS
   finishLiveRun(pi, root, run, status, error);
 }
 
-function markHandled(root: string, runId: string) {
+function markHandled(root: string, runId: string): boolean {
   const current = readRuns(root).find((run) => run.id === runId);
-  if (current?.reconciled) return;
+  if (current?.reconciled) return false;
   const now = new Date().toISOString();
   appendRunEvent(root, { id: runId, updatedAt: now, reconciled: true, reconciledAt: now });
   if (current) upsertThreadRunCard(root, { ...current, reconciled: true });
+  return true;
 }
 
 function requireLiveRunForAction(root: string, runId: string, action: string): LiveRun {
@@ -1553,7 +1554,7 @@ export default function FrayExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "fray_next",
     label: "Fray Next",
-    description: "Return the oldest unhandled child result so the orchestrator can handle completions one at a time.",
+    description: "Return the oldest unhandled child result for recovery, debugging, or deliberate manual drain. Normal completions arrive as native follow-up prompts.",
     parameters: Type.Object({ thread: Type.Optional(Type.String()) }),
     renderResult: compactRender("fray_next"),
     async execute(_id, params: any, _signal, _update, ctx) {
@@ -1622,14 +1623,25 @@ export default function FrayExtension(pi: ExtensionAPI) {
       const root = frayRoot(ctx.cwd);
       const run = currentRuns(root).find((r) => r.id === params.runId);
       if (!run) throw new Error(`unknown fray run ${params.runId}`);
-      const resultText = formatRunResult(root, run);
       const shouldMarkHandled = !!(params.markHandled || params.markReconciled);
       if (shouldMarkHandled) {
-        markHandled(root, params.runId);
-        queueCompletionReminder(pi, root);
+        const changed = markHandled(root, params.runId);
+        const followUpQueued = queueCompletionReminder(pi, root);
+        const nextRun = completionQueue(root)[0];
+        updateWidget(ctx);
+        const nextLine = nextRun
+          ? `next unhandled: ${nextRun.id} [${nextRun.status}] ${nextRun.thread || "-"}: ${nextRun.label}${followUpQueued ? " (native follow-up queued)" : " (native follow-up already queued or pending)"}`
+          : "fray result queue empty";
+        const text = [
+          `${changed ? "handled" : "already handled"} ${params.runId}`,
+          nextLine,
+          "No child output echoed. Do not call fray_next unless you are intentionally recovering, debugging, or manually draining the queue.",
+        ].join("\n");
+        return { content: [{ type: "text", text }], details: { run, markedHandled: true, alreadyHandled: !changed, nextRun, followUpQueued } };
       }
+      const resultText = formatRunResult(root, run);
       updateWidget(ctx);
-      return { content: [{ type: "text", text: resultText }], details: { run, markedHandled: shouldMarkHandled } };
+      return { content: [{ type: "text", text: resultText }], details: { run, markedHandled: false } };
     },
   });
 
@@ -1783,10 +1795,8 @@ export default function FrayExtension(pi: ExtensionAPI) {
   pi.on("input", async (event, ctx) => {
     remember(ctx);
     const root = frayRoot(ctx.cwd);
-    if (event.source === "extension") {
-      const reminderAction = handleCompletionReminderInput(pi, root, event.text);
-      if (reminderAction) return reminderAction;
-    }
+    const reminderAction = handleCompletionReminderInput(pi, root, event.text);
+    if (reminderAction) return reminderAction;
     if (!event.text.startsWith("/fray ")) return;
     return { action: "continue" };
   });
