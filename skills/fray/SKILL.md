@@ -88,7 +88,7 @@ thinkingHint: low | medium | high | xhigh
 capabilities.write: true | false
 ```
 
-The orchestrator may run fast/cheap while children run stronger non-fast models. Sub-agents usually get broad tool access. Do not over-restrict them by default; constrain by task scope and fray invariants, not by starving tools. Do not make CI/review/PR children read-only by reflex: if the likely next step is a safe code/doc/test fix on an existing branch, give the child write/push-capable instructions scoped to that branch and tell it to land the obvious fix unless a human-owned decision appears.
+If a dispatch path routes to the wrong provider or ignores a requested model (for example, a requested Claude model that only takes effect through the external Claude launcher), stop using that path for provider-sensitive work and switch to a known-good path (such as `fray_launch_external`) until the routing is fixed. The orchestrator may run fast/cheap while children run stronger non-fast models. Sub-agents usually get broad tool access. Do not over-restrict them by default; constrain by task scope and fray invariants, not by starving tools. Do not make CI/review/PR children read-only by reflex: if the likely next step is a safe code/doc/test fix on an existing branch, give the child write/push-capable instructions scoped to that branch and tell it to land the obvious fix unless a human-owned decision appears.
 
 Substantive implementation children should be mini-orchestrators within their assigned scope: plan briefly, implement, run local verification, self-review the diff, evaluate/integrate, and for landing work commit and push to `main` by default unless the repo/task specifies a PR flow or forbids pushing. When CI applies and credentials are available, the child should wait for CI and fix in-scope failures instead of handing off immediately after the first push.
 
@@ -130,6 +130,10 @@ A completed child is not handled until the orchestrator reconciles it, reports i
 8. Do not call `fray_next` in normal completion flow. If another result is queued, Fray schedules the next native follow-up automatically; use `fray_next` only for recovery, debugging, or a deliberate manual drain. If a direct user question interrupts, answer it and resume the inbox immediately.
 9. When no native follow-up or recorded follow-up remains, continue with dispatch or steering.
 
+### Inbox and queue hygiene
+
+Native follow-up completions are a hard inbox, not a notification feed: drain them promptly and keep the unhandled count low instead of letting results pile into a large backlog that must later be drained piecemeal. After every reconciliation, set the owning thread's status truthfully to `done`, `blocked`, `deferred`, or `active`; do not leave threads parked at `active` once their work has resolved. During release pushes or other high-throughput stretches, periodically run `fray_status` and clean up stale `active` threads so live state stays accurate. While a large unhandled queue exists, do not dispatch broad new waves of children; finish the inbox first and dispatch only direct blockers of in-flight work.
+
 Every substantive implementation, copy, behavior, test, benchmark, or load-bearing verdict gets an independent review child.
 
 ## Authority
@@ -145,6 +149,9 @@ The important rails are orchestration rails:
 - Do not treat child-first as passivity; dispatch, steer, patch, test, push, comment, close, and verify when context authorizes it.
 - Do not drop child completions; treat native completion follow-ups as a strict inbox, reconcile/report one at a time, and avoid routine `fray_next` polling.
 - Do not batch-reconcile silently; chat-report each result before marking it handled.
+- Do not let the unhandled inbox grow into a large backlog; drain follow-up completions promptly and set thread status truthfully after each reconciliation.
+- Do not dispatch broad new waves while a large unhandled queue exists; clear the inbox first and dispatch only direct blockers.
+- Do not keep using a dispatch path that routes to the wrong provider/model for provider-sensitive work; switch to a known-good path until it is fixed.
 - Do not silently dispatch children; report purpose and run ID in chat.
 - Do not accept empty or artifact-free child results as done; retry or ask.
 - Do not abort live children for reload/shutdown unless explicitly accepted; preserve partial facts and relaunch needed work after any abort.
