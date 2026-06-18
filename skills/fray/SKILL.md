@@ -144,6 +144,18 @@ Native follow-up completions are a hard inbox, not a notification feed: drain th
 
 Every substantive implementation, copy, behavior, test, benchmark, or load-bearing verdict gets an independent review child.
 
+## Ground-truth discipline
+
+Thread state and thread bodies must track what is provably true in the repo, `gh`, and CI, not what was intended or dispatched. Treat each rule here as a hard invariant.
+
+- `active` means live, ongoing work, not stale intent. A thread is `active` only while a child is running or its next action is imminent and owned. After every child result, set the thread status from ground truth (`done`, `blocked`, `deferred`, `needs-decision`, `todo`, or `active`); do not leave a thread `active` because work was once planned there.
+- Thread bodies record outcomes, not plans. Write what is proven by repo/`gh`/CI state, and fact-check against `git`/`gh` before writing that work landed, merged, shipped, or is fixed. Do not record a planned or dispatched action as a completed one.
+- Distinguish `main`/merged from tagged, released, or published. A commit on `main` is not a release. Before telling the user they can get a fix, verify the consumed ref/tag/action: the published version, the tag or release, and the actual ref any consumer pins. State the gap explicitly when code is merged but not yet released.
+- Do not invert a user's stated deliverable. If wording could mean two opposite things, check the prior artifact or the user's goal before editing rather than guessing; an edit that reverses the intended outcome is worse than asking.
+- Do not leave uncommitted, intermingled WIP from abandoned children. When a child is abandoned or superseded, either commit its scoped, buildable work with a clear message or explicitly park/clean it; never `git stash` to hide it and never leave mixed WIP in the shared tree for the next child to inherit.
+- Dispatch is not progress. A dispatch advances a thread only once its return is reconciled and the next action is re-derived from the result. Launching children does not move work forward; reconciled outcomes do.
+- Unverified work stays open. A thread whose verification was deferred ("smoke-test later", "confirm in CI later") remains `active` or `blocked`, not `done`. Mark `done` only after the verification it depends on has actually run and passed.
+
 ## Authority
 
 Sub-agents can fix obvious bugs and produce patches. They do not own default, security, product, brand, public API, config, or env-surface decisions unless the human already greenlit the decision and the prompt says so. Full tool permission is not full decision authority.
@@ -158,6 +170,11 @@ The important rails are orchestration rails:
 - Do not drop child completions; treat native completion follow-ups as a strict inbox, reconcile/report one at a time, and avoid routine `fray_next` polling.
 - Do not batch-reconcile silently; chat-report each result before marking it handled.
 - Do not let the unhandled inbox grow into a large backlog; drain follow-up completions promptly and set thread status truthfully after each reconciliation.
+- Do not leave threads `active` on stale intent; `active` means live work, and status is set from ground truth after every result.
+- Do not record plans, dispatches, or merges as shipped fixes; fact-check against `git`/`gh`/CI, and distinguish `main`/merged from tagged/released/published before telling the user a fix is available.
+- Do not invert a user's stated deliverable; when wording is ambiguous, check the prior artifact or goal before editing.
+- Do not leave intermingled WIP from abandoned children; commit scoped buildable work or explicitly park/clean it, and never `git stash` to hide it.
+- Do not treat dispatch as progress or mark deferred-verification work `done`; reconcile returns, re-derive next actions, and verify before closing.
 - Do not dispatch broad new waves while a large unhandled queue exists; clear the inbox first and dispatch only direct blockers.
 - Do not keep using a dispatch path that routes to the wrong provider/model for provider-sensitive work; switch to a known-good path until it is fixed.
 - Do not silently dispatch children; report purpose and run ID in chat.
