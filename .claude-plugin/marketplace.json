@@ -1,6 +1,7 @@
 {
   "name": "fray",
   "owner": { "name": "Colin McDonnell" },
+  "description": "fray — the orchestrator-first multi-agent methodology, packaged for Claude Code and other agent harnesses.",
   "plugins": [
     {
       "name": "fray",
