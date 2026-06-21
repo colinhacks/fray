@@ -27,7 +27,8 @@ fray ships as a globally-loaded Claude Code plugin, so its hooks and the `fray` 
    autonomous_mode: off
    state:
    ```
-3. (optional) drop a `.fray/backlog.md` parking-lot thread when the first loose one-off appears.
+3. ensure `.fray/` is git-ignored so the orchestration control surface never gets committed to the host repo: if the repo has a `.gitignore`, append a `.fray/` entry (under a `# fray orchestration control surface` comment) when one isn't already present; if there's no `.gitignore`, create one containing that entry. (Skip only if the repo deliberately tracks `.fray/` — rare; default is ignore.)
+4. (optional) drop a `.fray/backlog.md` parking-lot thread when the first loose one-off appears.
 
 Once `.fray/` exists, the hooks activate automatically (the per-turn pulse, the dispatch enforcement + epilogue, the rest/stop guards, the session seed). Bootstrapping is the ONLY thing the skill does eagerly on load — it does NOT then scan the board or start work (see the next section).
 
