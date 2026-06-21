@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import FrayExtension, { buildResumeTask, classifySettledRunStatus, completionQueueFromRuns, extractFinalAssistantTextFromSessionJsonl, extractFinalAssistantTextFromSessionJsonlAfter, findLiveContinuationId, foldRunEvents, formatRunDisplayTitle, isSlugLikeLabel, liveRuns, nextCompletionReminderRun, parseCompletionReminderRunId, readableTitleFromSlug, readSessionHeaderFromSessionJsonl, resolveRunFinalOutput, SPINNER_FRAME_MS, spinnerFrameAt, stableRunTitleText, staleLedgerLiveRuns } from "../extensions/fray/index.ts";
+import FrayExtension, { buildResumeTask, chooseModel, classifySettledRunStatus, completionQueueFromRuns, extractFinalAssistantTextFromSessionJsonl, extractFinalAssistantTextFromSessionJsonlAfter, findLiveContinuationId, foldRunEvents, formatRunDisplayTitle, isSlugLikeLabel, liveRuns, LOST_HANDLE_GRACE_MS, nextCompletionReminderRun, parseCompletionReminderRunId, readableTitleFromSlug, readSessionHeaderFromSessionJsonl, resolveRunFinalOutput, SPINNER_FRAME_MS, spinnerFrameAt, stableRunTitleText, staleLedgerLiveRuns } from "../extensions/fray/index.ts";
 
 const base = "2026-06-18T15:00:00.000Z";
 const events = [
@@ -34,6 +34,20 @@ assert.deepEqual(
   ]), new Set()).map((run) => run.id),
   [],
   "detached external runs are recovered by the external-run path instead of being marked lost as SDK children",
+);
+assert.deepEqual(
+  staleLedgerLiveRuns(foldRunEvents([
+    { id: "fray-recent", label: "new child", intent: "investigate", status: "running", startedAt: "2026-06-18T15:09:30.000Z", updatedAt: "2026-06-18T15:09:30.000Z" },
+  ]), new Set(), new Set(), Date.parse("2026-06-18T15:10:00.000Z"), LOST_HANDLE_GRACE_MS).map((run) => run.id),
+  [],
+  "recent SDK ledger runs are not marked lost before the lost-handle grace window expires",
+);
+assert.deepEqual(
+  staleLedgerLiveRuns(foldRunEvents([
+    { id: "fray-old", label: "old child", intent: "investigate", status: "running", startedAt: "2026-06-18T15:00:00.000Z", updatedAt: "2026-06-18T15:00:00.000Z" },
+  ]), new Set(), new Set(), Date.parse("2026-06-18T15:10:00.000Z"), LOST_HANDLE_GRACE_MS).map((run) => run.id),
+  ["fray-old"],
+  "SDK ledger runs older than the grace window are still marked lost when no live handle exists",
 );
 
 const scheduled = new Set<string>();
@@ -99,6 +113,17 @@ assert.deepEqual(
   { title: "Widget title jitter", indicator: "" },
   "running thread names do not gain an Issue prefix from thread metadata",
 );
+const explicitModel = { provider: "anthropic", id: "claude-opus-test" } as any;
+const modelCtx: any = {
+  model: { provider: "openai", id: "gpt-default" },
+  modelRegistry: {
+    find(provider: string, id: string) { return provider === explicitModel.provider && id === explicitModel.id ? explicitModel : undefined; },
+    getAvailable() { return [{ provider: "openai", id: "gpt-5.5" }]; },
+  },
+};
+assert.equal(chooseModel(modelCtx, "strong", "anthropic/claude-opus-test"), explicitModel, "explicit models are honored when the registry resolves them");
+assert.throws(() => chooseModel(modelCtx, "strong", "anthropic/missing-model"), /requested fray model is not available: anthropic\/missing-model/, "explicit model misses fail instead of silently routing to another provider");
+assert.equal(chooseModel(modelCtx, "current", "anthropic/missing-model", false), modelCtx.model, "resume-time recorded model misses can still fall back to the current model");
 
 function makeHarness(root: string, entries: any[] = []) {
   const handlers = new Map<string, Function[]>();
@@ -434,6 +459,24 @@ assert.match(launchedNext.content[0].text, /- External runner: custom/, "externa
 assert.ok(fs.existsSync(path.join(externalLaunchRoot, launchedExternal.details.findingsPath)), "external launch writes a findings sidecar");
 assert.ok(hExtLaunch.sent.length >= 1, "settled external launches queue native follow-up reminders");
 assertOnlyFollowUpDelivery(hExtLaunch.sent, "external launch reminder scheduling");
+
+const claudeLogFallbackRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fray-claude-log-fallback-"));
+const hClaudeLogFallback = makeHarness(claudeLogFallbackRoot);
+const launchedClaudeLogFallback = await hClaudeLogFallback.tool("fray_launch_external", {
+  label: "claude stdout fallback",
+  runner: "claude",
+  command: process.execPath,
+  args: ["-e", "console.log('CLAUDE LOG FALLBACK FINAL')"],
+});
+await new Promise((resolve) => setTimeout(resolve, 250));
+await hClaudeLogFallback.tool("fray_status", {});
+const claudeLogFallbackNext = await hClaudeLogFallback.tool("fray_next", {});
+assert.match(claudeLogFallbackNext.content[0].text, /\[completed\][\s\S]*claude stdout fallback/, "supplied-args Claude runs complete when stdout can be mirrored into the final output file");
+assert.match(claudeLogFallbackNext.content[0].text, /Final output source: log/, "supplied-args Claude stdout is recorded as the final output source");
+assert.match(claudeLogFallbackNext.content[0].text, /CLAUDE LOG FALLBACK FINAL/, "supplied-args Claude stdout is surfaced through the Fray queue");
+const claudeLogFinalAbs = path.isAbsolute(launchedClaudeLogFallback.details.finalOutputPath) ? launchedClaudeLogFallback.details.finalOutputPath : path.join(claudeLogFallbackRoot, launchedClaudeLogFallback.details.finalOutputPath);
+assert.match(fs.readFileSync(claudeLogFinalAbs, "utf8"), /CLAUDE LOG FALLBACK FINAL/, "supplied-args Claude stdout is mirrored into the durable final output file");
+assertOnlyFollowUpDelivery(hClaudeLogFallback.sent, "Claude log fallback reminder scheduling");
 
 const guard = await h3.emit("before_agent_start", { prompt: "Unrelated work", images: undefined, systemPrompt: "", systemPromptOptions: {} });
 assert.ok(guard.some((result: any) => /Fray orchestration guardrail/.test(result?.message?.content || "")), "unhandled results inject an orchestration guardrail before agent start");

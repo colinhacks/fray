@@ -59,6 +59,7 @@ const REMINDER_STATE_ENTRY = "fray-completion-reminder-state";
 const EXTERNAL_STATUS_SUFFIX = ".external-status.json";
 const EXTERNAL_LOG_TAIL_CHARS = 24000;
 const BACKLOG_THREAD = "backlog";
+export const LOST_HANDLE_GRACE_MS = 2 * 60 * 1000;
 
 type RunStatus = "starting" | "running" | "completed" | "failed" | "aborted" | "incomplete";
 type Intent = "harvest" | "investigate" | "implement" | "review" | "verify" | "design" | "custom";
@@ -486,8 +487,21 @@ function ageKey(run: RunRecord, primary: "started" | "completed"): string {
     : String(run.completedAt || run.updatedAt || run.startedAt || "");
 }
 
-export function staleLedgerLiveRuns(runs: RunRecord[], liveRunIds: Set<string>, pendingRunIds: Set<string> = new Set()): RunRecord[] {
-  return runs.filter((run) => !!run.id && !run.external && LIVE_RUN_STATUSES.has(run.status || "") && !liveRunIds.has(run.id) && !pendingRunIds.has(run.id));
+function runActivityMs(run: Pick<RunRecord, "updatedAt" | "startedAt" | "completedAt">): number {
+  for (const value of [run.updatedAt, run.startedAt, run.completedAt]) {
+    const parsed = Date.parse(String(value || ""));
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return 0;
+}
+
+function isPastLostHandleGrace(run: RunRecord, nowMs: number, graceMs: number): boolean {
+  const activityMs = runActivityMs(run);
+  return activityMs <= 0 || nowMs - activityMs >= graceMs;
+}
+
+export function staleLedgerLiveRuns(runs: RunRecord[], liveRunIds: Set<string>, pendingRunIds: Set<string> = new Set(), nowMs = Date.now(), graceMs = LOST_HANDLE_GRACE_MS): RunRecord[] {
+  return runs.filter((run) => !!run.id && !run.external && LIVE_RUN_STATUSES.has(run.status || "") && !liveRunIds.has(run.id) && !pendingRunIds.has(run.id) && isPastLostHandleGrace(run, nowMs, graceMs));
 }
 
 function staleChildRuns(root: string): RunRecord[] {
@@ -1096,12 +1110,13 @@ function compactBuiltinDefinition(factory: (cwd: string) => ToolDefinition<any, 
   };
 }
 
-function chooseModel(ctx: ExtensionContext, hint: ModelHint, explicit?: string): Model<any> | undefined {
+export function chooseModel(ctx: ExtensionContext, hint: ModelHint, explicit?: string, strictExplicit = true): Model<any> | undefined {
   const registry = ctx.modelRegistry;
   if (explicit) {
     const [provider, ...rest] = explicit.includes("/") ? explicit.split("/") : [ctx.model?.provider || "", explicit];
     const found = registry.find(provider, rest.join("/"));
     if (found) return found;
+    if (strictExplicit) throw new Error(`requested fray model is not available: ${explicit}`);
   }
   const available = registry.getAvailable();
   if (!available.length) return ctx.model;
@@ -1271,7 +1286,7 @@ function buildExternalInvocation(params: LaunchExternalArgs, cwd: string, finalO
       runner,
       command: commandOverride || "claude",
       args: suppliedArgs || ["--print", "--output-format", "text", prompt],
-      externalLogFallbackFinal: !params.finalOutputPath && !suppliedArgs,
+      externalLogFallbackFinal: !params.finalOutputPath,
     };
   }
 
@@ -1844,7 +1859,7 @@ async function resumeRun(pi: ExtensionAPI, ctx: ExtensionContext, sourceRunId: s
     const cwd = header.cwd && fs.existsSync(header.cwd) ? header.cwd : (known.cwd || ctx.cwd);
     const sessionManager = SessionManager.open(sessionFileAbs, undefined, cwd);
     const startLeafId = sessionManager.getLeafId() || undefined;
-    const model = chooseModel(ctx, "current", known.model);
+    const model = chooseModel(ctx, "current", known.model, false);
     const thinking = defaultThinking(intent, known.thinking);
     const tools = defaultTools(intent, true);
     const thread = known.thread || BACKLOG_THREAD;
