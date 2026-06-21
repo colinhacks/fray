@@ -9,7 +9,7 @@ This repository is a **monorepo of fray ports**, one per agent harness:
 | [`cc/`](cc/) | [Claude Code](https://claude.ai/code) | A Claude Code **plugin** — skill + hooks + board CLI, loaded globally, dormant per-repo until you run `/fray`. |
 | [`pi/`](pi/) | [Pi](https://github.com/earendil-works) | The Pi port — extensions, prompts, and skill for the Pi coding agent. |
 
-Future harnesses (`codex/`, `opencode/`, …) land as sibling directories.
+The [`codex/`](codex/) and [`opencode/`](opencode/) ports are also present.
 
 ## Claude Code plugin (`cc/`)
 
@@ -29,7 +29,18 @@ A marketplace install copies the plugin into `~/.claude/plugins/cache`, so edits
 - **Per-session, in-place:** `claude --plugin-dir /path/to/fray/cc` — loads the plugin from disk, no copy, edits take effect on reload.
 - **Global, live propagation:** replace the cache copy with a symlink back to the source so every session picks up edits machine-wide:
   ```sh
-  rm -rf ~/.claude/plugins/cache/fray/fray/1.0.0
-  ln -s /path/to/fray/cc ~/.claude/plugins/cache/fray/fray/1.0.0
+  rm -rf ~/.claude/plugins/cache/fray/fray/1.1.0
+  ln -s /path/to/fray/cc ~/.claude/plugins/cache/fray/fray/1.1.0
   ```
   Claude Code follows the symlink and resolves all components live. (A version bump or `claude plugin update` would re-copy and overwrite the symlink — re-create it after.)
+
+### Session-local enable/disable
+
+The `FRAY` environment variable overrides the per-project `enabled` setting in `.fray/config.yml` for the entire session. Set it when launching claude:
+
+```sh
+FRAY=0 claude   # fray disabled this session (hooks are no-ops)
+FRAY=1 claude   # fray enabled this session (overrides config.yml enabled: false)
+```
+
+Hooks inherit the claude process environment, so the setting applies to all hook invocations in that session and is independent per terminal / tmux pane. A mid-session toggle via a shell command is not supported — `Bash` tool env changes don't propagate to hook processes. A future add-on could use a `session_id`-keyed sentinel file for mid-session control; that is not implemented yet.

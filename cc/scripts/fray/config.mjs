@@ -29,6 +29,11 @@ import { join } from 'node:path';
  *      or unparseable config → enabled, fail-safe). `enabled: false` silences fray
  *      in a bootstrapped project without deleting `.fray/`.
  *
+ * A SESSION-LOCAL override is also checked (see {@link loadConfig}): `FRAY=0` in the
+ * launch environment disables fray for the entire session regardless of config.yml;
+ * `FRAY=1` enables it. This is set at launch time (`FRAY=0 claude`) and inherited by
+ * all hook processes. It takes precedence over the per-project config.
+ *
  * Every fray hook calls this FIRST and early-returns when it is false, so the
  * new-user DX is: install once globally → dormant everywhere → `/fray` in a repo
  * activates it there.
@@ -130,6 +135,17 @@ function scalar(raw) {
  * type-safe {@link FrayConfig}. The file is absent/unreadable → DEFAULTS.
  * A single malformed line → that line is skipped; everything else still parses.
  *
+ * SESSION-LOCAL OVERRIDE (checked first, before any file read): `process.env.FRAY`
+ * lets a session opt in/out at launch time without touching `config.yml`:
+ *   - `FRAY=0` / `FRAY=false` → fray disabled this session (enabled: false).
+ *   - `FRAY=1` / `FRAY=true`  → fray enabled this session (enabled: true).
+ *   - unset / any other value → fall back to `.fray/config.yml` (today's behavior).
+ * Set it when launching claude: `FRAY=0 claude`. CC hooks inherit the claude process
+ * env, so the setting is session-wide and independent per terminal / session.
+ * NOTE: a mid-session toggle is NOT supported via tool calls — Bash env changes
+ * don't persist across tool invocations and don't reach hook processes. A mid-session
+ * toggle would require a session_id-keyed sentinel file; that is a possible future add-on.
+ *
  * Parser shape (intentionally narrow — matches fray's flat config, NOT general YAML):
  *   - `key: value`         top-level scalar (e.g. `enabled: true`, `autonomous_mode: off`)
  *   - `state:`             opens the one nested block
@@ -141,6 +157,18 @@ function scalar(raw) {
  */
 export function loadConfig(projectDir) {
   const cfg = defaults();
+
+  // SESSION-LOCAL ENV GATE — takes precedence over any config file.
+  const frayEnv = (process.env.FRAY ?? '').trim().toLowerCase();
+  if (frayEnv === '0' || frayEnv === 'false') {
+    cfg.enabled = false;
+    return cfg;
+  }
+  if (frayEnv === '1' || frayEnv === 'true') {
+    cfg.enabled = true;
+    // Don't return early — still parse the file to pick up autonomousMode + state.
+  }
+
   let src;
   try {
     src = readFileSync(join(projectDir, '.fray', 'config.yml'), 'utf8');
@@ -177,7 +205,9 @@ export function loadConfig(projectDir) {
     // the default. (Bug found 2026-06-14: an inline comment flipped autonomous mode
     // back off. The nested `state:` entries already go through scalar(); the
     // top-level bools must too.)
-    if (key === 'enabled') cfg.enabled = toBool(scalar(val), cfg.enabled);
+    // When FRAY=1/true is set at launch, the session-local gate already fixed `enabled`;
+    // don't let the config file override it. autonomousMode + state still come from the file.
+    if (key === 'enabled' && frayEnv !== '1' && frayEnv !== 'true') cfg.enabled = toBool(scalar(val), cfg.enabled);
     else if (key === 'autonomous_mode') cfg.autonomousMode = toBool(scalar(val), cfg.autonomousMode);
     // unrecognized top-level keys are ignored by design (forward-compatible)
   }

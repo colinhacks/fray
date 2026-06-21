@@ -27,6 +27,21 @@ function bool(raw, fallback) {
 
 export function loadConfig(root) {
   const config = { enabled: true, autonomousMode: false, state: {} }
+
+  // SESSION-LOCAL ENV GATE — takes precedence over any config file.
+  // FRAY=0/false → disabled this session; FRAY=1/true → enabled this session.
+  // Set at launch time (`FRAY=0 claude`); inherited by all hook processes.
+  // A mid-session toggle is not supported (would need a session_id-keyed sentinel).
+  const frayEnv = (process.env.FRAY ?? "").trim().toLowerCase()
+  if (frayEnv === "0" || frayEnv === "false") {
+    config.enabled = false
+    return config
+  }
+  if (frayEnv === "1" || frayEnv === "true") {
+    config.enabled = true
+    // Don't return early — still parse the file to pick up autonomousMode + state.
+  }
+
   let src = ""
   try {
     src = readFileSync(join(root, ".fray", "config.yml"), "utf8")
@@ -48,7 +63,8 @@ export function loadConfig(root) {
       continue
     }
     inState = false
-    if (top[1] === "enabled") config.enabled = bool(top[2], config.enabled)
+    // When FRAY=1/true, don't let the config file override the session-local gate.
+    if (top[1] === "enabled" && frayEnv !== "1" && frayEnv !== "true") config.enabled = bool(top[2], config.enabled)
     else if (top[1] === "autonomous_mode") config.autonomousMode = bool(top[2], config.autonomousMode)
   }
   return config
@@ -93,7 +109,8 @@ export function readThreads(root) {
           if (!fm.status) errors.push("missing required field: status")
           else if (!STATUS.includes(fm.status)) errors.push(`invalid status "${fm.status}" (expected one of: ${STATUS.join(", ")})`)
         }
-        return { id, title: fm?.title || "", status: fm?.status || "?", next: nextStep(text), queued: /\bQUEUED\b/.test(text), text, errors }
+        const statusText = fm?.status_text || ""
+        return { id, title: fm?.title || "", status: fm?.status || "?", statusText, next: nextStep(text), queued: /\bQUEUED\b/.test(text), text, errors }
       })
   } catch {
     return []
