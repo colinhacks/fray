@@ -72,7 +72,12 @@ try {
   if (payload.agent_type && NON_FRAY_AGENT_TYPES.has(payload.agent_type)) process.exit(0);
   let dispatchCount = 0;
   try {
-    dispatchCount = parseInt(readFileSync(DISPATCH_COUNT, 'utf8').trim(), 10) || 0;
+    // A present-but-unparseable count (NaN) is NOT "fray never dispatched" — it's a
+    // corrupt/garbage existing file, so fail TOWARD recording (treat as ≥1). Only a
+    // cleanly-parsed integer is trusted (the sole writer, agent-dispatch.mjs, always
+    // writes `String(n+1)`, so NaN is unreachable in practice — this is belt-and-suspenders).
+    const n = parseInt(readFileSync(DISPATCH_COUNT, 'utf8').trim(), 10);
+    dispatchCount = Number.isNaN(n) ? 1 : n;
   } catch {
     // Count file absent/unreadable. Distinguish "fray never dispatched" (file truly
     // absent → the bug case → skip) from "transient read error on an existing file"
