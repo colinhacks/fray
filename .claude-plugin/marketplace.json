@@ -4,7 +4,7 @@
   "plugins": [
     {
       "name": "fray",
-      "source": "./",
+      "source": "./cc",
       "description": "Orchestrator-first multi-agent methodology + tooling: a per-project .fray/ thread board, dispatch/reconciliation hooks, and a board/validator CLI."
     }
   ]
