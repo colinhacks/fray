@@ -1,0 +1,20 @@
+#!/usr/bin/env node
+// @ts-check
+/**
+ * fray — the board command. This shim is on the Bash tool's PATH while the plugin is
+ * enabled, so `fray`, `fray --validate`, `fray --json`, etc. work as bare commands from
+ * any cwd. It simply execs the bundled board script (scripts/fray/index.mjs), which reads
+ * the PROJECT's `.fray/` from CLAUDE_PROJECT_DIR (exported to Bash tool calls) or, when run
+ * by hand, from the current working directory.
+ *
+ * Resolving the board script: this file lives at <plugin>/bin/fray, so the board is at
+ * ../scripts/fray/index.mjs relative to THIS file — independent of cwd and of where the
+ * plugin is installed (in-place dev dir or ~/.claude/plugins/cache/…). We import it via a
+ * file:// URL so argv/process.env (incl. CLAUDE_PROJECT_DIR) flow straight through.
+ */
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { dirname, join } from 'node:path';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const board = join(here, '..', 'scripts', 'fray', 'index.mjs');
+await import(pathToFileURL(board).href);

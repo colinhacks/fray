@@ -1,0 +1,11 @@
+{
+  "name": "fray",
+  "owner": { "name": "Colin McDonnell" },
+  "plugins": [
+    {
+      "name": "fray",
+      "source": "./",
+      "description": "Orchestrator-first multi-agent methodology + tooling: a per-project .fray/ thread board, dispatch/reconciliation hooks, and a board/validator CLI."
+    }
+  ]
+}

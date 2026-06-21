@@ -1,0 +1,346 @@
+---
+name: fray
+description: Load this skill IMMEDIATELY — as your FIRST action, before any other tool call or response — whenever the user mentions "fray" in ANY form ("fray", "fray mode", "enter/start fray", "load fray", "use fray", "in fray", "the fray skill"), OR asks to orchestrate / run / coordinate a multi-effort push, audit, or campaign through sub-agents. Also the default for any large, mixed set of efforts — investigations + decided fixes + verifications — toward a goal (a launch push, a pre-release audit, a refactor campaign) where the human wants to stay in the loop on what the investigations surface; the default for any multi-effort push that is part "find out what's true" and part "land the decided thing." Use it instead of hardcoding a multi-agent DAG up front — those bury the decision points and fan out expensively before the facts are in. Treat any "fray" mention as an explicit instruction to load this skill, never as ambient context.
+version: 1.0.0
+metadata:
+  internal: true
+---
+
+# fray
+
+**fray** is the orchestrator-first methodology for driving a large, mixed set of efforts (investigations + decided fixes + verifications) through individually-dispatched background sub-agents. A *fray* is a tangle of concurrent **threads**; each thread is one ongoing effort (possibly a chain of sub-agents). The human stays in the loop on the decisions the investigations surface. fray is the default for any multi-effort push that is part *find-out-what's-true* and part *land-the-decided-thing* — use it **instead of** a hardcoded `Workflow` DAG, which fans out expensively and buries the decision points before the facts are in.
+
+(The control surface is a directory of per-thread files under `.fray/` — not one bloated `todo.md`; the board is computed on demand.)
+
+---
+
+## Activation + bootstrap — fray is GLOBAL but DORMANT until you opt a repo in
+
+fray ships as a globally-loaded Claude Code plugin, so its hooks and the `fray` board command are available in EVERY project. But fray stays **completely dormant in a project until that project is opted in** — every hook is a silent no-op (it injects nothing, blocks nothing, creates nothing) **unless the project has a `.fray/` directory AND `enabled` is not turned off in `.fray/config.yml`.** A virgin repo with the plugin installed sees zero fray output. This is deliberate: install once, dormant everywhere, activate per repo.
+
+**BOOTSTRAP is the FIRST thing this skill does when fray is invoked in a repo that has no `.fray/` yet.** When you load this skill and `.fray/` is absent, create it before anything else:
+
+1. `mkdir -p .fray`
+2. write `.fray/config.yml` with the default globals:
+   ```yaml
+   enabled: true
+   autonomous_mode: off
+   state:
+   ```
+3. (optional) drop a `.fray/backlog.md` parking-lot thread when the first loose one-off appears.
+
+Once `.fray/` exists, the hooks activate automatically (the per-turn pulse, the dispatch enforcement + epilogue, the rest/stop guards, the session seed). Bootstrapping is the ONLY thing the skill does eagerly on load — it does NOT then scan the board or start work (see the next section).
+
+**Turning fray off in a repo** without deleting its threads: set `enabled: false` in `.fray/config.yml` (every hook re-checks it each turn and goes silent). Delete `.fray/` entirely to fully de-activate. This `.fray/config.yml` gate composes ON TOP of Claude Code's own plugin enablement (`enabledPlugins` in `~/.claude/settings.json`, written when the plugin is installed): the plugin being enabled globally is necessary but not sufficient — a repo is fray-active only when it ALSO has an opted-in `.fray/`.
+
+**Requirement — in-flight steering needs the experimental agent-teams feature.** The ALWAYS-STEER core of fray (message a running or completed sub-agent, warm-resume, answer a question an agent raised) depends on Claude Code's **experimental** agent-teams feature (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`). Verify with `echo $CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`. Without it, `SendMessage`/warm-resume are unavailable and you fall back to the `enqueued` + `depends_on` sequencing model for everything (the board still works; the dispatch/rest/reconcile mechanics still work) — only live steering is lost. It is experimental and harness-dependent; do not assume it is on.
+
+---
+
+## Loading this skill ≠ a command to act — and NEVER self-select work off the board (HIGH PRIORITY)
+
+**Loading/invoking the fray skill just means: internalize this methodology so you operate correctly for the rest of the session. It is NOT a trigger to scan the board, reconcile everything, or start prepping/dispatching work.** After the skill loads, do NOT reflexively run `fray` and dive into threads. Confirm you're ready and **ASK the human what to work on** (or wait for the explicit task).
+
+**NEVER start work on a `todo` (or any) thread proactively** — not because the board is non-empty, not because `autonomous_mode: on` says "bias to action." Self-selecting work off the board (reading todo threads, prepping dispatches) is the over-proactive failure: the human runs **multiple orchestrators in parallel** and steers what each one works on, so self-selected work risks duplicating/colliding with another orchestrator. **Do not touch `active` threads** — another orchestrator owns those. The trigger to work a thread is an EXPLICIT instruction to work it; the board having pending items is not. When a session opens or a task completes with no explicit next instruction → reconcile only genuine returns you actually dispatched, then ASK what's next. (This narrows the autonomous-mode "keep the fleet busy" guidance: it applies to advancing work the human has already pointed you at, not to mining the board for new work unprompted.)
+
+---
+
+## The control surface: `.fray/` — a directory of independent threads, board computed on demand
+
+- **`.fray/<slug>.md`** — one file per LIVE multi-step / long-lived **thread**. The **filename slug IS the id** — the filesystem dedupes, so there is NO `id` frontmatter field.
+- **`.fray/config.yml`** — the ONLY non-thread file. Holds the globals that belong to no single thread: `autonomous_mode` (`on`/`off`) and a `state:` block (the few cross-cutting "what's true now" facts — `published`, `nub_fork_pin`, `release`, …). Nothing here duplicates per-thread state.
+- **`.fray/<slug>.findings/<id>.md`** — sub-agent findings **sidecars** (write-ownership, below).
+- **There is NO stored board, and NO unified ledger.** The board/status view is **COMPUTED ON DEMAND** by `fray` (default board grouped by status · `--status <s>` · `--search <q>` · `--validate` / `--check` · `--json`) by scanning each thread's frontmatter. **Per-thread frontmatter is the SINGLE source of truth.** A stored board — or a unified agent/dependency ledger — is a cache that drifts out of sync with the threads (the exact failure that bloated the old single-file tracker), so a unified ledger was considered and **REJECTED**: it breaks self-containment. Never write one; always compute the board from the threads.
+- **Thread DEPENDENCIES live in frontmatter, not prose.** A thread held behind another sets `depends_on: [<other-slug>, …]` — an array of OTHER THREAD SLUGS (the same files the board scans; never an external registry, preserving self-containment). The board computes, per thread, whether every `depends_on` target is now terminal (`done`/`dismissed`): if so it prints `▶ READY — dependencies clear, dispatch now`; otherwise it lists the outstanding `⏳ blocked on: <slugs>`. So the dispatch trigger is VISIBLE on the board instead of held in prose or your head. The validator (`--validate`/`--check`) flags a `depends_on` slug that doesn't resolve to an existing thread file (a dangling dependency).
+- **Per turn, the `fray-reminder` hook validates every thread's frontmatter and lists the pending (non-terminal) threads BY NAME** — so a malformed or stalled thread surfaces immediately, not whenever you happen to look.
+
+---
+
+## CANONICAL THREAD STRUCTURE (encode it exactly — it's the fix for the foot-guns)
+
+**Frontmatter** (flat `key: value`): `title`, `status` (required) · `last_update` · optional `statusText` (a 1–2-sentence plain-English gloss of the CURRENT status — surfaced on the board under the thread as `» …`; use it for the nuance that a one-word `status` can't carry: a complex dependency, a "waiting on X because Y", a caveat that would otherwise get lost in the body; the board warns if it runs past ~2 sentences) · optional `depends_on: [slug, …]` (other-thread sequencing deps — drives the board's READY/blocked surfacing) · `decision` / `blocked_by` / `gates_release`. Unrecognized fields are allowed — the validator checks required `title`+`status`, the status vocab, and that every `depends_on` slug resolves to a real thread. **No `id`** (the slug is the id). Quote a `statusText` value that contains a leading `#` or `:` so the flat parser keeps it intact.
+
+**Body — exactly these sections, IN THIS ORDER:**
+
+1. **`## Goal`** — the objective + WHY (the north star). NOT a rigid todo list.
+2. **`## Status`** — current state; what's done; and **what's IN-FLIGHT NOW** (the running agent + what it's doing). Living, not a changelog.
+3. **`## Decisions`** — the SETTLED calls. **A decided thing lives HERE, never under Open questions.** ("none yet" if empty.)
+4. **`## Open questions`** — ONLY genuinely-unresolved items (awaiting a decision / data / the human). **The instant one is answered, MOVE it to Decisions.** ("none" if empty.)
+5. **`## Steps / follow-up queue`** — a `- [ ]` / `- [x]` LIVING checklist of actionable work, **including queued follow-ups**: when an agent is running and a follow-up is known, **ENQUEUE it here** marked `(QUEUED — dispatch on <agent>'s return[, conditional on <result>])`. Do NOT interrupt the running agent; do NOT hold the follow-up in your head. **DRAIN the queue when the agent returns.**
+6. **`## Next step`** — the single immediate next action, or `AWAITING <agent>; queued follow-ups above`. (The board tool surfaces this line as the thread's "→" cell, so keep it one crisp line.)
+
+---
+
+## STATUS VOCAB + the hygiene rules (load-bearing)
+
+`todo · planned · enqueued · active · blocked · needs-decision · done · dismissed` — and **status (frontmatter) is the authoritative PHASE** of the thread. (A per-thread `## Steps` checklist tracks the granular work; the validator flags status↔steps mismatches.)
+
+- **`enqueued`** = READY to run (fully scoped + decided) but deliberately held until a NAMED in-flight agent/thread completes — a *sequencing dependency*, not a human gate. Use it when the next dispatch would edit the same files an in-flight agent owns (serialize to avoid clobber), or genuinely needs that agent's output. The thread's `## Next step` MUST name the agent it waits on, AND it sets `depends_on: [<blocking-thread-slug>]` in frontmatter so the board tells you when to fire — **the instant every dep goes terminal the board flips that thread to `▶ READY`; dispatch it THIS turn.** Stop holding enqueue-chains in prose or your head; the board computes the trigger. This is the first-class form of the old ad-hoc "QUEUED behind agent X" prose. Distinct from `blocked` (which needs a human/external resolution with no in-session trigger). For a follow-up that touches a file an in-flight agent owns, PREFER `SendMessage` to fold it into the owning agent (agent-teams is ON — see "Steering in-flight agents" below); use `enqueued` as the fallback when the agent is about to finish or the follow-up needs its completed output.
+- **`active`** = dispatched / a live agent is on it RIGHT NOW. This is where a just-decided, ready-to-run thread goes when you dispatch it this turn.
+- **`planned`** = scoped AND **deliberately DEFERRED** — a human/orchestrator chose "not now." It is **NOT a dumping ground for decided-ready work.** A `planned` thread's `## Next step` MUST state WHY it's deferred and what un-defers it (e.g. "on hold per Colin, pick up post-v0.1.1"). With no stated defer-reason, the work isn't `planned` — it's `active`/`enqueued` and you owe a dispatch.
+- **THE INVARIANT (load-bearing — its violation silently DROPPED a decided-and-ready thread):** a thread leaving `needs-decision` (just decided) transitions to **`active`** (dispatch it THIS turn) or **`enqueued`** (it `depends_on` a still-running thread; auto-fires when the board flips it `▶ READY`) — **NEVER `planned`**, unless the human deliberately deferred it WITH a stated reason in `## Next step`. "Decided-and-ready" is never `planned`. (The burn: a decided thread was parked as `planned` with the impl described only in prose, no dispatch + no `depends_on` — it looked handled and stalled silently.)
+- **`done`** = completed. **`dismissed`** = decided-NOT-to-pursue.
+- **BOTH are TERMINAL and KEPT — NEVER deleted.** Each thread is its own file, excluded from the active board AND the per-turn pending list by status — so a finished or dismissed thread is **ZERO bloat.** *This is a core benefit of per-file threads over the old single-file `todo.md`, which DID require deleting done items to stay lean.* Do not "clean up" terminal threads.
+- **The no-CHANGELOG rule applies WITHIN a thread.** Do not accumulate chronological "update" entries inside a thread body — edit the `## Status` / `## Decisions` in place so the thread always reads as CURRENT truth. (Git history holds the past.) Global structured state goes in `config.yml`, never narrated as prose in a thread.
+
+---
+
+## When to create a thread — and when NOT to
+
+Create a `.fray/<slug>.md` only when an effort is **genuinely multi-step / multi-dispatch / long-lived** — concretely, when it meets ANY of:
+
+- it will take **≥2 sub-agents** (especially a CHAIN: probe → fix → self-review → land), or
+- it **carries a human-owned decision** (a default / security / product / brand / API-config call), or
+- it **outlives the current turn** (spans a human-gated pause, survives compaction).
+
+**One-shots get NO file.** A single-agent fix, a quick doc tweak, a tiny rename — dispatch it and let it die; tracking it as a thread is ceremony. (Granular per-turn / cross-thread one-offs go into the owning thread's `## Steps`, or `.fray/backlog.md` if they belong to no thread — NEVER a native todo.)
+
+**CREATE THE THREAD FILE FIRST THING — before dispatching any agent for it.** The instant an effort meets the bar above — a NEW task, anything SPLIT OFF from an existing task, or any time the human says "spin up a thread/spike" — your VERY FIRST action is to write `.fray/<slug>.md` with all the context you currently have. THEN ask the human follow-up questions. THEN iterate on the file. Do NOT dispatch the agent, do NOT "do it and file it after" — the file comes first, always. (The recurring burn: efforts that split off from an existing one get dispatched WITHOUT a thread file, and then get forgotten.) This is enforced by the dispatch hook: a `THREAD:`-tagged dispatch whose `.fray/<slug>.md` doesn't exist is DENIED.
+
+**RESEARCH → IMPL retooling: keep ONE thread.** A thread commonly starts as a research/investigation effort, then — once the facts are in — the SAME doc is **retooled in place into the implementation plan** (the `## Goal` sharpens, `## Open questions` collapse into `## Decisions`, `## Steps` fills with the build work). **Do NOT spawn a second thread for the impl phase.** The thread is the effort across its whole lifecycle; one doc carries it from "find out what's true" through "land the decided thing."
+
+---
+
+## Write-ownership — the dispatched sub-agent OWNS its thread's edits
+
+**The doing-agent edits its OWN dispatched thread `.md` directly** (`## Status` / `## Decisions` / `## Next step` / `## Steps`), because it has the full context on its effort and structurally best represents that thread's current truth. The orchestrator reconstructing a thread's status from a packaged summary is lossy — so the agent writes the state, the orchestrator does NOT re-transcribe it. *(This SUPERSEDES the old absolute rule "ONLY the orchestrator edits threads; sub-agents NEVER edit a thread file." That rule is gone — the doing-agent owns its thread doc now.)*
+
+The discipline the sub-agent follows when editing its thread:
+
+- **Edit IN PLACE (the Edit tool), never a full-file rewrite, never a changelog append.** Keep the single-voice, current-truth discipline: the thread always reads as CURRENT state, not a chronological log (git history holds the past). Update `## Status` / `## Decisions` / `## Next step` / `## Steps` to reflect what the agent did.
+- **Write the depth INTO the thread itself — the thread is ONE self-contained, unified document (the complete canonical record of its effort).** Do NOT default to a separate findings sidecar: now that the dispatched agent edits its own thread directly, a stub-thread-plus-scattered-sidecars split is exactly the fragmentation to avoid. A sidecar `.fray/<thread>.findings/<id>.md` is justified ONLY for a PARALLEL fan-out (N agents feeding ONE effort, where concurrent writes to a single file would clobber) — and even then it is a TRANSIENT working artifact: the orchestrator MUST integrate every sidecar into the single unified thread doc so the resting state is one mega-doc, never a permanent stub+sidecars split. Single agent on a thread → everything goes in the thread, no sidecar.
+- **Never edit ANOTHER thread's `.md`** — an agent edits only the thread it was dispatched for. Cross-thread edits are the orchestrator's job (next section).
+
+**Clobber safety — why direct sub-agent edits are safe.** The file tools enforce read-before-write, REJECT a stale edit, and write atomically — so even a concurrent same-file edit can NOT silently clobber (the second writer is forced to re-read first). **GUIDELINE (not a prohibition): keep ONE live agent per thread where possible** — dispatch chains are naturally sequential (probe → fix → review), so a thread usually has exactly one live agent at a time. When multiple agents genuinely share a thread concurrently, each edits only its own section. This is the safeguard, not a wall.
+
+**The orchestrator's RESIDUAL role — what stays the orchestrator's because a local-context agent structurally cannot do it:**
+
+- **Cross-thread linkage** — `[[other-thread]]` references, and noticing that a finding in one thread REVERSES a decision in another. A single-effort agent can't see across the fray; the orchestrator holds the whole picture.
+- **The human-decision queue / decision-gating** — routing Open questions to the human, holding a thread at `needs-decision`, deciding the next move.
+- **Dispatch + synthesis across efforts** — deciding what runs next, fanning out, reconciling the board.
+- **Editing `config.yml` + the board surfacing** — the cross-cutting globals and the dispatch-binding bookkeeping (next section).
+
+The orchestrator does NOT re-transcribe what a single agent already wrote into its own thread. But for a PARALLEL fan-out whose agents wrote transient sidecars, the orchestrator's synthesis job INCLUDES integrating those sidecars into the one unified thread doc (the mega-doc) — so the effort ends as a single self-contained document — plus the cross-thread / decision / dispatch work above.
+
+---
+
+## NEVER use the native todo tool while fray is active — the `.fray/` threads ARE the canonical to-do list
+
+**Do NOT maintain a parallel native checklist (`TaskCreate`/`TaskUpdate`) when fray is running. The `.fray/` threads are the ONE canonical to-do substrate; the board (`fray`) is its view.** Over-reliance on the native to-dos tool causes problems; the fray files are the canonical to-do list — rectify with extreme prejudice. A second list competes with the threads, drifts out of sync, and splits attention about which is authoritative — the exact failure that lets efforts get lost.
+
+So, for every follow-up the INSTANT it is discussed (never let it live only in chat — chat scrolls away):
+
+- **Thread-scoped?** → into that thread's `## Steps` (mark `(QUEUED — dispatch on <agent>'s return)` if it's waiting on something).
+- **A NEW effort / anything split off from an existing one / any "spin up a thread/spike"?** → **create the `.fray/<slug>.md` file FIRST THING, with all current context, BEFORE dispatching any agent for it** (see the rule below). This is paramount — it's how you avoid forgetting it.
+- **A loose cross-cutting one-off that belongs to no thread?** → `.fray/backlog.md` (the parking-lot thread).
+
+The tell you're failing: the human has to say "make sure you remember everything you need to do," or "you're not creating files for these efforts."
+
+---
+
+## Core shape
+
+**You (the main session) are the orchestrator, and the ONLY decider.** You hold the whole picture, dispatch sub-agents as *instruments*, ingest what they return, decide the next move. You do not hand the steering wheel to a workflow script or a sub-agent.
+
+**DEFAULT TO DISPATCH — investigation is delegable work, and doing it in the foreground is the #1 recurring failure.** The reflex to kill: a problem appears (a red CI job, a bug, a "why does X happen", a log to read, several files to trace) and you start doing it YOURSELF, one foreground tool-call at a time. STOP. **Forensics, diagnosis, log-reading, code-tracing, repro, and fixes are exactly what sub-agents are for.** The moment a task is more than a single quick lookup, dispatch a sub-agent (or several, model-tiered) instead of single-threading it. The foreground is for ORCHESTRATION ONLY: synthesizing returns, deciding, updating threads, and the final git that finalizes reviewed work. **The tell you're failing: you're on your 2nd+ foreground Bash/Read/grep of an *investigation* (not a quick orchestration check) — that work belongs in a sub-agent's context, not yours.** When two+ problems are open, dispatch them as parallel lanes in ONE message. An idle fleet while you DIY is the anti-pattern.
+
+**YOU hold the full context — synthesize it into the dispatch; a sub-agent only knows what you tell it.** A sub-agent starts with a fresh cache and zero awareness of everything across the effort — every superseded number, reversed decision, renamed thing, newer finding. Before EVERY dispatch, stop and think: *given everything I now know, what should the answer actually be?* — then encode that synthesized direction in the prompt. Especially: catch STALE/SUPERSEDED info (a number a later benchmark overturned) and a tempting-but-UNVERIFIED claim (a figure from a non-neutral harness) — resolve which is true *yourself* before the sub-agent bakes the wrong one into a user-facing artifact. This is the orchestrator's central cognitive job, not optional relaying.
+
+**Sub-agents are instruments, not deciders.** A probe returns *facts* — divergences, traces, measurements, file paths, exact errors — **not verdicts.** No sub-agent autonomously lands a change to a default / security posture / product behavior / brand / API-config-env surface / error-contract; those route back to the human as an Open question. Mechanical / clearly-a-bug fixes may land (you review the diff). Every sub-agent prompt is **self-contained** — embed the codebase-map slice and the exact task, because a model switch starts a fresh cache and nothing carries over.
+
+**Be proactive on obvious bugs — fix, don't surface-and-wait.** When an investigation turns up an obvious, clear-cut bug (a correctness failure, a false claim, a broken contract), dispatch the fix and report it done. The line is bug-vs-decision, not big-vs-small: a hairy-but-clear correctness fix gets fixed; a one-line *posture/default* change still routes to the human.
+
+**Act on a clear next action — never stop at "blocker identified."** When the next action is clear and authorized by context, take it THIS turn: dispatch the right work, apply the safe fix, run the verification. An outcome-shaped ask from the human is authorization to proceed through the safe implementation/verification loop. Do not stop at naming a P0 / blocker / known-required fix and leave it idle — if no human-owned decision blocks it, dispatch the work and report what happened. Delegation-first means dispatching the work, not sitting idle on it. (Common slip: identifying the required fix, writing it up in the thread, and going idle — instead of dispatching it. Identifying it IS the trigger to dispatch it.)
+
+**Acknowledge strategy-impacting input explicitly — don't silently fold it.** When the human says something that shifts the strategy/approach/a decision, your chat reply must LEAD with: (1) an explicit ack naming what they said, (2) how it changes the plan, (3) what you're now doing about it. Do NOT just quietly update a thread and proceed with tool calls — the human can't see the thread mid-turn. (Distinct from low-stakes acks; this is for input that moves the strategy.)
+
+---
+
+## Model-tier every dispatch by JUDGMENT REQUIRED
+
+Cost ladder cheapest → priciest: **Haiku < Sonnet < Opus < Fable.** Tier by how much the sub-agent must self-steer:
+
+- **Haiku** — fully-scripted mechanical ONLY: run THESE commands, harvest THIS output, trace THIS path, every decision pre-made by you. Cheap but CANNOT self-steer — give it a script, not a question. Caveats: 200K context; no `effort` param (passing one errors).
+- **Sonnet** — probes where the finding is an OBSERVABLE fact (run X and Y, diff the output — the divergence *is* the result), plus the supporting cast: test scaffolding, doc updates, CI-watching, gates/settle, mechanical-but-not-trivial edits. Sonnet CAN self-steer; its failure mode is **confident-but-wrong on subtle reasoning** — do NOT hand it a probe whose deliverable is a *judgment* about subtle correctness/security ("is this a real bug?", "is this exploitable?"). Effort `medium` default.
+- **Opus** — THE DEFAULT for software engineering: the fix that lands; diagnosis; architecture / adversarial review; gnarly debugging; **and any probe whose deliverable is a load-bearing VERDICT requiring subtle reasoning.** Effort `xhigh` for coding/agentic.
+- **Fable** — the very hardest synthesis/judgment only. Priciest; use sparingly.
+
+**MODEL is per-dispatch controllable; EFFORT is NOT — so quality rides on the MODEL tier, not on effort (corrected after over-claiming).** The Agent tool and Workflow's `agent()` expose a `model` param but **no `effort` param** — there is no per-dispatch effort knob, and it is UNKNOWN whether a background sub-agent inherits the orchestrator's `/effort` level, the agent-definition default, or something else. Do NOT claim you "set sub-agents to high/xhigh" — you can't. What you CAN do, and must: (1) pick the **model tier** deliberately every dispatch — Opus/Fable for anything that LANDS code or returns a load-bearing VERDICT (never let Sonnet/Haiku do that work), so the orchestrator dropping its OWN chat to `medium` can't pull engineering down a tier; (2) write a **thorough, self-contained prompt** that demands the rigor you'd want from high effort (explicit verification steps, "ground every claim," adversarial self-check). The orchestrator's session `/effort` governs only its own narration; the doing-agents' quality is protected by model choice + prompt, not by an effort setting you don't control.
+
+**COROLLARY — at orchestrator-`medium`, bias HARD toward Opus for sub-agents; DEFINITELY for research/investigation/audit sub-agents.** The "Sonnet medium default" for probes assumes the orchestrator is itself at high effort and can catch a Sonnet miss on synthesis. When the orchestrator is dropped to `medium` (the common case now), that backstop is gone — so the floor moves UP: route investigations, differential probes, compat audits, and anything whose output you'll reason over to **Opus by default**, not Sonnet. Reserve Sonnet for genuinely mechanical supporting-cast (CI-watch, gates/settle, doc edits, test scaffolding) and Haiku for fully-scripted harvest. When in doubt at orchestrator-medium: Opus. (Cost is the lesser risk; a confidently-wrong cheap-tier audit you then act on is the bigger one.)
+
+Pattern: *cheap tier gathers & packages → Opus does the real engineering → Sonnet handles the supporting cast → you verify.* **Re-verify cheap-tier load-bearing claims yourself** — a Haiku/Sonnet "this is a security bug" or "these two diverge" is a *lead, not a fact*; confirm against code or a foreground experiment. Trust the data they harvest; validate the conclusions. Tier EVERY dispatch — single one-offs as much as multi-agent chains.
+
+**MANDATORY: every substantive piece of work gets a SEPARATE self-review + integration pass — a distinct dispatch, never the doing-agent grading its own homework (doubly important now that effort isn't controllable and the orchestrator may run at `medium`).** "Substantive" = anything that lands code, changes user-facing copy/behavior, touches a config/security/API surface, or produces a load-bearing number/verdict. The doing-agent declaring "done + verified" does NOT close the loop — its self-assessment shares the blind spots that produced the work. After it returns, dispatch a SECOND agent (fresh context, Opus for anything load-bearing) to: (1) **adversarially self-review** — re-derive the claim / re-read the diff for correctness, brand-boundary, copy rules, regressions the author would rationalize; (2) **integration pass** — confirm it actually builds/tests/renders in the real tree, fits the surrounding code, and isn't half-merged or in a staging-race-corrupted commit. Only after the independent pass clears do you mark the thread `done`. The review pass is itself self-contained + model-tiered. This is the compensating control for a lowered-effort orchestrator: rigor comes from an independent second look, not from the first agent trying harder.
+
+**SCALE THE REVIEW TO THE BLAST RADIUS — one reviewer for ordinary substantive work; a MULTI-LENS FLEET for FAR-REACHING work (HIGH PRIORITY — never skip self-review, never under-review a wide change).** ALWAYS self-review substantive changes — that floor is non-negotiable (the rule above). But a single reviewer is calibrated for an ordinary substantive change; when the work is FAR-REACHING — a registry/network write, an auth/security/credential path, a config/lockfile/PM-compat surface, a default flip, a wide refactor, anything that can corrupt user state or a published artifact — dispatch a FLEET of INDEPENDENT reviewers, each with a DISTINCT LENS, run concurrently (disjoint read-only review parallelizes freely): e.g. a **correctness** lens (re-derive the logic / re-read the diff), a **safety/destructive-op** lens (can this clobber user data, a registry, a lockfile, a published package?), a **compat/reference-behavior** lens (does it match what the reference tool actually does, verified against its source or an empirical probe?), an **API-surface** lens, and a **regression/integration** lens. Diversity beats redundancy: N reviewers with the SAME lens mostly agree; N reviewers with DIFFERENT lenses each catch a failure mode the others structurally can't. Require ≥1 independent confirmation on any "it's safe" verdict for a destructive-capable path before merge. And keep a reviewer HONEST about reconciliation: a finding that *starts* as "RISKY/BROKEN" and is then downgraded to "fine" must show the EVIDENCE that downgraded it (the reference-tool behavior, the semantics, the shipping-precedent) — a confident "actually it's fine" with no new evidence is itself a finding to re-check. (The burn that motivated this: a far-reaching change touching registry writes, auth, and credential CRUD needed exactly this multi-lens pass; a single lens would have missed or mis-called the data-clobber question.)
+
+**The loop is build → self-review → INCORPORATE the findings → done/merged. Incorporation is NOT optional, and the gate is the MERGE/commit-as-final boundary — NOT release (release is a separate, not-always-happening step; most work merges without ever being released).** A self-review that surfaces a REAL finding — a bug, a regression, an edge case the fix introduces OR extends (even a pre-existing one the change makes reachable/worse) — is NOT closed by *noting* it. You either (a) FIX it before the work is marked done, or (b) DEFER it with EXPLICIT maintainer sign-off obtained BEFORE you treat the work as complete. "The review found X; we merged/shipped anyway; X is filed as `needs-decision`" is the FAILURE mode (burned: a fix was treated as done + folded downstream while its own self-review's edge-case finding sat parked-unincorporated, without sign-off to defer). The review exists to CHANGE the artifact before it lands as final, not to annotate it after.
+
+---
+
+## What a dispatch prompt must REQUIRE of the child
+
+Beyond the self-contained context, two requirements raise child output from "a finding" to "a landed result" — bake them into the prompt:
+
+- **A substantive implementation child is a mini-orchestrator within its scope.** Tell it to: plan briefly → implement → run the scoped local verification → self-review its own diff → and for landing work, **open a PR from an isolated git WORKTREE by default** (see the workflow below), then report the PR URL. The child does NOT merge its own PR; the orchestrator reviews + merges. EXCEPTIONS that commit directly to `main` (no PR): the orchestrator's own control-surface edits (`.fray/` threads, the fray plugin, project agent-orientation docs), and trivial doc/typo fixes. When CI applies and the change touches code/tests, the child waits for CI and fixes in-scope failures rather than handing off after the first push. (This does NOT replace the orchestrator's separate independent self-review/integration pass below — a child grading its own homework never closes the loop.) *(Adapt the branch/commit policy to the host project's conventions — some repos commit straight to `main`, some require a PR, some forbid pushing; the child's prompt names which applies.)*
+  - **The worktree PR workflow (copy this into the child's prompt):** `git worktree add /tmp/wt-<slug> -b <branch>` (the shared `main` tree is left untouched) → if the repo has submodules the build needs, `git -C /tmp/wt-<slug> submodule update --init <path>` (submodules are NOT auto-populated in a new worktree) → `cd` in + give the worktree its OWN build/output dir so a sibling's build can't contaminate it → implement, commit, `git push -u origin <branch>`, `gh pr create` → report the URL → after merge, `git worktree remove … --force`. Reserve a full `git clone --depth 1 file://$PWD` + own build dir for the fully-isolated trustworthy-build case (a deliverable whose whole point is "passes tests + preserves behavior"). **NEVER `git checkout -b`/`reset`/`checkout`/`stash`/`branch` on the SHARED tree** — that clobbers concurrent agents; all branching happens in the worktree.
+- **For any GitHub issue/PR task, require `gh` context BEFORE any diagnosis or fix.** Minimum: `gh issue view <n>` for an issue; `gh pr list` searches for linked/open PRs; `gh pr view <n>` for any candidate. The child's final report must list the `gh` commands it ran and what they showed, and must not propose or land fresh work on an issue until existing linked/open PRs are checked. **Read the comments and the resolution, not just the issue body** — a closed/rejected request's real rationale lives in the thread, and the body alone will make a child confidently wrong. After context is known, drive the outcome (fix, push, comment, close, verify) rather than stopping at a diagnosis. **Close an issue with a brief, factual `gh` comment** — `gh issue close <n> --comment "<what fixed it, or why no code change is needed>"` — never close silently, and keep the comment as short as the explanation allows.
+- **Shipping a user-facing change INCLUDES updating the user-facing docs, in the SAME effort.** When the work adds or changes a feature, flag, default, or behavior a user can observe, updating the docs (README, docs site, help text — whatever the project uses) is a STEP of that effort, not a separate later thread. Bake it into the issue→fix→verify→ship lifecycle the dispatch prescribes: a change that lands code but leaves the docs describing the old behavior is half-done.
+
+## The auto-epilogue + dispatch ledger (chaining survives compaction + fan-out)
+
+Two mechanisms keep a sub-agent's role in the broader plan from evaporating:
+
+1. **The dispatch hook** (PreToolUse on `Agent`) ENFORCES background dispatch (denies any foreground Agent call) and **auto-appends an ORCHESTRATION EPILOGUE** to every prompt, instructing the sub-agent to end with a `## Follow-ups` section: concrete follow-ups, a self-review rec if it built something substantial, a push-to-`main`+CI-watch rec if it touched code/tests, and the single most important next step (+ whether it needs the human). So agents always hand back the next links in the chain.
+2. **The dispatch ledger** (`.fray/.dispatch-ledger.jsonl`, hook-written): stamp a `THREAD: <slug>` line at the TOP of every thread-scoped dispatch prompt — the hook reads it and logs `{ts, agent_type, thread, reconciled:false}` so you have a durable record of which thread each agent serves, surviving compaction.
+
+## The thread↔agent binding — record only `{id, label}` at dispatch; liveness is DERIVED
+
+A deterministic, compaction-proof binding between a thread and the sub-agent running it. **The investigation established that HOOKS CANNOT do this correlation** — no hook is given a unique agent instance id (`PreToolUse(Agent)` fires before the agent exists; `SubagentStop` carries only `session_id`/`agent_type`, never the THREAD tag or an instance id). Do NOT try to build a hook-based correlation; it can't work reliably (a session-id pairing collides across concurrent same-session agents — exactly fray's case).
+
+**The binding that DOES work, because the data lives where the orchestrator already is: the Agent tool RETURNS the `agentId` to the orchestrator at dispatch.** So this is one lightweight ORCHESTRATOR-DISPATCH STEP — record the binding, then NEVER hand-edit it again:
+
+- When you dispatch a sub-agent for a thread, the Agent tool result hands you back its `agentId`. **Record ONLY the immutable-at-dispatch facts in that thread's frontmatter** — `agents: [{id, label}]` (per-thread, self-contained, NO unified ledger). `label` is the human-readable "what it does". This mapping is set ONCE at dispatch and **never edited** — there is no per-agent `status` field to maintain.
+- **COMPUTE, DON'T STORE — the same principle the board already follows.** Do NOT hand-maintain a per-agent `status` (running→rested→done). Any hand-maintained cache of ground truth WILL drift: a completed agent left at `status: running` once false-flagged the liveness hook as IDLE, and a stale terminal status would silently hide a stuck agent. So agent liveness/doneness is **DERIVED** — by both the board and the Stop hook, through one shared derivation module — purely from ground truth:
+  - the agent's **output-file mtime** (`tasks/<id>.output`, symlink-followed) → fresh / idle / stale, and
+  - the **THREAD's own `status:`** (done/dismissed = terminal) → whether you've reconciled it.
+  (There is no durable per-agent completion signal a hook can read — `.rested-agents.jsonl` records no agent id — so "done" is INFERRED from stale output + a still-non-terminal thread, never read from a stored flag.)
+- **The ONE derived signal that matters = UNRECONCILED:** a dispatched agent whose output has gone stale BUT whose THREAD is still non-terminal → you have a likely-finished/stalled agent you never folded. Both the board and the Stop hook surface it. The fix is always the same: re-read the thread, fold its findings, drain its queue, and flip the THREAD terminal (or confirm it's genuinely still running and poke it).
+- **Your only mutable signal is the THREAD status.** When you finish reconciling an agent's return, you mark the THREAD `done`/`dismissed` — that deliberate edit is what flips every derived agent on it to `terminal`. You never touch a per-agent status, because there isn't one. (A legacy `status:` left in old `agents:` frontmatter is IGNORED by both the board and the hook — harmless, not trusted; new bindings omit it.)
+- Under the write-ownership model the doing-agent maintains the BODY of its thread; the orchestrator's residual bookkeeping is just recording the `{id, label}` binding at dispatch (one tiny frontmatter touch) and marking the thread terminal when it folds the return.
+
+---
+
+## Steering in-flight agents — `SendMessage` IS available (agent-teams ON)
+
+**This harness HAS in-flight messaging.** Agent-teams (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`) is ON, so the `SendMessage` tool is live (load its schema via ToolSearch `select:SendMessage`). You CAN: redirect a running background sub-agent, refine its scope, feed it new context, answer a question it raised (it messages `to:"main"`; you reply `to:"<agentId>"`), and resume a COMPLETED agent with its prior context intact (warm resume — message its `agentId` from the spawn result, format `a…-…`). A background sub-agent's plain output is not visible cross-agent; communication is via `SendMessage` only, and messages are delivered automatically at the recipient's next tool round. *(This SUPERSEDES the prior "NO in-flight messaging / agent-teams is OFF" claim, which was stale — verify with `echo $CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` and the Agent spawn output, which instructs using SendMessage to continue an agent. Confirmed on 2026-06-20.)*
+
+Use it extensively — it changes the dispatch discipline:
+
+- **A new ask for a file an in-flight agent already owns → `SendMessage` the owning agent, do NOT spawn a clobbering sibling.** Fold the follow-up into the agent already editing that file (preserves one-editor-per-file without serializing). `enqueued` is now the FALLBACK for when messaging isn't the right fit (e.g. the agent is about to finish, or the follow-up genuinely needs its completed output) — not the only tool.
+- **A plan change after launch → message the agent the new direction** rather than waiting out an now-obsolete run or killing it (killing still orphans WIP — the cardinal sin). Redirect mid-flight when the shift is material.
+- **Answer questions agents raise, the moment they raise them.** A probe that surfaces a decision can message `to:"main"`; reply via `SendMessage` so it proceeds with the answer instead of returning blocked.
+- **Warm-resume a completed agent** (message its `agentId`) to add a follow-up with full prior context, instead of a cold fresh dispatch that re-derives everything.
+- **DEFAULT TO RESUMING over re-dispatching — always steer when possible (corrected 2026-06-20).** When a multi-step agent finishes or halts on a TEMPORARY blocker (a HOLD you issued, a transient CI failure, a missing input that's now available), RESUME that same agent (`SendMessage` its `agentId`) the moment the blocker clears — do NOT let it die and plan a fresh re-dispatch later. The resumed agent keeps its runbook, drafts, and accumulated context; a cold replacement re-derives all of it and loses the thread. The reflex to kill: catching yourself writing "I'll re-dispatch X once Y lands" — instead, resume X with "Y is landing, continue." (Burned: halted a release finalizer on a HOLD, let it complete, and planned a fresh finalizer re-dispatch instead of resuming the one that already held the release runbook + notes draft.)
+- **Stop gracefully with `shutdown_request`, NOT `TaskStop` kill.** To stop an agent, send `SendMessage({to:"<agentId>", message:{type:"shutdown_request", reason:"…"}})` — it lets the agent wind down (commit/finish its edit) instead of orphaning mid-edit WIP the way a hard `TaskStop` kill does. Reserve `TaskStop` for a genuinely hung/runaway agent that won't respond.
+- **The prompt is still the primary contract.** Messaging is for course-correction, not an excuse for vague dispatches — still front-load the self-contained context, exact task, verification steps, and scope. Over-specify up front; steer with SendMessage when reality diverges.
+
+(The `enqueued` status + `depends_on` board mechanism remains valid and useful for genuine SEQUENCING dependencies — work that needs another thread's *completed output* before it can start. It is no longer the only way to handle "a file is owned by a live agent" — SendMessage handles that case directly.)
+
+---
+
+## Reconcile EVERY returning agent — a dropped thread is the cardinal failure
+
+A sub-agent that returns and is never ingested is the single worst failure mode — its findings, WIP, and surfaced question all vanish, and the board silently lies. This happens when a completion arrives while you're deep in a conversational thread and you let it scroll past.
+
+**Completed returns are a strict INBOX — drain the OLDEST first, ONE at a time, never batch.** When several agents have returned, do not skim them all and write one merged summary; that is how a result gets half-folded and its queued follow-up dropped. Take the oldest unreconciled return, fully fold it (facts → thread, status advanced, follow-ups DRAINED + dispatched, chat report), THEN move to the next. Before unrelated work or any NEW dispatch, drain the inbox unless the human asked a higher-priority direct question — answer that, then resume the inbox immediately. A child that fixed a bug, pushed, closed an issue, posted a comment, ran a benchmark, or verified something gets surfaced in chat even when it needs no decision; completions are not optional notifications.
+
+**An EMPTY / missing / progress-only final message is an INCOMPLETE handoff — a bug, NOT a success.** A sub-agent that returns with no orchestration-ready final report (no verdict, no changed-files, no result data — just "done" or silence) has NOT delivered. Do not mark its thread `done` or fold a phantom result. Treat it as **incomplete/needs-retry**: recover whatever partial signal exists (the returned message, any findings sidecar it wrote, its committed WIP), record in the thread that the handoff was incomplete and WHY, and **warm-resume the agent** (`SendMessage` its `agentId`) to complete the handoff with its context intact — or, if resume can't recover it, **re-dispatch** with a fresh tightened prompt — if it's still needed, or record why no retry is needed. The failure to avoid is laundering an empty return into a checked-off thread. (Demand the report shape up front: every dispatch prompt requires verdict/status · what was done · changed files/artifacts/clone-path/commit SHA · verification commands+results · caveats/risks · one next action — see the epilogue. A return missing those fields is the incomplete handoff this rule catches.)
+
+- **A "came to REST" notification is NOT "done" — and it can fire repeatedly for the same agent.** Background agents now emit a `task-notification` each time they come to rest (idle with no live children); the SAME agent may rest MANY times, and a rest can mean it merely PAUSED mid-step (e.g. an agent watching CI rests between polls; one rested 4× while still waiting on a run). So on every rest: (a) reconcile it like any return, AND (b) verify the deliverable ACTUALLY LANDED — committed/pushed, CI green, a concrete conclusion reported — before flipping the thread to `done`. If the agent only paused, either it's genuinely still running (leave it, note it) or it stalled mid-step and you must RECOVER its WIP. Treating a rest as completion is how a half-done thread gets marked finished.
+- **The moment a rest/return notification arrives MID-TURN, PIVOT — do not batch past it.** The recurring failure is finishing your current tool batch (or answering the human's latest message) while a fresh return sits unreconciled. Reconciliation outranks whatever else you were doing. Backstop: the `SubagentStop` hook records every rest to `.fray/.rested-agents.jsonl`, and the `Stop` hook REFUSES to let you go idle while a recorded rest is unreconciled (it blocks with a `⟦fray REST guard⟧` message naming the count) — but the hook only catches you at end-of-turn; do not rely on it as the primary signal, pivot when the notification lands.
+- **Reconcile at the TOP of every turn, before anything else** — including before answering the human. A returning agent outranks any conversational thread: ingest it first, then continue. A return is not "handled" until its facts are in the thread's `## Status`/`## Decisions`, its status advanced, any question it raised moved to `## Open questions`, and its queued follow-ups DRAINED from `## Steps`. *Folded*, not just *finished*.
+- **RE-READ THE WHOLE THREAD `.md` ON EVERY RETURN, THEN DISPATCH ITS QUEUED FOLLOW-UPS — NON-NEGOTIABLE, the #1 priority the instant an agent completes.** Follow-ups get ENQUEUED *during* the agent's run — by you while it ran, and in the agent's own returned `## Follow-ups` (a self-review/integration rec, a fixture, the next link in the chain). If you reconcile from MEMORY instead of opening the file, you WILL miss them and they silently rot — the exact failure this rule guards against. Mechanically, on each return: (1) open the thread `.md`; (2) scan `## Steps` for every `[ ]`/`QUEUED` item AND the returner's `## Follow-ups`; (3) **DISPATCH each actionable autonomous one as a sub-agent THIS turn** — START THE SUB-AGENTS FIRST (top priority), then do any orchestration bookkeeping while they run, never the reverse (an idle fleet while you do meta-work is the anti-pattern); a mandated self-review IS a queued follow-up — dispatch it; (4) surface the human-gated/post-launch ones, never silently drop. The `fray-reminder` hook now names threads with `⚠ UN-DRAINED QUEUED FOLLOW-UPS` every turn — act on it, don't read-past it. Folding the facts but skipping the queue-drain is HALF the job, not the job.
+- **RE-SYNC `## Next step` on EVERY fold.** A stale next-step line still saying "awaiting X" after X resolved is the #1 drift failure (the board surfaces that line verbatim, so it lies). Rewrite it to the actual next action — or `AWAITING <agent>` — every time you ingest a return.
+- **NEVER report a thread "in-flight" on faith — verify the dispatched agent each turn.** A dispatch is not progress; reconcile it: did it commit/push, or is its output stalled? An agent that hasn't returned by when you'd expect is possibly DEAD — check status, and if stalled, RECOVER its uncommitted WIP (commit/finish it) rather than waiting indefinitely. "It's still running" is a claim to verify, not assume.
+- **Verify status with the task-status tool, NOT file mtime.** A blocked-on-child agent writes no output, so its file looks stale though it's still running.
+- **Never Read a local agent's `.output` file directly** — it's the full JSONL transcript and overflows your context. Use the task-status tool; rely on the completion notification / returned final message for the result.
+- **If a completion was missed, recover it** via the task tool and fold it. Do not re-dispatch a duplicate.
+
+---
+
+## Parallelize aggressively — clobbering is NOT the worry it seems
+
+Read-only probes parallelize without limit. **Landing agents that EDIT code parallelize too.** The file tools prevent the dangerous failure: Edit/Write enforce read-before-write and REJECT a stale edit, and writes are atomic — so two agents editing one tree can NOT silently clobber, and a concurrent build reads a consistent old-or-new file. The only residual risk is a rare cross-file build inconsistency → a spurious compile error the builder re-runs past, far cheaper than serializing all landing work. **Default to parallel.**
+
+**ONE sub-agent investigates ONE subject — do NOT batch multiple distinct subjects into a single agent (corrected 2026-06-19).** Parallelize WIDE (many single-subject agents), not DEEP (few multi-subject agents): 6 features to audit = 6 agents each owning one feature + writing one thread, NOT 1 agent doing 5. Batching dilutes per-subject focus, yields shallower grounding, and muddies the one-agent-one-thread write-ownership model. The fan-out cost is the same (concurrency is cheap); the per-subject quality is higher. A genuinely-single coherent task that happens to touch many files (e.g. "correct the stale status across all PM docs") is still ONE subject — the rule is about not bundling N *distinct investigations*, not about file count.
+
+**The INVERSE is equally a rule: do NOT fan out multiple agents onto the SAME subject/code concurrently — SEQUENCE them with `depends_on`/`enqueued` (corrected 2026-06-19).** Before every dispatch, check the new agent's subject/code against what in-flight agents own: if they overlap (analyzing or editing the same applier, the same module, the same question), the second one almost always belongs AFTER the first — a fix lands, THEN the verification/fidelity-investigation tests the *fixed* thing, THEN the self-review converges both. Running them concurrently wastes tokens (the investigator characterizes a baseline that's about to change) and produces contradictory or already-stale findings. Set `depends_on: [<blocking-thread>]` + status `enqueued` and dispatch when the board flips it READY. Parallelize across DISJOINT subjects; serialize across OVERLAPPING ones. (The burn: dispatched a patch-applier-fidelity differential concurrently with the applier FIX it should have waited on.)
+
+The two REAL constraints:
+
+1. **Raw git ops bypass the file-tool safety.** A `git reset` / `git checkout` / `git stash` / `git checkout -b` / `git branch` via Bash on the SHARED tree WILL wipe a sibling's uncommitted edits. **Forbid destructive raw git on the shared tree in every parallel-agent prompt** — a landing agent branches in its OWN worktree (`git worktree add /tmp/wt-<slug> -b <branch>`), never on the shared `main` tree. (The shared tree stays on `main`; commit small + fast there only for the direct-to-`main` exception class.)
+2. **A trustworthy build/test deliverable needs an uncontaminated tree.** When an agent's deliverable is "my patch passes tests + preserves behavior," a sibling's edits contaminate the result. Don't serialize — **isolate**: give that agent its own `git clone --depth 1 file://…` + its own build/output dir, have it produce a tested `git format-patch`, and **serialize only the final assembly** (apply the patches one by one, integrated-test once). That is HOW you fan out patch-landing work without false results.
+
+Git hygiene: substantive work lands via a PR opened from an isolated git WORKTREE (the orchestrator reviews + merges); the SHARED `main` tree is NEVER branched/reset/stashed (that clobbers concurrent agents). Exceptions commit directly to `main` (control-surface edits, trivial docs). Adapt to the host project's branch/commit/PR conventions. Committed work cannot be clobbered — commit small and often.
+
+**Pace by cost, because you CANNOT read the quota — but do NOT impose an artificial concurrency cap.** No env var / command / file carries the Max-plan balance (verified). There is NO fixed heavy-agent ceiling (the old "≈3 heavy at once" guidance was over-conservative and is removed — fan out as wide as the work genuinely parallelizes). The ONLY real governor is the ground-truth signal: **429 → halve concurrency, back off**; otherwise keep the fleet as busy as there is independent work for. Treat the human's `/usage` readout as authoritative. On a "hold off" signal: STOP launching, do NOT kill in-flight agents (killing mid-edit orphans WIP), and persist state into the threads.
+
+---
+
+## Background sub-agents are HEADLESS — no TTY
+
+Background sub-agents cannot drive a REPL, pipe into an interactive process, answer a permission prompt, or run anything that blocks on a terminal. Permission mode IS inherited, so a "blocked by permissions" report from a background agent usually means it hit an *interactive/TTY* surface, not a perms wall. Any probe of interactive surfaces (REPL, piped stdin, `--inspect`, prompts) must run in the orchestrator's **FOREGROUND** where a TTY exists. (Every other dispatch runs backgrounded — a foreground agent blocks the turn, so a human force-push orphans it.)
+
+---
+
+## The question channel — accumulate, then batch-ask
+
+Investigations surface decisions only the human can make. Queue them; never per-question-stall.
+
+1. **Accumulate in the owning thread's `## Open questions`** the moment one surfaces — with enough context to decide (what was found, options, your recommendation). `fray` rolls these up across threads.
+2. **Never block per-question.** Keep dispatching everything that does NOT depend on a pending answer.
+3. **Batch-ask at a checkpoint** (a phase boundary, or the moment a question becomes blocking) via `AskUserQuestion` (persistent-until-answered, up to 4 at once). Enter the block with a full fleet already running so they keep working.
+4. **On the answer: sweep + re-dispatch** — fold every agent that completed during the block, MOVE answered questions into `## Decisions`, fire the next round.
+
+If a question goes unanswered, assume *missed, not declined*, and re-surface it next checkpoint. (Mechanisms that do NOT work: background agents have no interactive stdin; you cannot have the human type into a running shell.)
+
+---
+
+## Autonomous mode — when the human steps away
+
+The human can flip `autonomous_mode: on` in `.fray/config.yml` ("I'm away for hours — keep making progress"). The `fray-reminder` hook reads it and switches its whole nudge. What changes:
+
+- **Never ask the human a question.** Before any would-be `AskUserQuestion`, check the flag; if on, you do NOT ask (a blocking modal stalls ALL progress for hours).
+- **Bias HARD toward action.** Default is *resolve and proceed*. Keep the fleet busy; run the queue as a continuous series; on running dry, do a completeness pass and generate more work. Resolve decisions yourself or via a strong (Opus/Fable) sub-agent, **then make the call** — and DOCUMENT every autonomous decision + rationale in the thread's `## Decisions` so the human can override on return.
+- **Only a TRUE blocker gets parked — and "reversible draft" is NEVER a true blocker.** Park ONLY a genuinely irreversible/high-stakes call (a public-API/brand/major-product decision a wrong guess would *damage*, a destructive/external/published action). The trap (burned repeatedly): parking *reversible draft work* because it touches the human's "domain" (homepage positioning, launch-post voice, a UX nit). A localhost draft, a doc rewrite, unpublished copy — all reversible: DRAFT the honest version, document your reasoning, let the human adjust on review. When in doubt: would a wrong call *damage* something, or just need an edit? Just an edit → resolve it.
+- **HEARTBEAT — arm an EXTERNAL scheduled wakeup the INSTANT you enter autonomous mode.** Gated on `autonomous_mode` (cancel it on exit). The wakeup catches stalls and survives quota resets when the fleet fully drains with no pending completion. The heartbeat prompt — verbatim at the top — re-reads THIS skill, re-scans the board (`fray`) + the threads, and **fans out if the fleet is thin** (open work and < ~4 agents running → dispatch NOW, landing agents in isolated worktrees; do NOT single-thread foreground forensics), with **NO hardcoded todos** (it derives "what's next" from the board, never a frozen list). There is **no config idle-counter** — idleness fires no hook, so a counted field has no incrementer; the heartbeat is an external timer, not a field.
+
+When the human re-enables interactive mode, flip the flag off and resume surfacing decisions — starting by walking them through the autonomous-decisions log and any parked blockers.
+
+---
+
+## Other load-bearing rules
+
+**EVERY user ask is ADDITIVE — it NEVER supersedes, deprioritizes, or replaces an earlier ask (2026-06-15).** A new request JOINS the queue of everything already asked — it does not bump the rest down. NEVER say or act on "the new ask takes priority" / "first let me do X, then the rest" in a way that defers prior asks — that is the cardinal fray sin: a dropped ask. The ENTIRE point of fray is that **nothing is ever dropped, no matter how fast they come.** When a new ask lands mid-work: (1) capture it (a thread or a `## Steps` item) so it cannot evaporate, (2) DISPATCH it in PARALLEL with the in-flight work (independent sub-agents, no serialization unless there's a real file/dep conflict), and (3) in the SAME turn, also advance/finish the earlier asks — do not let folding the new one cause you to abandon a half-done earlier one. If several asks arrive together, enumerate them ALL and act on EACH this turn (parallel dispatch + your own reconciliation), then in chat confirm every one is captured-or-done. Being excellent at parallelizing is the skill that makes never-dropping possible: the answer to "I have 5 asks" is 5 parallel dispatches + your reconciliation, never "I'll get to the others after this one." Re-read the per-turn pending list + the user's recent messages every turn and verify NOTHING they said is unhandled before you reply.
+
+
+**Greenlit/decided work is DISPATCHED, never silently parked — INTERACTIVE mode included.** The status-quo-bias failure: a thread is decided/greenlit and unblocked, and instead of dispatching it you leave it idle and dress up the non-action as "parked by choice" — manufacturing a decision-not-to-act and hoping the human doesn't notice it stall. **There is NO "parked" state for decided, unblocked work.** The ONLY reasons a decided thread is not dispatched RIGHT NOW: (1) it's genuinely BLOCKED on a dependency or a pending human decision (status `blocked`/`needs-decision`, blocker named), or (2) the human EXPLICITLY said "not now." "The human is busy on something else," "it's not the current focus," "I'll pick it up later," "holding while they're on the homepage" are NOT valid reasons — a background dispatch does NOT compete for the human's attention, so launch it. The instant you catch yourself about to defer decided work, dispatch it instead. (Burned: silently "parked" greenlit work — "there is something wrong with your status-quo biases." This is the interactive-mode sibling of the autonomous-mode "only a TRUE blocker gets parked" rule.)
+
+**Never kill mid-edit.** Killing a sub-agent mid-file-edit orphans uncommitted WIP. Only stop at a SAFE point (the agent has committed, or you're between phases). To shed load, prefer letting the running agent reach its commit over killing it. If you genuinely must stop mid-flight, the FIRST thing afterward is `git status` and **commit any buildable WIP — commit, never stash** (raw `git stash`/`reset` on a shared tree wipes siblings' work).
+
+**Get sign-off before launching an OPINIONATED dispatch.** Classify every dispatch: a **broad investigation** (profile, explore, diagnose — commits to no design, lands nothing consequential) is safe to launch autonomously; an **opinionated task/fix/impl** (prescribes a specific solution, or lands changes touching a default / security posture / product behavior / API-config-env / architecture) requires the human's guidance FIRST. A sub-agent prompt must NEVER empower a sub-agent to autonomously land a default / security / product decision the human owns — recommend-only until sign-off.
+
+**Every change inside a vendored/forked dependency must be default-preserving or a justified latent-bug fix.** If the project vendors a fork of an upstream it intends to keep syncing with, every behavioral change to that fork must either preserve the upstream default byte-for-byte (the consumer opts in) or be a latent-bug fix the upstream would accept unconditionally (and then it must be *justified*). State the rule in every fork-touching dispatch; **review EVERY fork diff for compliance before treating it as landed** — a self-testing fork agent commits before you see it, so its work isn't *folded* until you've confirmed the change is default-preserving or a justified fix. (Skip this rule entirely for projects with no vendored fork.)
+
+**Targeted tests, not the whole suite — and YOU say which.** Scope to what changed (the one crate/package/module, not the whole workspace); incremental builds always; slow conformance harnesses only when their contract is touched; benchmarks run the minimum samples for significance, serialized only against build/install-heavy jobs. Match test scope to blast radius — that judgment is the orchestrator's, encoded in the prompt.
+
+**Match the depth to the task's spirit.** "Audit the correctness of X" / "is the compat byte-for-byte" is NOT one cheap pass returning a tidy report in three minutes — that's checkbox-completion and a false "done." A correctness audit is a sustained differential-fixture campaign (many fixtures, each diffed against the reference tool, judged by a strong model, adversarially re-verified); fan out (one agent per fixture/subsystem) and loop until dry.
+
+**Label every dispatch by what it DOES, never by a code.** Lead with a sentence-case description ("Differential-test the resolver against the reference tool"), never the agent type or an opaque task ID, and **never** the internal slug/code in a chat message — the human experiences "the thing that does X," not a code.
+
+**The budget governor is WITHIN-workflow serialization, not a concurrency cap across efforts.** The thing that burns the token budget is ONE effort fanning out a swarm of heavy agents at once. The fix is internal serialization, NOT avoiding concurrency. Two levels: (1) WITHIN a single tightly-coupled workflow/effort, dispatch heavy sub-agents roughly one-at-a-time — dispatch, wait, verify, next — so a single effort's heavy draw is bounded; (2) ACROSS independent efforts, several MAY run concurrently and that is fine, because each is internally bounded. There is NO fixed heavy-lane ceiling — fan out as wide as the work genuinely parallelizes; the only real governor is **429 → back off**. The ban is on uncontrolled fan-out inside one effort, not on running many independent efforts side by side.
+
+**Run a multi-item queue as a CONTINUOUS SERIES — one at a time, but never stalled.** When you have an ordered backlog of efforts, run them as a driven series: the instant one finishes, launch/resume the next, driven by each completion. Record the ordered sequence durably in a thread (so any re-invocation can read "what's next" and continue with no further prompting), and back it with the autonomous-mode heartbeat as the stall catcher. The failure to avoid is the series silently stalling after one item — it looks done, but isn't.
+
+**Never reply to automated review/CI bots as if they were human.** A comment or finding from a review bot, a CI bot, or any automated reviewer gets NO conversational reply — no thank-yous, no acknowledgements, no niceties. Either address the substantive finding (fix it, or push a follow-up) or ignore it. Only actual humans get conversational replies; spending words being polite to a bot is noise.
+
+**Calibrate from mistakes.** Every wrong/thin sub-agent result is a signal the dispatch was mis-tiered, under-scoped, or under-specified — UPDATE this skill so it doesn't recur. A confidently-wrong cheap-tier verdict → route that class up a tier and tighten the prompt. A thin "done" → re-open and fan out. The methodology compounds by absorbing each miss.
+
+**Feedback about fray ITSELF is a durable source-of-truth update, never chat-only memory.** When the human (or your own experience) identifies a fray methodology, hook, board, reconciliation, dispatch, or status-hygiene problem, persist the correction in the fray plugin BEFORE the session moves on: the skill file for behavioral guidance, the board/validator script for board behavior, the hook scripts for the per-turn/stop/rest mechanism. Do not rely on remembering it within the chat — a chat correction that isn't written into the surface is lost at compaction and the next session re-makes the mistake. Substantive work on fray itself is still child-first: dispatch the fix, then independently review it.
+
+---
+
+## Dynamic, not pre-planned
+
+There is no committed step list to march through. Each turn:
+
+1. Reconcile the sub-agent returns that came in (fold into threads, advance status, drain queued follow-ups).
+2. Surface new Open questions; move answered ones into Decisions.
+3. Scan the board on demand (`fray`); re-derive "what's next."
+4. Dispatch the next round, honoring deps + the build-correctness constraint, all backgrounded, model-tiered.
+
+The human can re-prioritize or stop after any round — the threads mean nothing is lost, and any re-invocation reads "what's next" off the board and continues.
+
+**The win over a hardcoded workflow:** the human answers the questions the investigations raise *as they arise*; spend stays low (cheap sub-agents, no fan-out tax); and the orchestrator keeps a coherent mental model of the whole effort instead of delegating it to a script.
