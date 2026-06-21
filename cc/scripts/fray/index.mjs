@@ -148,7 +148,14 @@ function statesDeferOrBlocker(next) {
 }
 
 // .fray/config.yml globals — parsed by the shared, type-safe loadConfig.
+// loadConfig() honors the FRAY env gate first (see config.mjs).
 const cfg = loadConfig(PROJECT_DIR);
+
+// When fray is disabled via FRAY=0 env, exit cleanly — this session opted out.
+if (!cfg.enabled) {
+  console.log('fray: disabled this session (FRAY=0 in env — or enabled:false in .fray/config.yml)');
+  process.exit(0);
+}
 
 // No `.fray/` here → fray is not active in this project. Print a friendly pointer instead
 // of crashing on a missing directory (the board ships globally and may be run anywhere).
