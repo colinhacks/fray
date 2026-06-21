@@ -10,7 +10,7 @@
 // Run directly with node (no transpiler). Supersedes agent-must-be-background.sh.
 // FAIL OPEN: any parse error → allow unmodified. A broken dispatch hook must never halt
 // orchestration (the overnight heartbeat itself dispatches through here).
-import { readFileSync, appendFileSync, existsSync } from 'node:fs';
+import { readFileSync, appendFileSync, writeFileSync, existsSync } from 'node:fs';
 import { frayActive } from '../scripts/fray/config.mjs';
 
 const EPILOGUE = `
@@ -57,6 +57,28 @@ try {
           'fray mode (hook-enforced): Agent sub-agents MUST be dispatched with run_in_background:true — never foreground/blocking. A foreground agent blocks the orchestrator turn and a human interjection orphans its work. Re-send this Agent call with run_in_background:true.',
       },
     });
+  }
+
+  // fray DISPATCH MARKER — bump a durable counter for EVERY backgrounded fray Agent
+  // dispatch (tagged or untagged one-shot), BEFORE the THREAD:-ledger branch below.
+  // This is the load-bearing signal the SubagentStop recorder (fray-subagent-rest.mjs)
+  // gates on: it only records a rest once fray has actually dispatched a background
+  // agent in this repo. Without it, the recorder logged a "rest" for EVERY SubagentStop
+  // — including built-in Explore/Plan agents and Skill executions fray never dispatched —
+  // tripping the Stop hook's REST guard with phantom agents (2026-06-21). The ledger
+  // (.dispatch-ledger.jsonl) is THREAD:-only and so can't cover untagged one-shots; this
+  // count does. Fail open: a counter error must never block a dispatch.
+  try {
+    const countFile = `${dir}/.fray/.dispatch-count`;
+    let n = 0;
+    try {
+      n = parseInt(readFileSync(countFile, 'utf8').trim(), 10) || 0;
+    } catch {
+      /* absent / unreadable → start at 0 */
+    }
+    writeFileSync(countFile, String(n + 1) + '\n');
+  } catch {
+    /* fail open — never block a dispatch on the counter */
   }
 
   const prompt = typeof ti.prompt === 'string' ? ti.prompt : '';

@@ -10,8 +10,25 @@
  * a rest sits un-reconciled. This is the mechanism backstop for the #1 recurring
  * failure — a rested agent's findings never getting folded + its queue drained.
  *
+ * fray-ATTRIBUTION GATE (2026-06-21): SubagentStop fires for EVERY subagent stop —
+ * built-in Explore/Plan agents, Skill executions (`fray:fray` itself!), and other
+ * harness-internal subagents — NOT only fray's backgrounded `Agent` dispatches.
+ * Recording all of them logged phantom rests in repos where fray dispatched ZERO
+ * agents, tripping the Stop hook's REST guard against agents that never existed.
+ * So we only record a rest once fray has ACTUALLY dispatched a background agent in
+ * this repo: the dispatch hook (agent-dispatch.mjs) bumps `.fray/.dispatch-count` on
+ * every backgrounded dispatch (tagged or untagged one-shot), and we gate on it.
+ *   - NO false POSITIVES: count == 0 (no fray dispatch) → never record. Kills the bug.
+ *   - NO false NEGATIVES: once fray has dispatched, EVERY rest is recorded — including
+ *     an agent that rests repeatedly (resume) and untagged one-shots (which write no
+ *     ledger entry). The count is a "has fray ever dispatched here" gate, NOT a cap,
+ *     so a real rest is never suppressed. (A `agent_type` denylist of known builtins
+ *     is layered on as cheap defense-in-depth, but the count is the load-bearing gate.)
+ *
  * FAIL-OPEN: any error → exit 0. A sub-agent must NEVER be blocked from stopping
- * by this recorder, and a write failure must not surface as an error.
+ * by this recorder, and a write failure must not surface as an error. Likewise, if
+ * the gate signal is unreadable we FAIL TOWARD RECORDING (a missed rest is the worse
+ * failure — it silently hides exactly what the REST guard exists to catch).
  */
 import { appendFileSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -20,6 +37,15 @@ import { frayActive } from '../scripts/fray/config.mjs';
 const PROJECT_DIR = process.env.CLAUDE_PROJECT_DIR || process.cwd();
 const FRAY_DIR = join(PROJECT_DIR, '.fray');
 const REST_LOG = join(FRAY_DIR, '.rested-agents.jsonl');
+const DISPATCH_COUNT = join(FRAY_DIR, '.dispatch-count');
+
+// Known harness-internal / built-in agent_type values that fray NEVER dispatches as a
+// background effort. A SubagentStop carrying one of these is definitively not a fray rest.
+// Cheap, conservative defense-in-depth: the dispatch-count gate already covers the bug;
+// this just suppresses the obvious builtins even if a count race ever let one through.
+// Keep CONSERVATIVE — only list types that can NEVER be a real fray dispatch, so this can
+// never introduce a false negative.
+const NON_FRAY_AGENT_TYPES = new Set(['Explore', 'Plan', 'statusline-setup']);
 
 try {
   // fray ACTIVATION GATE — fray ships globally and this hook fires on EVERY subagent stop
@@ -35,13 +61,33 @@ try {
     const raw = readFileSync(0, 'utf8');
     if (raw.trim()) payload = JSON.parse(raw);
   } catch {
-    /* no/invalid stdin → record the bare event anyway */
+    /* no/invalid stdin → record the bare event anyway (fail toward recording) */
   }
+
+  // ATTRIBUTION GATE — only record a rest that is plausibly a fray-dispatched background
+  // agent. Two checks, both fail TOWARD recording (a missed real rest is the worse bug):
+  //   1) agent_type denylist — a known harness builtin (Explore/Plan/…) is never a fray rest.
+  //   2) dispatch-count gate — fray must have dispatched ≥1 background agent in this repo.
+  //      count == 0 → no fray agent exists to rest → this stop is non-fray noise → skip.
+  if (payload.agent_type && NON_FRAY_AGENT_TYPES.has(payload.agent_type)) process.exit(0);
+  let dispatchCount = 0;
+  try {
+    dispatchCount = parseInt(readFileSync(DISPATCH_COUNT, 'utf8').trim(), 10) || 0;
+  } catch {
+    // Count file absent/unreadable. Distinguish "fray never dispatched" (file truly
+    // absent → the bug case → skip) from "transient read error on an existing file"
+    // (fail toward recording). existsSync settles it.
+    dispatchCount = existsSync(DISPATCH_COUNT) ? 1 : 0;
+  }
+  if (dispatchCount === 0) process.exit(0); // no fray dispatch → not a fray rest → no record
+
   const rec = {
     ts: new Date().toISOString(),
     // best-effort identifiers — payload shape varies; record whatever is present
     transcript: payload.transcript_path || null,
     session: payload.session_id || null,
+    agent_type: payload.agent_type || null,
+    agent_id: payload.agent_id || null,
   };
   appendFileSync(REST_LOG, JSON.stringify(rec) + '\n');
 } catch {
