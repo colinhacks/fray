@@ -1,0 +1,23 @@
+{
+  "name": "fray-codex",
+  "version": "0.1.0",
+  "description": "Codex adapter for the repo-local Fray orchestration workflow.",
+  "author": {
+    "name": "Nub maintainers"
+  },
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "Fray for Codex",
+    "shortDescription": "Run the Fray orchestration workflow in Codex.",
+    "longDescription": "Adds Codex-native Fray instructions and helper scripts while preserving the shared .fray control surface used by this repository.",
+    "developerName": "Nub maintainers",
+    "category": "Productivity",
+    "capabilities": ["Sub-agents", "Project Management"],
+    "defaultPrompt": [
+      "Use Fray for this launch push.",
+      "Show the current Fray board.",
+      "Preflight this Fray dispatch."
+    ]
+  }
+}
