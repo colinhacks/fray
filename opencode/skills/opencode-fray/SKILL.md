@@ -63,7 +63,7 @@ Use the board to choose the next dispatch. Do not maintain a separate native tod
 ## Control Surface
 
 - `.fray/<slug>.md`: one file per live multi-step or long-lived thread. The filename slug is the id.
-- `.fray/config.yml`: globals only, including `enabled`, `autonomous_mode`, and shared `state` facts.
+- `.fray/config.yml`: globals only — `autonomous_mode` and shared `state` facts. Enablement is per-session via the `.fray/.session-state/<session_id>` sentinel, not a config flag.
 - `.fray/<slug>.findings/<id>.md`: optional sidecars for durable sub-agent output.
 - `.fray/.dispatch-ledger.jsonl`: optional durable dispatch metadata. In OpenCode, the thread body is usually enough; use the ledger if a thread has many concurrent task ids.
 - `.opencode/fray/index.mjs`: the OpenCode-local computed board. There is no stored board.

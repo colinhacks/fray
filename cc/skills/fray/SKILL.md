@@ -16,14 +16,13 @@ metadata:
 
 ## Activation + bootstrap — fray is GLOBAL but DORMANT until you opt a repo in
 
-fray ships as a globally-loaded Claude Code plugin, so its hooks and the `fray` board command are available in EVERY project. But fray stays **completely dormant in a project until that project is opted in** — every hook is a silent no-op (it injects nothing, blocks nothing, creates nothing) **unless the project has a `.fray/` directory AND `enabled` is not turned off in `.fray/config.yml`.** A virgin repo with the plugin installed sees zero fray output. This is deliberate: install once, dormant everywhere, activate per repo.
+fray ships as a globally-loaded Claude Code plugin, so its hooks and the `fray` board command are available in EVERY project. But fray stays **completely dormant in a project until that project is opted in** — every hook is a silent no-op (it injects nothing, blocks nothing, creates nothing) **unless the project has a `.fray/` directory** AND the current session is not toggled off (see the per-session toggle below). A virgin repo with the plugin installed sees zero fray output. This is deliberate: install once, dormant everywhere, activate per repo.
 
 **BOOTSTRAP is the FIRST thing this skill does when fray is invoked in a repo that has no `.fray/` yet.** When you load this skill and `.fray/` is absent, create it before anything else:
 
 1. `mkdir -p .fray`
 2. write `.fray/config.yml` with the default globals:
    ```yaml
-   enabled: true
    autonomous_mode: off
    state:
    ```
@@ -32,7 +31,7 @@ fray ships as a globally-loaded Claude Code plugin, so its hooks and the `fray` 
 
 Once `.fray/` exists, the hooks activate automatically (the per-turn pulse, the dispatch enforcement + epilogue, the rest/stop guards, the session seed). Bootstrapping is the ONLY thing the skill does eagerly on load — it does NOT then scan the board or start work (see the next section).
 
-**Turning fray off in a repo** without deleting its threads: set `enabled: false` in `.fray/config.yml` (every hook re-checks it each turn and goes silent). Delete `.fray/` entirely to fully de-activate. This `.fray/config.yml` gate composes ON TOP of Claude Code's own plugin enablement (`enabledPlugins` in `~/.claude/settings.json`, written when the plugin is installed): the plugin being enabled globally is necessary but not sufficient — a repo is fray-active only when it ALSO has an opted-in `.fray/`.
+**Turning fray off for THE CURRENT SESSION** (per-session, mid-session, no relaunch): run `fray off`; restore with `fray on`, clear the override with `fray reset`, inspect with `fray status`. Enablement is keyed on the Claude Code session id (`CLAUDE_CODE_SESSION_ID` — the same id the hooks receive), so toggling one session never affects other concurrent sessions in the same repo. `fray on`/`off` write a sentinel at `.fray/.session-state/<session_id>` that every hook re-reads each turn; an agent can flip it via a single Bash tool call (`fray off`) or a Write to that path. The DEFAULT (no sentinel) is **active whenever `.fray/` exists**. To fully de-activate for everyone, delete `.fray/`. This per-session gate composes ON TOP of Claude Code's own plugin enablement (`enabledPlugins` in `~/.claude/settings.json`): the plugin being enabled globally is necessary but not sufficient — a repo is fray-active only when it ALSO has an opted-in `.fray/` and the session isn't toggled off. (There is no repo-global `enabled` flag anymore — it was un-scopable and not mid-session-toggleable.)
 
 **Requirement — in-flight steering needs the experimental agent-teams feature.** The ALWAYS-STEER core of fray (message a running or completed sub-agent, warm-resume, answer a question an agent raised) depends on Claude Code's **experimental** agent-teams feature (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`). Verify with `echo $CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`. Without it, `SendMessage`/warm-resume are unavailable and you fall back to the `enqueued` + `depends_on` sequencing model for everything (the board still works; the dispatch/rest/reconcile mechanics still work) — only live steering is lost. It is experimental and harness-dependent; do not assume it is on.
 

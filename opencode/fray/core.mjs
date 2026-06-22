@@ -1,8 +1,56 @@
-import { existsSync, readFileSync, readdirSync, appendFileSync } from "node:fs"
+import { existsSync, readFileSync, readdirSync, appendFileSync, mkdirSync, writeFileSync, rmSync } from "node:fs"
 import { dirname, join } from "node:path"
 
 export const STATUS = ["todo", "planned", "enqueued", "active", "blocked", "needs-decision", "done", "dismissed"]
 export const TERMINAL = ["done", "dismissed"]
+
+// PER-SESSION SENTINEL — enablement is keyed on the session id (not a config flag), so it
+// can be scoped to / toggled mid- a single session. `.fray/.session-state/<session_id>`
+// with `off`/`on` is the per-session override; absent → default (active when `.fray/` exists).
+export function sessionOverride(root, sessionId) {
+  if (!root || !sessionId) return null
+  try {
+    const f = join(root, ".fray", ".session-state", String(sessionId))
+    if (!existsSync(f)) return null
+    const v = readFileSync(f, "utf8").trim().toLowerCase()
+    if (["off", "false", "no", "0", "disabled"].includes(v)) return "off"
+    if (["on", "true", "yes", "1", "enabled"].includes(v)) return "on"
+    return "off"
+  } catch {
+    return null
+  }
+}
+
+export function setSessionOverride(root, sessionId, state) {
+  const dir = join(root, ".fray", ".session-state")
+  mkdirSync(dir, { recursive: true })
+  const f = join(dir, String(sessionId))
+  writeFileSync(f, state + "\n")
+  return f
+}
+
+export function clearSessionOverride(root, sessionId) {
+  try {
+    rmSync(join(root, ".fray", ".session-state", String(sessionId)), { force: true })
+  } catch {
+    /* already gone */
+  }
+}
+
+// THE ACTIVATION GATE — active iff `.fray/` exists AND the per-session sentinel is not
+// forced off. Replaces the former repo-global `enabled:` config flag.
+export function frayActive(root, sessionId) {
+  if (!root) return false
+  try {
+    if (!existsSync(join(root, ".fray"))) return false
+  } catch {
+    return false
+  }
+  const ov = sessionOverride(root, sessionId)
+  if (ov === "off") return false
+  if (ov === "on") return true
+  return true
+}
 
 export function frayRoot(directory = process.cwd(), worktree) {
   if (worktree && existsSync(join(worktree, ".fray"))) return worktree
@@ -26,21 +74,9 @@ function bool(raw, fallback) {
 }
 
 export function loadConfig(root) {
-  const config = { enabled: true, autonomousMode: false, state: {} }
-
-  // SESSION-LOCAL ENV GATE — takes precedence over any config file.
-  // FRAY=0/false → disabled this session; FRAY=1/true → enabled this session.
-  // Set at launch time (`FRAY=0 claude`); inherited by all hook processes.
-  // A mid-session toggle is not supported (would need a session_id-keyed sentinel).
-  const frayEnv = (process.env.FRAY ?? "").trim().toLowerCase()
-  if (frayEnv === "0" || frayEnv === "false") {
-    config.enabled = false
-    return config
-  }
-  if (frayEnv === "1" || frayEnv === "true") {
-    config.enabled = true
-    // Don't return early — still parse the file to pick up autonomousMode + state.
-  }
+  // Enablement is NOT a config field — it lives in the per-session sentinel (see frayActive).
+  // This parses only autonomous_mode + the state block.
+  const config = { autonomousMode: false, state: {} }
 
   let src = ""
   try {
@@ -63,9 +99,7 @@ export function loadConfig(root) {
       continue
     }
     inState = false
-    // When FRAY=1/true, don't let the config file override the session-local gate.
-    if (top[1] === "enabled" && frayEnv !== "1" && frayEnv !== "true") config.enabled = bool(top[2], config.enabled)
-    else if (top[1] === "autonomous_mode") config.autonomousMode = bool(top[2], config.autonomousMode)
+    if (top[1] === "autonomous_mode") config.autonomousMode = bool(top[2], config.autonomousMode)
   }
   return config
 }
@@ -155,9 +189,9 @@ export function searchThreads(root, query) {
   return hits.length ? hits.map((thread) => `${thread.id} [${thread.status}] - ${thread.title}`).join("\n") : `no threads match "${query}"`
 }
 
-export function reminder(root) {
+export function reminder(root, sessionId) {
+  if (!frayActive(root, sessionId)) return ""
   const cfg = loadConfig(root)
-  if (!cfg.enabled) return ""
   const threads = readThreads(root)
   const pending = threads.filter((thread) => !TERMINAL.includes(thread.status)).map((thread) => `${thread.id}[${thread.status}]`)
   const queued = threads.filter((thread) => !TERMINAL.includes(thread.status) && thread.queued).map((thread) => thread.id)

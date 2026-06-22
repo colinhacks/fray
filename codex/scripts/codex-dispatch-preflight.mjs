@@ -18,7 +18,7 @@ import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { loadConfig } from '../scripts/fray/config.mjs';
+import { frayActive } from '../scripts/fray/config.mjs';
 
 const PROJECT_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..');
 
@@ -78,10 +78,10 @@ if (
 }
 
 const thread = threadRaw.replace(/^\.fray\//, '').replace(/\.md$/, '');
-const cfg = loadConfig(PROJECT_DIR);
+const SESSION_ID = arg('--session-id') ?? process.env.CODEX_SESSION_ID ?? process.env.FRAY_SESSION_ID ?? undefined;
 
-if (cfg.enabled === false) {
-  console.error('codex-dispatch-preflight: Fray is disabled in .fray/config.yml');
+if (!frayActive(PROJECT_DIR, SESSION_ID)) {
+  console.error('codex-dispatch-preflight: Fray is disabled for this session (per-session sentinel = off, or no .fray/).');
   process.exit(2);
 }
 

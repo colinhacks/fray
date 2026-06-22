@@ -139,19 +139,7 @@ const CLEANUP_REMINDER = [
 ].join(' ');
 
 async function main() {
-  // fray ACTIVATION GATE — fray ships globally and this hook fires in EVERY project.
-  // Allow the stop silently unless the project is opted in (`.fray/` exists AND not
-  // disabled), so a virgin repo never gets a fray Stop block. Plus the own switch below.
-  try {
-    if (!frayActive(PROJECT_DIR)) return allow();
-  } catch {
-    return allow();
-  }
-
-  const { enabled, cooldownSeconds } = readKnobs();
-  if (!enabled) return allow();
-
-  // Read the Stop payload from stdin.
+  // Read the Stop payload from stdin FIRST — its session_id drives the per-session gate.
   let payload = {};
   try {
     const raw = readFileSync(0, 'utf8');
@@ -159,6 +147,19 @@ async function main() {
   } catch {
     /* no/invalid stdin → treat as empty; guards below still apply */
   }
+
+  // fray ACTIVATION GATE — fray ships globally and this hook fires in EVERY project.
+  // Allow the stop silently unless the project is opted in (`.fray/` exists AND the
+  // per-session sentinel is not forced off), so a virgin repo never gets a fray Stop
+  // block. Plus the stop_reminder own switch below.
+  try {
+    if (!frayActive(PROJECT_DIR, payload.session_id)) return allow();
+  } catch {
+    return allow();
+  }
+
+  const { enabled, cooldownSeconds } = readKnobs();
+  if (!enabled) return allow();
 
   // Guard 1 (applies to BOTH concerns): never block a stop that is itself a
   // continuation we caused — prevents any no-rest loop.

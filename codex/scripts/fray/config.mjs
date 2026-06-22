@@ -11,44 +11,89 @@
  * plus the one nested `state:` block) — not a general YAML parser, just enough.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
 /**
- * THE ACTIVATION GATE — is fray active in this project?
+ * THE PER-SESSION SENTINEL — how fray is toggled on/off for ONE session.
  *
- * fray ships as a GLOBALLY-loaded Claude Code plugin, so its hooks fire in EVERY
- * project. They must be a SILENT no-op until a project opts in, or a virgin repo
- * gets fray noise it never asked for. A project is opted-in iff it has a `.fray/`
- * directory AND `enabled` is not turned off in `.fray/config.yml`.
+ * Enablement is keyed on the SESSION ID (not a repo-global flag), so it can be scoped to
+ * (and toggled mid-) a single session without affecting other concurrent sessions in the
+ * same repo. Sentinel path: `.fray/.session-state/<session_id>`; content `off`/`on` is an
+ * explicit per-session override, absent → fall back to the default (active when `.fray/`
+ * exists). Mirrors the cc harness; the Codex session id comes from the harness's hook
+ * payload / env (best-effort — when no id is derivable the default applies).
  *
- * So the gate is TWO conditions, in order:
- *   1. `.fray/` directory EXISTS — the project has been bootstrapped (the `/fray`
- *      skill creates it on first invocation). No `.fray/` → fray is dormant here.
- *   2. `enabled` is not `false` — the per-project kill switch (default on; a missing
- *      or unparseable config → enabled, fail-safe). `enabled: false` silences fray
- *      in a bootstrapped project without deleting `.fray/`.
+ * @param {string} projectDir
+ * @param {string|undefined|null} sessionId
+ * @returns {'on'|'off'|null}
+ */
+export function sessionOverride(projectDir, sessionId) {
+  if (!projectDir || !sessionId) return null;
+  try {
+    const f = join(projectDir, '.fray', '.session-state', sessionId);
+    if (!existsSync(f)) return null;
+    const v = readFileSync(f, 'utf8').trim().toLowerCase();
+    if (v === 'off' || v === 'false' || v === 'no' || v === '0' || v === 'disabled') return 'off';
+    if (v === 'on' || v === 'true' || v === 'yes' || v === '1' || v === 'enabled') return 'on';
+    return 'off';
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Write the per-session sentinel for `sessionId`. Returns its path.
+ * @param {string} projectDir
+ * @param {string} sessionId
+ * @param {'on'|'off'} state
+ * @returns {string}
+ */
+export function setSessionOverride(projectDir, sessionId, state) {
+  const dir = join(projectDir, '.fray', '.session-state');
+  mkdirSync(dir, { recursive: true });
+  const f = join(dir, sessionId);
+  writeFileSync(f, state + '\n');
+  return f;
+}
+
+/**
+ * Remove the per-session sentinel for `sessionId`.
+ * @param {string} projectDir
+ * @param {string} sessionId
+ */
+export function clearSessionOverride(projectDir, sessionId) {
+  try {
+    rmSync(join(projectDir, '.fray', '.session-state', sessionId), { force: true });
+  } catch {
+    /* already gone */
+  }
+}
+
+/**
+ * THE ACTIVATION GATE — is fray active in this project, for this session?
+ *   1. `.fray/` EXISTS (bootstrapped) — else dormant.
+ *   2. PER-SESSION SENTINEL override (`off`/`on`) when a session id is known.
+ *   3. DEFAULT: active when `.fray/` exists (the sentinel is the override).
  *
- * A SESSION-LOCAL override is also checked (see {@link loadConfig}): `FRAY=0` in the
- * launch environment disables fray for the entire session regardless of config.yml;
- * `FRAY=1` enables it. This is set at launch time (`FRAY=0 claude`) and inherited by
- * all hook processes. It takes precedence over the per-project config.
- *
- * Every fray hook calls this FIRST and early-returns when it is false, so the
- * new-user DX is: install once globally → dormant everywhere → `/fray` in a repo
- * activates it there.
+ * Replaces the former repo-global `enabled:` config flag (repo-wide, un-scopable,
+ * not mid-session-toggleable).
  *
  * @param {string} projectDir  The repo root (e.g. `process.env.CLAUDE_PROJECT_DIR`).
- * @returns {boolean} whether fray is active (bootstrapped + not disabled) here.
+ * @param {string} [sessionId]
+ * @returns {boolean}
  */
-export function frayActive(projectDir) {
+export function frayActive(projectDir, sessionId) {
   if (!projectDir) return false;
   try {
     if (!existsSync(join(projectDir, '.fray'))) return false; // not bootstrapped → dormant
   } catch {
     return false; // unreadable → treat as dormant (silent, fail-safe for a virgin repo)
   }
-  return loadConfig(projectDir).enabled !== false; // bootstrapped → honor the kill switch
+  const override = sessionOverride(projectDir, sessionId);
+  if (override === 'off') return false;
+  if (override === 'on') return true;
+  return true; // DEFAULT: `.fray/` exists → active
 }
 
 /**
@@ -88,7 +133,6 @@ export const TERMINAL = ['done', 'dismissed'];
 
 /**
  * @typedef {Object} FrayConfig
- * @property {boolean} enabled       Master kill-switch. `false` makes all fray hooks no-op. Default `true` (fail-safe — a botched config never silently disables orchestration).
  * @property {boolean} autonomousMode  Whether autonomous mode is on. Default `false`.
  * @property {Record<string, string>} state  The `state:` block — cross-cutting "what's true now" globals. Default `{}`.
  */
@@ -96,11 +140,12 @@ export const TERMINAL = ['done', 'dismissed'];
 /**
  * The type-safe DEFAULTS, returned when `.fray/config.yml` is absent. Individual
  * malformed lines are simply skipped (we keep whatever parsed), so a partially
- * broken file still yields a fully-populated config.
+ * broken file still yields a fully-populated config. Enablement is NOT a config
+ * field — it lives in the per-session sentinel (see {@link frayActive}).
  * @returns {FrayConfig}
  */
 function defaults() {
-  return { enabled: true, autonomousMode: false, state: {} };
+  return { autonomousMode: false, state: {} };
 }
 
 /**
@@ -135,16 +180,8 @@ function scalar(raw) {
  * type-safe {@link FrayConfig}. The file is absent/unreadable → DEFAULTS.
  * A single malformed line → that line is skipped; everything else still parses.
  *
- * SESSION-LOCAL OVERRIDE (checked first, before any file read): `process.env.FRAY`
- * lets a session opt in/out at launch time without touching `config.yml`:
- *   - `FRAY=0` / `FRAY=false` → fray disabled this session (enabled: false).
- *   - `FRAY=1` / `FRAY=true`  → fray enabled this session (enabled: true).
- *   - unset / any other value → fall back to `.fray/config.yml` (today's behavior).
- * Set it when launching claude: `FRAY=0 claude`. CC hooks inherit the claude process
- * env, so the setting is session-wide and independent per terminal / session.
- * NOTE: a mid-session toggle is NOT supported via tool calls — Bash env changes
- * don't persist across tool invocations and don't reach hook processes. A mid-session
- * toggle would require a session_id-keyed sentinel file; that is a possible future add-on.
+ * ENABLEMENT is NOT read here — it lives in the per-session sentinel now (see
+ * {@link frayActive}). This parses only `autonomous_mode` + the `state:` block.
  *
  * Parser shape (intentionally narrow — matches fray's flat config, NOT general YAML):
  *   - `key: value`         top-level scalar (e.g. `enabled: true`, `autonomous_mode: off`)
@@ -157,17 +194,6 @@ function scalar(raw) {
  */
 export function loadConfig(projectDir) {
   const cfg = defaults();
-
-  // SESSION-LOCAL ENV GATE — takes precedence over any config file.
-  const frayEnv = (process.env.FRAY ?? '').trim().toLowerCase();
-  if (frayEnv === '0' || frayEnv === 'false') {
-    cfg.enabled = false;
-    return cfg;
-  }
-  if (frayEnv === '1' || frayEnv === 'true') {
-    cfg.enabled = true;
-    // Don't return early — still parse the file to pick up autonomousMode + state.
-  }
 
   let src;
   try {
@@ -205,10 +231,7 @@ export function loadConfig(projectDir) {
     // the default. (Bug found 2026-06-14: an inline comment flipped autonomous mode
     // back off. The nested `state:` entries already go through scalar(); the
     // top-level bools must too.)
-    // When FRAY=1/true is set at launch, the session-local gate already fixed `enabled`;
-    // don't let the config file override it. autonomousMode + state still come from the file.
-    if (key === 'enabled' && frayEnv !== '1' && frayEnv !== 'true') cfg.enabled = toBool(scalar(val), cfg.enabled);
-    else if (key === 'autonomous_mode') cfg.autonomousMode = toBool(scalar(val), cfg.autonomousMode);
+    if (key === 'autonomous_mode') cfg.autonomousMode = toBool(scalar(val), cfg.autonomousMode);
     // unrecognized top-level keys are ignored by design (forward-compatible)
   }
 

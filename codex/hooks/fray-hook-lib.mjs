@@ -127,15 +127,32 @@ export function returnedUnreconciled(projectDir) {
   };
 }
 
-export function loadFray(projectDir) {
-  const frayDir = join(projectDir, '.fray');
-  const configPath = join(frayDir, 'config.yml');
-  if (!existsSync(configPath)) return { enabled: false, pending: [], queued: [], unreconciled: [], unattached: [], errors: [] };
+// PER-SESSION SENTINEL — enablement is keyed on the session id, not a config flag.
+// `.fray/.session-state/<session_id>` with `off`/`on` is a per-session override; absent →
+// default (active when `.fray/` exists). Mirrors the cc harness; dependency-free here.
+function sessionOverride(projectDir, sessionId) {
+  if (!projectDir || !sessionId) return null;
+  try {
+    const f = join(projectDir, '.fray', '.session-state', String(sessionId));
+    if (!existsSync(f)) return null;
+    const v = readFileSync(f, 'utf8').trim().toLowerCase();
+    if (/^(off|false|no|0|disabled)$/.test(v)) return 'off';
+    if (/^(on|true|yes|1|enabled)$/.test(v)) return 'on';
+    return 'off';
+  } catch {
+    return null;
+  }
+}
 
-  const config = readFileSync(configPath, 'utf8');
-  const enabledMatch = config.match(/^enabled:\s*(.+)$/m);
-  const enabled = enabledMatch ? !/^(false|off|no|0)\b/i.test(enabledMatch[1].trim()) : true;
-  if (!enabled) return { enabled: false, pending: [], queued: [], unreconciled: [], unattached: [], errors: [] };
+export function loadFray(projectDir, sessionId) {
+  const frayDir = join(projectDir, '.fray');
+  // Bootstrapped iff `.fray/` exists (config.yml is no longer the enablement gate).
+  if (!existsSync(frayDir)) return { enabled: false, pending: [], queued: [], unreconciled: [], unattached: [], errors: [] };
+
+  // Per-session override: `off` silences this session; absent / `on` → active.
+  if (sessionOverride(projectDir, sessionId) === 'off') {
+    return { enabled: false, pending: [], queued: [], unreconciled: [], unattached: [], errors: [] };
+  }
 
   const pending = [];
   const queued = [];

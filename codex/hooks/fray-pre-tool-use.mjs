@@ -6,7 +6,7 @@ const toolName = String(input.tool_name || input.toolName || input.tool || input
 if (toolName && toolName !== 'wait_agent') process.exit(0);
 
 const projectDir = findProjectDir(input.cwd);
-const fray = loadFray(projectDir);
+const fray = loadFray(projectDir, input.session_id ?? input.sessionId);
 if (!fray.enabled) process.exit(0);
 
 const returned = returnedUnreconciled(projectDir);

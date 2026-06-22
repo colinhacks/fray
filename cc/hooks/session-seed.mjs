@@ -20,7 +20,7 @@
 import { readFileSync } from 'node:fs';
 import { frayActive } from '../scripts/fray/config.mjs';
 
-/** @type {{ agent_id?: unknown, agentId?: unknown, source?: string }} */
+/** @type {{ agent_id?: unknown, agentId?: unknown, source?: string, session_id?: string }} */
 let input = {};
 try {
   input = JSON.parse(readFileSync(0, 'utf8'));
@@ -32,7 +32,7 @@ if (input.agent_id ?? input.agentId) process.exit(0);
 // fray ACTIVATION GATE — fray ships globally and this hook fires in EVERY project. Seed
 // NOTHING unless the project is opted in (`.fray/` exists AND not disabled), so a virgin
 // repo gets no fray doctrine. The `/fray` skill bootstraps `.fray/` to activate fray here.
-if (!frayActive(process.env.CLAUDE_PROJECT_DIR ?? '.')) process.exit(0);
+if (!frayActive(process.env.CLAUDE_PROJECT_DIR ?? '.', input.session_id)) process.exit(0);
 
 // The static orchestrator role + hygiene doctrine. Lifted VERBATIM from fray-reminder.mjs
 // (the former authoritative copy) — it does not change within a session, so it seeds ONCE

@@ -27,7 +27,15 @@
 
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { loadConfig, STATUS, TERMINAL } from './config.mjs';
+import {
+  loadConfig,
+  STATUS,
+  TERMINAL,
+  setSessionOverride,
+  clearSessionOverride,
+  sessionOverride,
+  frayActive,
+} from './config.mjs';
 import { parseAgents } from './agent-liveness.mjs';
 import { deriveAgentState, findAgentOutputAge } from './agent-status.mjs';
 
@@ -147,15 +155,40 @@ function statesDeferOrBlocker(next) {
   return /\b(on hold|hold(ing)?|deferr?(ed|ing)?|defer|parked?|park|not now|later|post-v|pick up|picked up|awaiting|await|blocked|block(ing|ed)? on|waiting on|wait on|needs?[- ]decision|pending|until|once|after .+ (returns?|lands?|merges?|completes?)|colin|human)\b/i.test(next);
 }
 
-// .fray/config.yml globals — parsed by the shared, type-safe loadConfig.
-// loadConfig() honors the FRAY env gate first (see config.mjs).
-const cfg = loadConfig(PROJECT_DIR);
-
-// When fray is disabled via FRAY=0 env, exit cleanly — this session opted out.
-if (!cfg.enabled) {
-  console.log('fray: disabled this session (FRAY=0 in env — or enabled:false in .fray/config.yml)');
-  process.exit(0);
+// PER-SESSION TOGGLE — `fray on|off|reset|status` flips/reports enablement for THIS
+// session via the `.fray/.session-state/<session_id>` sentinel (keyed on the harness
+// session id), the same gate the hooks honor. Handled before the board renders.
+const SESSION_ID = process.env.CODEX_SESSION_ID || process.env.FRAY_SESSION_ID || undefined;
+{
+  const sub = process.argv[2];
+  if (sub === 'on' || sub === 'off' || sub === 'enable' || sub === 'disable') {
+    if (!SESSION_ID) {
+      console.error('fray: no session id (set CODEX_SESSION_ID/FRAY_SESSION_ID) — cannot toggle this session.');
+      process.exit(1);
+    }
+    const state = sub === 'on' || sub === 'enable' ? 'on' : 'off';
+    const path = setSessionOverride(PROJECT_DIR, SESSION_ID, state);
+    console.log(`fray: ${state === 'on' ? 'ENABLED' : 'DISABLED'} for this session (${SESSION_ID}).`);
+    console.log(`  sentinel: ${path}`);
+    console.log(`  revert to default with: fray reset`);
+    process.exit(0);
+  }
+  if (sub === 'reset' || sub === 'default') {
+    if (SESSION_ID) clearSessionOverride(PROJECT_DIR, SESSION_ID);
+    console.log(`fray: session override cleared for ${SESSION_ID ?? '(no session id)'} — back to the default (active when .fray/ exists).`);
+    process.exit(0);
+  }
+  if (sub === 'status') {
+    const ov = sessionOverride(PROJECT_DIR, SESSION_ID);
+    const active = frayActive(PROJECT_DIR, SESSION_ID);
+    console.log(`fray: ${active ? 'ACTIVE' : 'INACTIVE'} this session (${SESSION_ID ?? 'no session id'})`);
+    console.log(`  override: ${ov ?? 'none (default — active when .fray/ exists)'}`);
+    process.exit(0);
+  }
 }
+
+// .fray/config.yml globals — parsed by the shared, type-safe loadConfig (autonomous_mode + state).
+const cfg = loadConfig(PROJECT_DIR);
 
 // No `.fray/` here → fray is not active in this project. Print a friendly pointer instead
 // of crashing on a missing directory (the board ships globally and may be run anywhere).

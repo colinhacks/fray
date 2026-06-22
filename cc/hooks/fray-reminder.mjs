@@ -20,9 +20,11 @@ import { frayActive, loadConfig, STATUS, TERMINAL } from '../scripts/fray/config
 // Token-saving: skip entirely inside sub-agent contexts. The hook stdin carries
 // `agent_id` ONLY when fired inside a sub-agent (UserPromptSubmit shouldn't fire there
 // at all, so this is belt-and-suspenders). Main session → no agent_id → proceed.
+let sessionId; // hook-input session_id (== CLAUDE_CODE_SESSION_ID) for the per-session gate
 try {
   const hi = JSON.parse(readFileSync(0, 'utf8'));
   if (hi.agent_id ?? hi.agentId) process.exit(0);
+  sessionId = hi.session_id;
 } catch {
   /* no stdin / not JSON → assume main session, proceed */
 }
@@ -46,7 +48,7 @@ try {
   // fray ACTIVATION GATE — fray ships globally and this hook fires in EVERY project.
   // Inject NOTHING unless the project is opted in (`.fray/` exists AND not disabled), so
   // a virgin repo sees zero fray noise. The `/fray` skill bootstraps `.fray/` to activate.
-  if (!frayActive(dir)) process.exit(0);
+  if (!frayActive(dir, sessionId)) process.exit(0);
   // autonomous_mode lives in .fray/config.yml — parsed by the shared, type-safe loadConfig.
   // The board/status view is COMPUTED by the tool, never stored.
   const cfg = loadConfig(dir);

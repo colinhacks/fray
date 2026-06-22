@@ -5,8 +5,8 @@ import {
   appendLedger,
   formatBoard,
   formatValidation,
+  frayActive,
   frayRoot,
-  loadConfig,
   reminder,
   searchThreads,
   threadPath,
@@ -95,8 +95,7 @@ export const OpenCodeFray = async ({ directory, worktree }: { directory: string;
     },
 
     "experimental.chat.system.transform": async (_input: unknown, output: { system?: string[] }) => {
-      const cfg = loadConfig(root)
-      if (!cfg.enabled) return
+      if (!frayActive(root)) return
       output.system ||= []
       const pulse = reminder(root)
       if (pulse) output.system.push(pulse)
@@ -110,8 +109,7 @@ export const OpenCodeFray = async ({ directory, worktree }: { directory: string;
     "command.execute.before": async (input: { command?: string }, output: { parts?: Array<Record<string, unknown>> }) => {
       const command = String(input.command || "")
       if (command !== "fray" && command !== "fray-validate") return
-      const cfg = loadConfig(root)
-      if (!cfg.enabled) return
+      if (!frayActive(root)) return
       output.parts ||= []
       const textPart = output.parts.find((part) => part.type === "text" && typeof part.text === "string")
       if (textPart) textPart.text = `${textPart.text}\n\n${command === "fray" ? formatBoard(root) : formatValidation(root)}`
@@ -126,8 +124,7 @@ export const OpenCodeFray = async ({ directory, worktree }: { directory: string;
       const thread = leadingThread(prompt)
       if (!thread) return
 
-      const cfg = loadConfig(root)
-      if (!cfg.enabled) return
+      if (!frayActive(root, input.sessionID)) return
 
       if (!existsSync(threadPath(root, thread))) {
         throw new Error(`Fray thread .fray/${thread}.md does not exist. Create the thread file before dispatching.`)
@@ -162,8 +159,7 @@ export const OpenCodeFray = async ({ directory, worktree }: { directory: string;
       const prompt = typeof input.args?.prompt === "string" ? input.args.prompt : ""
       const thread = leadingThread(prompt)
       if (!thread) return
-      const cfg = loadConfig(root)
-      if (!cfg.enabled) return
+      if (!frayActive(root, input.sessionID)) return
       const text = String(output.output || "")
       appendLedger(root, {
         ts: new Date().toISOString(),
@@ -180,15 +176,13 @@ export const OpenCodeFray = async ({ directory, worktree }: { directory: string;
     },
 
     "experimental.session.compacting": async (_input: unknown, output: { context?: string[] }) => {
-      const cfg = loadConfig(root)
-      if (!cfg.enabled) return
+      if (!frayActive(root)) return
       output.context ||= []
       output.context.push(`## OpenCode Fray State\n${reminder(root)}\nBefore continuing, load the opencode-fray skill and run \`fray_status\` or \`node .opencode/fray/index.mjs\`.`)
     },
 
     "shell.env": async (_input: unknown, output: { env?: Record<string, string> }) => {
-      const cfg = loadConfig(root)
-      if (!cfg.enabled) return
+      if (!frayActive(root)) return
       output.env ||= {}
       output.env.FRAY_ROOT = root
       output.env.FRAY_OPENCODE = "1"

@@ -44,9 +44,9 @@ try {
 
   // fray ACTIVATION GATE — fray ships globally, so this hook fires in EVERY project.
   // Stay a SILENT no-op (allow the dispatch unmodified — no bg-enforce / epilogue / ledger)
-  // unless the project is opted in: `.fray/` exists AND `enabled` is not false. A virgin
-  // repo with no `.fray/` is dormant; the `/fray` skill bootstraps it to activate.
-  if (!frayActive(dir)) emit({});
+  // unless the project is opted in: `.fray/` exists AND the per-session sentinel is not
+  // forced off. A virgin repo with no `.fray/` is dormant; the `/fray` skill bootstraps it.
+  if (!frayActive(dir, input.session_id)) emit({});
 
   if (ti.run_in_background !== true) {
     emit({

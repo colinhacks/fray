@@ -3,7 +3,7 @@ import { findProjectDir, loadFray, readStdinJson } from './fray-hook-lib.mjs';
 
 const input = readStdinJson();
 const projectDir = findProjectDir(input.cwd);
-const fray = loadFray(projectDir);
+const fray = loadFray(projectDir, input.session_id ?? input.sessionId);
 if (!fray.enabled) process.exit(0);
 
 const additionalContext = [

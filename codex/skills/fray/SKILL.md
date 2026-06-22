@@ -13,7 +13,7 @@ Use the repo's Fray control surface exactly as written: independent thread files
 
 The plugin bundles hooks for this discipline:
 
-- `SessionStart` on `startup|resume|clear|compact` adds Fray reactivation context when `.fray/config.yml` is enabled.
+- `SessionStart` on `startup|resume|clear|compact` adds Fray reactivation context when fray is active for the session (`.fray/` exists and the session is not toggled off via the per-session sentinel).
 - `UserPromptSubmit` reminds the orchestrator to run the pulse and reconcile returns.
 - `PreToolUse` with matcher `wait_agent` blocks `wait_agent` whenever Fray is active, if Codex exposes `wait_agent` to hooks in the active runtime.
 - `Stop` blocks final orchestrator answers while any dispatch ledger row is `returned: true` and not reconciled.
@@ -25,7 +25,7 @@ These hooks are guardrails, not a replacement for reading this skill. Codex requ
 
 ## Start Every Fray Turn
 
-If `.fray/config.yml` exists and has `enabled: true` or omits `enabled`, Fray is active. After compaction, resume, context transition, or any new turn in an active Fray repo, load this skill eagerly before doing task work. Do not use the old `interactive-workflow` skill or any generic workflow memory as a substitute; that predecessor is obsolete and can contradict the repo-local `.fray/` contract.
+If `.fray/` exists and the current session is not toggled off (via the `.fray/.session-state/<session_id>` sentinel), Fray is active. After compaction, resume, context transition, or any new turn in an active Fray repo, load this skill eagerly before doing task work. Do not use the old `interactive-workflow` skill or any generic workflow memory as a substitute; that predecessor is obsolete and can contradict the repo-local `.fray/` contract.
 
 Run the pulse before meaningful work:
 
@@ -47,7 +47,7 @@ Use the output to reconcile returned agents, surface pending questions, and choo
 ## Control Surface
 
 - `.fray/<slug>.md`: one file per live multi-step or long-lived thread. The filename slug is the id.
-- `.fray/config.yml`: globals only, including `enabled` and `autonomous_mode`.
+- `.fray/config.yml`: globals only (`autonomous_mode` + `state`). Enablement is per-session via `.fray/.session-state/<session_id>`, not a config flag.
 - `.fray/<slug>.findings/<id>.md`: optional sidecars for durable sub-agent output.
 - `node .agents/plugins/fray-codex/scripts/fray/index.mjs`: the board. There is no stored board.
 

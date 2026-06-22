@@ -8,7 +8,7 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadConfig, STATUS, TERMINAL } from '../scripts/fray/config.mjs';
+import { loadConfig, frayActive, STATUS, TERMINAL } from '../scripts/fray/config.mjs';
 
 function arg(name) {
   const i = process.argv.indexOf(name);
@@ -33,6 +33,10 @@ function read(path) {
 }
 
 const cfg = loadConfig(PROJECT_DIR);
+// Enablement is per-session now (sentinel), not a config flag. Codex passes a session id
+// via env when available; absent → the default (active when `.fray/` exists).
+const SESSION_ID = arg('--session-id') ?? process.env.CODEX_SESSION_ID ?? process.env.FRAY_SESSION_ID ?? undefined;
+const frayEnabled = frayActive(PROJECT_DIR, SESSION_ID);
 const pending = [];
 const queued = [];
 const errors = [];
@@ -107,7 +111,7 @@ try {
 }
 
 const payload = {
-  enabled: cfg.enabled,
+  enabled: frayEnabled,
   autonomous_mode: cfg.autonomousMode,
   pending,
   queued_followup_threads: queued,
@@ -119,7 +123,7 @@ const payload = {
 
 const strictErrors = [];
 const strictWarnings = [];
-if (strict && cfg.enabled !== false) {
+if (strict && frayEnabled) {
   if (returnedDispatches.length) {
     strictErrors.push(
       `${returnedDispatches.length} returned dispatch(es) are unreconciled. Fold each return into its .fray thread before answering or advancing unrelated work.`,
@@ -143,8 +147,8 @@ if (asJson) {
   process.exit(strictErrors.length || errors.length ? 1 : 0);
 }
 
-if (cfg.enabled === false) {
-  console.log('FRAY disabled: .fray/config.yml has enabled: false');
+if (!frayEnabled) {
+  console.log('FRAY disabled for this session (per-session sentinel `.fray/.session-state/<session_id>` = off).');
   process.exit(0);
 }
 

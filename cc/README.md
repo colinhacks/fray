@@ -40,19 +40,22 @@ To activate fray in a repo, invoke the skill:
 
 On its first invocation in a repo with no `.fray/`, the skill **bootstraps**: it creates `.fray/` and a default `.fray/config.yml`. From then on the hooks fire automatically in that project.
 
-- **Turn fray off** in a project without losing its threads: set `enabled: false` in `.fray/config.yml` (the hooks re-check it every turn and go silent).
+- **Turn fray off for THE CURRENT SESSION** (not the whole repo) — quiet one session without touching others: run `fray off`. Restore with `fray on`; revert to the default with `fray reset`; check with `fray status`. Both an agent and a human can do this via a single tool call mid-session — no relaunch.
 - **Fully de-activate**: delete `.fray/`.
+
+Enablement is **per-session**, keyed on the Claude Code session id (`CLAUDE_CODE_SESSION_ID`, the same id the hooks receive). `fray on`/`off` write a sentinel at `.fray/.session-state/<session_id>`; the hooks honor it every turn. The DEFAULT (no sentinel) is **active when `.fray/` exists** — the sentinel is a per-session override on top. There is no repo-global `enabled` flag anymore: it was repo-wide (hit every concurrent session) and couldn't be toggled mid-session.
 
 The DX in one line: **install once → dormant everywhere → `/fray` in a repo activates it there.**
 
 ### `.fray/config.yml`
 
 ```yaml
-enabled: true          # master kill-switch for this project (default on)
 autonomous_mode: off   # when on, the orchestrator stops asking and biases hard to action
 state:                 # optional cross-cutting "what's true now" globals
   # release: v1.2.3
 ```
+
+(Enablement is no longer a config field — see the per-session toggle above.)
 
 ---
 
@@ -72,7 +75,8 @@ state:                 # optional cross-cutting "what's true now" globals
 fray's state lives in `.fray/`, in the consuming project — never a single bloated `todo.md`:
 
 - **`.fray/<slug>.md`** — one file per live, multi-step thread. The filename slug *is* the thread id. Each thread is a self-contained document with a fixed structure: `## Goal · ## Status · ## Decisions · ## Open questions · ## Steps/follow-up queue · ## Next step`.
-- **`.fray/config.yml`** — the only non-thread file: the globals (`enabled`, `autonomous_mode`, a `state:` block).
+- **`.fray/config.yml`** — non-thread globals: `autonomous_mode` and a `state:` block. (Enablement is NOT here — it's per-session; see the toggle above.)
+- **`.fray/.session-state/<session_id>`** — per-session enablement sentinels (`on`/`off`), written by `fray on`/`fray off`. Local-only runtime state under the already-ignored `.fray/`.
 - **`.fray/<slug>.findings/<id>.md`** — optional sub-agent findings sidecars (only for parallel fan-out; the resting state is one unified thread doc).
 
 There is **no stored board** and **no unified ledger** — both would be caches that drift out of sync with the threads. The board is **computed on demand** from the thread frontmatter.

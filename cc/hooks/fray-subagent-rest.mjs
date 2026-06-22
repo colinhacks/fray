@@ -54,8 +54,6 @@ try {
   // rest is meaningless when there's no thread board to reconcile against, and silently
   // materializing `.fray/` would break the dormant-until-bootstrapped DX. So we only ever
   // append to an ALREADY-EXISTING, opted-in `.fray/` — the `/fray` skill creates it, never us.
-  if (!frayActive(PROJECT_DIR) || !existsSync(FRAY_DIR)) process.exit(0);
-
   let payload = {};
   try {
     const raw = readFileSync(0, 'utf8');
@@ -63,6 +61,8 @@ try {
   } catch {
     /* no/invalid stdin → record the bare event anyway (fail toward recording) */
   }
+
+  if (!frayActive(PROJECT_DIR, payload.session_id) || !existsSync(FRAY_DIR)) process.exit(0);
 
   // ATTRIBUTION GATE — only record a rest that is plausibly a fray-dispatched background
   // agent. Two checks, both fail TOWARD recording (a missed real rest is the worse bug):

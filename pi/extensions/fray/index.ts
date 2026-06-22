@@ -94,11 +94,63 @@ type DispatchArgs = {
 
 
 type FrayConfig = {
-  enabled: boolean;
   autonomousMode: boolean;
   state: Record<string, string>;
   maxChildren: number;
 };
+
+// PER-SESSION SENTINEL — enablement is keyed on the session id (not a config flag), so it
+// can be scoped to / toggled mid- a single session. `.fray/.session-state/<session_id>` with
+// `off`/`on` is the per-session override; absent → default (active when `.fray/` exists).
+// pi derives the session id from PI_SESSION_ID/FRAY_SESSION_ID when available.
+function piSessionId(): string | undefined {
+  return process.env.PI_SESSION_ID || process.env.FRAY_SESSION_ID || undefined;
+}
+
+function sessionOverride(root: string, sessionId: string | undefined): "on" | "off" | null {
+  if (!root || !sessionId) return null;
+  try {
+    const f = path.join(root, ".fray", ".session-state", String(sessionId));
+    if (!fs.existsSync(f)) return null;
+    const v = fs.readFileSync(f, "utf8").trim().toLowerCase();
+    if (["off", "false", "no", "0", "disabled"].includes(v)) return "off";
+    if (["on", "true", "yes", "1", "enabled"].includes(v)) return "on";
+    return "off";
+  } catch {
+    return null;
+  }
+}
+
+function setSessionOverride(root: string, sessionId: string, state: "on" | "off"): string {
+  const dir = path.join(root, ".fray", ".session-state");
+  fs.mkdirSync(dir, { recursive: true });
+  const f = path.join(dir, String(sessionId));
+  fs.writeFileSync(f, state + "\n");
+  return f;
+}
+
+function clearSessionOverride(root: string, sessionId: string): void {
+  try {
+    fs.rmSync(path.join(root, ".fray", ".session-state", String(sessionId)), { force: true });
+  } catch {
+    /* already gone */
+  }
+}
+
+// THE ACTIVATION GATE — active iff `.fray/` exists AND the per-session sentinel is not
+// forced off. Replaces the former repo-global `enabled:` config flag.
+function frayActive(root: string, sessionId: string | undefined = piSessionId()): boolean {
+  if (!root) return false;
+  try {
+    if (!fs.existsSync(path.join(root, ".fray"))) return false;
+  } catch {
+    return false;
+  }
+  const ov = sessionOverride(root, sessionId);
+  if (ov === "off") return false;
+  if (ov === "on") return true;
+  return true;
+}
 
 type Thread = {
   id: string;
@@ -197,7 +249,8 @@ function bool(raw: unknown, fallback: boolean): boolean {
 }
 
 function loadConfig(root: string): FrayConfig {
-  const config: FrayConfig = { enabled: true, autonomousMode: false, state: {}, maxChildren: 8 };
+  // Enablement is NOT a config field — it lives in the per-session sentinel (see frayActive).
+  const config: FrayConfig = { autonomousMode: false, state: {}, maxChildren: 8 };
   let src = "";
   try {
     src = fs.readFileSync(path.join(root, ".fray", "config.yml"), "utf8");
@@ -219,8 +272,7 @@ function loadConfig(root: string): FrayConfig {
       continue;
     }
     inState = false;
-    if (top[1] === "enabled") config.enabled = bool(top[2], config.enabled);
-    else if (top[1] === "autonomous_mode") config.autonomousMode = bool(top[2], config.autonomousMode);
+    if (top[1] === "autonomous_mode") config.autonomousMode = bool(top[2], config.autonomousMode);
     else if (top[1] === "max_children") config.maxChildren = Math.max(1, Number.parseInt(scalar(top[2]), 10) || config.maxChildren);
   }
   return config;
@@ -915,7 +967,7 @@ function updateWidget(ctx?: ExtensionContext, nowMs = Date.now()) {
   }
 
   const cfg = loadConfig(root);
-  if (!cfg.enabled) {
+  if (!frayActive(root)) {
     setWidgetIfChanged(ctx, CHILD_WIDGET_KEY, undefined);
     setStatusIfChanged(ctx, STATUS_KEY, `${theme.fg("dim", "fray:")} ${theme.fg("dim", "off")}`);
     return;
@@ -1531,7 +1583,7 @@ function recoverExternalRuns(pi: ExtensionAPI, root: string): RunRecord[] {
 async function launchExternalRun(pi: ExtensionAPI, ctx: ExtensionContext, params: LaunchExternalArgs) {
   const root = frayRoot(ctx.cwd);
   const cfg = loadConfig(root);
-  if (!cfg.enabled) throw new Error("fray is disabled in .fray/config.yml");
+  if (!frayActive(root)) throw new Error("fray is disabled for this session (per-session sentinel = off, or no .fray/).");
   const liveCount = liveChildRuns(root).length;
   if (liveCount >= cfg.maxChildren) throw new Error(`fray has ${liveCount} live children; max_children is ${cfg.maxChildren}`);
   if (!params?.label || typeof params.label !== "string") throw new Error("label is required");
@@ -1825,7 +1877,7 @@ export function findLiveContinuationId(
 async function resumeRun(pi: ExtensionAPI, ctx: ExtensionContext, sourceRunId: string, message: string) {
   const root = frayRoot(ctx.cwd);
   const cfg = loadConfig(root);
-  if (!cfg.enabled) throw new Error("fray is disabled in .fray/config.yml");
+  if (!frayActive(root)) throw new Error("fray is disabled for this session (per-session sentinel = off, or no .fray/).");
 
   const known = readRuns(root).find((run) => run.id === sourceRunId);
   if (!known) throw new Error(`unknown fray run ${sourceRunId}; no live child handle or ledger record exists`);
@@ -1944,7 +1996,7 @@ async function resumeRun(pi: ExtensionAPI, ctx: ExtensionContext, sourceRunId: s
 async function dispatchChild(pi: ExtensionAPI, ctx: ExtensionContext, args: DispatchArgs) {
   const root = frayRoot(ctx.cwd);
   const cfg = loadConfig(root);
-  if (!cfg.enabled) throw new Error("fray is disabled in .fray/config.yml");
+  if (!frayActive(root)) throw new Error("fray is disabled for this session (per-session sentinel = off, or no .fray/).");
   if (Date.now() < cooldownUntil) throw new Error(`fray dispatch is cooling down after provider rate-limit until ${new Date(cooldownUntil).toISOString()}`);
   const liveCount = liveChildRuns(root).length;
   if (liveCount >= cfg.maxChildren) throw new Error(`fray has ${liveCount} live children; max_children is ${cfg.maxChildren}`);
@@ -2447,7 +2499,7 @@ export default function FrayExtension(pi: ExtensionAPI) {
       const file = path.join(root, ".fray", "config.yml");
       ensureDir(path.dirname(file));
       let src = "";
-      try { src = fs.readFileSync(file, "utf8"); } catch { src = "enabled: true\nautonomous_mode: off\nstate: {}\n"; }
+      try { src = fs.readFileSync(file, "utf8"); } catch { src = "autonomous_mode: off\nstate: {}\n"; }
       if (/^autonomous_mode:/m.test(src)) src = src.replace(/^autonomous_mode:.*$/m, `autonomous_mode: ${params.autonomousMode ? "on" : "off"}`);
       else src = `autonomous_mode: ${params.autonomousMode ? "on" : "off"}\n${src}`;
       fs.writeFileSync(file, src);
@@ -2456,6 +2508,29 @@ export default function FrayExtension(pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("fray-session", {
+    description: "Toggle fray for THIS session: `on`/`off` write the per-session sentinel, `reset` clears it, no arg shows status. Keyed on PI_SESSION_ID/FRAY_SESSION_ID.",
+    handler: async (args, ctx) => {
+      remember(ctx);
+      const root = frayRoot(ctx.cwd);
+      const sid = piSessionId();
+      const sub = String(Array.isArray(args) ? args[0] : args || "").trim().toLowerCase();
+      if (sub === "on" || sub === "off") {
+        if (!sid) { ctx.ui.notify("fray-session: no session id (set PI_SESSION_ID/FRAY_SESSION_ID).", "warning"); return; }
+        const p = setSessionOverride(root, sid, sub);
+        ctx.ui.notify(`fray ${sub === "on" ? "ENABLED" : "DISABLED"} for this session (${sid}). sentinel: ${p}`, "info");
+        updateWidget(ctx);
+        return;
+      }
+      if (sub === "reset" || sub === "default") {
+        if (sid) clearSessionOverride(root, sid);
+        ctx.ui.notify(`fray session override cleared (${sid ?? "no session id"}) — back to default (active when .fray/ exists).`, "info");
+        updateWidget(ctx);
+        return;
+      }
+      ctx.ui.notify(`fray: ${frayActive(root) ? "ACTIVE" : "INACTIVE"} this session (${sid ?? "no session id"}); override: ${sessionOverride(root, sid) ?? "none"}`, "info");
+    },
+  });
   pi.registerCommand("fray-queue", {
     description: "Show unhandled fray child results, oldest first",
     handler: async (_args, ctx) => {
