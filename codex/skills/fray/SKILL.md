@@ -198,7 +198,21 @@ For every coding worker prompt, include:
 
 Sub-agents are not deciders. They may fix obvious bugs, but default/security/product/brand/API-config-env decisions route back to the human unless already greenlit. Opinionated implementation needs sign-off first; broad investigation does not.
 
+Surface, don't guess. A sub-agent operates autonomously ONLY until something human-owned or genuinely ambiguous arises — a default/security/product/brand/API-config-env decision, a fork between materially-different approaches, or an unexpected blocker. At that point it does not guess and does not land it: it comes to rest and surfaces the choice (options plus its recommendation) to the orchestrator, who surfaces it to the human. Guessing past one of these and shipping the guess is the failure; coming to rest with a crisp question is the success. Bake this criterion into dispatch prompts.
+
 Background sub-agents are headless. Do interactive/TTY probes in the orchestrator foreground.
+
+## Nested Implementer Pattern
+
+For substantive new functionality, prefer the two-level nested-implementer pattern over the flat shape (orchestrator dispatches instruments, orchestrator reviews). Dispatch ONE level-1 implementer that self-organizes its own review via level-2 sub-agents, enabled because a general-purpose sub-agent can itself spawn agents. The loop:
+
+- PLAN the implementation.
+- Dispatch a level-2 PLAN-REVIEW; take a second pass folding in valid critique.
+- IMPLEMENT against the refined plan.
+- Dispatch level-2 SELF-REVIEW; for a major change, run MULTIPLE PARALLEL reviewers with distinct lenses (correctness, security, a subsystem).
+- CRITICALLY INCORPORATE: the implementer judges each review on merit and folds in only valid findings. It does not blind-trust; a level-2 reviewer has narrower and possibly staler context than the implementer.
+
+Invariants: review at BOTH the plan and implementation stages; depth scales with blast radius (trivial change needs no nesting; major change gets the parallel-lens panel); reviews are advice, not verdicts. This composes with, and does not replace, the orchestrator's own independent review/integration pass on the returned work.
 
 ## Reconcile Returns
 

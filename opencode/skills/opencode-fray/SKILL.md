@@ -235,6 +235,8 @@ Work on main. Do not create branches, stashes, worktrees, or recursive repo copi
 
 Sub-agents are not deciders. They may fix obvious bugs. They must not autonomously land default, security, product, brand, public API, config, or env-surface decisions unless the human already greenlit the decision and the prompt says so.
 
+Surface, don't guess. A sub-agent operates autonomously ONLY until something human-owned or genuinely ambiguous arises — a default/security/product/brand/API-config-env decision, a fork between materially-different approaches, or an unexpected blocker. At that point it does not guess and does not land it: it comes to rest and surfaces the choice (options plus its recommendation) to the orchestrator, who surfaces it to the human. Guessing past one of these and shipping the guess is the failure; coming to rest with a crisp question is the success. Bake this criterion into dispatch prompts.
+
 ## Write Ownership
 
 Only the orchestrator edits `.fray/<slug>.md` and `.fray/config.yml`. Sub-agents return results to the orchestrator. If a sub-agent needs to persist durable output, instruct it to write a sidecar under `.fray/<thread>.findings/<id>.md`, then fold the signal into the canonical thread yourself.
@@ -274,6 +276,18 @@ Use a fresh `Task` for review when the work:
 - produces a load-bearing verdict or number.
 
 The review prompt should include the original goal, changed files, relevant constraints, and exact verification expected. Ask for findings first, ordered by severity, then residual risks and follow-ups.
+
+### Nested implementer pattern
+
+For substantive new functionality, prefer the two-level nested-implementer pattern over the flat shape (orchestrator dispatches instruments, orchestrator reviews). Dispatch ONE level-1 implementer that self-organizes its own review via level-2 `Task` sub-agents. The loop:
+
+- PLAN the implementation.
+- Dispatch a level-2 plan-review; take a second pass folding in valid critique.
+- IMPLEMENT against the refined plan.
+- Dispatch level-2 self-review; for a major change, run multiple PARALLEL reviewers with distinct lenses (correctness, security, a subsystem).
+- CRITICALLY INCORPORATE: the implementer judges each review on merit and folds in only valid findings. It does not blind-trust; a level-2 reviewer has narrower and possibly staler context than the implementer.
+
+Invariants: review at BOTH the plan and implementation stages; depth scales with blast radius (trivial change needs no nesting; major change gets the parallel-lens panel); reviews are advice, not verdicts. This composes with, and does not replace, the orchestrator's own independent review pass on the returned work.
 
 ## OpenCode Tooling
 
