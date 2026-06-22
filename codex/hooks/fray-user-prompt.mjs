@@ -3,7 +3,7 @@ import { contextMessage, findProjectDir, readStdinJson } from './fray-hook-lib.m
 
 const input = readStdinJson();
 const projectDir = findProjectDir(input.cwd);
-const additionalContext = contextMessage(projectDir, 'user-prompt');
+const additionalContext = contextMessage(projectDir, 'user-prompt', input.session_id ?? input.sessionId);
 
 if (!additionalContext) process.exit(0);
 

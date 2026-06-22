@@ -203,8 +203,8 @@ export function loadFray(projectDir, sessionId) {
   return { enabled: true, pending, queued, unreconciled, returned, unattached, errors };
 }
 
-export function contextMessage(projectDir, source = '') {
-  const fray = loadFray(projectDir);
+export function contextMessage(projectDir, source = '', sessionId) {
+  const fray = loadFray(projectDir, sessionId);
   if (!fray.enabled) return '';
   const pending = fray.pending.slice(0, 12).map((t) => `${t.slug} [${t.status}]`).join(', ');
   const suffix = fray.pending.length > 12 ? `, +${fray.pending.length - 12} more` : '';
