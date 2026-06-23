@@ -120,6 +120,15 @@ export const OpenCodeFray = async ({ directory, worktree }: { directory: string;
       if (toolName !== "task") return
 
       const args = output.args || {}
+
+      // Strip the `name`/`team_name` fields from every Task dispatch. Setting either strands
+      // nested dispatches: an L1 sub-agent that dispatches an L2 WITH a name gets L2's result
+      // routed wrong (it never returns cleanly to L1). We scrub the fields in place so the
+      // orchestrator never has to remember to omit them.
+      delete (args as Record<string, unknown>).name
+      delete (args as Record<string, unknown>).team_name
+      output.args = args
+
       let prompt = typeof args.prompt === "string" ? args.prompt : ""
       const thread = leadingThread(prompt)
       if (!thread) return

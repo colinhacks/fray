@@ -209,6 +209,7 @@ Invariants:
 - **Review at BOTH stages** — the plan AND the implementation. Catching a wrong plan before code exists is the cheapest fix in the loop.
 - **Depth scales with blast radius** — a trivial change needs NO nesting (just implement + the orchestrator's own review pass); a major one gets the parallel-lens review panel. Don't ceremony-wrap a one-liner; don't single-lens a far-reaching change.
 - **The implementer owns judgment over its reviewers** — it incorporates critically, never mechanically.
+- **NEVER set the `name`/`team_name` field on a nested (L1→L2) dispatch** — it strands the nested agent (the L2 result routes wrong and never returns cleanly to L1). The dispatch hook now AUTO-STRIPS both fields from every Agent dispatch, so this is enforced for you; keep it in mind as defense-in-depth (e.g. a non-fray repo where the hook is dormant).
 
 This **composes with, does not replace,** the orchestrator-level controls: the orchestrator STILL runs its own independent self-review / integration / multi-lens judge-panel pass on the returned work (the level-1 child grading-its-own-homework via level-2 reviewers is the child's internal rigor, not a substitute for the orchestrator's external check). And it composes with the Workflow tool where a hardcoded DAG genuinely fits — the nested-implementer is the dynamic-dispatch analogue of that staged plan→review→implement→review pipeline.
 
@@ -216,7 +217,7 @@ This **composes with, does not replace,** the orchestrator-level controls: the o
 
 Two mechanisms keep a sub-agent's role in the broader plan from evaporating:
 
-1. **The dispatch hook** (PreToolUse on `Agent`) ENFORCES background dispatch (denies any foreground Agent call) and **auto-appends an ORCHESTRATION EPILOGUE** to every prompt, instructing the sub-agent to end with a `## Follow-ups` section: concrete follow-ups, a self-review rec if it built something substantial, a push-to-`main`+CI-watch rec if it touched code/tests, and the single most important next step (+ whether it needs the human). So agents always hand back the next links in the chain.
+1. **The dispatch hook** (PreToolUse on `Agent`) ENFORCES background dispatch (denies any foreground Agent call), **auto-strips the `name`/`team_name` fields** (they strand nested L1→L2 dispatches — the hook scrubs them silently so an orchestrator never has to remember), and **auto-appends an ORCHESTRATION EPILOGUE** to every prompt, instructing the sub-agent to end with a `## Follow-ups` section: concrete follow-ups, a self-review rec if it built something substantial, a push-to-`main`+CI-watch rec if it touched code/tests, and the single most important next step (+ whether it needs the human). So agents always hand back the next links in the chain.
 2. **The dispatch ledger** (`.fray/.dispatch-ledger.jsonl`, hook-written): stamp a `THREAD: <slug>` line at the TOP of every thread-scoped dispatch prompt — the hook reads it and logs `{ts, agent_type, thread, reconciled:false}` so you have a durable record of which thread each agent serves, surviving compaction.
 
 ## The thread↔agent binding — record only `{id, label}` at dispatch; liveness is DERIVED

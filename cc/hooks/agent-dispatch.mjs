@@ -81,6 +81,14 @@ try {
     /* fail open — never block a dispatch on the counter */
   }
 
+  // STRIP the `name`/`team_name` fields from EVERY dispatch. Setting either strands nested
+  // dispatches: when an L1 sub-agent dispatches an L2 WITH a name, L2's result routes wrong and
+  // never returns cleanly to L1. PreToolUse can rewrite the tool input (the epilogue append below
+  // already relies on `updatedInput`), so we silently scrub the fields and let the dispatch run —
+  // the orchestrator never has to remember "don't set name." `tiStripped` is the base for the
+  // `updatedInput` we emit on every allowed dispatch (with the epilogue appended).
+  const { name: _droppedName, team_name: _droppedTeam, ...tiStripped } = ti;
+
   const prompt = typeof ti.prompt === 'string' ? ti.prompt : '';
 
   // fray pointer-back: if the dispatch names a THREAD (a `THREAD: <name>` line the
@@ -114,7 +122,9 @@ try {
     }
   }
 
-  const updatedInput = prompt.includes('[ORCHESTRATION EPILOGUE') ? ti : { ...ti, prompt: prompt + EPILOGUE };
+  const updatedInput = prompt.includes('[ORCHESTRATION EPILOGUE')
+    ? tiStripped
+    : { ...tiStripped, prompt: prompt + EPILOGUE };
 
   emit({
     hookSpecificOutput: {
