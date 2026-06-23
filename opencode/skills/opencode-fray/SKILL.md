@@ -290,7 +290,11 @@ A dispatched `Task` sub-agent is itself a LEAD (L1) that can dispatch its own L2
 - Dispatch level-2 self-review; for a major change, run multiple PARALLEL reviewers with distinct lenses (correctness, security, a subsystem).
 - CRITICALLY INCORPORATE: the implementer judges each review on merit and folds in only valid findings. It does not blind-trust; a level-2 reviewer has narrower and possibly staler context than the implementer.
 
-Invariants: review at BOTH the plan and implementation stages; depth scales with blast radius (trivial change needs no nesting; major change gets the parallel-lens panel); reviews are advice, not verdicts. This composes with, and does not replace, the orchestrator's own independent review pass on the returned work.
+Invariants: review at BOTH the plan and implementation stages; depth scales with blast radius (trivial change needs no nesting; major change gets the parallel-lens panel); reviews are advice, not verdicts.
+
+**L1 owns its full loop — orchestrator must NOT babysit the review-fix cycle.** An L1 dispatched to BUILD or IMPLEMENT OWNS its full loop (build → adversarial self-review via its own L2 → fix → re-review → until clean) and reports UP only when (a) DONE or (b) BLOCKED on a human-owned decision. The orchestrator must NOT run a sibling reviewer and relay findings to the L1 turn-by-turn — that scatters one effort's review-fix cycle across the orchestrator's context. The tell: repeatedly messaging the same L1 with "reviewer found X, fix it" instead of the L1 having self-reviewed and surfacing only human-owned decisions. What routes up: architecture, default/security/brand/API-config calls, scope changes. Independence is preserved because the L1's self-review L2 is a fresh-context adversarial agent. (Exception: a final pre-merge gate review by the orchestrator is fine; mediating the iterative build-fix cycle is not.)
+
+This composes with, and does not replace, the orchestrator's own independent review pass on the returned work.
 
 ## OpenCode Tooling
 

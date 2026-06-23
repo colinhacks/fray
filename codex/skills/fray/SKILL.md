@@ -223,7 +223,11 @@ The budget governor forbids UNBOUNDED fan-out (a runaway swarm of heavy agents i
 - Dispatch level-2 SELF-REVIEW; for a major change, run MULTIPLE PARALLEL reviewers with distinct lenses (correctness, security, a subsystem).
 - CRITICALLY INCORPORATE: the implementer judges each review on merit and folds in only valid findings. It does not blind-trust; a level-2 reviewer has narrower and possibly staler context than the implementer.
 
-Invariants: review at BOTH the plan and implementation stages; depth scales with blast radius (trivial change needs no nesting; major change gets the parallel-lens panel); reviews are advice, not verdicts. This composes with, and does not replace, the orchestrator's own independent review/integration pass on the returned work.
+Invariants: review at BOTH the plan and implementation stages; depth scales with blast radius (trivial change needs no nesting; major change gets the parallel-lens panel); reviews are advice, not verdicts.
+
+**L1 owns its full loop — orchestrator must NOT babysit the review-fix cycle.** An L1 dispatched to BUILD or IMPLEMENT OWNS its full loop (build → adversarial self-review via its own L2 → fix → re-review → until clean) and reports UP only when (a) DONE or (b) BLOCKED on a human-owned decision. The orchestrator must NOT run a sibling reviewer and relay findings to the L1 turn-by-turn — that scatters one effort's cycle across the orchestrator's context. The tell: the orchestrator is repeatedly SendMessage-ing the same L1 with "reviewer found X, fix it." What routes up: genuinely human-owned decisions (architecture, a default/security/brand/API-config call, a scope change) — those the L1 surfaces and waits on. Independence is preserved because the L1's self-review L2 is a fresh-context adversarial agent. (Exception: a final pre-merge gate review the orchestrator runs is fine; mediating the iterative build-fix cycle is not.)
+
+This composes with, and does not replace, the orchestrator's own independent review/integration pass on the returned work.
 
 ## Reconcile Returns
 

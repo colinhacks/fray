@@ -1,7 +1,7 @@
 ---
 name: fray
 description: Load this skill IMMEDIATELY — as your FIRST action, before any other tool call or response — whenever the user mentions "fray" in ANY form ("fray", "fray mode", "enter/start fray", "load fray", "use fray", "in fray", "the fray skill"), OR asks to orchestrate / run / coordinate a multi-effort push, audit, or campaign through sub-agents. Also the default for any large, mixed set of efforts — investigations + decided fixes + verifications — toward a goal (a launch push, a pre-release audit, a refactor campaign) where the human wants to stay in the loop on what the investigations surface; the default for any multi-effort push that is part "find out what's true" and part "land the decided thing." Use it instead of hardcoding a multi-agent DAG up front — those bury the decision points and fan out expensively before the facts are in. Treat any "fray" mention as an explicit instruction to load this skill, never as ambient context.
-version: 1.0.0
+version: 1.0.1
 metadata:
   internal: true
 ---
@@ -232,6 +232,18 @@ Invariants:
 - **Depth scales with blast radius** — a trivial change needs NO nesting (just implement + the orchestrator's own review pass); a major one gets the parallel-lens review panel. Don't ceremony-wrap a one-liner; don't single-lens a far-reaching change.
 - **The implementer owns judgment over its reviewers** — it incorporates critically, never mechanically.
 - **NEVER set the `name`/`team_name` field on a nested (L1→L2) dispatch** — it strands the nested agent (the L2 result routes wrong and never returns cleanly to L1). The dispatch hook now AUTO-STRIPS both fields from every Agent dispatch, so this is enforced for you; keep it in mind as defense-in-depth (e.g. a non-fray repo where the hook is dormant).
+
+### The L1 owns its full loop — orchestrator must NOT babysit the review-fix cycle
+
+**An L1 dispatched to BUILD or IMPLEMENT a deliverable OWNS its full loop — build → adversarial self-review (via its OWN L2) → fix → re-review → until clean — and reports UP to the orchestrator only when (a) DONE, or (b) BLOCKED on a human-owned decision.** The orchestrator must NOT run a SIBLING reviewer agent and then relay review→fix findings to the L1 turn-by-turn — that is orchestrator-babysitting, and it scatters one effort's review-fix cycle across the orchestrator's context instead of keeping it in the L1's.
+
+The review/fix/verify MECHANICS live inside the L1. What DOES route up to the orchestrator (and on to the human): genuinely human-owned DECISIONS — architecture, a default/security/product/brand/API-config call, a scope change. Those the L1 surfaces and waits on; it does not invent them.
+
+The tell you're violating this: the orchestrator is repeatedly `SendMessage`-ing the same L1 with "reviewer found X, fix it" / "now fix Y" instead of the L1 having self-reviewed and only surfacing the human-owned decisions.
+
+Independence is preserved because the L1's self-review L2 is a FRESH-context adversarial agent — it does not need to be dispatched by the orchestrator to be independent.
+
+*(Exception: a final pre-merge review the orchestrator runs as a gate is fine — the anti-pattern is the orchestrator mediating the iterative build-fix cycle.)*
 
 Both uses **compose with, do not replace,** the orchestrator-level controls: the orchestrator STILL runs its own independent self-review / integration / multi-lens judge-panel pass on the returned work (an L1 grading-its-own-homework via L2 reviewers, or fanning out L2 sub-work, is the L1's internal rigor + speed — not a substitute for the orchestrator's external check). And it composes with the Workflow tool where a hardcoded DAG genuinely fits — the nested lead is the dynamic-dispatch analogue of that staged pipeline.
 
