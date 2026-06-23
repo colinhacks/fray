@@ -31,9 +31,9 @@
  * Thresholds (minutes), tunable via env for experimentation:
  *   FRAY_IDLE_MIN   (default 10) — no activity this long → flag as idle/poke.
  *   FRAY_FROZEN_MIN (default 25) — this long → call it likely-stale/unreconciled.
- *      Deliberately generous: a real agent can sit silent inside a long `cargo
- *      build`/CI watch for many minutes, and a release build of THIS repo runs ~5-15
- *      min, so 25 min gives headroom before we cry wolf and risk a false poke.
+ *      Deliberately generous: a real agent can sit silent inside a long build, test
+ *      run, or CI watch for many minutes, so 25 min gives headroom before we cry wolf
+ *      and risk a false poke. Tune via the env var for faster- or slower-paced repos.
  *
  * FAIL-OPEN ABSOLUTELY: any error (no tasks dir, unparseable frontmatter, no agents:,
  * unreadable file) → return [] (no lines). This must NEVER throw or block end-of-turn.

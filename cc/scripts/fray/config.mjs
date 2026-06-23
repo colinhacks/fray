@@ -145,8 +145,8 @@ export function frayActive(projectDir, sessionId) {
  * - `needs-decision` — surfaced a question the human owns; recommend-only until answered.
  * - `planned` — scoped AND **deliberately DEFERRED** (a human/orchestrator chose
  *   "not now"). NOT a dumping ground for decided-ready work: the `## Next step` MUST
- *   state WHY it's deferred and what un-defers it (e.g. "on hold per Colin, pick up
- *   post-v0.1.1"). Distinct from `todo` ("could start now, just hasn't") and
+ *   state WHY it's deferred and what un-defers it (e.g. "on hold per the maintainer,
+ *   pick up after the next release"). Distinct from `todo` ("could start now, just hasn't") and
  *   `needs-decision` (gated on a human call). THE INVARIANT: a thread leaving
  *   `needs-decision` (just decided) transitions to `active` (dispatch this turn) or
  *   `enqueued` (`depends_on` a blocker) — NEVER `planned`, unless deliberately

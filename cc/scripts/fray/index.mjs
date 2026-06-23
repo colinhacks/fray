@@ -143,9 +143,9 @@ function hasDecidedContent(body) {
 /**
  * Does a thread's `## Next step` (its one crisp line) state a DEFER-REASON or a
  * BLOCKER — i.e. an explicit "why this isn't being dispatched right now"? This is
- * the false-positive guard: a legitimately-deferred `planned` thread (e.g.
- * security-scanner: "on hold per Colin, pick up post-v0.1.1") MUST NOT be flagged
- * as a drop-risk. Conservative by design — we look for the vocabulary of a stated
+ * the false-positive guard: a legitimately-deferred `planned` thread (e.g. one whose
+ * Next step says "on hold per the maintainer, pick up after the next release") MUST NOT
+ * be flagged as a drop-risk. Conservative by design — we look for the vocabulary of a stated
  * deferral/gate, NOT for the mere absence of a dispatch. Better to miss a real
  * drop-risk than to cry-wolf on a thread that says why it's parked.
  * @param {string} next  the `## Next step` line
@@ -153,7 +153,7 @@ function hasDecidedContent(body) {
  */
 function statesDeferOrBlocker(next) {
   if (!next) return false;
-  return /\b(on hold|hold(ing)?|deferr?(ed|ing)?|defer|parked?|park|not now|later|post-v|pick up|picked up|awaiting|await|blocked|block(ing|ed)? on|waiting on|wait on|needs?[- ]decision|pending|until|once|after .+ (returns?|lands?|merges?|completes?)|colin|human)\b/i.test(next);
+  return /\b(on hold|hold(ing)?|deferr?(ed|ing)?|defer|parked?|park|not now|later|post-v|pick up|picked up|awaiting|await|blocked|block(ing|ed)? on|waiting on|wait on|needs?[- ]decision|pending|until|once|after .+ (returns?|lands?|merges?|completes?)|human|maintainer)\b/i.test(next);
 }
 
 // PER-SESSION TOGGLE — `fray on` / `fray off` / `fray status` flip (or report) fray
@@ -276,8 +276,8 @@ function blockers(t) {
 // don't break on a heuristic). They exist because a decided-and-ready thread was once
 // parked as `planned` with no dispatch + no `depends_on` and silently DROPPED. The
 // guard against crying-wolf: we fire only when there is NO stated defer-reason/blocker
-// (so a legitimately-deferred thread like security-scanner — "on hold per Colin, pick
-// up post-v0.1.1" — is NOT flagged). Self-contained: every signal is read off the
+// (so a legitimately-deferred thread whose Next step says WHY — e.g. "on hold per the
+// maintainer, pick up after the next release" — is NOT flagged). Self-contained: every signal is read off the
 // thread's own frontmatter + section text; no external state.
 for (const t of threads) {
   if (TERMINAL.includes(t.status)) continue; // terminal threads are done — never a drop-risk
