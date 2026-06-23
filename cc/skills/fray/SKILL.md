@@ -193,9 +193,31 @@ Beyond the self-contained context, these requirements raise child output from "a
 - **For any GitHub issue/PR task, require `gh` context BEFORE any diagnosis or fix.** Minimum: `gh issue view <n>` for an issue; `gh pr list` searches for linked/open PRs; `gh pr view <n>` for any candidate. The child's final report must list the `gh` commands it ran and what they showed, and must not propose or land fresh work on an issue until existing linked/open PRs are checked. **Read the comments and the resolution, not just the issue body** — a closed/rejected request's real rationale lives in the thread, and the body alone will make a child confidently wrong. After context is known, drive the outcome (fix, push, comment, close, verify) rather than stopping at a diagnosis. **Close an issue with a brief, factual `gh` comment** — `gh issue close <n> --comment "<what fixed it, or why no code change is needed>"` — never close silently, and keep the comment as short as the explanation allows.
 - **Shipping a user-facing change INCLUDES updating the user-facing docs, in the SAME effort.** When the work adds or changes a feature, flag, default, or behavior a user can observe, updating the docs (README, docs site, help text — whatever the project uses) is a STEP of that effort, not a separate later thread. Bake it into the issue→fix→verify→ship lifecycle the dispatch prescribes: a change that lands code but leaves the docs describing the old behavior is half-done.
 
-## The two-level nested-implementer pattern — a level-1 implementer that self-organizes its own review
+## The two-level nested-lead pattern (L1→L2) — a dispatched lead that fans out its OWN sub-agents
 
-The shapes above are FLAT (orchestrator dispatches instruments; orchestrator reviews). For **substantive new functionality**, prefer the NESTED shape: dispatch ONE level-1 implementer (general-purpose, Opus) that self-organizes its OWN review via level-2 sub-agents — technically enabled because a general-purpose sub-agent has the Agent tool. The level-1 child runs:
+The shapes above are FLAT (orchestrator dispatches instruments; orchestrator reviews). But a dispatched sub-agent (general-purpose, Opus) is itself a LEAD ("L1") with the Agent tool — so it can spin up its OWN sub-agents ("L2s"), exactly like the orchestrator does. Two distinct uses of this, both encouraged:
+
+### Use A — L1 FANS OUT L2s for independent sub-work, then synthesizes (the parallelization win)
+
+When an L1 lead's task DECOMPOSES into genuinely-independent pieces, it should **fan out a BOUNDED set of L2s (≈3–10) in parallel**, collect their results, and synthesize ONE deliverable — rather than grinding through the pieces serially in its own context. This is the pattern that consistently wins on wall-clock:
+
+- **Research "to its logical conclusion" across N paths** — one L2 per architecture path / design option / candidate approach, then the L1 synthesizes the comparison.
+- **A survey across N independent units** — one L2 per attack / reference / file / subsystem / fixture, then the L1 rolls the findings into one report.
+- **Separable implementation pieces** — one L2 per independent module/file when the pieces don't share state, then the L1 integrates + builds.
+
+**WHEN to fan out:** the sub-pieces are INDEPENDENT (no piece needs another's output) and parallelism saves real wall-clock. **WHEN to stay serial instead:** a true dependency chain (piece B consumes piece A's result — sequence them, don't fan out), or the work is trivial enough that dispatch overhead exceeds the saving (just do it inline). Mirror the orchestrator's own discipline: parallelize across DISJOINT sub-questions, serialize across OVERLAPPING ones; ONE L2 per subject (wide, not deep).
+
+**MECHANICS the L1 must follow:**
+- **Bounded, not a swarm** — ≈3–10 L2s, never an unbounded spray (the budget governor above). The real ceiling is 429 backoff.
+- **Nested dispatch is supported and smoke-tested** — an L2's completion returns to the DISPATCHING L1 (not up to the main orchestrator), so the L1 owns collecting them.
+- **Do NOT set `name`/`team_name`** on the L2 dispatch — the dispatch hook auto-strips both (it strands nested agents otherwise); just omit them.
+- **TIER each L2 by cognitive load** — mechanical/survey research → cheaper model (Sonnet); hard analysis / engineering / adversarial review → Opus. Don't run an all-Opus fan-out for survey work.
+- **COLLECT + SYNTHESIZE** — the L1 folds every L2 finding into ONE coherent deliverable; it never returns scattered, un-integrated sub-results. (Sidecar `.fray/<thread>.findings/<id>.md` files are the transient per-L2 scratch; the L1 integrates them into its single unified deliverable.)
+- **The L1 still owns its thread + reports UP to the orchestrator** as usual — the L2 fan-out is the L1's internal mechanism, invisible to the orchestrator except in the quality + speed of what the L1 hands back.
+
+### Use B — L1 self-organizes its own REVIEW via L2s (the nested-implementer)
+
+For **substantive new functionality**, the L1 implementer self-organizes its OWN review via L2 sub-agents. The level-1 child runs:
 
 1. **PLAN** — write the implementation plan.
 2. **PLAN-REVIEW** — dispatch a level-2 sub-agent to critique the plan (gaps, wrong assumptions, simpler approach, missed constraint).
@@ -211,7 +233,7 @@ Invariants:
 - **The implementer owns judgment over its reviewers** — it incorporates critically, never mechanically.
 - **NEVER set the `name`/`team_name` field on a nested (L1→L2) dispatch** — it strands the nested agent (the L2 result routes wrong and never returns cleanly to L1). The dispatch hook now AUTO-STRIPS both fields from every Agent dispatch, so this is enforced for you; keep it in mind as defense-in-depth (e.g. a non-fray repo where the hook is dormant).
 
-This **composes with, does not replace,** the orchestrator-level controls: the orchestrator STILL runs its own independent self-review / integration / multi-lens judge-panel pass on the returned work (the level-1 child grading-its-own-homework via level-2 reviewers is the child's internal rigor, not a substitute for the orchestrator's external check). And it composes with the Workflow tool where a hardcoded DAG genuinely fits — the nested-implementer is the dynamic-dispatch analogue of that staged plan→review→implement→review pipeline.
+Both uses **compose with, do not replace,** the orchestrator-level controls: the orchestrator STILL runs its own independent self-review / integration / multi-lens judge-panel pass on the returned work (an L1 grading-its-own-homework via L2 reviewers, or fanning out L2 sub-work, is the L1's internal rigor + speed — not a substitute for the orchestrator's external check). And it composes with the Workflow tool where a hardcoded DAG genuinely fits — the nested lead is the dynamic-dispatch analogue of that staged pipeline.
 
 ## The auto-epilogue + dispatch ledger (chaining survives compaction + fan-out)
 
@@ -349,7 +371,7 @@ When the human re-enables interactive mode, flip the flag off and resume surfaci
 
 **Label every dispatch by what it DOES, never by a code.** Lead with a sentence-case description ("Differential-test the resolver against the reference tool"), never the agent type or an opaque task ID, and **never** the internal slug/code in a chat message — the human experiences "the thing that does X," not a code.
 
-**The budget governor is WITHIN-workflow serialization, not a concurrency cap across efforts.** The thing that burns the token budget is ONE effort fanning out a swarm of heavy agents at once. The fix is internal serialization, NOT avoiding concurrency. Two levels: (1) WITHIN a single tightly-coupled workflow/effort, dispatch heavy sub-agents roughly one-at-a-time — dispatch, wait, verify, next — so a single effort's heavy draw is bounded; (2) ACROSS independent efforts, several MAY run concurrently and that is fine, because each is internally bounded. There is NO fixed heavy-lane ceiling — fan out as wide as the work genuinely parallelizes; the only real governor is **429 → back off**. The ban is on uncontrolled fan-out inside one effort, not on running many independent efforts side by side.
+**The budget governor forbids UNBOUNDED fan-out, NOT bounded parallelism.** The thing that burns the token budget is ONE effort spraying a *swarm* of heavy agents at once (20+ Opus in one shot) — that is the only banned pattern. The fix is BOUNDING the fan-out, NOT serializing to one-at-a-time. The real ceiling is the ground-truth signal **429 → back off**, not a hard count. Two levels: (1) WITHIN a single effort, an L1 lead MAY fan out a BOUNDED set of L2s (≈3–10) for genuinely-independent sub-work and synthesize their results (see the nested-lead pattern, Use A, above) — what it must NOT do is launch an unbounded swarm; (2) ACROSS independent efforts, several MAY run concurrently and that is fine, because each is internally bounded. There is NO fixed heavy-lane ceiling — fan out as wide as the work genuinely parallelizes; the only real governor is 429. The ban is on UNCONTROLLED fan-out (a runaway swarm), not on a lead spinning up a handful of parallel L2s, and not on running many independent efforts side by side.
 
 **Run a multi-item queue as a CONTINUOUS SERIES — one at a time, but never stalled.** When you have an ordered backlog of efforts, run them as a driven series: the instant one finishes, launch/resume the next, driven by each completion. Record the ordered sequence durably in a thread (so any re-invocation can read "what's next" and continue with no further prompting), and back it with the autonomous-mode heartbeat as the stall catcher. The failure to avoid is the series silently stalling after one item — it looks done, but isn't.
 

@@ -207,9 +207,15 @@ Surface, don't guess. A sub-agent operates autonomously ONLY until something hum
 
 Background sub-agents are headless. Do interactive/TTY probes in the orchestrator foreground.
 
-## Nested Implementer Pattern
+## Nested Lead Pattern (L1→L2)
 
-For substantive new functionality, prefer the two-level nested-implementer pattern over the flat shape (orchestrator dispatches instruments, orchestrator reviews). Dispatch ONE level-1 implementer that self-organizes its own review via level-2 sub-agents, enabled because a general-purpose sub-agent can itself spawn agents. The loop:
+A dispatched sub-agent is itself a LEAD (L1) with the dispatch tool, so it can spin up its own sub-agents (L2s) — just like the orchestrator. Two uses, both encouraged.
+
+**Use A — fan out L2s for independent sub-work, then synthesize.** When an L1's task decomposes into genuinely-independent pieces, it should fan out a BOUNDED set of L2s (≈3–10) in parallel, collect, and synthesize ONE deliverable — not grind through them serially. Examples: research "to its logical conclusion" with one L2 per architecture path/option; a survey with one L2 per attack/reference/file/subsystem; separable implementation pieces with one L2 each. Fan out when the pieces are INDEPENDENT and parallelism saves real wall-clock; stay serial for a true dependency chain (sequence them) or trivial work (do it inline). Mechanics: bounded not a swarm (the real ceiling is 429 backoff, not one-at-a-time); nested dispatch is supported and an L2's completion returns to the DISPATCHING L1; do NOT set `name`/`team_name` (the dispatch hook auto-strips both — they strand nested agents); TIER each L2 by load (survey → Sonnet, hard analysis/engineering → Opus); the L1 COLLECTS + SYNTHESIZES into one coherent deliverable (never scattered sub-results) and still owns its thread + reports up to the orchestrator.
+
+The budget governor forbids UNBOUNDED fan-out (a runaway swarm of heavy agents in one shot), NOT bounded parallelism. A bounded L1 L2-fan-out is fine; an unbounded spray is not.
+
+**Use B — self-organize the implementer's own review via L2s.** For substantive new functionality, the L1 implementer self-organizes its own review via level-2 sub-agents. The loop:
 
 - PLAN the implementation.
 - Dispatch a level-2 PLAN-REVIEW; take a second pass folding in valid critique.

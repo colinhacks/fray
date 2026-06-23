@@ -276,9 +276,13 @@ Use a fresh `Task` for review when the work:
 
 The review prompt should include the original goal, changed files, relevant constraints, and exact verification expected. Ask for findings first, ordered by severity, then residual risks and follow-ups.
 
-### Nested implementer pattern
+### Nested lead pattern (L1→L2)
 
-For substantive new functionality, prefer the two-level nested-implementer pattern over the flat shape (orchestrator dispatches instruments, orchestrator reviews). Dispatch ONE level-1 implementer that self-organizes its own review via level-2 `Task` sub-agents. The loop:
+A dispatched `Task` sub-agent is itself a LEAD (L1) that can dispatch its own L2 `Task` sub-agents — like the orchestrator. Two uses, both encouraged.
+
+**Use A — fan out L2s for independent sub-work, then synthesize.** When an L1's task decomposes into genuinely-independent pieces, fan out a BOUNDED set of L2s (≈3–10) in parallel, collect, and synthesize ONE deliverable rather than grinding through them serially. Examples: research "to its logical conclusion" with one L2 per architecture path/option; a survey with one L2 per attack/reference/file/subsystem; separable implementation pieces. Fan out when pieces are INDEPENDENT and parallelism saves real wall-clock; stay serial for a true dependency chain (sequence them) or trivial work (do it inline). Mechanics: bounded not a swarm (the real ceiling is 429 backoff, not one-at-a-time); an L2's completion returns to the DISPATCHING L1; do not set `name`/`team_name` (the dispatch hook auto-strips both — they strand nested agents); TIER each L2 by load (survey → cheaper model, hard analysis/engineering → top model); the L1 COLLECTS + SYNTHESIZES into one coherent deliverable (never scattered sub-results) and still owns its thread + reports up. The budget governor forbids UNBOUNDED fan-out (a runaway swarm), not bounded parallelism.
+
+**Use B — the implementer self-organizes its own review via L2s.** For substantive new functionality, dispatch ONE level-1 implementer that self-organizes its own review via level-2 `Task` sub-agents. The loop:
 
 - PLAN the implementation.
 - Dispatch a level-2 plan-review; take a second pass folding in valid critique.
