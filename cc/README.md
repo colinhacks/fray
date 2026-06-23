@@ -110,7 +110,7 @@ The plugin wires six lifecycle hooks. All of them are gated on the activation ch
 | :-- | :-- | :-- |
 | `agent-dispatch` | `PreToolUse(Agent)` | Enforces **background** dispatch (denies any foreground Agent call), auto-appends an **orchestration epilogue** to every sub-agent prompt (so it hands back the next links in the chain), gates `THREAD:`-tagged dispatches on the thread file existing, and logs a dispatch ledger. |
 | `fray-reminder` | `UserPromptSubmit` | The per-turn pulse: lists pending threads **by name**, validates frontmatter, flags un-drained queued follow-ups, and switches doctrine for autonomous mode. |
-| `session-seed` | `SessionStart` | Seeds the static orchestrator role + hygiene doctrine once per session (and a re-grounding after compaction). |
+| `session-seed` | `SessionStart` | Seeds the static orchestrator role + hygiene doctrine once per session (and a re-grounding after compaction). Also detects whether Claude Code's experimental **agent teams** is enabled (fray's steering core depends on it) and, if not, injects a one-time-per-session notice with the exact global-enable steps. |
 | `fray-stop-reminder` | `Stop` | Refuses to let the orchestrator go idle while a sub-agent rest sits unreconciled; surfaces idle/stale dispatched agents. |
 | `fray-subagent-rest` | `SubagentStop` | Records each sub-agent rest so the Stop guard can catch an un-folded return. |
 

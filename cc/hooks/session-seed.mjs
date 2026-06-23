@@ -17,8 +17,46 @@
 // Claude Code hooks docs, 2026-06-14), so the old PostCompact wiring was a silent no-op.
 // SessionStart additionalContext IS injected into the next turn. Robust: never throws (a
 // broken hook must not disrupt the session).
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { frayActive } from '../scripts/fray/config.mjs';
+
+/**
+ * Is Claude Code's EXPERIMENTAL AGENT TEAMS feature enabled for this session?
+ *
+ * fray's entire steering model (ALWAYS STEER, don't re-dispatch — SendMessage to a
+ * RUNNING or COMPLETED sub-agent, warm-resume) depends on this feature; without it the
+ * methodology silently degrades to cold re-dispatch. The feature is toggled by the
+ * `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` environment variable (the canonical mechanism,
+ * the same var fray's docs reference). Claude Code injects the `env:` block from
+ * settings.json into every process it spawns — INCLUDING hook processes — so a hook can
+ * RELIABLY read the state straight from `process.env` (empirically verified: with the var
+ * set in ~/.claude/settings.json `env`, it is present in a hook's `process.env`). Truthy
+ * spellings accepted: 1 / true / yes / on (case-insensitive).
+ *
+ * BELT-AND-SUSPENDERS: process.env is the primary, reliable signal, but we ALSO read the
+ * global `~/.claude/settings.json` `env` block as a fallback — so a user who set the var
+ * THERE but whose hook env somehow missed it (an unlikely edge case) is never false-prompted.
+ * Both checks fail-open (any read/parse error → treated as "not found here").
+ * @returns {boolean}
+ */
+function truthy(v) {
+  const s = String(v ?? '').trim().toLowerCase();
+  return s === '1' || s === 'true' || s === 'yes' || s === 'on';
+}
+
+function agentTeamsEnabled() {
+  if (truthy(process.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS)) return true;
+  // Fallback: the canonical persistent home is the global settings.json `env` block.
+  try {
+    const home = process.env.HOME || process.env.USERPROFILE;
+    if (!home) return false;
+    const settings = JSON.parse(readFileSync(join(home, '.claude', 'settings.json'), 'utf8'));
+    return truthy(settings?.env?.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS);
+  } catch {
+    return false; // absent / unreadable / malformed → rely on the env check above
+  }
+}
 
 /** @type {{ agent_id?: unknown, agentId?: unknown, source?: string, session_id?: string }} */
 let input = {};
@@ -52,9 +90,51 @@ const grounding = `⟦fray re-grounding (post-compaction)⟧ Context was just co
 - The dispatched sub-agent EDITS ITS OWN thread .md in place (+ a .fray/<thread>.findings/<id>.md sidecar only for parallel fan-out); the orchestrator does cross-thread linkage/reversals, the decision queue, dispatch/synthesis, and config.yml + the agents:[] agentId binding — never re-transcribing what the agent wrote.
 - You are empowered (merge agents' PRs, create repos, install tooling, land greenlit work — substantive work via PR from a worktree, control-surface/trivial-doc edits direct to main); reversible action > freezing; do NOT build an "awaiting-maintainer" queue from reversible decisions (the #1 repeated correction).`;
 
-// `core` on EVERY session start; `grounding` ADDITIONALLY only after a compaction.
+// AGENT-TEAMS GATE — fray's steering core needs experimental agent teams. If it's OFF,
+// inject a ONE-TIME notice (this session only) telling the user how to enable it, defaulting
+// to the GLOBAL enable (it benefits every fray session across every repo). Idempotent /
+// non-nagging: SessionStart can fire multiple times per session (startup/resume/clear/
+// compact), so a per-session sentinel under .fray/.session-state/ ensures we notify AT MOST
+// once per session. Enabled → say nothing. Fail-open: any error → skip the notice.
+let teamsNotice = null;
+try {
+  if (!agentTeamsEnabled()) {
+    const projectDir = process.env.CLAUDE_PROJECT_DIR ?? '.';
+    const sid = input.session_id || process.env.CLAUDE_CODE_SESSION_ID || '';
+    const stateDir = join(projectDir, '.fray', '.session-state');
+    // Sentinel keyed on the session id so the notice fires once per session, not per
+    // SessionStart event. With no session id we still emit once (no de-dup file to write).
+    const marker = sid ? join(stateDir, `${sid}.teams-notified`) : '';
+    const alreadyNotified = marker ? existsSync(marker) : false;
+    if (!alreadyNotified) {
+      teamsNotice =
+        '⟦fray setup⟧ Claude Code\'s EXPERIMENTAL AGENT TEAMS feature appears to be OFF (the `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` env var is unset in this session). ' +
+        'fray\'s core steering model — ALWAYS STEER, don\'t re-dispatch: SendMessage to a RUNNING or COMPLETED sub-agent, warm-resume — DEPENDS on it; without it fray silently degrades to cold re-dispatch (you lose live steering + warm-resume and fall back to the `enqueued`/`depends_on` sequencing model). ' +
+        'ENABLE IT GLOBALLY (recommended — benefits every fray session in every repo): add it to the `env` block of your GLOBAL settings at `~/.claude/settings.json`:\n' +
+        '    {\n      "env": {\n        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"\n      }\n    }\n' +
+        'then RESTART Claude Code (env settings load at startup). ' +
+        '(Alternative: `export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in your shell profile.) ' +
+        'Tell the user this once and offer to make the settings.json edit for them. It is EXPERIMENTAL + harness-dependent — if it can\'t be enabled, fray still works (board, dispatch enforcement, rest/stop reconciliation, the whole thread model); only live steering + warm-resume are unavailable.';
+      // Mark notified for this session so resume/compact within it won't re-nag.
+      if (marker) {
+        try {
+          mkdirSync(stateDir, { recursive: true });
+          writeFileSync(marker, new Date().toISOString() + '\n');
+        } catch {
+          /* best-effort de-dup; a failed write just risks one extra notice */
+        }
+      }
+    }
+  }
+} catch {
+  teamsNotice = null; // fail-open — never block the seed on the teams check
+}
+
+// `core` on EVERY session start; `grounding` ADDITIONALLY only after a compaction;
+// `teamsNotice` once per session when agent teams is OFF.
 const parts = [core];
 if (input.source === 'compact') parts.push(grounding);
+if (teamsNotice) parts.push(teamsNotice);
 
 process.stdout.write(
   JSON.stringify({
