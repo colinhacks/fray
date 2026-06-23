@@ -98,7 +98,7 @@ Thread **dependencies** are expressed in frontmatter (`depends_on: [<other-slug>
 
 ### Status vocabulary
 
-`todo · planned · enqueued · active · blocked · needs-decision · done · dismissed`
+`todo · enqueued · active · blocked · needs-decision · done · dismissed`
 
 `done` and `dismissed` are terminal and **kept forever** — each is its own file, excluded from the board and the per-turn pending list by status, so a finished thread is zero bloat. (No "clean up" step; that's the whole point of per-file threads.)
 

@@ -51,7 +51,7 @@ Use the output to reconcile returned agents, surface pending questions, and choo
 - `.fray/<slug>.findings/<id>.md`: optional sidecars for durable sub-agent output.
 - `node .agents/plugins/fray-codex/scripts/fray/index.mjs`: the board. There is no stored board.
 
-Do not create a meta-thread whose job is to track other Fray threads. That recreates the stale-board problem Fray exists to avoid. If review gates, agent names, pending decisions, or next actions matter, put them in the owning thread's frontmatter/body. Use the computed board any time you need the current set of `active`, `enqueued`, `needs-decision`, or `planned` work:
+Do not create a meta-thread whose job is to track other Fray threads. That recreates the stale-board problem Fray exists to avoid. If review gates, agent names, pending decisions, or next actions matter, put them in the owning thread's frontmatter/body. Use the computed board any time you need the current set of `active`, `enqueued`, `needs-decision`, or `todo` work:
 
 ```bash
 node .agents/plugins/fray-codex/scripts/fray/index.mjs --status active
@@ -62,9 +62,10 @@ node .agents/plugins/fray-codex/scripts/fray/index.mjs --json
 
 Thread frontmatter must include `title` and `status`. Status vocabulary is:
 
-`todo`, `planned`, `enqueued`, `active`, `blocked`, `needs-decision`, `done`, `dismissed`.
+`todo`, `enqueued`, `active`, `blocked`, `needs-decision`, `done`, `dismissed`.
 
-- `enqueued` means ready to run, fully scoped, and deliberately held until a named in-flight agent/thread completes. This is a sequencing dependency, not a human gate. Use it when the next dispatch would edit the same files an in-flight agent owns, or when it genuinely needs that agent's output. `## Next step` must name what it is waiting on, and when that agent returns, dispatch or resume the enqueued work in the same turn.
+- `todo` means thought-through, has an open doc, and awaiting explicit actioning — the "scoped but not yet scheduled" bucket. No defer-reason ceremony required. A ready thread waiting on a TRANSIENT blocker (a PR merge, a wave drain, a prior agent's output) is NOT `todo` — it is `enqueued` + `depends_on`, which auto-fires.
+- `enqueued` means basically ready to go and AUTO-FIRES when its `depends_on` clear — deliberately held until a named in-flight agent/thread completes. This is a sequencing dependency, not a human gate. Use it when the next dispatch would edit the same files an in-flight agent owns, or when it genuinely needs that agent's output. Set `depends_on:` in frontmatter so the board computes the trigger — encode the dependency THERE, never as prose. When the deps go terminal, dispatch or resume the enqueued work in the same turn. The per-turn reminder emits a LOUD by-name DROP-RISK callout for any `enqueued` thread whose deps have all cleared but was never dispatched — act on it immediately.
 - In Codex, prefer adding input to an existing live agent when the follow-up clearly belongs inside that agent's current scope and can be delivered safely. Use `enqueued` when the follow-up is a distinct unit, needs canonical board visibility, or should run only after the current agent returns.
 - `blocked` means waiting on a human, external event, or unresolved decision with no in-session trigger.
 - `done` and `dismissed` are terminal and kept. Never delete terminal threads just to reduce board noise.

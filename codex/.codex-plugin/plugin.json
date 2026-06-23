@@ -1,6 +1,6 @@
 {
   "name": "fray-codex",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Codex adapter for the repo-local Fray orchestration workflow.",
   "author": {
     "name": "Colin McDonnell"

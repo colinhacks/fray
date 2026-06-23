@@ -110,7 +110,7 @@ export function findAgentOutputAge(agentId, now = Date.now()) {
  * @param {boolean} [a.threadActive]    is the owning thread's status exactly `active`? Only
  *                                       `active` threads are "being worked", so only they
  *                                       can have an UNRECONCILED/idle agent. Deliberately-
- *                                       PARKED phases (needs-decision/blocked/planned/
+ *                                       PARKED phases (needs-decision/blocked/
  *                                       enqueued/todo) with done agents are EXPECTED, not a
  *                                       drift signal — never flagged. (Defaults true for
  *                                       backward-compat when a caller doesn't pass it.)
@@ -122,7 +122,7 @@ export function deriveAgentState({ ageMin, threadTerminal, threadActive = true, 
   // A reconciled thread is the orchestrator's deliberate "I folded this" signal — the
   // only mutable bit in the whole loop, and it lives on the THREAD, not the agent.
   if (threadTerminal) return 'terminal';
-  // PARKED (non-terminal but not `active`: needs-decision/blocked/planned/enqueued/todo)
+  // PARKED (non-terminal but not `active`: needs-decision/blocked/enqueued/todo)
   // is also a deliberate orchestrator state — a stale/done agent on a parked thread is
   // EXPECTED (the work finished, the thread awaits a human/dep), NOT unreconciled. Only an
   // `active` thread is "being worked right now", so only it can have a drift-signal agent.

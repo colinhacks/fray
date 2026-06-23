@@ -98,31 +98,32 @@ export function frayActive(projectDir, sessionId) {
 
 /**
  * The thread-status vocabulary.
- * - `todo` — not started; no agent dispatched, nothing blocking it.
- * - `enqueued` — READY to run (work fully scoped + decided) but deliberately held
- *   until a NAMED in-flight agent/thread completes — a sequencing dependency
- *   (same-file serialization, or it needs the prior agent's output). Distinct from
- *   `blocked`: an `enqueued` thread has a concrete auto-trigger (agent X returns →
- *   dispatch it), it is NOT waiting on a human/decision. The thread's `## Next step`
- *   must name the agent/thread it is waiting on. PREFER messaging the in-flight
- *   agent to fold the work in over enqueuing-then-dispatching, when the work fits
- *   that agent's scope (see the fray skill — steer-in-flight beats spawn-fresh).
+ * - `todo` — thought-through, has an open doc, awaiting explicit actioning. The
+ *   "scoped but not yet scheduled" bucket — NO defer-reason ceremony required; `todo`
+ *   simply means "not yet scheduled/actioned." Use it for work that COULD start but
+ *   hasn't been picked up. CRUCIAL: a ready thread waiting on a TRANSIENT blocker (a
+ *   PR merge, a wave drain, a prior agent's output) is NOT `todo` — it is `enqueued`
+ *   + `depends_on` (which auto-fires on the board). Encode the dependency in
+ *   `depends_on` frontmatter, NEVER as prose in `## Next step`.
+ * - `enqueued` — basically ready to go; AUTO-FIRES when its `depends_on` clear. Held
+ *   until a NAMED in-flight agent/thread (in `depends_on`) completes — a sequencing
+ *   dependency (same-file serialization, or it needs the prior agent's output).
+ *   Distinct from `blocked`: an `enqueued` thread has a concrete auto-trigger (its
+ *   deps clear → dispatch it), it is NOT waiting on a human/decision. PREFER messaging
+ *   the in-flight agent to fold the work in over enqueuing-then-dispatching, when the
+ *   work fits that agent's scope (see the fray skill — steer-in-flight beats
+ *   spawn-fresh). THE INVARIANT: a thread leaving `needs-decision` (just decided)
+ *   transitions to `active` (dispatch this turn) or `enqueued` (`depends_on` a blocker)
+ *   — a ready thread waiting on a transient blocker is `enqueued` + `depends_on`, not
+ *   `todo` and never a prose-only defer-note.
  * - `blocked` — cannot proceed; waiting on a human decision, an answer, or an
  *   external event with no in-session auto-trigger.
  * - `needs-decision` — surfaced a question the human owns; recommend-only until answered.
- * - `planned` — scoped AND **deliberately DEFERRED** (a human/orchestrator chose
- *   "not now"). NOT a dumping ground for decided-ready work: the `## Next step` MUST
- *   state WHY it's deferred and what un-defers it (e.g. "on hold per Colin, pick up
- *   post-v0.1.1"). Distinct from `todo` ("could start now, just hasn't") and
- *   `needs-decision` (gated on a human call). THE INVARIANT: a thread leaving
- *   `needs-decision` (just decided) transitions to `active` (dispatch this turn) or
- *   `enqueued` (`depends_on` a blocker) — NEVER `planned`, unless deliberately
- *   deferred WITH a stated reason. "Decided-and-ready" is never `planned`.
  * - `done` / `dismissed` — TERMINAL (completed / decided-against): kept, never
  *   deleted, excluded from the active board's pending views.
  * @type {readonly string[]}
  */
-export const STATUS = ['todo', 'planned', 'enqueued', 'active', 'blocked', 'needs-decision', 'done', 'dismissed'];
+export const STATUS = ['todo', 'enqueued', 'active', 'blocked', 'needs-decision', 'done', 'dismissed'];
 
 /**
  * The terminal subset of {@link STATUS}: completed OR decided-against. Both are

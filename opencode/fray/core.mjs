@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, readdirSync, appendFileSync, mkdirSync, writeFileSync, rmSync } from "node:fs"
 import { dirname, join } from "node:path"
 
-export const STATUS = ["todo", "planned", "enqueued", "active", "blocked", "needs-decision", "done", "dismissed"]
+export const STATUS = ["todo", "enqueued", "active", "blocked", "needs-decision", "done", "dismissed"]
 export const TERMINAL = ["done", "dismissed"]
 
 // PER-SESSION SENTINEL — enablement is keyed on the session id (not a config flag), so it
@@ -115,6 +115,15 @@ function frontmatter(src) {
   return out
 }
 
+// Parse a thread's `depends_on:` frontmatter (inline `[a, b]` OR YAML block `- a`) into slugs.
+function parseDepends(src) {
+  const inline = src.match(/^depends_on:\s*\[([^\]]*)\]/m)
+  if (inline) return inline[1].split(",").map((s) => s.trim().replace(/^["']|["']$/g, "")).filter(Boolean)
+  const block = src.match(/^depends_on:\s*\n((?:[ \t]+-[ \t]*.+\n?)+)/m)
+  if (block) return block[1].split("\n").map((l) => l.replace(/^[ \t]+-[ \t]*/, "").trim().replace(/^["']|["']$/g, "")).filter(Boolean)
+  return []
+}
+
 function nextStep(src) {
   const lines = src.split("\n")
   const start = lines.findIndex((line) => /^##\s+Next step\s*$/i.test(line))
@@ -144,11 +153,22 @@ export function readThreads(root) {
           else if (!STATUS.includes(fm.status)) errors.push(`invalid status "${fm.status}" (expected one of: ${STATUS.join(", ")})`)
         }
         const statusText = fm?.status_text || ""
-        return { id, title: fm?.title || "", status: fm?.status || "?", statusText, next: nextStep(text), queued: /\bQUEUED\b/.test(text), text, errors }
+        return { id, title: fm?.title || "", status: fm?.status || "?", statusText, next: nextStep(text), queued: /\bQUEUED\b/.test(text), dependsOn: parseDepends(text), text, errors }
       })
   } catch {
     return []
   }
+}
+
+// DROP-RISK: `enqueued` threads WITH declared deps, ALL of which are terminal — the
+// auto-trigger fired but nothing dispatched it (the canonical silent-stall shape after
+// `planned` was dropped from the vocab). An unknown-slug dep is NOT terminal → not
+// flagged (conservative; avoids crying wolf on a typo). Returns the thread ids.
+export function dropRiskThreads(threads) {
+  const statusOf = new Map(threads.map((t) => [t.id, t.status]))
+  return threads
+    .filter((t) => t.status === "enqueued" && (t.dependsOn || []).length > 0 && t.dependsOn.every((d) => TERMINAL.includes(statusOf.get(d) || "?")))
+    .map((t) => t.id)
 }
 
 export function validationErrors(root) {
@@ -164,8 +184,10 @@ export function formatBoard(root, only) {
   const cfg = loadConfig(root)
   const threads = readThreads(root)
   const errors = validationErrors(root)
+  const dropRisk = dropRiskThreads(threads)
   const out = [`fray board - autonomous_mode: ${cfg.autonomousMode ? "on" : "off"}${only ? ` - status:${only}` : ""}`]
   if (errors.length) out.push(`\nVALIDATION ERRORS:\n${errors.join("\n")}`)
+  if (dropRisk.length) out.push(`\nDROP-RISK (enqueued, all depends_on terminal — should have fired): ${dropRisk.join(", ")}`)
   for (const status of only ? [only] : STATUS) {
     const group = threads.filter((thread) => thread.status === status)
     if (!group.length) continue
@@ -195,12 +217,14 @@ export function reminder(root, sessionId) {
   const threads = readThreads(root)
   const pending = threads.filter((thread) => !TERMINAL.includes(thread.status)).map((thread) => `${thread.id}[${thread.status}]`)
   const queued = threads.filter((thread) => !TERMINAL.includes(thread.status) && thread.queued).map((thread) => thread.id)
+  const dropRisk = dropRiskThreads(threads)
   const errors = validationErrors(root)
   const mode = cfg.autonomousMode ? "AUTONOMOUS MODE = ON. Do not stall for human input except for irreversible/destructive/published-external actions or human-owned default/security/product/brand/API-config-env decisions. Keep the OpenCode Task fleet busy and document reversible draft decisions in .fray/." : "autonomous_mode=off. Surface human-owned decisions, but keep autonomous investigation/fix/review work moving."
   const base = `FRAY OpenCode reminder: ${mode} Pending threads: ${pending.join(", ") || "none"}. Reconcile returned Task agents before new chat work; fold facts into .fray/<thread>.md, record/clear task_id handles, drain queued follow-ups, and dispatch autonomous follow-ups this turn. Completed agents can be resumed by task_id when continuity matters; there is no live SendMessage/fork-current-chat primitive, so running agents cannot be steered mid-flight.`
   const queuedText = queued.length ? ` Undrained QUEUED follow-ups: ${queued.join(", ")}. Re-read those thread files on the owning agent's return and dispatch the queued work immediately.` : ""
+  const dropRiskText = dropRisk.length ? ` DROP-RISK THREADS: ${dropRisk.join(", ")}. These are \`enqueued\` with ALL their \`depends_on\` now TERMINAL — their auto-trigger fired and they were NEVER dispatched (the exact silent-stall this guard exists to kill). RE-READ each thread file THIS turn and DISPATCH/ADVANCE it. If one is genuinely not ready, move it back to \`todo\` or fix its \`depends_on\`; leaving it \`enqueued\` with cleared deps is a bug.` : ""
   const errorText = errors.length ? ` Validation errors: ${errors.join("; ")}.` : ""
-  return `${base}${queuedText}${errorText}`
+  return `${base}${queuedText}${dropRiskText}${errorText}`
 }
 
 export function appendLedger(root, row) {

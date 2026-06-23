@@ -39,7 +39,18 @@ const SESSION_ID = arg('--session-id') ?? process.env.CODEX_SESSION_ID ?? proces
 const frayEnabled = frayActive(PROJECT_DIR, SESSION_ID);
 const pending = [];
 const queued = [];
+const dropRisk = []; // `enqueued` threads whose depends_on are ALL terminal — should have auto-fired, never dispatched. The canonical silent-stall shape; surfaced BY NAME so it can't be skipped by reflex.
+const scanned = []; // {slug,status,deps} for every thread — second pass resolves cross-thread dep statuses for the drop-risk check.
 const errors = [];
+
+// Parse a thread's `depends_on:` frontmatter (inline `[a, b]` OR YAML block `- a`) into slugs.
+function parseDepends(src) {
+  const inline = src.match(/^depends_on:\s*\[([^\]]*)\]/m);
+  if (inline) return inline[1].split(',').map((s) => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
+  const block = src.match(/^depends_on:\s*\n((?:[ \t]+-[ \t]*.+\n?)+)/m);
+  if (block) return block[1].split('\n').map((l) => l.replace(/^[ \t]+-[ \t]*/, '').trim().replace(/^["']|["']$/g, '')).filter(Boolean);
+  return [];
+}
 const returnedDispatches = [];
 const unreconciledDispatches = [];
 const unattachedDispatches = [];
@@ -66,11 +77,25 @@ try {
     if (!status) errors.push(`${slug}: missing status`);
     else if (!STATUS.includes(status)) errors.push(`${slug}: invalid status "${status}"`);
 
+    scanned.push({ slug, status, deps: parseDepends(src) });
     if (!TERMINAL.includes(status)) pending.push({ slug, title, status: status || '?', next });
     if (!TERMINAL.includes(status) && /\bQUEUED\b/.test(src)) queued.push(slug);
   }
 } catch {
   errors.push('missing or unreadable .fray directory');
+}
+
+// DROP-RISK: an `enqueued` thread WITH declared deps, ALL of which are terminal — its
+// auto-trigger fired and nothing dispatched it. An unknown-slug dep is NOT terminal →
+// not flagged (conservative; avoids crying wolf on a typo).
+{
+  const statusOf = new Map(scanned.map((t) => [t.slug, t.status]));
+  for (const t of scanned) {
+    if (t.status === 'enqueued' && t.deps.length > 0 &&
+        t.deps.every((d) => TERMINAL.includes(statusOf.get(d) ?? '?'))) {
+      dropRisk.push(t.slug);
+    }
+  }
 }
 
 try {
@@ -115,6 +140,7 @@ const payload = {
   autonomous_mode: cfg.autonomousMode,
   pending,
   queued_followup_threads: queued,
+  drop_risk_threads: dropRisk,
   returned_unreconciled_dispatches: returnedDispatches,
   unreconciled_dispatches: unreconciledDispatches,
   unattached_dispatches: unattachedDispatches,
@@ -192,6 +218,11 @@ if (unattachedDispatches.length) {
 }
 if (queued.length) {
   console.log(`QUEUED FOLLOW-UPS PRESENT in ${queued.length} thread(s): ${queued.join(', ')}`);
+}
+if (dropRisk.length) {
+  console.log(
+    `DROP-RISK THREADS in ${dropRisk.length} thread(s): ${dropRisk.join(', ')}. These are \`enqueued\` with ALL their \`depends_on\` now TERMINAL — their auto-trigger fired and they were NEVER dispatched (the exact silent-stall this guard exists to kill). RE-READ each thread .md THIS turn and DISPATCH/ADVANCE it. If one is genuinely not ready, move it back to \`todo\` or fix its \`depends_on\`; leaving it \`enqueued\` with cleared deps is a bug.`,
+  );
 }
 
 console.log(

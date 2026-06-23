@@ -72,7 +72,6 @@ Thread frontmatter must include `title` and `status`. Status vocabulary is:
 
 ```text
 todo
-planned
 enqueued
 active
 blocked
@@ -81,7 +80,7 @@ done
 dismissed
 ```
 
-`enqueued` means ready to run, fully scoped, and deliberately held until a named in-flight task or thread completes. This is a sequencing dependency, not a human gate. `blocked` means waiting on a human, external event, or unresolved decision with no in-session trigger. `done` and `dismissed` are terminal and kept.
+`todo` means thought-through, has an open doc, and awaiting explicit actioning — the "scoped but not yet scheduled" bucket, no defer-reason ceremony required. A ready thread waiting on a TRANSIENT blocker (a PR merge, a wave drain, a prior task's output) is NOT `todo` — it is `enqueued` + `depends_on`, which auto-fires. `enqueued` means basically ready to go and AUTO-FIRES when its `depends_on` clear — deliberately held until a named in-flight task or thread completes. This is a sequencing dependency, not a human gate; set `depends_on:` in frontmatter so the board computes the trigger, never encode it as prose. The per-turn reminder emits a LOUD by-name DROP-RISK callout for any `enqueued` thread whose deps have all cleared but was never dispatched — act on it immediately. `blocked` means waiting on a human, external event, or unresolved decision with no in-session trigger. `done` and `dismissed` are terminal and kept.
 
 Each thread body must keep these sections, in this order:
 

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-const STATUS = ['todo', 'planned', 'enqueued', 'active', 'blocked', 'needs-decision', 'done', 'dismissed'];
+const STATUS = ['todo', 'enqueued', 'active', 'blocked', 'needs-decision', 'done', 'dismissed'];
 const TERMINAL = ['done', 'dismissed'];
 
 export function readStdinJson() {
