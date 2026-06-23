@@ -34,6 +34,16 @@ A marketplace install copies the plugin into `~/.claude/plugins/cache`, so edits
   ```
   Claude Code follows the symlink and resolves all components live. (A version bump or `claude plugin update` would re-copy and overwrite the symlink — re-create it after.)
 
+### Bumping the plugin version
+
+The Claude Code plugin version lives in two files that MUST stay in lockstep — `cc/.claude-plugin/plugin.json` (`"version"`) and the `cc/skills/fray/SKILL.md` frontmatter (`version:`). Never edit them by hand (they drifted once that way). Bump both atomically:
+
+```sh
+node scripts/set-version.ts 1.8.0     # or: nub scripts/set-version.ts 1.8.0
+```
+
+The script validates the semver, writes both files, and prints what changed. `node scripts/set-version.ts --check` verifies they agree and exits nonzero on drift — CI (`.github/workflows/version-check.yml`) runs it on every push/PR. The other ports (`codex/`, `pi/`, `opencode/`) are on independent version tracks and are deliberately not touched by this script.
+
 ### Per-session enable/disable (toggleable mid-session)
 
 Enablement is **per-session**, keyed on the Claude Code session id (`CLAUDE_CODE_SESSION_ID` — the same id the hooks receive in their stdin payload, verified equal). Toggle the CURRENT session with the board command:

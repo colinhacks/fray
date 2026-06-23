@@ -1,0 +1,21 @@
+name: version-check
+
+# Fails on plugin version drift — the cc plugin.json "version" and the
+# cc/skills/fray/SKILL.md frontmatter `version:` must always agree.
+# Bump them together with `node scripts/set-version.ts <version>`.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+      - name: Check plugin version sync
+        run: node scripts/set-version.ts --check
