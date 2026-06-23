@@ -1,7 +1,7 @@
 ---
 name: fray
 description: Load this skill IMMEDIATELY — as your FIRST action, before any other tool call or response — whenever the user mentions "fray" in ANY form ("fray", "fray mode", "enter/start fray", "load fray", "use fray", "in fray", "the fray skill"), OR asks to orchestrate / run / coordinate a multi-effort push, audit, or campaign through sub-agents. Also the default for any large, mixed set of efforts — investigations + decided fixes + verifications — toward a goal (a launch push, a pre-release audit, a refactor campaign) where the human wants to stay in the loop on what the investigations surface; the default for any multi-effort push that is part "find out what's true" and part "land the decided thing." Use it instead of hardcoding a multi-agent DAG up front — those bury the decision points and fan out expensively before the facts are in. Treat any "fray" mention as an explicit instruction to load this skill, never as ambient context.
-version: 1.0.2
+version: 1.0.3
 metadata:
   internal: true
 ---
@@ -252,6 +252,8 @@ Invariants:
 ### The L1 owns its full loop — orchestrator must NOT babysit the review-fix cycle
 
 **An L1 dispatched to BUILD or IMPLEMENT a deliverable OWNS its full loop — build → adversarial self-review (via its OWN L2) → fix → re-review → until clean — and reports UP to the orchestrator only when (a) DONE, or (b) BLOCKED on a human-owned decision.** The orchestrator must NOT run a SIBLING reviewer agent and then relay review→fix findings to the L1 turn-by-turn — that is orchestrator-babysitting, and it scatters one effort's review-fix cycle across the orchestrator's context instead of keeping it in the L1's.
+
+**For a SIGNIFICANT implementation push, a dedicated self-review SUB-AGENT pass is NON-NEGOTIABLE — not optional, not "I checked it myself".** The L1's process MUST be: (1) implement; (2) run its own build/test gates; (3) DISPATCH one or more dedicated adversarial self-review sub-agents on the diff — and for large, security-critical, or memory/UB-adjacent changes, dispatch MULTIPLE reviewers split by dimension (e.g. soundness, per-platform, regression, spec-conformance); (4) address EVERY real finding (fix → re-review until clean); (5) only THEN declare done / push as ready. "Self-review" here means a fresh-context sub-agent reviewing the diff, NOT the implementer eyeballing its own work. Small/mechanical changes may skip this; a significant push may NOT. The orchestrator, when dispatching such an L1, must spell this step out explicitly in the prompt — never rely on the implicit rule or vague phrasing like "self-review your work", because a sub-agent prompt must be self-contained.
 
 The review/fix/verify MECHANICS live inside the L1. What DOES route up to the orchestrator (and on to the human): genuinely human-owned DECISIONS — architecture, a default/security/product/brand/API-config call, a scope change. Those the L1 surfaces and waits on; it does not invent them.
 
