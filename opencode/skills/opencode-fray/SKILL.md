@@ -136,7 +136,7 @@ Use `Task` this way after OpenCode has restarted with this project's `.opencode/
 - `subagent_type: "fray-implementer"` or `"general"` for decided implementation work.
 - `subagent_type: "fray-reviewer"` for independent adversarial review.
 - `subagent_type: "fray-architect"` for hard design and decision-analysis work.
-- `subagent_type: "fray-docs-writer"`, `"fray-aube-engineer"`, or `"fray-frontend-inspector"` for specialized docs, vendored package-manager, or rendered-site work.
+- `subagent_type: "fray-docs-writer"`, `"fray-vendored-dep-engineer"`, or `"fray-frontend-inspector"` for specialized docs, vendored/forked-dependency, or rendered-site work.
 - If the current running session exposes only `"explore"` and `"general"`, restart OpenCode so the project-local profiles are loaded.
 - `task_id: ""` for a fresh dispatch.
 - `task_id: "<previous id>"` only when intentionally resuming that same sub-agent context.
@@ -322,7 +322,7 @@ Claude Code model-tier mapping:
 - Sonnet-shaped supporting work -> `fray-researcher` or `fray-verifier` (`openai/gpt-5.4`, `variant: medium`). Use for differential probes, source-backed research, test/build runs, and CI/log checking.
 - Opus-shaped engineering work -> `general` or `fray-implementer` (`openai/gpt-5.5`, `variant: high`). Use for diagnosis and fixes that land.
 - Opus/Fable-shaped judgment -> `fray-reviewer` or `fray-architect` (`openai/gpt-5.5`, `variant: xhigh`). Use for adversarial review, architecture, public-surface decisions, and load-bearing verdicts. Never use GPT-5 Pro for fray; it is too expensive for this workflow.
-- Specialized lanes -> `fray-docs-writer` for docs/copy, `fray-aube-engineer` for vendored aube/fork/pin work, and `fray-frontend-inspector` for rendered-site/browser QA.
+- Specialized lanes -> `fray-docs-writer` for docs/copy, `fray-vendored-dep-engineer` for vendored/forked-dependency + fork/pin work, and `fray-frontend-inspector` for rendered-site/browser QA.
 
 Agent selection norms:
 
