@@ -1,7 +1,7 @@
 ---
 name: fray
 description: Load this skill IMMEDIATELY — as your FIRST action, before any other tool call or response — whenever the user mentions "fray" in ANY form ("fray", "fray mode", "enter/start fray", "load fray", "use fray", "in fray", "the fray skill"), OR asks to orchestrate / run / coordinate a multi-effort push, audit, or campaign through sub-agents. Also the default for any large, mixed set of efforts — investigations + decided fixes + verifications — toward a goal (a launch push, a pre-release audit, a refactor campaign) where the human wants to stay in the loop on what the investigations surface; the default for any multi-effort push that is part "find out what's true" and part "land the decided thing." Use it instead of hardcoding a multi-agent DAG up front — those bury the decision points and fan out expensively before the facts are in. Treat any "fray" mention as an explicit instruction to load this skill, never as ambient context.
-version: 1.0.1
+version: 1.0.2
 metadata:
   internal: true
 ---
@@ -82,6 +82,22 @@ Once `.fray/` exists, the hooks activate automatically (the per-turn pulse, the 
 - **`done`** = completed. **`dismissed`** = decided-NOT-to-pursue.
 - **BOTH are TERMINAL and KEPT — NEVER deleted.** Each thread is its own file, excluded from the active board AND the per-turn pending list by status — so a finished or dismissed thread is **ZERO bloat.** *This is a core benefit of per-file threads over the old single-file `todo.md`, which DID require deleting done items to stay lean.* Do not "clean up" terminal threads.
 - **The no-CHANGELOG rule applies WITHIN a thread.** Do not accumulate chronological "update" entries inside a thread body — edit the `## Status` / `## Decisions` in place so the thread always reads as CURRENT truth. (Git history holds the past.) Global structured state goes in `config.yml`, never narrated as prose in a thread.
+
+### Board hygiene is the orchestrator's standing job — the per-turn surfacing is FOR catching drift
+
+The per-turn `fray-reminder` hook lists every pending thread by status. **That is a STANDING PROMPT to notice rot, not just a dispatch menu.** Proactively run a cleanup pass whenever the board looks bloated or stale — many threads parked in one status, or `needs-decision` growing. Do NOT wait to be told.
+
+**Sharpened status semantics (apply these in cleanup):**
+
+- **`needs-decision`** = ONLY active, in-flight work blocked on a SINGLE human decision RIGHT NOW. It should nearly always be near-empty. A planning/design thread whose open questions are being worked out is NOT `needs-decision` — its open questions live in the thread's `## Open questions` body.
+- **`todo`** = thought-through, has a doc, awaiting explicit actioning. This includes a feature in a collaborative planning phase whose design is being finalized for a future release — those open design questions live in `## Open questions`, not as a board-level `needs-decision`. A delivered recommendation awaiting a future build is also `todo`.
+- **`done`** = a research/brainstorm/investigation thread whose deliverable WAS surfacing findings, with no remaining autonomous work — terminal and KEPT. The investigation was the whole deliverable; that is the end of the thread until revisited.
+- **`dismissed`** = superseded, abandoned, or no-longer-relevant.
+- `active` = a live agent is building it now; `blocked` = waiting on a named external thing with no in-session trigger.
+
+**The cleanup mechanism:** when drift is detected, dispatch an L1 cleanup-lead (Sonnet is enough for classification, Opus if threads are complex) that fans L2 readers to check each stale thread — including referenced PR/git state — applies the re-statuses, preserves every thread body, and returns a per-thread table (thread · old status · new status · why). Verify the table before the changes are written, or instruct the L1 to write and report. Run on demand and whenever the reminder hook shows accumulation.
+
+**When surfacing decisions to the human: surface ONLY the genuine current-workstream decisions (the curated set), NEVER a raw board dump.** Dumping the full `needs-decision` list drags in stale brainstorms and buries the real calls. Curate; surface only what actually needs an answer right now.
 
 ---
 

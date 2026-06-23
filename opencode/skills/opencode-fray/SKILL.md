@@ -82,6 +82,8 @@ dismissed
 
 `todo` means thought-through, has an open doc, and awaiting explicit actioning — the "scoped but not yet scheduled" bucket, no defer-reason ceremony required. A ready thread waiting on a TRANSIENT blocker (a PR merge, a wave drain, a prior task's output) is NOT `todo` — it is `enqueued` + `depends_on`, which auto-fires. `enqueued` means basically ready to go and AUTO-FIRES when its `depends_on` clear — deliberately held until a named in-flight task or thread completes. This is a sequencing dependency, not a human gate; set `depends_on:` in frontmatter so the board computes the trigger, never encode it as prose. The per-turn reminder emits a LOUD by-name DROP-RISK callout for any `enqueued` thread whose deps have all cleared but was never dispatched — act on it immediately. `blocked` means waiting on a human, external event, or unresolved decision with no in-session trigger. `done` and `dismissed` are terminal and kept.
 
+**Board hygiene is the orchestrator's standing job.** The per-turn status surfacing is a STANDING PROMPT to notice rot, not just a dispatch menu. Proactively clean up whenever the board looks bloated or `needs-decision` is growing — do NOT wait to be told. `needs-decision` should nearly always be near-empty: it means in-flight work blocked on a SINGLE human decision RIGHT NOW. A design or planning thread with open questions is `todo` (questions go in `## Open questions`). A completed investigation whose whole deliverable was the findings is `done`. Superseded/abandoned is `dismissed`. When surfacing decisions to the human, surface ONLY the genuine current-workstream calls — never dump the full board.
+
 Each thread body must keep these sections, in this order:
 
 ```text

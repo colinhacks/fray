@@ -70,6 +70,8 @@ Thread frontmatter must include `title` and `status`. Status vocabulary is:
 - `blocked` means waiting on a human, external event, or unresolved decision with no in-session trigger.
 - `done` and `dismissed` are terminal and kept. Never delete terminal threads just to reduce board noise.
 
+**Board hygiene is the orchestrator's standing job.** The per-turn reminder lists pending threads by status — treat that as a STANDING PROMPT to notice rot, not just a dispatch menu. Proactively clean up whenever `needs-decision` is growing or many threads are parked in one status; do NOT wait to be told. `needs-decision` should nearly always be near-empty — it means in-flight work blocked on a SINGLE human decision RIGHT NOW, not a planning thread or brainstorm. A design thread whose questions are being worked out is `todo`, with its open questions in `## Open questions`. A completed investigation whose deliverable WAS the findings is `done`. Superseded or abandoned threads are `dismissed`. When surfacing decisions to the human, surface ONLY the genuine current-workstream calls — never dump the full board.
+
 Each thread body must keep these sections, in this order:
 
 1. `## Goal`
