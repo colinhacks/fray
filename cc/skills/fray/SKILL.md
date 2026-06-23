@@ -309,6 +309,8 @@ Investigations surface decisions only the human can make. Queue them; never per-
 3. **Batch-ask at a checkpoint** (a phase boundary, or the moment a question becomes blocking) via `AskUserQuestion` (persistent-until-answered, up to 4 at once). Enter the block with a full fleet already running so they keep working.
 4. **On the answer: sweep + re-dispatch** — fold every agent that completed during the block, MOVE answered questions into `## Decisions`, fire the next round.
 
+**Surfacing decisions to the human — ALWAYS full-context, numbered, zero invented shorthand.** When you surface a decision, question, or set of calls to the human FOR THE FIRST TIME (in chat), give COMPLETE context. Do NOT use abbreviations, codenames, internal field names, or any shorthand you or a sub-agent invented, and do NOT assume the human has read the thread doc. Each item must be self-contained enough that someone coming in COLD could give a reasonable answer — state (a) what the thing IS, (b) the current state / what the project does today, (c) what the alternatives or reference tools do, (d) the actual decision being asked, and (e) your recommendation. ALWAYS present the items as a NUMBERED LIST, so the human can reply with a clean set of numbered answers. (Inside a thread doc, established shorthand is fine; this rule governs what you SURFACE to the human in chat — that surface must be cold-readable.) The tell you violated this: the human has to ask "what does X mean?" or re-derive context you already had.
+
 If a question goes unanswered, assume *missed, not declined*, and re-surface it next checkpoint. (Mechanisms that do NOT work: background agents have no interactive stdin; you cannot have the human type into a running shell.)
 
 ---
