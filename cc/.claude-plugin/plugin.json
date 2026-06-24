@@ -1,7 +1,7 @@
 {
   "name": "fray",
   "description": "Orchestrator-first methodology for driving multi-effort pushes through individually-dispatched background sub-agents — a per-project .fray/ thread board, dispatch/reconciliation hooks, and a board/validator CLI. Dormant until you run /fray in a repo.",
-  "version": "1.7.2",
+  "version": "1.7.3",
   "author": { "name": "Colin McDonnell" },
   "homepage": "https://github.com/colinhacks/fray",
   "repository": "https://github.com/colinhacks/fray",

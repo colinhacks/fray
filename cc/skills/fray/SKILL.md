@@ -1,7 +1,7 @@
 ---
 name: fray
 description: Load this skill IMMEDIATELY — as your FIRST action, before any other tool call or response — whenever the user mentions "fray" in ANY form ("fray", "fray mode", "enter/start fray", "load fray", "use fray", "in fray", "the fray skill"), OR asks to orchestrate / run / coordinate a multi-effort push, audit, or campaign through sub-agents. Also the default for any large, mixed set of efforts — investigations + decided fixes + verifications — toward a goal (a launch push, a pre-release audit, a refactor campaign) where the human wants to stay in the loop on what the investigations surface; the default for any multi-effort push that is part "find out what's true" and part "land the decided thing." Use it instead of hardcoding a multi-agent DAG up front — those bury the decision points and fan out expensively before the facts are in. Treat any "fray" mention as an explicit instruction to load this skill, never as ambient context.
-version: 1.7.2
+version: 1.7.3
 metadata:
   internal: true
 ---
@@ -212,6 +212,14 @@ Beyond the self-contained context, these requirements raise child output from "a
   - **The worktree PR workflow (copy this into the child's prompt):** `git worktree add /tmp/wt-<slug> -b <branch>` (the shared `main` tree is left untouched) → if the repo has submodules the build needs, `git -C /tmp/wt-<slug> submodule update --init <path>` (submodules are NOT auto-populated in a new worktree) → `cd` in + give the worktree its OWN build/output dir so a sibling's build can't contaminate it → implement, commit, `git push -u origin <branch>`, `gh pr create` → report the URL → after merge, `git worktree remove … --force`. Reserve a full `git clone --depth 1 file://$PWD` + own build dir for the fully-isolated trustworthy-build case (a deliverable whose whole point is "passes tests + preserves behavior"). **NEVER `git checkout -b`/`reset`/`checkout`/`stash`/`branch` on the SHARED tree** — that clobbers concurrent agents; all branching happens in the worktree.
 - **For any GitHub issue/PR task, require `gh` context BEFORE any diagnosis or fix.** Minimum: `gh issue view <n>` for an issue; `gh pr list` searches for linked/open PRs; `gh pr view <n>` for any candidate. The child's final report must list the `gh` commands it ran and what they showed, and must not propose or land fresh work on an issue until existing linked/open PRs are checked. **Read the comments and the resolution, not just the issue body** — a closed/rejected request's real rationale lives in the thread, and the body alone will make a child confidently wrong. After context is known, drive the outcome (fix, push, comment, close, verify) rather than stopping at a diagnosis. **Close an issue with a brief, factual `gh` comment** — `gh issue close <n> --comment "<what fixed it, or why no code change is needed>"` — never close silently, and keep the comment as short as the explanation allows.
 - **Shipping a user-facing change INCLUDES updating the user-facing docs, in the SAME effort.** When the work adds or changes a feature, flag, default, or behavior a user can observe, updating the docs (README, docs site, help text — whatever the project uses) is a STEP of that effort, not a separate later thread. Bake it into the issue→fix→verify→ship lifecycle the dispatch prescribes: a change that lands code but leaves the docs describing the old behavior is half-done.
+
+## "workflow" keyword — auto-escalate to the L1+L2 spike
+
+**When the maintainer uses the word "workflow" in a task request, default to running that task as a full L1+L2 high-effort dev spike** — dispatch an L1 lead agent that fans out L2 sub-agents (investigate → implement → self-review → land), NOT a solo pass or a minimal-effort dispatch. "workflow" is the maintainer's spoken keyword that means "give this the full multi-agent treatment": an L1 that owns a worktree/thread and fans L2 waves (parallel where the work parallelizes), synthesizes, and self-reviews before landing. Absent the word, judge effort normally; with it, escalate to the L1+L2 spike by default.
+
+**Disambiguation:** this is the maintainer's SPOKEN word "workflow" (in a task request), and the response is this DYNAMIC fray L1+L2 spike pattern (individually-dispatched background sub-agents) — NOT necessarily the deterministic `Workflow` tool/DAG. The trigger is the human's word; the machinery is the nested-lead pattern described in the section below.
+
+---
 
 ## The two-level nested-lead pattern (L1→L2) — a dispatched lead that fans out its OWN sub-agents
 
