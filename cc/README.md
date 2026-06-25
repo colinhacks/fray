@@ -110,7 +110,7 @@ fray-update <slug> --patch "<find>===>><replace>"       # body find/replace, mus
 fray-update <slug> --append "<text>"                    # append to the body
 ```
 
-It enforces the invariant that **`status: needs-decision` requires a non-empty `statusText`** (the queue derives from it), auto-stamps `last_update`, and prints the full decision queue after every edit so a pending decision is never buried.
+It enforces the invariant that **`status: needs-decision` requires a non-empty `status_text`** (the queue derives from it), auto-stamps `last_update`, and prints the full decision queue after every edit so a pending decision is never buried.
 
 ### Status vocabulary
 

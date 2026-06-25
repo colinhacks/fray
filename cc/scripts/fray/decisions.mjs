@@ -2,7 +2,7 @@
 // @ts-check
 // Decisions view, DERIVED from fray threads (no static store). Scans the project's
 // .fray/*.md, selects threads with `status: needs-decision`, and prints each thread's
-// slug + its FULL statusText (the decision write-up) — the rich inline-reading view that
+// slug + its FULL status_text (the decision write-up) — the rich inline-reading view that
 // complements the one-line-per-thread board (scripts/fray/index.mjs).
 //
 // Self-contained + importable: `collectDecisions()` is reused by the thread updater
@@ -18,7 +18,7 @@ import { join, basename } from 'node:path';
 const root = process.env.CLAUDE_PROJECT_DIR || process.cwd();
 const frayDir = join(root, '.fray');
 
-const STATUS_TEXT_KEYS = ['statusText', 'status_text'];
+const STATUS_TEXT_KEY = 'status_text';
 
 // Parse the leading `---` frontmatter block into a flat map. Only single-line
 // `key: value` pairs are read (the thread frontmatter is flat scalars + a list).
@@ -59,8 +59,8 @@ export function collectDecisions() {
     }
     const fm = parseFrontmatter(text);
     if (!fm || fm.status !== 'needs-decision') continue;
-    const rawText = STATUS_TEXT_KEYS.map((k) => fm[k]).find((v) => v !== undefined);
-    out.push({ slug: basename(f, '.md'), statusText: unquote(rawText) });
+    const rawText = fm[STATUS_TEXT_KEY];
+    out.push({ slug: basename(f, '.md'), status_text: unquote(rawText) });
   }
   return out;
 }
@@ -74,7 +74,7 @@ function main() {
   console.log(`⚖ ${items.length} decision(s) awaiting you:\n`);
   items.forEach((d, i) => {
     console.log(`[${d.slug}]`);
-    console.log(d.statusText || '(no statusText written up)');
+    console.log(d.status_text || '(no status_text written up)');
     if (i < items.length - 1) console.log('');
   });
 }

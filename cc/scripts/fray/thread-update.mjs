@@ -9,9 +9,9 @@
 // plugin is enabled). The project root is resolved from CLAUDE_PROJECT_DIR (exported to
 // bin/hook processes), matching how bin/fray + index.mjs find the project's .fray/.
 //
-// Enforced invariant: setting `status: needs-decision` REQUIRES a non-empty statusText
+// Enforced invariant: setting `status: needs-decision` REQUIRES a non-empty status_text
 // (the decision write-up) — supplied via --status-text or already present on the thread.
-// The decisions queue DERIVES from these statusText fields (see decisions.mjs), so a
+// The decisions queue DERIVES from these status_text fields (see decisions.mjs), so a
 // needs-decision thread without a write-up would surface as an empty queue row. After
 // every edit this tool prints the FULL decisions queue (collectDecisions) so a pending
 // decision is never silently buried.
@@ -24,9 +24,9 @@ import { STATUS } from './config.mjs';
 // board validates against) — importing it keeps the updater and the board from drifting.
 const STATUSES = STATUS;
 const PATCH_SEP = '===>>';
-// Both spellings exist in the wild. We WRITE snake_case `status_text` (the key the board
-// reads), but match/replace EITHER when already present on a thread.
-const STATUS_TEXT_KEYS = ['statusText', 'status_text'];
+// The decision write-up lives in the `status_text` frontmatter key — the single canonical
+// spelling, read and written everywhere (the board reads the same key).
+const STATUS_TEXT_KEY = 'status_text';
 
 // The project root comes from the environment, NOT this script's own path: the tool
 // ships inside the fray PLUGIN, so a script-relative root would point at the PLUGIN,
@@ -41,14 +41,14 @@ function die(msg) {
 
 const usage = `usage: fray-update <slug> [options]
   --status <s>              set status; one of: ${STATUSES.join(' · ')}
-                            (needs-decision REQUIRES a statusText write-up)
-  --status-text "<text>"    set the statusText field (decision write-up / gloss)
+                            (needs-decision REQUIRES a status_text write-up)
+  --status-text "<text>"    set the status_text field (decision write-up / gloss)
   --set key=value           set any other frontmatter scalar (repeatable)
   --patch "<find>${PATCH_SEP}<replace>"  body find/replace, must match EXACTLY once (repeatable, applied in order, atomic)
   --append "<text>"         append text to the body`;
 
 function parseArgs(argv) {
-  const out = { slug: undefined, status: undefined, statusText: undefined, sets: [], patches: [], appends: [] };
+  const out = { slug: undefined, status: undefined, status_text: undefined, sets: [], patches: [], appends: [] };
   let i = 0;
   for (; i < argv.length; i++) {
     const a = argv[i];
@@ -58,7 +58,7 @@ function parseArgs(argv) {
     };
     switch (a) {
       case '--status': out.status = needVal('--status'); break;
-      case '--status-text': out.statusText = needVal('--status-text'); break;
+      case '--status-text': out.status_text = needVal('--status-text'); break;
       case '--set': out.sets.push(needVal('--set')); break;
       case '--patch': out.patches.push(needVal('--patch')); break;
       case '--append': out.appends.push(needVal('--append')); break;
@@ -122,27 +122,18 @@ function fmSet(fm, key, rawValue) {
   return fm;
 }
 
-// Set statusText into whichever key the thread already uses; for a thread that has
-// NEITHER, default to snake_case `status_text` — the key the board (index.mjs) reads to
-// render the `» gloss` line and to gate the drop-risk warning. (The board reads ONLY
-// `status_text`; writing camelCase here would render no gloss + a spurious warning.)
+// Write the decision write-up to the canonical `status_text` key — the only key the board
+// (index.mjs) reads to render the `» gloss` line and to gate the drop-risk warning.
 function setStatusText(fm, rawValue) {
-  for (const k of STATUS_TEXT_KEYS) {
-    if (fmGet(fm, k) !== undefined) return fmSet(fm, k, rawValue);
-  }
-  return fmSet(fm, 'status_text', rawValue);
+  return fmSet(fm, STATUS_TEXT_KEY, rawValue);
 }
 
 function getStatusText(fm) {
-  for (const k of STATUS_TEXT_KEYS) {
-    const v = fmGet(fm, k);
-    if (v !== undefined) return v;
-  }
-  return undefined;
+  return fmGet(fm, STATUS_TEXT_KEY);
 }
 
-// A statusText value counts as "present" only if it's a non-empty string.
-function statusTextNonEmpty(raw) {
+// A status_text value counts as "present" only if it's a non-empty string.
+function isStatusTextNonEmpty(raw) {
   if (raw === undefined) return false;
   let v = raw.trim();
   const m = v.match(/^"((?:[^"\\]|\\.)*)"$/);
@@ -161,15 +152,15 @@ function main() {
   const { fm, body } = splitFrontmatter(original);
   if (fm === null) die(`thread ${args.slug}.md has no YAML frontmatter block`);
 
-  // --- Validate status + the needs-decision/statusText invariant BEFORE writing ---
+  // --- Validate status + the needs-decision/status_text invariant BEFORE writing ---
   if (args.status !== undefined && !STATUSES.includes(args.status)) {
     die(`invalid status "${args.status}"; must be one of: ${STATUSES.join(' · ')}`);
   }
   const effectiveStatus = args.status ?? undefined;
   if (effectiveStatus === 'needs-decision') {
-    const willHaveStatusText = args.statusText !== undefined
-      ? statusTextNonEmpty(`"${args.statusText}"`) || args.statusText.trim().length > 0
-      : statusTextNonEmpty(getStatusText(fm));
+    const willHaveStatusText = args.status_text !== undefined
+      ? isStatusTextNonEmpty(`"${args.status_text}"`) || args.status_text.trim().length > 0
+      : isStatusTextNonEmpty(getStatusText(fm));
     if (!willHaveStatusText) {
       die('status needs-decision REQUIRES a decision write-up — pass --status-text "<text>" (or set it on the thread first)');
     }
@@ -199,7 +190,7 @@ function main() {
   // --- Apply frontmatter edits ---
   let lastUpdateExplicit = false;
   if (args.status !== undefined) fmSet(fm, 'status', args.status);
-  if (args.statusText !== undefined) setStatusText(fm, args.statusText);
+  if (args.status_text !== undefined) setStatusText(fm, args.status_text);
   for (const kv of args.sets) {
     const eq = kv.indexOf('=');
     if (eq === -1) die(`--set requires key=value (got "${kv}")`);
@@ -210,7 +201,7 @@ function main() {
     fmSet(fm, key, value);
   }
   // Auto-stamp last_update unless explicitly set. Only when SOMETHING changed.
-  const mutated = args.status !== undefined || args.statusText !== undefined || args.sets.length || patchOps.length || args.appends.length;
+  const mutated = args.status !== undefined || args.status_text !== undefined || args.sets.length || patchOps.length || args.appends.length;
   if (mutated && !lastUpdateExplicit) fmSet(fm, 'last_update', today());
 
   // body is everything after the closing `---` line (its join started at end+1),
@@ -230,7 +221,7 @@ function main() {
   console.log(`  status: ${finalStatus}`);
   if (finalStatusText !== undefined) {
     const display = finalStatusText.replace(/^"(.*)"$/, '$1');
-    console.log(`  statusText: ${display.length > 120 ? display.slice(0, 117) + '…' : display}`);
+    console.log(`  status_text: ${display.length > 120 ? display.slice(0, 117) + '…' : display}`);
   }
   if (patchOps.length) console.log(`  patches applied: ${patchOps.length}`);
   if (args.appends.length) console.log(`  appended: ${args.appends.length} block(s)`);
@@ -246,7 +237,7 @@ function main() {
     console.log(`⚖ ${decisions.length} decision(s) awaiting you:\n`);
     decisions.forEach((d, i) => {
       console.log(`[${d.slug}]`);
-      console.log(d.statusText || '(no statusText written up)');
+      console.log(d.status_text || '(no status_text written up)');
       if (i < decisions.length - 1) console.log('');
     });
   }

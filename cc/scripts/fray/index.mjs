@@ -150,7 +150,7 @@ function nextStep(src) {
       console.log(`⚖ ${items.length} decision(s) awaiting you:\n`);
       items.forEach((d, i) => {
         console.log(`[${d.slug}]`);
-        console.log(d.statusText || '(no statusText written up)');
+        console.log(d.status_text || '(no status_text written up)');
         if (i < items.length - 1) console.log('');
       });
     }
@@ -202,7 +202,7 @@ const threads = frayEntries
       id,
       title: fm?.title ?? '',
       status: fm?.status ?? '?',
-      statusText: fm?.status_text ?? '',
+      status_text: fm?.status_text ?? '',
       next,
       dependsOn,
       agents,
@@ -260,12 +260,12 @@ for (const t of threads) {
 
   // status_text is a 1-2 sentence English status note (frontmatter); flag overlong ones —
   // anything past ~2 sentences belongs in the body, not the at-a-glance board field.
-  if (t.statusText && t.statusText.length > 280) {
-    t.warnings.push(`status_text is ${t.statusText.length} chars — keep it to 1-2 sentences; move detail into the body`);
+  if (t.status_text && t.status_text.length > 280) {
+    t.warnings.push(`status_text is ${t.status_text.length} chars — keep it to 1-2 sentences; move detail into the body`);
   }
 
   // Soft warning: non-terminal threads without a status_text have no at-a-glance board note.
-  if (!t.statusText && t.id !== 'backlog') {
+  if (!t.status_text && t.id !== 'backlog') {
     t.warnings.push('no status_text — add a 1-2 sentence gloss of the current state (shown on the board as the » line)');
   }
 
@@ -346,7 +346,7 @@ for (const s of showStatuses) {
   out.push(`\n## ${s} (${group.length})`);
   for (const t of group) {
     out.push(`- ${t.id} — ${t.title}`);
-    if (t.statusText) out.push(`    » ${t.statusText}`);
+    if (t.status_text) out.push(`    » ${t.status_text}`);
     out.push(`    → ${t.next}`);
     if (t.dependsOn.length) {
       const b = blockers(t);
