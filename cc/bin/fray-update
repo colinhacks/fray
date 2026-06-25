@@ -1,0 +1,19 @@
+#!/usr/bin/env node
+// @ts-check
+/**
+ * fray-update — the structured thread updater. This shim is on the Bash tool's PATH while
+ * the plugin is enabled, so `fray-update <slug> [options]` works as a bare command from any
+ * cwd. It execs the bundled updater (scripts/fray/thread-update.mjs), which writes the
+ * PROJECT's `.fray/<slug>.md` (resolved from CLAUDE_PROJECT_DIR) and prints the decisions
+ * queue after every edit.
+ *
+ * Resolving the script: this file lives at <plugin>/bin/fray-update, so the updater is at
+ * ../scripts/fray/thread-update.mjs relative to THIS file — independent of cwd and of where
+ * the plugin is installed. Imported via a file:// URL so argv/process.env flow straight through.
+ */
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { dirname, join } from 'node:path';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const updater = join(here, '..', 'scripts', 'fray', 'thread-update.mjs');
+await import(pathToFileURL(updater).href);

@@ -30,22 +30,22 @@ claude --plugin-dir /path/to/fray
 
 ## Activation
 
-The plugin is global, but fray is **dormant in a project until that project has a `.fray/` directory.** Every hook is a silent no-op — it injects nothing, blocks nothing, creates nothing — in any repo without an opted-in `.fray/`. A virgin repo with fray installed sees zero fray output.
+The plugin is global, but fray is **dormant until a SESSION opts in.** Every hook is a silent no-op — it injects nothing, blocks nothing, creates nothing — unless the repo has a `.fray/` directory AND the current session has explicitly opted in. A virgin repo with fray installed sees zero fray output; so does a fresh session in a fray repo that hasn't run `fray on`.
 
-To activate fray in a repo, invoke the skill:
+To activate fray for your session, invoke the skill:
 
 ```
 /fray
 ```
 
-On its first invocation in a repo with no `.fray/`, the skill **bootstraps**: it creates `.fray/` and a default `.fray/config.yml`. From then on the hooks fire automatically in that project.
+Its STEP 0 runs `fray on`, which opts THIS session in. On first invocation in a repo with no `.fray/`, the skill also **bootstraps**: it creates `.fray/` and a default `.fray/config.yml`. From then on the hooks fire for any opted-in session in that project.
 
-- **Turn fray off for THE CURRENT SESSION** (not the whole repo) — quiet one session without touching others: run `fray off`. Restore with `fray on`; revert to the default with `fray reset`; check with `fray status`. Both an agent and a human can do this via a single tool call mid-session — no relaunch.
-- **Fully de-activate**: delete `.fray/`.
+- **Activate / quiet THE CURRENT SESSION** (not the whole repo) — `fray on` opts this session in; `fray off` silences it; `fray reset` reverts to the dormant default; `fray status` reports the state. Both an agent and a human can do this via a single tool call mid-session — no relaunch, and without touching other sessions.
+- **Fully de-activate the repo**: delete `.fray/`.
 
-Enablement is **per-session**, keyed on the Claude Code session id (`CLAUDE_CODE_SESSION_ID`, the same id the hooks receive). `fray on`/`off` write a sentinel at `.fray/.session-state/<session_id>`; the hooks honor it every turn. The DEFAULT (no sentinel) is **active when `.fray/` exists** — the sentinel is a per-session override on top. There is no repo-global `enabled` flag anymore: it was repo-wide (hit every concurrent session) and couldn't be toggled mid-session.
+Enablement is **opt-in and per-session**, keyed on the Claude Code session id (`CLAUDE_CODE_SESSION_ID`, the same id the hooks receive). `fray on`/`off` write a sentinel at `.fray/.session-state/<session_id>`; the hooks honor it every turn. The DEFAULT (no sentinel) is **DORMANT** — a session is active only after it runs `fray on`. There is no repo-global `enabled` flag anymore: it was repo-wide (hit every concurrent session) and couldn't be toggled mid-session.
 
-The DX in one line: **install once → dormant everywhere → `/fray` in a repo activates it there.**
+The DX in one line: **install once → dormant everywhere → `/fray` opts your session in.**
 
 ### `.fray/config.yml`
 
@@ -92,9 +92,25 @@ fray --status todo # one status
 fray --search <q>  # find a thread by id / title / body text
 fray --validate    # validate all thread frontmatter; exit 1 on error (used by the hook + CI)
 fray --json        # machine-readable {config, threads, errors, warnings}
+fray decisions     # the rich write-up of every needs-decision thread (the decision queue)
 ```
 
 Thread **dependencies** are expressed in frontmatter (`depends_on: [<other-slug>]`); the board computes when every dependency has gone terminal and flips the thread to `▶ READY — dispatch now`.
+
+### The thread updater
+
+`fray-update` is a structured, atomic editor for a thread's frontmatter + body — a superset of a raw text edit, on the Bash PATH alongside `fray`:
+
+```bash
+fray-update <slug> --status active                      # set status (validated against the vocab)
+fray-update <slug> --status needs-decision \
+  --status-text "<the decision write-up>"               # needs-decision REQUIRES a write-up
+fray-update <slug> --set key=value                      # set any other frontmatter scalar
+fray-update <slug> --patch "<find>===>><replace>"       # body find/replace, must match exactly once
+fray-update <slug> --append "<text>"                    # append to the body
+```
+
+It enforces the invariant that **`status: needs-decision` requires a non-empty `statusText`** (the queue derives from it), auto-stamps `last_update`, and prints the full decision queue after every edit so a pending decision is never buried.
 
 ### Status vocabulary
 
@@ -149,12 +165,15 @@ fray/
 │   └── fray-subagent-rest.mjs
 ├── scripts/
 │   └── fray/
-│       ├── index.mjs        # the board + validator
-│       ├── config.mjs       # shared config parse + activation gate + status vocab
+│       ├── index.mjs         # the board + validator (+ on/off/status/decisions subcommands)
+│       ├── config.mjs        # shared config parse + activation gate + status vocab
+│       ├── thread-update.mjs # structured atomic thread editor (frontmatter + body)
+│       ├── decisions.mjs     # the needs-decision queue, derived from threads
 │       ├── agent-liveness.mjs
 │       └── agent-status.mjs  # shared derived-state logic (board + Stop hook)
 ├── bin/
-│   └── fray                 # the board command (on the Bash PATH when enabled)
+│   ├── fray                  # the board command (on the Bash PATH when enabled)
+│   └── fray-update           # the structured thread updater (on the Bash PATH when enabled)
 └── README.md
 ```
 

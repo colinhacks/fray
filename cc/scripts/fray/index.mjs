@@ -39,6 +39,7 @@ import {
 } from './config.mjs';
 import { parseAgents } from './agent-liveness.mjs';
 import { deriveAgentState, findAgentOutputAge } from './agent-status.mjs';
+import { collectDecisions } from './decisions.mjs';
 
 // The project root comes from the environment, NOT from this script's own path: the
 // board ships inside the fray PLUGIN (and, after a marketplace install, lives in
@@ -105,9 +106,10 @@ function nextStep(src) {
 
 // PER-SESSION TOGGLE — `fray on` / `fray off` / `fray status` flip (or report) fray
 // enablement for THIS Claude Code session, keyed on CLAUDE_CODE_SESSION_ID (the same id
-// the hooks gate on — verified equal). Writing the sentinel is what an agent OR a human
-// runs to quiet/restore the current session mid-flight, no relaunch. These are handled
-// BEFORE the board renders, since they are not board queries.
+// the hooks gate on — verified equal). Activation is OPT-IN: a session is dormant by
+// default, so `fray on` is what an agent (the `/fray` skill's step 0) OR a human runs to
+// ACTIVATE the current session; `fray off` silences it; both write the sentinel, no
+// relaunch. These are handled BEFORE the board renders, since they are not board queries.
 {
   const sub = process.argv[2];
   if (sub === 'on' || sub === 'off' || sub === 'enable' || sub === 'disable') {
@@ -120,13 +122,13 @@ function nextStep(src) {
     const path = setSessionOverride(PROJECT_DIR, sid, state);
     console.log(`fray: ${state === 'on' ? 'ENABLED' : 'DISABLED'} for this session (${sid}).`);
     console.log(`  sentinel: ${path}`);
-    console.log(`  revert to default with: fray reset`);
+    console.log(`  revert to default (dormant) with: fray reset`);
     process.exit(0);
   }
   if (sub === 'reset' || sub === 'default') {
     const sid = currentSessionId();
     if (sid) clearSessionOverride(PROJECT_DIR, sid);
-    console.log(`fray: session override cleared for ${sid ?? '(no session id)'} — back to the default (active when .fray/ exists).`);
+    console.log(`fray: session override cleared for ${sid ?? '(no session id)'} — back to the default (DORMANT; run \`fray on\` to activate this session).`);
     process.exit(0);
   }
   if (sub === 'status') {
@@ -134,7 +136,24 @@ function nextStep(src) {
     const ov = sessionOverride(PROJECT_DIR, sid);
     const active = frayActive(PROJECT_DIR, sid);
     console.log(`fray: ${active ? 'ACTIVE' : 'INACTIVE'} this session (${sid ?? 'no session id'})`);
-    console.log(`  override: ${ov ?? 'none (default — active when .fray/ exists)'}`);
+    console.log(`  override: ${ov ?? 'none (default — DORMANT; run `fray on` to activate)'}`);
+    process.exit(0);
+  }
+  // `fray decisions` — the rich inline-reading view of every `needs-decision` thread's
+  // FULL write-up (collectDecisions). The same queue the thread updater prints after each
+  // edit; surfaced here as a board subcommand for an on-demand read.
+  if (sub === 'decisions') {
+    const items = collectDecisions();
+    if (items.length === 0) {
+      console.log('✓ no pending decisions');
+    } else {
+      console.log(`⚖ ${items.length} decision(s) awaiting you:\n`);
+      items.forEach((d, i) => {
+        console.log(`[${d.slug}]`);
+        console.log(d.statusText || '(no statusText written up)');
+        if (i < items.length - 1) console.log('');
+      });
+    }
     process.exit(0);
   }
 }

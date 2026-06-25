@@ -28,7 +28,8 @@ import { join } from 'node:path';
  * EXPLICIT per-session override:
  *   - file contains `off` (or `false`/`no`/`0`/`disabled`) → fray FORCED OFF this session
  *   - file contains `on`  (or `true`/`yes`/`1`/`enabled`)  → fray FORCED ON  this session
- *   - file ABSENT → no override → fall back to the default (fray ON when `.fray/` exists)
+ *   - file ABSENT → no override → fall back to the default (DORMANT — opt-in: a session
+ *     is active only after it explicitly runs `fray on`)
  *
  * @param {string} projectDir
  * @param {string|undefined|null} sessionId
@@ -101,16 +102,20 @@ export function currentSessionId(explicit) {
  * The gate, in order:
  *   1. `.fray/` directory EXISTS — the project has been bootstrapped (the `/fray`
  *      skill creates it on first invocation). No `.fray/` → fray is dormant here.
- *   2. The PER-SESSION SENTINEL (`.fray/.session-state/<session_id>`) — an EXPLICIT
- *      per-session override. `off` → fray silenced for THIS session only; `on` →
- *      forced on. ABSENT → the default below.
- *   3. DEFAULT (no sentinel): fray ON when `.fray/` exists — preserves the
- *      "fray repo is active" model. The sentinel is a per-session override on top.
+ *   2. The PER-SESSION SENTINEL (`.fray/.session-state/<session_id>`) — the EXPLICIT
+ *      per-session opt-in. `on` → fray active for THIS session; `off` → silenced.
+ *      ABSENT → the default below.
+ *   3. DEFAULT (no sentinel): fray is DORMANT — activation is OPT-IN PER SESSION. A
+ *      fresh session in a `.fray/` repo stays silent (every hook a no-op) until it
+ *      explicitly opts in via an `on` sentinel — written by the `/fray` skill's step 0
+ *      or a manual `fray on`. No sentinel → dormant, EVEN THOUGH `.fray/` exists. (This
+ *      is the opt-IN model; the former default was opt-OUT — active whenever `.fray/`
+ *      existed — which contradicted the plugin's "dormant until you run /fray" contract.)
  *
  * This replaces the former repo-global `enabled:` flag in `.fray/config.yml`: that
  * flag was repo-wide (hit every concurrent session, couldn't be scoped) and could
  * not be toggled mid-session. The sentinel is per-session and writable by a tool
- * call, so a session can be quieted (or restored) without a relaunch.
+ * call, so a session can be activated (or quieted) without a relaunch.
  *
  * @param {string} projectDir  The repo root (e.g. `process.env.CLAUDE_PROJECT_DIR`).
  * @param {string} [sessionId]  The session id (defaults to `CLAUDE_CODE_SESSION_ID`).
@@ -126,7 +131,7 @@ export function frayActive(projectDir, sessionId) {
   const override = sessionOverride(projectDir, currentSessionId(sessionId));
   if (override === 'off') return false; // explicit per-session silence
   if (override === 'on') return true; // explicit per-session enable
-  return true; // DEFAULT: `.fray/` exists → active (sentinel is the override)
+  return false; // DEFAULT: OPT-IN — dormant until this session runs `fray on`
 }
 
 /**
