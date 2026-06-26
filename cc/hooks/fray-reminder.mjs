@@ -21,10 +21,12 @@ import { frayActive, loadConfig, STATUS, TERMINAL } from '../scripts/fray/config
 // `agent_id` ONLY when fired inside a sub-agent (UserPromptSubmit shouldn't fire there
 // at all, so this is belt-and-suspenders). Main session → no agent_id → proceed.
 let sessionId; // hook-input session_id (== CLAUDE_CODE_SESSION_ID) for the per-session gate
+let transcriptPath; // hook-input transcript_path — lets the liveness check find this session's tasks dir fast
 try {
   const hi = JSON.parse(readFileSync(0, 'utf8'));
   if (hi.agent_id ?? hi.agentId) process.exit(0);
   sessionId = hi.session_id;
+  transcriptPath = hi.transcript_path;
 } catch {
   /* no stdin / not JSON → assume main session, proceed */
 }
@@ -148,7 +150,21 @@ try {
       ? "AUTONOMOUS MODE = ON (the human is away). What this MEANS: MAKE REASONABLE DECISIONS WITHOUT A HUMAN IN THE LOOP — do NOT ask questions, do NOT stall for confirmation; bias HARD to action and keep the background fleet busy. At a fork, pick the sensible option, DOCUMENT the call in the tracker, and PROCEED (choosing intelligently and letting the maintainer adjust on review beats stopping). Reconcile every completed sub-agent and immediately dispatch the next work. The ONLY things you may NOT autonomously land: a default / security-posture / product / brand / API-config-env decision the maintainer owns (recommend-only — design+prototype, surface to the tracker's decisions queue, don't flip the default), anything irreversible/destructive/published-external, and parked work not yet greenlit. Everything else: decide and do. Scan the board via `fray`. You ARE empowered — land greenlit work, merge landing agents' PRs, create repos, install tooling — yourself, no asking. Substantive work lands via a PR from an isolated git WORKTREE (agents open, you merge); the SHARED main tree is never branched/reset/stashed; exception-class edits (control surfaces, trivial docs) commit direct to main. Do NOT build an 'awaiting-maintainer' queue from REVERSIBLE decisions (the #1 repeated correction). The only true gates: a truly-irreversible-destructive act, a user-facing DEFAULT (ship behind a flag, don't freeze), and public-facing wording."
       : `autonomous_mode=${mode} → interactive: surface decisions + ask rather than auto-landing.`;
 
-  emit(`${modeLine}  ${status}`);
+  // Surface ONLY the high-confidence "ACTIVE THREAD, NO LIVE AGENT" lines per turn (never the
+  // soft idle notes — those would be noise). A genuinely stranded active thread SHOULD nag
+  // every turn until reconciled (the anti-drop signal that would have caught the GVS miss), and
+  // it is rare by construction (newest agent quiet >45m + rested + no PR/merge), so it can't cry
+  // wolf. Dynamic import so a broken helper can never crash the prompt before this catch.
+  let stranded = '';
+  try {
+    const { strandedThreadLines } = await import('../scripts/fray/agent-liveness.mjs');
+    const sl = strandedThreadLines({ transcriptPath, projectDir: dir });
+    if (sl.length) stranded = '\n\n' + sl.join('\n');
+  } catch {
+    /* fail-open — no stranded surfacing rather than risk the prompt */
+  }
+
+  emit(`${modeLine}  ${status}${stranded}`);
 } catch {
   // Fail-open: a broken hook must not disrupt the prompt. The static doctrine now lives in
   // SessionStart (session-seed.mjs), so there is nothing safe to fall back to here — inject

@@ -37,8 +37,8 @@ import {
   currentSessionId,
   frayActive,
 } from './config.mjs';
-import { bindingsByThread } from './agent-bindings.mjs';
-import { deriveAgentState, findAgentOutputAge } from './agent-status.mjs';
+import { newestBindingByThread, downstreamThreads, restedAgentIds } from './agent-bindings.mjs';
+import { deriveAgentState, findAgentOutputAge, IDLE_MIN, DROPPED_MIN } from './agent-status.mjs';
 import { collectDecisions } from './decisions.mjs';
 
 // The project root comes from the environment, NOT from this script's own path: the
@@ -173,7 +173,12 @@ try {
 
 // AUTOMATIC thread↔agent binding (`.fray/.agent-bindings.jsonl`, written by the agent-bind
 // hook at dispatch) — the replacement for the old hand-maintained `agents:` frontmatter.
-const agentBindings = bindingsByThread(PROJECT_DIR);
+// Liveness keys on each thread's NEWEST agent only (a superseded older one is never flagged),
+// suppresses threads with a PR landing via the merge cascade, and uses the rest log to tell a
+// parked agent apart from one still inside a long tool call.
+const newestBindings = newestBindingByThread(PROJECT_DIR);
+const downstream = downstreamThreads(PROJECT_DIR);
+const restedIds = restedAgentIds(PROJECT_DIR);
 
 const threads = frayEntries
   .filter((f) => f.endsWith('.md') && !f.startsWith('_')) // `_`-prefixed = non-thread meta (e.g. a stray _board.md)
@@ -194,14 +199,19 @@ const threads = frayEntries
     const dependsOn = parseList(fm?.depends_on);
     const next = nextStep(src);
     const threadTerminal = TERMINAL.includes(fm?.status ?? '?');
-    const threadActive = fm?.status === 'active'; // only `active` threads flag UNRECONCILED/idle agents; parked phases are expected to hold done agents
+    const threadActive = fm?.status === 'active'; // only `active` threads flag dropped/idle agents; parked phases are expected to hold done agents
+    const threadDownstream = downstream.has(id); // PR landing via the cascade → legitimately active, suppress
     // Agent liveness is DERIVED, never read from a stored per-agent flag: the AUTOMATIC
-    // binding carries only immutable `{id, label}`; state comes from output-file age (ground
-    // truth) + the thread's own status, via the SAME derivation the Stop hook uses.
-    const agents = (agentBindings.get(id) ?? []).map((a) => ({
-      ...a,
-      state: deriveAgentState({ ageMin: findAgentOutputAge(a.id), threadTerminal, threadActive }),
-    }));
+    // binding carries only immutable `{id, label}`; state comes from the NEWEST agent's
+    // output-file age (ground truth) + the thread's own status + the rest log, via the SAME
+    // derivation the Stop hook uses. Newest-only: a superseded older agent is never flagged.
+    const binding = newestBindings.get(id);
+    const agents = binding
+      ? [{
+          ...binding,
+          state: deriveAgentState({ ageMin: findAgentOutputAge(binding.id), threadTerminal, threadActive, threadDownstream, hasRested: restedIds.has(binding.id), idleMin: IDLE_MIN, droppedMin: DROPPED_MIN }),
+        }]
+      : [];
     return {
       id,
       title: fm?.title ?? '',
@@ -258,13 +268,14 @@ function renderThread(t, out) {
       ? `    ⏳ blocked on: ${b.join(', ')}`
       : `    ▶ READY — dependencies clear, dispatch now`);
   }
-  // Dispatched-agent liveness — DERIVED (output-file age + thread status), never stored.
+  // Dispatched-agent liveness — DERIVED (newest-agent output age + thread status + rest log),
+  // never stored. Newest agent only; downstream (mid-merge) threads already suppressed.
   for (const a of t.agents) {
     if (a.state === 'fresh' || a.state === 'terminal' || a.state === 'unknown') continue;
     const who = `${a.label ? `${a.label} ` : ''}[${a.id.slice(0, 9)}]`;
-    out.push(a.state === 'unreconciled'
-      ? `    ⚠ UNRECONCILED agent ${who} — output stale, thread non-terminal; fold + reconcile`
-      : `    ⚠ IDLE agent ${who} — no recent output; poke or confirm mid-build`);
+    out.push(a.state === 'dropped'
+      ? `    ⚠ ACTIVE THREAD, NO LIVE AGENT — newest agent ${who} quiet, no PR/merge in flight; fold + flip to done, or resume it`
+      : `    · idle agent ${who} — no recent output; fine if watching CI/mid-build, else poke`);
   }
   for (const w of t.warnings) out.push(`    ⚠ ${w}`);
 }

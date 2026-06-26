@@ -21,26 +21,43 @@
  * is exactly why the old hand-maintained `status` field drifted and false-flagged a
  * completed agent as idle; deriving it makes that drift class structurally impossible.
  *
- * Derived states (one per dispatched agent):
- *   - 'terminal'       — the THREAD is terminal (done/dismissed). Nothing to flag.
- *   - 'unreconciled'   — output is stale (>frozenMin) BUT the thread is non-terminal:
- *                        a likely-finished agent the orchestrator never folded. THE one
- *                        signal that matters.
- *   - 'frozen'         — output stale (>frozenMin), thread non-terminal, treated the same
- *                        as unreconciled (a stale-output agent IS the unreconciled case);
- *                        kept as a distinct return only for callers that want the wording.
- *   - 'idle'           — output quiet (>idleMin, <=frozenMin), thread non-terminal: poke
- *                        or confirm it's mid-long-build.
+ * Derived states (one per dispatched agent — keyed on the thread's NEWEST agent only):
+ *   - 'terminal'       — nothing to flag, for ANY of: the THREAD is terminal (done/dismissed);
+ *                        the thread is PARKED (non-terminal but not `active`); or the thread is
+ *                        DOWNSTREAM (a PR is landing via the merge cascade, so it is
+ *                        legitimately active while it merges, not because an agent is stuck).
+ *   - 'dropped'        — the conservative, high-confidence "no live agent" signal: an `active`
+ *                        thread whose newest agent's output is stale beyond `droppedMin` AND
+ *                        which has rested at least once (ended a turn) — so it is quiet at a
+ *                        stopping point, not mid-tool-call. Likely finished-but-unreconciled or
+ *                        genuinely dropped. THE one signal that matters.
+ *   - 'idle'           — quiet, but NOT confidently dropped: output between `idleMin` and
+ *                        `droppedMin`, OR stale-but-never-rested (still inside one long tool
+ *                        call — a build/test — so alive). Informational only; say it softly.
  *   - 'fresh'          — output recent (<=idleMin): actively working, say nothing.
  *   - 'unknown'        — no readable output file (placeholder id, never-started): can't
  *                        judge; fail-open (say nothing).
+ *
+ * WHY a generous `droppedMin` (45m, vs the old 25m). Sub-agents now legitimately arm CI
+ * watchers and go quiet for long stretches while CI runs (30–40m), so "no output for 25m" is
+ * NORMAL, not stuck — the old threshold cried wolf. 45m gives a watcher room to fire and
+ * resume the agent (which refreshes its output) before we ever call it dropped; the bar is
+ * deliberately "better to miss a soft case than nag a benign one."
  */
 
 import { readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 export const DEFAULT_IDLE_MIN = 10;
-export const DEFAULT_FROZEN_MIN = 25;
+export const DEFAULT_DROPPED_MIN = 45;
+// Back-compat alias for the old name; repointed to the new, generous default.
+export const DEFAULT_FROZEN_MIN = DEFAULT_DROPPED_MIN;
+
+// Env-resolved thresholds, defined ONCE here so EVERY consumer (the Stop-hook liveness helper
+// AND the board) reads the same knobs and can never disagree. FRAY_FROZEN_MIN is honored as the
+// old alias for FRAY_DROPPED_MIN.
+export const IDLE_MIN = parseInt(process.env.FRAY_IDLE_MIN || '', 10) || DEFAULT_IDLE_MIN;
+export const DROPPED_MIN = parseInt(process.env.FRAY_DROPPED_MIN || process.env.FRAY_FROZEN_MIN || '', 10) || DEFAULT_DROPPED_MIN;
 
 /**
  * GROUND-TRUTH age of an agent's last activity, in minutes — globbed across ALL local
@@ -114,21 +131,36 @@ export function findAgentOutputAge(agentId, now = Date.now()) {
  *                                       enqueued/todo) with done agents are EXPECTED, not a
  *                                       drift signal — never flagged. (Defaults true for
  *                                       backward-compat when a caller doesn't pass it.)
+ * @param {boolean} [a.threadDownstream] does the thread have a PR landing via the merge
+ *                                       cascade (`.fray/merge-queue.jsonl`)? Such a thread is
+ *                                       legitimately `active` while it merges — the producing
+ *                                       agent has finished and reconciled — so it is never a
+ *                                       drop. (Defaults false.)
+ * @param {boolean} [a.hasRested]        has the agent recorded at least one rest (ended a
+ *                                       turn)? Stale output + NO rest = still inside one long
+ *                                       tool call (a build/test) → ALIVE, never 'dropped'.
+ *                                       (Defaults true for back-compat with callers that don't
+ *                                       supply it.)
  * @param {number} [a.idleMin]          idle threshold (min). Default {@link DEFAULT_IDLE_MIN}.
- * @param {number} [a.frozenMin]        frozen/stale threshold (min). Default {@link DEFAULT_FROZEN_MIN}.
- * @returns {'terminal'|'unreconciled'|'idle'|'fresh'|'unknown'}
+ * @param {number} [a.droppedMin]       dropped/stale threshold (min). Default {@link DEFAULT_DROPPED_MIN}.
+ * @param {number} [a.frozenMin]        DEPRECATED alias for `droppedMin` (old callers).
+ * @returns {'terminal'|'dropped'|'idle'|'fresh'|'unknown'}
  */
-export function deriveAgentState({ ageMin, threadTerminal, threadActive = true, idleMin = DEFAULT_IDLE_MIN, frozenMin = DEFAULT_FROZEN_MIN }) {
+export function deriveAgentState({ ageMin, threadTerminal, threadActive = true, threadDownstream = false, hasRested = true, idleMin = DEFAULT_IDLE_MIN, droppedMin = DEFAULT_DROPPED_MIN, frozenMin }) {
+  if (frozenMin != null) droppedMin = frozenMin; // back-compat: old callers passed frozenMin
   // A reconciled thread is the orchestrator's deliberate "I folded this" signal — the
   // only mutable bit in the whole loop, and it lives on the THREAD, not the agent.
   if (threadTerminal) return 'terminal';
   // PARKED (non-terminal but not `active`: needs-decision/blocked/enqueued/todo)
   // is also a deliberate orchestrator state — a stale/done agent on a parked thread is
-  // EXPECTED (the work finished, the thread awaits a human/dep), NOT unreconciled. Only an
+  // EXPECTED (the work finished, the thread awaits a human/dep), NOT a drop. Only an
   // `active` thread is "being worked right now", so only it can have a drift-signal agent.
   if (!threadActive) return 'terminal';
+  // DOWNSTREAM: a PR is landing for this thread via the cascade — it is active for the
+  // merge, not a stuck agent. The producing agent has finished + been reconciled; suppress.
+  if (threadDownstream) return 'terminal';
   if (ageMin == null) return 'unknown'; // no activity file → can't judge (fail-open)
-  if (ageMin > frozenMin) return 'unreconciled'; // stale output + ACTIVE thread = the signal that matters
+  if (ageMin > droppedMin) return hasRested ? 'dropped' : 'idle'; // stale + rested = quiet at a stopping point (the signal); stale + never-rested = still in one long tool call → alive
   if (ageMin > idleMin) return 'idle';
   return 'fresh';
 }

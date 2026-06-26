@@ -131,3 +131,100 @@ export function threadForAgent(projectDir, agentId) {
   for (const b of readBindings(projectDir)) if (b.agent_id === agentId) found = b.thread;
   return found;
 }
+
+/**
+ * Per thread, the SINGLE NEWEST binding — the agent CURRENTLY serving the thread.
+ *
+ * Liveness must key on this, NOT on every agent ever bound: a thread is frequently
+ * re-dispatched (an agent dies/rests and a FRESH agent picks the same thread up), and a
+ * SUPERSEDED older agent staying quiet is EXPECTED, never a drop. Flagging the old agent
+ * after a new one took over was the #1 false positive (e.g. dead `ac067e883` kept firing on
+ * `gvs-warning-silent` long after live `a56d5f1` replaced it). Keying on the newest binding
+ * makes that class structurally impossible.
+ *
+ * Newest = max binding `ts` (ISO), with append-order (file index) as the tiebreaker — so an
+ * unparseable/absent ts still resolves deterministically to the later-written line.
+ * @param {string} projectDir
+ * @returns {Map<string, {id:string, label:string|null, ts:string|null}>}
+ */
+export function newestBindingByThread(projectDir) {
+  /** @type {Map<string, {id:string, label:string|null, ts:string|null, _ms:number, _idx:number}>} */
+  const out = new Map();
+  const bindings = readBindings(projectDir);
+  for (let idx = 0; idx < bindings.length; idx++) {
+    const b = bindings[idx];
+    const ms = Date.parse(b.ts ?? '');
+    const key = Number.isFinite(ms) ? ms : -Infinity;
+    const cur = out.get(b.thread);
+    if (!cur || key > cur._ms || (key === cur._ms && idx > cur._idx)) {
+      out.set(b.thread, { id: b.agent_id, label: b.label ?? null, ts: b.ts ?? null, _ms: key, _idx: idx });
+    }
+  }
+  /** @type {Map<string, {id:string, label:string|null, ts:string|null}>} */
+  const clean = new Map();
+  for (const [thread, v] of out) clean.set(thread, { id: v.id, label: v.label, ts: v.ts });
+  return clean;
+}
+
+/**
+ * Threads with a PR landing in flight via the merge cascade (`.fray/merge-queue.jsonl`).
+ *
+ * Such a thread is LEGITIMATELY `active` while its PR merges — the agent that produced the
+ * work has finished and its output is reconciled; the thread stays active purely for the
+ * DOWNSTREAM merge, not because an agent is stuck. Suppressing liveness for these kills the
+ * second false-positive class (a completed agent flagged because its thread is mid-merge).
+ * Fail-open: no file / unparseable → empty set (suppress nothing).
+ * @param {string} projectDir
+ * @returns {Set<string>}
+ */
+export function downstreamThreads(projectDir) {
+  /** @type {Set<string>} */
+  const out = new Set();
+  try {
+    const raw = readFileSync(join(projectDir, '.fray', 'merge-queue.jsonl'), 'utf8');
+    for (const line of raw.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const r = JSON.parse(line);
+        if (r && r.thread) out.add(String(r.thread));
+      } catch {
+        /* skip a malformed line */
+      }
+    }
+  } catch {
+    /* no merge-queue → nothing downstream */
+  }
+  return out;
+}
+
+/**
+ * agent_ids that have recorded at least one SubagentStop (rest) in `.fray/.rested-agents.jsonl`
+ * — i.e. reached a clean stopping point at least once (ended a turn).
+ *
+ * This is the signal that separates a TERMINATED/parked agent from one still grinding inside a
+ * single long tool call. An agent mid-build (one 40-min `cargo build`, no rest yet) has stale
+ * output but is ALIVE — and must never be called "dropped". Combined with stale output, a rest
+ * record means the agent ended its turn and has been quiet since: the conservative "no live
+ * agent" condition. Fail-open: no file / unparseable → empty set.
+ * @param {string} projectDir
+ * @returns {Set<string>}
+ */
+export function restedAgentIds(projectDir) {
+  /** @type {Set<string>} */
+  const out = new Set();
+  try {
+    const raw = readFileSync(join(projectDir, '.fray', '.rested-agents.jsonl'), 'utf8');
+    for (const line of raw.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const r = JSON.parse(line);
+        if (r && r.agent_id) out.add(String(r.agent_id));
+      } catch {
+        /* skip a malformed line */
+      }
+    }
+  } catch {
+    /* no rest log → no rested agents */
+  }
+  return out;
+}

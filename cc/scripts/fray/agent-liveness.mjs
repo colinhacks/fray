@@ -25,29 +25,31 @@
  *   2. The owning THREAD's own `status:` frontmatter (done/dismissed = terminal) — the
  *      orchestrator's deliberate "I reconciled this" signal, and the ONLY mutable bit.
  *
- * Emitted lines, all DERIVED (never read from a per-agent flag):
- *   - IDLE  (age > IDLE_MIN, thread non-terminal):   poke (SendMessage) or check if frozen.
- *   - UNRECONCILED (age > FROZEN_MIN, thread non-terminal): a likely-finished/stalled
- *     agent the orchestrator never folded → reconcile (fold, drain, flip terminal).
- *   - (thread terminal → say nothing; the orchestrator already reconciled it.)
+ * THREAD-CENTRIC, LOW-NOISE. For each `active` thread we consider ONLY its NEWEST bound agent
+ * (a superseded older agent is never flagged) and SUPPRESS the thread entirely when a PR is
+ * landing for it via the merge cascade (it's active for the merge, not a stuck agent). The bar
+ * is "better to miss a soft case than nag a benign one":
+ *   - ⚠ ACTIVE THREAD, NO LIVE AGENT (state 'dropped'): an active, non-downstream thread whose
+ *     NEWEST agent is quiet beyond DROPPED_MIN AND has rested (ended a turn) — the
+ *     high-confidence "this thread is stuck active with nobody on it" signal. Calm wording.
+ *   - a soft idle note (state 'idle'): quiet but not confidently dropped — fine if it's
+ *     watching CI or mid-build. Informational only.
+ *   - (thread terminal / parked / downstream / fresh agent → say nothing.)
  *
  * Thresholds (minutes), tunable via env for experimentation:
- *   FRAY_IDLE_MIN   (default 10) — no activity this long → flag as idle/poke.
- *   FRAY_FROZEN_MIN (default 25) — this long → call it likely-stale/unreconciled.
- *      Deliberately generous: a real agent can sit silent inside a long build, test
- *      run, or CI watch for many minutes, so 25 min gives headroom before we cry wolf
- *      and risk a false poke. Tune via the env var for faster- or slower-paced repos.
+ *   FRAY_IDLE_MIN    (default 10) — quiet this long → soft idle note.
+ *   FRAY_DROPPED_MIN (default 45, FRAY_FROZEN_MIN honored as the old alias) — quiet this long
+ *      AND rested → call it dropped. Deliberately generous: a real agent legitimately arms a
+ *      CI watcher and sits silent for 30–40 min, so 45 min lets the watcher fire and resume it
+ *      before we ever flag. Tune via the env var for faster- or slower-paced repos.
  *
  * FAIL-OPEN ABSOLUTELY: any error (no tasks dir, no bindings file, unparseable frontmatter,
  * unreadable file) → return [] (no lines). This must NEVER throw or block end-of-turn.
  */
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { deriveAgentState, DEFAULT_IDLE_MIN, DEFAULT_FROZEN_MIN } from './agent-status.mjs';
-import { bindingsByThread } from './agent-bindings.mjs';
-
-const IDLE_MIN = parseInt(process.env.FRAY_IDLE_MIN || '', 10) || DEFAULT_IDLE_MIN;
-const FROZEN_MIN = parseInt(process.env.FRAY_FROZEN_MIN || '', 10) || DEFAULT_FROZEN_MIN;
+import { deriveAgentState, findAgentOutputAge, IDLE_MIN, DROPPED_MIN } from './agent-status.mjs';
+import { newestBindingByThread, downstreamThreads, restedAgentIds } from './agent-bindings.mjs';
 
 // Thread-level terminal statuses (frontmatter `status:`), matching scripts/fray TERMINAL.
 const TERMINAL_THREAD = new Set(['done', 'dismissed']);
@@ -85,69 +87,105 @@ export function deriveTasksDir(transcriptPath) {
 }
 
 /**
- * Compute idle/unreconciled reminder lines for all dispatched agents, DERIVED purely
- * from ground truth (output-file mtime + thread status) — never a stored per-agent flag.
+ * GROUND-TRUTH age (minutes) of an agent's last activity. Prefers the exact session's tasks
+ * dir (fast, one statSync) when we have it; falls back to the session-independent glob whenever
+ * the agent's `.output` isn't in THIS session's tasks dir — either there's no transcript_path,
+ * OR the binding is from a PRIOR session (e.g. after a restart), where the cross-session glob is
+ * what keeps anti-drop working across restarts. Returns null when no output file exists.
+ * @param {string} agentId
+ * @param {string|null} tasksDir
+ * @param {number} now
+ * @returns {number|null}
+ */
+function agentAge(agentId, tasksDir, now) {
+  if (tasksDir) {
+    try {
+      const st = statSync(join(tasksDir, `${agentId}.output`)); // follows the symlink → target mtime
+      return (now - st.mtimeMs) / 60000;
+    } catch {
+      /* not in this session's tasks dir → fall through to the glob */
+    }
+  }
+  return findAgentOutputAge(agentId, now);
+}
+
+/**
+ * Compute thread-centric liveness lines, DERIVED purely from ground truth (newest-binding age +
+ * rest log + thread status + merge-queue) — never a stored per-agent flag. At most ONE line per
+ * thread, keyed on the thread's NEWEST agent only, with downstream (mid-merge) threads
+ * suppressed. The loud "ACTIVE THREAD, NO LIVE AGENT" lines come first, then soft idle notes.
  * @param {{transcriptPath?: string|null, projectDir: string, now?: number}} args
  * @returns {string[]} reminder lines (possibly empty)
  */
 export function agentLivenessLines({ transcriptPath, projectDir, now = Date.now() }) {
   /** @type {string[]} */
-  const lines = [];
+  const dropped = [];
+  /** @type {string[]} */
+  const idle = [];
   try {
-    const tasksDir = deriveTasksDir(transcriptPath);
-    if (!tasksDir) return lines; // can't locate activity files → fail-open, say nothing
+    const tasksDir = deriveTasksDir(transcriptPath); // may be null → agentAge falls back to glob
     const frayDir = join(projectDir, '.fray');
 
-    // AUTOMATIC binding: which agents serve which thread, read from `.agent-bindings.jsonl`
-    // (recorded by the agent-bind hook at dispatch). No frontmatter `agents:` is consulted.
-    const byThread = bindingsByThread(projectDir);
+    // AUTOMATIC binding: the NEWEST agent serving each thread (a superseded older agent is
+    // never considered). Plus the merge-cascade set (suppress mid-merge threads) and the rest
+    // log (separate a parked agent from one still inside a long tool call).
+    const newest = newestBindingByThread(projectDir);
+    const downstream = downstreamThreads(projectDir);
+    const rested = restedAgentIds(projectDir);
 
     let files;
     try {
       files = readdirSync(frayDir).filter((f) => f.endsWith('.md') && !f.startsWith('_'));
     } catch {
-      return lines;
+      return dropped;
     }
 
     for (const f of files) {
+      const slug = f.replace(/\.md$/, '');
+      const binding = newest.get(slug);
+      if (!binding) continue; // no agent ever bound to this thread → nothing to judge
+
       let src;
       try {
         src = readFileSync(join(frayDir, f), 'utf8');
       } catch {
         continue;
       }
-      const slug = f.replace(/\.md$/, '');
       const threadStatus = src.match(/^status:\s*(\S+)/m)?.[1] ?? '';
       const threadTerminal = TERMINAL_THREAD.has(threadStatus);
-      const threadActive = threadStatus === 'active'; // only `active` threads can have an UNRECONCILED/idle agent; parked phases (needs-decision/blocked/enqueued/todo) with done agents are EXPECTED, not drift
-      const agents = byThread.get(slug) ?? [];
+      const threadActive = threadStatus === 'active'; // ONLY active threads can strand an agent; parked phases holding a done agent are EXPECTED
+      if (threadTerminal || !threadActive) continue;
+      // PR landing via the cascade → legitimately active, suppress. Skip BEFORE agentAge so a
+      // mid-merge thread never pays the (potentially full-/tmp-glob) age lookup just to be
+      // dropped by deriveAgentState's downstream short-circuit anyway.
+      if (downstream.has(slug)) continue;
 
-      for (const a of agents) {
-        // Age comes from the output-file mtime — the ground truth. No per-agent stored
-        // status is consulted. Placeholders (`current`) / never-started ids just miss.
-        let ageMin = null;
-        try {
-          const st = statSync(join(tasksDir, `${a.id}.output`)); // follows the symlink → target mtime
-          ageMin = (now - st.mtimeMs) / 60000;
-        } catch {
-          ageMin = null; // no activity file → can't judge idleness (fail-open per agent)
-        }
-        const who = `${a.label ? `${a.label} ` : ''}[${a.id.slice(0, 9)}] (thread ${slug})`;
+      const ageMin = agentAge(binding.id, tasksDir, now);
+      const hasRested = rested.has(binding.id);
+      const state = deriveAgentState({ ageMin, threadTerminal, threadActive, hasRested, idleMin: IDLE_MIN, droppedMin: DROPPED_MIN }); // downstream already short-circuited above
+      const who = `${binding.label ? `${binding.label} ` : ''}[${binding.id.slice(0, 9)}]`;
 
-        // DERIVE the state from ground truth only (output age + thread status).
-        const state = deriveAgentState({ ageMin, threadTerminal, threadActive, idleMin: IDLE_MIN, frozenMin: FROZEN_MIN });
-        if (state === 'unreconciled') {
-          // Stale output + non-terminal thread = a likely-finished/stalled agent the
-          // orchestrator never folded. THE signal that matters.
-          lines.push(`⚠ UNRECONCILED: agent ${who} — no output for ${Math.round(ageMin)}m (> ${FROZEN_MIN}m) but thread status is "${threadStatus || '?'}" (non-terminal). Reconcile: fold findings, drain queue, flip the THREAD terminal — or confirm it's genuinely still running (then poke via SendMessage).`);
-        } else if (state === 'idle') {
-          lines.push(`⚠ IDLE: agent ${who} — no output for ${Math.round(ageMin)}m. Poke (SendMessage) to continue, or check if it's mid-long-build (then leave it).`);
-        }
-        // 'terminal' (thread reconciled), 'fresh' (working), 'unknown' (no file) → say nothing.
+      if (state === 'dropped') {
+        dropped.push(`⚠ ACTIVE THREAD, NO LIVE AGENT: ${slug} — its newest agent ${who} has been quiet ${Math.round(ageMin ?? 0)}m with no PR/merge in flight, so it likely finished or dropped. Fold its report and flip the thread to done, or resume it (SendMessage ${binding.id.slice(0, 9)}) if it's still mid-task.`);
+      } else if (state === 'idle') {
+        idle.push(`fray: thread ${slug} — agent ${who} quiet ${Math.round(ageMin ?? 0)}m. Fine if it's watching CI or mid-build; check in (SendMessage) if that's unexpected.`);
       }
+      // 'terminal' (reconciled / parked / downstream), 'fresh' (working), 'unknown' (no file) → say nothing.
     }
   } catch {
-    /* fail-open: return whatever we have (typically []) */
+    /* fail-open: return whatever we have */
   }
-  return lines;
+  return [...dropped, ...idle];
+}
+
+/**
+ * The high-confidence subset of {@link agentLivenessLines}: ONLY the "ACTIVE THREAD, NO LIVE
+ * AGENT" lines. Used by the per-turn reminder, where surfacing the soft idle notes every prompt
+ * would be noise — but a genuinely stranded active thread SHOULD nag every turn until reconciled
+ * (that is the anti-drop signal), and it's rare by construction, so it won't cry wolf.
+ * @param {{transcriptPath?: string|null, projectDir: string, now?: number}} args
+ * @returns {string[]}
+ */
+export function strandedThreadLines(args) {
+  return agentLivenessLines(args).filter((l) => l.startsWith('⚠ ACTIVE THREAD'));
 }
