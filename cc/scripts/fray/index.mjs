@@ -239,6 +239,36 @@ function blockers(t) {
   return t.dependsOn.filter((dep) => slugs.has(dep) && !TERMINAL.includes(statusOf.get(dep) ?? '?'));
 }
 
+/**
+ * Render one thread's board block (slug line + status_text gloss + next-step + dep state +
+ * agent-liveness + warnings) into `out`. Shared by the per-status groups AND the dedicated
+ * `⚖ pending decisions` section so the two can never drift. status_text is emitted IN FULL —
+ * the board NEVER truncates it (the length cap is a soft scan-loop warning, itself exempted
+ * for needs-decision, so a decision's open question is always fully readable on a wide term).
+ * @param {(typeof threads)[number]} t
+ * @param {string[]} out
+ */
+function renderThread(t, out) {
+  out.push(`- ${t.id} — ${t.title}`);
+  if (t.status_text) out.push(`    » ${t.status_text}`);
+  out.push(`    → ${t.next}`);
+  if (t.dependsOn.length) {
+    const b = blockers(t);
+    out.push(b.length
+      ? `    ⏳ blocked on: ${b.join(', ')}`
+      : `    ▶ READY — dependencies clear, dispatch now`);
+  }
+  // Dispatched-agent liveness — DERIVED (output-file age + thread status), never stored.
+  for (const a of t.agents) {
+    if (a.state === 'fresh' || a.state === 'terminal' || a.state === 'unknown') continue;
+    const who = `${a.label ? `${a.label} ` : ''}[${a.id.slice(0, 9)}]`;
+    out.push(a.state === 'unreconciled'
+      ? `    ⚠ UNRECONCILED agent ${who} — output stale, thread non-terminal; fold + reconcile`
+      : `    ⚠ IDLE agent ${who} — no recent output; poke or confirm mid-build`);
+  }
+  for (const w of t.warnings) out.push(`    ⚠ ${w}`);
+}
+
 // ── Stall-suspect WARNINGS (drop-risk heuristics) ───────────────────────────────
 // These are CONSERVATIVE warnings, NOT hard errors — they never fail `--validate`'s
 // exit code (that stays gated on real frontmatter errors so the per-turn hook + CI
@@ -264,7 +294,9 @@ for (const t of threads) {
 
   // status_text is a 1-2 sentence English status note (frontmatter); flag overlong ones —
   // anything past ~2 sentences belongs in the body, not the at-a-glance board field.
-  if (t.status_text && t.status_text.length > 280) {
+  // EXEMPT needs-decision: its status_text IS the pending-decision queue entry (the concise
+  // open question), surfaced UNTRUNCATED on the board + reminder — never warn on or clip it.
+  if (t.status !== 'needs-decision' && t.status_text && t.status_text.length > 280) {
     t.warnings.push(`status_text is ${t.status_text.length} chars — keep it to 1-2 sentences; move detail into the body`);
   }
 
@@ -344,30 +376,29 @@ const out = [];
 out.push(`fray board — autonomous_mode: ${cfg.autonomousMode ? 'on' : 'off'}${only ? ` — status:${only}` : showAll ? ' — all' : ' — live'}`);
 if (allErrors.length) out.push(`\n⚠ VALIDATION ERRORS:\n${allErrors.join('\n')}`);
 if (allWarnings.length) out.push(`\n⚠ DROP-RISK WARNINGS (advisory):\n${allWarnings.join('\n')}`);
+
+// ⚖ PENDING DECISIONS — the COMPUTED human-decision queue: every `needs-decision` thread,
+// surfaced by its FULL status_text (the concise open question). HOISTED to the top of the
+// board (not buried mid-status-list) and rendered UNTRUNCATED — the terminal is wide and the
+// question must be fully readable. Nothing is stored: this is filtered live from the scanned
+// threads, the same compute-don't-cache principle as the rest of the board. Shown in the
+// live/default + `--all` views and when `--status needs-decision` is requested; suppressed
+// for any OTHER single-status filter (the user asked for a different slice). needs-decision
+// is rendered ONLY here — it is skipped in the per-status group loop below to avoid duplication.
+if (!only || only === 'needs-decision') {
+  const pendingDecisions = threads.filter((t) => t.status === 'needs-decision');
+  if (pendingDecisions.length) {
+    out.push(`\n## ⚖ pending decisions (${pendingDecisions.length}) — awaiting your call`);
+    for (const t of pendingDecisions) renderThread(t, out);
+  }
+}
+
 for (const s of showStatuses) {
+  if (s === 'needs-decision') continue; // rendered in the dedicated ⚖ pending decisions section above
   const group = threads.filter((t) => t.status === s);
   if (!group.length) continue;
   out.push(`\n## ${s} (${group.length})`);
-  for (const t of group) {
-    out.push(`- ${t.id} — ${t.title}`);
-    if (t.status_text) out.push(`    » ${t.status_text}`);
-    out.push(`    → ${t.next}`);
-    if (t.dependsOn.length) {
-      const b = blockers(t);
-      out.push(b.length
-        ? `    ⏳ blocked on: ${b.join(', ')}`
-        : `    ▶ READY — dependencies clear, dispatch now`);
-    }
-    // Dispatched-agent liveness — DERIVED (output-file age + thread status), never stored.
-    for (const a of t.agents) {
-      if (a.state === 'fresh' || a.state === 'terminal' || a.state === 'unknown') continue;
-      const who = `${a.label ? `${a.label} ` : ''}[${a.id.slice(0, 9)}]`;
-      out.push(a.state === 'unreconciled'
-        ? `    ⚠ UNRECONCILED agent ${who} — output stale, thread non-terminal; fold + reconcile`
-        : `    ⚠ IDLE agent ${who} — no recent output; poke or confirm mid-build`);
-    }
-    for (const w of t.warnings) out.push(`    ⚠ ${w}`);
-  }
+  for (const t of group) renderThread(t, out);
 }
 const unknown = threads.filter((t) => !STATUS.includes(t.status));
 if (unknown.length) out.push(`\n## (invalid status) (${unknown.length})\n${unknown.map((t) => `- ${t.id} [${t.status}]`).join('\n')}`);
