@@ -15,7 +15,7 @@
 // hook must not disrupt the prompt) — any failure → inject nothing.
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { frayActive, loadConfig, STATUS, TERMINAL } from '../scripts/fray/config.mjs';
+import { frayActive, loadConfig, STATUS, TERMINAL, PARKED } from '../scripts/fray/config.mjs';
 
 // Token-saving: skip entirely inside sub-agent contexts. The hook stdin carries
 // `agent_id` ONLY when fired inside a sub-agent (UserPromptSubmit shouldn't fire there
@@ -95,7 +95,7 @@ try {
   // shared module — same source the tool's `--validate` uses. Unrecognized fields are
   // allowed by design — only required fields + the status vocab are checked.
   /** @type {string[]} */
-  const pending = []; // `<slug>[status]` for every non-terminal thread — compact, one line, names included so a stalled thread is caught BY NAME (not just a count). Full detail stays in the `fray` board, NOT injected per-message.
+  const pending = []; // `<slug>[status]` for every non-terminal, non-PARKED thread — compact, one line, names included so a stalled thread is caught BY NAME (not just a count). PARKED phases (`plan`/`todo`) are deliberately EXCLUDED from the per-turn nag (they are real, board-visible work, just not auto-surfaced) — only genuinely-actionable/in-flight statuses (enqueued/active/blocked/needs-decision) nag. Full detail stays in the `fray` board, NOT injected per-message.
   /** @type {string[]} */
   const queued = []; // non-terminal threads that still carry a `QUEUED` follow-up marker — surfaced BY NAME so the drain-the-queue step can't be skipped (missing these is totally unacceptable).
   /** @type {string[]} */
@@ -125,7 +125,11 @@ try {
   /** @type {{slug:string,status_text:string}[]} */
   const decisions = []; // every `needs-decision` thread — the COMPUTED pending-decision queue, surfaced each turn by its FULL status_text (the concise open question). Nothing stored; derived live from the scan.
   for (const t of scanned) {
-    if (!TERMINAL.includes(t.status ?? '')) {
+    // PARKED (`plan`/`todo`) is non-terminal but deliberately NOT auto-nagged — it is parked
+    // work the orchestrator pulls up via the `fray` board on its own schedule, not every turn.
+    // Only the genuinely-actionable/in-flight statuses (enqueued/active/blocked/needs-decision)
+    // reach the per-turn pending list + its sub-checks (queued/drop-risk/decisions).
+    if (!TERMINAL.includes(t.status ?? '') && !PARKED.includes(t.status ?? '')) {
       pending.push(`${t.id}[${t.status ?? '?'}]`);
       if (/\bQUEUED\b/.test(t.src)) queued.push(t.id);
       if (t.status === 'needs-decision') decisions.push({ slug: t.id, status_text: t.status_text });

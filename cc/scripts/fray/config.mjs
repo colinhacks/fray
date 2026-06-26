@@ -136,6 +136,16 @@ export function frayActive(projectDir, sessionId) {
 
 /**
  * The thread-status vocabulary.
+ * - `plan` — the EARLIEST phase: the thread's deliverable RIGHT NOW is the
+ *   DESIGN/approach itself, not an implementation. Its `## Open questions` are
+ *   actively driving the work; you'd dispatch a Plan/architect agent or work it WITH
+ *   the human — NEVER an implementer (there is nothing settled to implement yet).
+ *   Non-terminal. THE TRANSITION RULE: a `plan` thread flips to `todo` at the END of
+ *   the planning process — the instant the design is locked and only implementation
+ *   remains. Planning ENDS by marking the thread `todo` (or going straight to `active`
+ *   if you dispatch the implementer immediately). Distinct from `needs-decision`:
+ *   `needs-decision` is blocked on ONE specific human yes/no; `plan` is ongoing
+ *   collaborative design with multiple open questions still in motion.
  * - `todo` — thought-through, has an open doc, awaiting explicit actioning. The
  *   "scoped but not yet scheduled" bucket — NO defer-reason ceremony required; `todo`
  *   simply means "not yet scheduled/actioned." Use it for work that COULD start but
@@ -161,7 +171,7 @@ export function frayActive(projectDir, sessionId) {
  *   deleted, excluded from the active board's pending views.
  * @type {readonly string[]}
  */
-export const STATUS = ['todo', 'enqueued', 'active', 'blocked', 'needs-decision', 'done', 'dismissed'];
+export const STATUS = ['plan', 'todo', 'enqueued', 'active', 'blocked', 'needs-decision', 'done', 'dismissed'];
 
 /**
  * The terminal subset of {@link STATUS}: completed OR decided-against. Both are
@@ -169,6 +179,19 @@ export const STATUS = ['todo', 'enqueued', 'active', 'blocked', 'needs-decision'
  * @type {readonly string[]}
  */
 export const TERMINAL = ['done', 'dismissed'];
+
+/**
+ * The PARKED (non-terminal but not-yet-picked-up) subset of {@link STATUS}:
+ * `plan` (design still in progress) and `todo` (design settled, build not started).
+ * Both are real, live statuses that the on-demand `fray` board DOES show — but they
+ * are EXCLUDED from the AUTO-INJECTED per-turn / stop-hook "pending threads" nag,
+ * because nagging the orchestrator every turn about parked work is noise. Only the
+ * genuinely-actionable/in-flight statuses (`enqueued`/`active`/`blocked`/`needs-decision`)
+ * are auto-surfaced; parked work is pulled up deliberately via `fray` when you choose
+ * to action it. NOT terminal — these threads are open work, just not auto-nagged.
+ * @type {readonly string[]}
+ */
+export const PARKED = ['plan', 'todo'];
 
 /**
  * @typedef {Object} FrayConfig

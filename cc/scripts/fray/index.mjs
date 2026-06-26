@@ -11,7 +11,7 @@
  *
  * Usage (the `fray` command is the bin/ shim that runs this script against the
  * project's `.fray/`, regardless of cwd or where the plugin is installed):
- *   fray               # print the LIVE board (active/enqueued/blocked/needs-decision only)
+ *   fray               # print the LIVE board (plan/active/enqueued/blocked/needs-decision only)
  *   fray --all         # print all threads (every status)
  *   fray --status todo # print only threads in one status
  *   fray --validate    # print ONLY validation errors; exit 1 if any (for the hook / CI). --check is an alias.
