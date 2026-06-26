@@ -78,6 +78,7 @@ fray's state lives in `.fray/`, in the consuming project — never a single bloa
 - **`.fray/config.yml`** — non-thread globals: `autonomous_mode` and a `state:` block. (Enablement is NOT here — it's per-session; see the toggle above.)
 - **`.fray/.session-state/<session_id>`** — per-session enablement sentinels (`on`/`off`), written by `fray on`/`fray off`. Local-only runtime state under the already-ignored `.fray/`.
 - **`.fray/<slug>.findings/<id>.md`** — optional sub-agent findings sidecars (only for parallel fan-out; the resting state is one unified thread doc).
+- **`.fray/.agent-bindings.jsonl`** — ephemeral, hook-written `agentId → thread` routing records (the `agent-bind` PostToolUse hook captures one per background dispatch from the Agent tool result). Lets the board + Stop-hook reconnect a sub-agent's return/rest to its thread — the AUTOMATIC replacement for a hand-maintained `agents:` frontmatter list. Pure routing state, never a thread's source of truth.
 
 There is **no stored board** and **no unified ledger** — both would be caches that drift out of sync with the threads. The board is **computed on demand** from the thread frontmatter.
 

@@ -2,14 +2,17 @@
 /**
  * fray — agent-liveness helper for the Stop hook.
  *
- * The orchestrator dispatches background sub-agents and records their bindings in
- * each thread's frontmatter (`agents: [{id, label}]` — IMMUTABLE-at-dispatch facts
- * only). This module DERIVES each dispatched agent's real liveness from ground truth
+ * Background sub-agents are bound to their thread AUTOMATICALLY: the `agent-bind`
+ * PostToolUse hook records `agentId → thread` into `.fray/.agent-bindings.jsonl` at
+ * dispatch (see `./agent-bindings.mjs`). This module reads that ephemeral binding to learn
+ * which agents serve which thread, then DERIVES each one's real liveness from ground truth
  * and returns reminder LINES for the Stop hook to surface. Hooks cannot call
- * SendMessage/Agent, so this is detect-and-remind only — exactly the ask.
+ * SendMessage/Agent, so this is detect-and-remind only — exactly the ask. (The old
+ * hand-maintained `agents: [{id, label}]` thread frontmatter is GONE — never read; a
+ * lingering one in an old thread file is an ignored no-op.)
  *
- * COMPUTE, DON'T STORE. There is no hand-maintained per-agent `status` field to trust
- * (and any legacy one in old frontmatter is IGNORED). State comes from `deriveAgentState`
+ * COMPUTE, DON'T STORE. The binding supplies only the id↔thread mapping; it carries no
+ * per-agent state. State comes from `deriveAgentState`
  * (`./agent-status.mjs`) over two ground-truth signals:
  *   1. The session tasks dir, derived from the Stop payload's `transcript_path`
  *      (`~/.claude/projects/<slug>/<session>.jsonl`). The per-agent activity files
@@ -35,12 +38,13 @@
  *      run, or CI watch for many minutes, so 25 min gives headroom before we cry wolf
  *      and risk a false poke. Tune via the env var for faster- or slower-paced repos.
  *
- * FAIL-OPEN ABSOLUTELY: any error (no tasks dir, unparseable frontmatter, no agents:,
+ * FAIL-OPEN ABSOLUTELY: any error (no tasks dir, no bindings file, unparseable frontmatter,
  * unreadable file) → return [] (no lines). This must NEVER throw or block end-of-turn.
  */
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { deriveAgentState, DEFAULT_IDLE_MIN, DEFAULT_FROZEN_MIN } from './agent-status.mjs';
+import { bindingsByThread } from './agent-bindings.mjs';
 
 const IDLE_MIN = parseInt(process.env.FRAY_IDLE_MIN || '', 10) || DEFAULT_IDLE_MIN;
 const FROZEN_MIN = parseInt(process.env.FRAY_FROZEN_MIN || '', 10) || DEFAULT_FROZEN_MIN;
@@ -81,44 +85,6 @@ export function deriveTasksDir(transcriptPath) {
 }
 
 /**
- * Extract `{id, label}` records from a thread's frontmatter `agents:` list — the
- * IMMUTABLE-at-dispatch binding. Tolerates both the structured object form and the
- * bare-id-list form. A legacy `status:` key inside an object is DELIBERATELY NOT read:
- * agent state is DERIVED from ground truth, never from a hand-stored field. Best-effort
- * regex parse (the file is hand-authored YAML-ish; no YAML dep by design).
- * @param {string} src
- * @returns {{id:string,label:string|null}[]}
- */
-export function parseAgents(src) {
-  /** @type {{id:string,label:string|null}[]} */
-  const out = [];
-  try {
-    const m = src.match(/^agents:\s*\[([\s\S]*?)\]\s*$/m);
-    if (!m) return out;
-    const body = m[1];
-    // Structured form: one {...} object per agent. (`status:` if present is IGNORED.)
-    const objs = body.match(/\{[^}]*\}/g);
-    if (objs && objs.length) {
-      for (const o of objs) {
-        const id = o.match(/\bid:\s*([^,}\s]+)/)?.[1];
-        if (!id) continue;
-        const label = o.match(/\blabel:\s*"([^"]*)"/)?.[1] ?? o.match(/\blabel:\s*([^,}]+)/)?.[1]?.trim() ?? null;
-        out.push({ id, label });
-      }
-      return out;
-    }
-    // Bare-id-list form: `[a1b2, c3d4, ...]`.
-    for (const raw of body.split(',')) {
-      const id = raw.trim().replace(/^["']|["']$/g, '');
-      if (id) out.push({ id, label: null });
-    }
-  } catch {
-    /* fail-open → whatever we parsed so far */
-  }
-  return out;
-}
-
-/**
  * Compute idle/unreconciled reminder lines for all dispatched agents, DERIVED purely
  * from ground truth (output-file mtime + thread status) — never a stored per-agent flag.
  * @param {{transcriptPath?: string|null, projectDir: string, now?: number}} args
@@ -131,6 +97,10 @@ export function agentLivenessLines({ transcriptPath, projectDir, now = Date.now(
     const tasksDir = deriveTasksDir(transcriptPath);
     if (!tasksDir) return lines; // can't locate activity files → fail-open, say nothing
     const frayDir = join(projectDir, '.fray');
+
+    // AUTOMATIC binding: which agents serve which thread, read from `.agent-bindings.jsonl`
+    // (recorded by the agent-bind hook at dispatch). No frontmatter `agents:` is consulted.
+    const byThread = bindingsByThread(projectDir);
 
     let files;
     try {
@@ -150,7 +120,7 @@ export function agentLivenessLines({ transcriptPath, projectDir, now = Date.now(
       const threadStatus = src.match(/^status:\s*(\S+)/m)?.[1] ?? '';
       const threadTerminal = TERMINAL_THREAD.has(threadStatus);
       const threadActive = threadStatus === 'active'; // only `active` threads can have an UNRECONCILED/idle agent; parked phases (needs-decision/blocked/enqueued/todo) with done agents are EXPECTED, not drift
-      const agents = parseAgents(src);
+      const agents = byThread.get(slug) ?? [];
 
       for (const a of agents) {
         // Age comes from the output-file mtime — the ground truth. No per-agent stored

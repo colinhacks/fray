@@ -137,6 +137,7 @@ function writeState(patch) {
 function newRestsSince(sinceMs, surfacedAgents, lastAnonTs) {
   const seen = new Set(surfacedAgents);
   const newAgents = new Set();
+  const threads = new Set(); // bound thread slugs of the newly-counted rests, to name in the nudge
   let anonCount = 0;
   let maxAnonTs = lastAnonTs; // advance the anon high-water mark to the newest anon rest seen
   try {
@@ -149,9 +150,13 @@ function newRestsSince(sinceMs, surfacedAgents, lastAnonTs) {
         if (!Number.isFinite(ts) || ts <= sinceMs) continue;
         const id = rec.agent_id;
         if (id) {
-          if (!seen.has(id)) newAgents.add(id);
+          if (!seen.has(id)) {
+            newAgents.add(id);
+            if (rec.thread) threads.add(rec.thread);
+          }
         } else if (ts > lastAnonTs) {
           anonCount++;
+          if (rec.thread) threads.add(rec.thread);
           if (ts > maxAnonTs) maxAnonTs = ts;
         }
       } catch {
@@ -161,7 +166,7 @@ function newRestsSince(sinceMs, surfacedAgents, lastAnonTs) {
   } catch {
     /* no log → no rests */
   }
-  return { count: newAgents.size + anonCount, agents: [...newAgents], maxAnonTs };
+  return { count: newAgents.size + anonCount, agents: [...newAgents], threads: [...threads], maxAnonTs };
 }
 
 /** Was any thread file (`.fray/*.md`) touched since `sinceMs`? */
@@ -185,8 +190,9 @@ function threadTouchedSince(sinceMs) {
 // rest≠done, incomplete-handoff handling) lives in the `fray` skill the model already
 // has loaded — repeating it here every fire produced a ~200-word wall that rendered as
 // an alarming block. The hook only needs to POINT at the work; the skill carries the how.
-function restReminder(n) {
-  return `fray: ${n} new sub-agent rest(s) since you last reconciled — reconcile each (oldest first, re-read its thread, drain its queue, verify it actually landed) or stop if all are already handled.`;
+function restReminder(n, threads = []) {
+  const where = threads.length ? ` (thread(s): ${threads.join(', ')})` : '';
+  return `fray: ${n} new sub-agent rest(s) since you last reconciled${where} — reconcile each (oldest first, re-read its thread, drain its queue, verify it actually landed) or stop if all are already handled.`;
 }
 
 const CLEANUP_REMINDER =
@@ -244,7 +250,7 @@ async function main() {
   // Fire only on rests from agents NOT yet surfaced (deduped by agent-id) AND newer
   // than the last surface, so each genuinely-new rest forces exactly one reconciliation
   // prompt (loop-safe with Guard 1) without re-nagging a resuming agent's repeat rests.
-  const { count: newRests, agents: newAgentIds, maxAnonTs } = newRestsSince(last_rest_surfaced, surfaced_agents, last_anon_ts);
+  const { count: newRests, agents: newAgentIds, threads: newRestThreads, maxAnonTs } = newRestsSince(last_rest_surfaced, surfaced_agents, last_anon_ts);
   // Cooldown: don't re-block on EVERY rest — under multi-session work the rest log
   // fills with OTHER sessions' subagent stops, which would otherwise block our idle
   // every couple minutes. A real completion of OUR agent re-invokes us via its
@@ -257,7 +263,7 @@ async function main() {
     // recent ids — older ones are long-since reconciled).
     const merged = [...surfaced_agents, ...newAgentIds].slice(-200);
     writeState({ last_rest_surfaced: now, last_fired: now, surfaced_agents: merged, last_anon_ts: maxAnonTs });
-    return block(restReminder(newRests) + livenessBlock, USER_NOTE);
+    return block(restReminder(newRests, newRestThreads) + livenessBlock, USER_NOTE);
   }
 
   // (B) CLEANUP NUDGE — original behavior, rate-limited + activity-gated. The

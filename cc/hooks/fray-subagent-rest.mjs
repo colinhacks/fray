@@ -33,6 +33,7 @@
 import { appendFileSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { frayActive } from '../scripts/fray/config.mjs';
+import { threadForAgent } from '../scripts/fray/agent-bindings.mjs';
 
 const PROJECT_DIR = process.env.CLAUDE_PROJECT_DIR || process.cwd();
 const FRAY_DIR = join(PROJECT_DIR, '.fray');
@@ -86,6 +87,15 @@ try {
   }
   if (dispatchCount === 0) process.exit(0); // no fray dispatch → not a fray rest → no record
 
+  // Resolve the thread this agent serves from the AUTOMATIC binding (agentId → thread),
+  // so the Stop-hook rest reminder can point reconciliation at the right thread file.
+  // Fail-open: an unresolved id just records `thread: null`.
+  let thread = null;
+  try {
+    thread = threadForAgent(PROJECT_DIR, payload.agent_id);
+  } catch {
+    /* fail-open */
+  }
   const rec = {
     ts: new Date().toISOString(),
     // best-effort identifiers — payload shape varies; record whatever is present
@@ -93,6 +103,7 @@ try {
     session: payload.session_id || null,
     agent_type: payload.agent_type || null,
     agent_id: payload.agent_id || null,
+    thread: thread || null,
   };
   appendFileSync(REST_LOG, JSON.stringify(rec) + '\n');
 } catch {

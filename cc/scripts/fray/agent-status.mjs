@@ -5,21 +5,21 @@
  * reported state can never drift between the two.
  *
  * THE PRINCIPLE — compute, don't store (the same rule the board already follows for
- * thread status). A thread's `agents:` binding records ONLY immutable-at-dispatch facts
- * (`{id, label}`); it carries NO hand-maintained per-agent `status` field. (A legacy
- * `status:` may still be PRESENT in old frontmatter — it is IGNORED, never trusted.)
+ * thread status). The thread↔agent binding (`.fray/.agent-bindings.jsonl`, written
+ * AUTOMATICALLY by the agent-bind hook) records ONLY immutable-at-dispatch facts
+ * (`agentId → thread`, plus a label); it carries NO per-agent `status`. (The old
+ * hand-maintained `agents:` frontmatter is gone; a lingering one is an ignored no-op.)
  * Every liveness/doneness judgement is DERIVED here from ground truth:
  *
  *   - output-file (`tasks/<id>.output`) mtime → how long since the agent last wrote,
  *   - the THREAD's own `status:` (done/dismissed = terminal) → whether the orchestrator
  *     has deliberately reconciled the thread.
  *
- * There is NO durable per-agent completion signal a hook can read: `.rested-agents.jsonl`
- * records only `{ts, transcript, session}` — NO agent id — so it cannot attribute a rest
- * to a specific agent. "Done" is therefore INFERRED (terminal-or-stale output + thread
- * status), never read from a stored per-agent flag. That absence is exactly why the old
- * hand-maintained `status` field drifted and false-flagged a completed agent as idle;
- * removing it makes that drift class structurally impossible.
+ * There is NO durable per-agent COMPLETION signal: a rest (`.rested-agents.jsonl`) records
+ * an `agent_id` but a rest is NOT "done" (an agent rests repeatedly). So "done" is INFERRED
+ * (terminal-or-stale output + thread status), never read from a stored per-agent flag. That
+ * is exactly why the old hand-maintained `status` field drifted and false-flagged a
+ * completed agent as idle; deriving it makes that drift class structurally impossible.
  *
  * Derived states (one per dispatched agent):
  *   - 'terminal'       — the THREAD is terminal (done/dismissed). Nothing to flag.

@@ -37,7 +37,7 @@ import {
   currentSessionId,
   frayActive,
 } from './config.mjs';
-import { parseAgents } from './agent-liveness.mjs';
+import { bindingsByThread } from './agent-bindings.mjs';
 import { deriveAgentState, findAgentOutputAge } from './agent-status.mjs';
 import { collectDecisions } from './decisions.mjs';
 
@@ -171,6 +171,10 @@ try {
   process.exit(0);
 }
 
+// AUTOMATIC thread↔agent binding (`.fray/.agent-bindings.jsonl`, written by the agent-bind
+// hook at dispatch) — the replacement for the old hand-maintained `agents:` frontmatter.
+const agentBindings = bindingsByThread(PROJECT_DIR);
+
 const threads = frayEntries
   .filter((f) => f.endsWith('.md') && !f.startsWith('_')) // `_`-prefixed = non-thread meta (e.g. a stray _board.md)
   .sort()
@@ -191,10 +195,10 @@ const threads = frayEntries
     const next = nextStep(src);
     const threadTerminal = TERMINAL.includes(fm?.status ?? '?');
     const threadActive = fm?.status === 'active'; // only `active` threads flag UNRECONCILED/idle agents; parked phases are expected to hold done agents
-    // Agent liveness is DERIVED, never read from a stored per-agent flag: the binding
-    // carries only immutable `{id, label}`; state comes from output-file age (ground
+    // Agent liveness is DERIVED, never read from a stored per-agent flag: the AUTOMATIC
+    // binding carries only immutable `{id, label}`; state comes from output-file age (ground
     // truth) + the thread's own status, via the SAME derivation the Stop hook uses.
-    const agents = parseAgents(src).map((a) => ({
+    const agents = (agentBindings.get(id) ?? []).map((a) => ({
       ...a,
       state: deriveAgentState({ ageMin: findAgentOutputAge(a.id), threadTerminal, threadActive }),
     }));
