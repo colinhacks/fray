@@ -135,43 +135,85 @@ export function frayActive(projectDir, sessionId) {
 }
 
 /**
- * The thread-status vocabulary.
- * - `plan` — the EARLIEST phase: the thread's deliverable RIGHT NOW is the
- *   DESIGN/approach itself, not an implementation. Its `## Open questions` are
- *   actively driving the work; you'd dispatch a Plan/architect agent or work it WITH
- *   the human — NEVER an implementer (there is nothing settled to implement yet).
- *   Non-terminal. THE TRANSITION RULE: a `plan` thread flips to `todo` at the END of
- *   the planning process — the instant the design is locked and only implementation
- *   remains. Planning ENDS by marking the thread `todo` (or going straight to `active`
- *   if you dispatch the implementer immediately). Distinct from `needs-decision`:
- *   `needs-decision` is blocked on ONE specific human yes/no; `plan` is ongoing
- *   collaborative design with multiple open questions still in motion.
- * - `todo` — thought-through, has an open doc, awaiting explicit actioning. The
- *   "scoped but not yet scheduled" bucket — NO defer-reason ceremony required; `todo`
- *   simply means "not yet scheduled/actioned." Use it for work that COULD start but
- *   hasn't been picked up. CRUCIAL: a ready thread waiting on a TRANSIENT blocker (a
- *   PR merge, a wave drain, a prior agent's output) is NOT `todo` — it is `enqueued`
- *   + `depends_on` (which auto-fires on the board). Encode the dependency in
- *   `depends_on` frontmatter, NEVER as prose in `## Next step`.
- * - `enqueued` — basically ready to go; AUTO-FIRES when its `depends_on` clear. Held
- *   until a NAMED in-flight agent/thread (in `depends_on`) completes — a sequencing
- *   dependency (same-file serialization, or it needs the prior agent's output).
- *   Distinct from `blocked`: an `enqueued` thread has a concrete auto-trigger (its
- *   deps clear → dispatch it), it is NOT waiting on a human/decision. PREFER messaging
- *   the in-flight agent to fold the work in over enqueuing-then-dispatching, when the
- *   work fits that agent's scope (see the fray skill — steer-in-flight beats
- *   spawn-fresh). THE INVARIANT: a thread leaving `needs-decision` (just decided)
- *   transitions to `active` (dispatch this turn) or `enqueued` (`depends_on` a blocker)
- *   — a ready thread waiting on a transient blocker is `enqueued` + `depends_on`, not
- *   `todo` and never a prose-only defer-note.
- * - `blocked` — cannot proceed; waiting on a human decision, an answer, or an
- *   external event with no in-session auto-trigger.
- * - `needs-decision` — surfaced a question the human owns; recommend-only until answered.
- * - `done` / `dismissed` — TERMINAL (completed / decided-against): kept, never
- *   deleted, excluded from the active board's pending views.
+ * The CANONICAL thread-status vocabulary — listed in LIFECYCLE order. This is the ONLY
+ * set written to disk going forward; the legacy spellings (`todo`/`plan`/`needs-decision`)
+ * are accepted on read via {@link STATUS_ALIASES} + {@link normalizeStatus}, never as a
+ * canonical value.
+ * - `planning` — ACTIVE design discussion happening RIGHT NOW: the thread's deliverable is
+ *   the DESIGN/approach itself, not an implementation. Its `## Open questions` are driving
+ *   the work; you'd work it WITH the human or dispatch a Plan/architect agent — NEVER an
+ *   implementer (nothing is settled to build yet). SURFACED in the per-turn nag (it is the
+ *   active-equivalent for a plan). THE TRANSITION RULE: a `planning` thread flips to
+ *   `planned` at a design stopping point — the instant the design is parked or locked and
+ *   active discussion pauses (or straight to `active` if you dispatch the implementer).
+ * - `planned` — PARKED: scoped/designed but NOT actively worked. The "thought-through, has
+ *   a doc, not yet scheduled" bucket — no defer-reason ceremony. NOT surfaced in the nag
+ *   (the board shows it; the per-turn pulse stays quiet). CRUCIAL: a ready thread waiting
+ *   on a TRANSIENT blocker (a PR merge, a prior agent's output) is NOT `planned` — it is
+ *   `enqueued` + `depends_on` (which auto-fires on the board), encoded in frontmatter, never
+ *   as prose in `## Next step`. (This is the RENAME of the old `todo`, and it also absorbs
+ *   the old first-class `plan` status.)
+ * - `enqueued` — basically ready to go; AUTO-FIRES when its `depends_on` clear. Held until a
+ *   NAMED in-flight agent/thread (in `depends_on`) completes — a sequencing dependency
+ *   (same-file serialization, or it needs the prior agent's output). Distinct from
+ *   `blocked`: an `enqueued` thread has a concrete auto-trigger, it is NOT waiting on a
+ *   human. PREFER messaging the in-flight agent to fold the work in over
+ *   enqueuing-then-dispatching, when the work fits that agent's scope (steer-in-flight beats
+ *   spawn-fresh). SURFACED in the nag.
+ * - `active` — building NOW; a live agent is on it. SURFACED. A just-decided, ready-to-run
+ *   thread goes here when you dispatch it this turn.
+ * - `blocked` — CANONICAL for blocked / awaiting-human-decision / waiting-on-external:
+ *   cannot proceed without a human decision, an answer, or an external event with no
+ *   in-session auto-trigger. SURFACED, and hoisted into the board's `⚖ awaiting you` queue
+ *   by its status_text. (This ABSORBS the old `needs-decision` status — that spelling is no
+ *   longer canonical; it reads as `blocked`.)
+ * - `done` / `dismissed` — TERMINAL (completed / decided-against): kept, never deleted,
+ *   excluded from the active board's pending views.
  * @type {readonly string[]}
  */
-export const STATUS = ['plan', 'todo', 'enqueued', 'active', 'blocked', 'needs-decision', 'done', 'dismissed'];
+export const STATUS = ['planning', 'planned', 'enqueued', 'active', 'blocked', 'done', 'dismissed'];
+
+/**
+ * BACK-COMPAT READ ALIASES — legacy status spellings, accepted FOREVER on read (never a
+ * validation error) and normalized to their canonical target. A thread file still carrying
+ * `status: todo` / `status: plan` / `status: needs-decision` validates fine and is bucketed
+ * as its canonical equivalent. The CLI normalizes these to canonical on write.
+ * @type {Readonly<Record<string,string>>}
+ */
+export const STATUS_ALIASES = { todo: 'planned', plan: 'planned', 'needs-decision': 'blocked' };
+
+/**
+ * The full set ACCEPTED by the validator: canonical statuses plus the read-aliases. Used
+ * for the "expected one of …" error message and the `--status <s>` filter.
+ * @type {readonly string[]}
+ */
+export const ACCEPTED_STATUSES = [...STATUS, ...Object.keys(STATUS_ALIASES)];
+
+/**
+ * Normalize a raw `status:` value to its CANONICAL form: a legacy alias maps to its target,
+ * a canonical value passes through, anything else (incl. unknown/garbage) returns unchanged
+ * so the caller's validation can still reject it. Apply this wherever a thread's raw status
+ * is read, validated, or bucketed.
+ * @param {string|undefined|null} raw
+ * @returns {string|undefined|null}
+ */
+export function normalizeStatus(raw) {
+  if (raw == null) return raw;
+  const v = String(raw).trim();
+  return STATUS_ALIASES[v] ?? v;
+}
+
+/**
+ * Is `raw` an accepted status — a canonical value OR a read-alias? (Validation accepts both;
+ * rejects anything else.)
+ * @param {string|undefined|null} raw
+ * @returns {boolean}
+ */
+export function isValidStatus(raw) {
+  if (raw == null) return false;
+  const v = String(raw).trim();
+  return STATUS.includes(v) || Object.prototype.hasOwnProperty.call(STATUS_ALIASES, v);
+}
 
 /**
  * The terminal subset of {@link STATUS}: completed OR decided-against. Both are
@@ -181,17 +223,25 @@ export const STATUS = ['plan', 'todo', 'enqueued', 'active', 'blocked', 'needs-d
 export const TERMINAL = ['done', 'dismissed'];
 
 /**
- * The PARKED (non-terminal but not-yet-picked-up) subset of {@link STATUS}:
- * `plan` (design still in progress) and `todo` (design settled, build not started).
- * Both are real, live statuses that the on-demand `fray` board DOES show — but they
- * are EXCLUDED from the AUTO-INJECTED per-turn / stop-hook "pending threads" nag,
- * because nagging the orchestrator every turn about parked work is noise. Only the
- * genuinely-actionable/in-flight statuses (`enqueued`/`active`/`blocked`/`needs-decision`)
- * are auto-surfaced; parked work is pulled up deliberately via `fray` when you choose
- * to action it. NOT terminal — these threads are open work, just not auto-nagged.
+ * The PARKED (non-terminal but not-yet-actively-worked) subset of canonical {@link STATUS}:
+ * just `planned`. It is a real, live status the on-demand `fray` board DOES show — but it is
+ * EXCLUDED from the AUTO-INJECTED per-turn / stop-hook "pending threads" nag, because nagging
+ * the orchestrator every turn about parked work is noise. Pull parked work up deliberately
+ * via `fray` when you choose to action it. (`planning` is NOT parked — active design counts
+ * as in-flight and IS surfaced.)
  * @type {readonly string[]}
  */
-export const PARKED = ['plan', 'todo'];
+export const PARKED = ['planned'];
+
+/**
+ * The SURFACED (auto-nagged) subset of canonical {@link STATUS}: the genuinely
+ * actionable/in-flight statuses the per-turn + stop hooks list by name —
+ * `planning` (active design), `enqueued`, `active`, `blocked`. Everything else
+ * (`planned` + the terminals) is excluded from the nag. Equals
+ * `STATUS − PARKED − TERMINAL`, kept explicit so the intent is readable.
+ * @type {readonly string[]}
+ */
+export const SURFACED = ['planning', 'enqueued', 'active', 'blocked'];
 
 /**
  * @typedef {Object} FrayConfig
@@ -301,4 +351,83 @@ export function loadConfig(projectDir) {
   }
 
   return cfg;
+}
+
+// ── ANTI-DRIFT RECONCILE FORCING-FUNCTION ─────────────────────────────────────────
+// The board is COMPUTED from per-thread frontmatter, so a thread whose status drifted
+// from reality (a PR merged, but the thread never flipped to done) is surfaced as live
+// truth until SOMETHING re-grounds it. "Reconcile" historically only meant "fold agent
+// returns" — nothing forced a periodic re-grounding of the whole board against the actual
+// code/PRs. This forcing-function fixes that: a LAST-COMPLETE-RECONCILE timestamp persists
+// in `.fray/.last-reconcile` (gitignored runtime, like the rest of `.fray`); when it goes
+// stale the per-turn hook emits a LOUD instruction to spin up a reconcile sub-agent. The
+// hook does only timestamp math — the actual PR-liveness checking belongs to the dispatched
+// reconcile sub-agent, NOT the every-turn hook.
+
+/** Default staleness threshold (minutes) before the per-turn hook nags for a reconcile. */
+export const DEFAULT_RECONCILE_THRESHOLD_MIN = 15;
+
+/**
+ * Resolve the reconcile-staleness threshold (minutes) from the parsed config's `state:`
+ * block (`reconcile_threshold_min`), falling back to {@link DEFAULT_RECONCILE_THRESHOLD_MIN}.
+ * A non-positive / unparseable value falls back too.
+ * @param {FrayConfig} cfg
+ * @returns {number}
+ */
+export function reconcileThresholdMin(cfg) {
+  const raw = cfg?.state?.reconcile_threshold_min;
+  const n = parseInt(String(raw ?? ''), 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_RECONCILE_THRESHOLD_MIN;
+}
+
+/**
+ * Path to the last-complete-reconcile timestamp file (epoch-ms) under `.fray/`.
+ * @param {string} projectDir
+ * @returns {string}
+ */
+export function lastReconcilePath(projectDir) {
+  return join(projectDir, '.fray', '.last-reconcile');
+}
+
+/**
+ * Read the persisted last-reconcile epoch-ms, or `null` when absent/unreadable/garbage.
+ * @param {string} projectDir
+ * @returns {number|null}
+ */
+export function readLastReconcile(projectDir) {
+  try {
+    const raw = readFileSync(lastReconcilePath(projectDir), 'utf8').trim();
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Stamp the last-complete-reconcile timestamp to `ts` (default now). Creates `.fray/` as
+ * needed. Returns the file path.
+ * @param {string} projectDir
+ * @param {number} [ts]
+ * @returns {string}
+ */
+export function writeLastReconcile(projectDir, ts = Date.now()) {
+  const dir = join(projectDir, '.fray');
+  mkdirSync(dir, { recursive: true });
+  const f = lastReconcilePath(projectDir);
+  writeFileSync(f, String(ts) + '\n');
+  return f;
+}
+
+/**
+ * Is the board reconcile STALE? Pure timestamp math (no I/O) so it is trivially testable.
+ * A missing timestamp (`lastMs == null`) counts as stale — instruct a FIRST reconcile.
+ * @param {number|null} lastMs   the persisted last-reconcile epoch-ms (or null when absent)
+ * @param {number} thresholdMin  staleness threshold in minutes
+ * @param {number} [now]
+ * @returns {boolean}
+ */
+export function isReconcileStale(lastMs, thresholdMin, now = Date.now()) {
+  if (lastMs == null) return true;
+  return now - lastMs > thresholdMin * 60_000;
 }

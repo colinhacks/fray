@@ -11,9 +11,10 @@
  *
  * Usage (the `fray` command is the bin/ shim that runs this script against the
  * project's `.fray/`, regardless of cwd or where the plugin is installed):
- *   fray               # print the LIVE board (plan/active/enqueued/blocked/needs-decision only)
+ *   fray               # print the LIVE board (planning/active/enqueued/blocked only; planned is hidden)
  *   fray --all         # print all threads (every status)
- *   fray --status todo # print only threads in one status
+ *   fray --status planned # print only threads in one status (legacy aliases todo/plan/needs-decision accepted)
+ *   fray reconcile     # stamp .fray/.last-reconcile = now (records a completed board reconcile)
  *   fray --validate    # print ONLY validation errors; exit 1 if any (for the hook / CI). --check is an alias.
  *   fray --json        # machine-readable {config, threads, errors} — ALWAYS complete, never filtered
  *
@@ -31,11 +32,15 @@ import {
   loadConfig,
   STATUS,
   TERMINAL,
+  ACCEPTED_STATUSES,
+  normalizeStatus,
+  isValidStatus,
   setSessionOverride,
   clearSessionOverride,
   sessionOverride,
   currentSessionId,
   frayActive,
+  writeLastReconcile,
 } from './config.mjs';
 import { newestBindingByThread, downstreamThreads, restedAgentIds } from './agent-bindings.mjs';
 import { deriveAgentState, findAgentOutputAge, IDLE_MIN, DROPPED_MIN } from './agent-status.mjs';
@@ -125,6 +130,16 @@ function nextStep(src) {
     console.log(`  revert to default (dormant) with: fray reset`);
     process.exit(0);
   }
+  // `fray reconcile` — RECORD a completed board reconcile by stamping `.fray/.last-reconcile`
+  // to now. The per-turn fray-reminder hook nags when this timestamp goes stale; a reconcile
+  // sub-agent (or a human) runs this AFTER re-grounding every non-terminal thread against the
+  // actual code/PRs, to reset the staleness clock. Pure timestamp write — no board scan needed.
+  if (sub === 'reconcile') {
+    const f = writeLastReconcile(PROJECT_DIR);
+    console.log('fray: board reconcile recorded — staleness clock reset.');
+    console.log(`  stamped: ${f}`);
+    process.exit(0);
+  }
   if (sub === 'reset' || sub === 'default') {
     const sid = currentSessionId();
     if (sid) clearSessionOverride(PROJECT_DIR, sid);
@@ -139,9 +154,10 @@ function nextStep(src) {
     console.log(`  override: ${ov ?? 'none (default — DORMANT; run `fray on` to activate)'}`);
     process.exit(0);
   }
-  // `fray decisions` — the rich inline-reading view of every `needs-decision` thread's
-  // FULL write-up (collectDecisions). The same queue the thread updater prints after each
-  // edit; surfaced here as a board subcommand for an on-demand read.
+  // `fray decisions` — the rich inline-reading view of every `blocked` thread's FULL
+  // write-up (collectDecisions; `blocked` absorbs the old `needs-decision`). The same queue
+  // the thread updater prints after each edit; surfaced here as a board subcommand for an
+  // on-demand read.
   if (sub === 'decisions') {
     const items = collectDecisions();
     if (items.length === 0) {
@@ -193,13 +209,17 @@ const threads = frayEntries
       errors.push('no YAML frontmatter');
     } else {
       for (const k of REQUIRED) if (!fm[k]) errors.push(`missing required field: ${k}`);
-      if (fm.status && !STATUS.includes(fm.status))
-        errors.push(`invalid status "${fm.status}" (expected one of: ${STATUS.join(', ')})`);
+      if (fm.status && !isValidStatus(fm.status))
+        errors.push(`invalid status "${fm.status}" (expected one of: ${ACCEPTED_STATUSES.join(', ')})`);
     }
+    // Bucket on the CANONICAL status: a legacy `todo`/`plan`/`needs-decision` thread groups
+    // (and is surfaced) as its canonical target. Unknown/garbage passes through unchanged so
+    // it still lands in the `(invalid status)` group below.
+    const status = normalizeStatus(fm?.status) ?? '?';
     const dependsOn = parseList(fm?.depends_on);
     const next = nextStep(src);
-    const threadTerminal = TERMINAL.includes(fm?.status ?? '?');
-    const threadActive = fm?.status === 'active'; // only `active` threads flag dropped/idle agents; parked phases are expected to hold done agents
+    const threadTerminal = TERMINAL.includes(status);
+    const threadActive = status === 'active'; // only `active` threads flag dropped/idle agents; parked phases are expected to hold done agents
     const threadDownstream = downstream.has(id); // PR landing via the cascade → legitimately active, suppress
     // Agent liveness is DERIVED, never read from a stored per-agent flag: the AUTOMATIC
     // binding carries only immutable `{id, label}`; state comes from the NEWEST agent's
@@ -215,7 +235,7 @@ const threads = frayEntries
     return {
       id,
       title: fm?.title ?? '',
-      status: fm?.status ?? '?',
+      status, // CANONICAL (legacy aliases normalized); unknown passes through as-is
       status_text: fm?.status_text ?? '',
       next,
       dependsOn,
@@ -252,9 +272,9 @@ function blockers(t) {
 /**
  * Render one thread's board block (slug line + status_text gloss + next-step + dep state +
  * agent-liveness + warnings) into `out`. Shared by the per-status groups AND the dedicated
- * `⚖ pending decisions` section so the two can never drift. status_text is emitted IN FULL —
- * the board NEVER truncates it (the length cap is a soft scan-loop warning, itself exempted
- * for needs-decision, so a decision's open question is always fully readable on a wide term).
+ * `⚖ awaiting you` (blocked) section so the two can never drift. status_text is emitted IN
+ * FULL — the board NEVER truncates it (the length cap is a soft scan-loop warning, itself
+ * exempted for `blocked`, so a blocker's open question is always fully readable on a wide term).
  * @param {(typeof threads)[number]} t
  * @param {string[]} out
  */
@@ -305,9 +325,9 @@ for (const t of threads) {
 
   // status_text is a 1-2 sentence English status note (frontmatter); flag overlong ones —
   // anything past ~2 sentences belongs in the body, not the at-a-glance board field.
-  // EXEMPT needs-decision: its status_text IS the pending-decision queue entry (the concise
+  // EXEMPT blocked: its status_text IS the ⚖ awaiting-you queue entry (the concise blocker /
   // open question), surfaced UNTRUNCATED on the board + reminder — never warn on or clip it.
-  if (t.status !== 'needs-decision' && t.status_text && t.status_text.length > 280) {
+  if (t.status !== 'blocked' && t.status_text && t.status_text.length > 280) {
     t.warnings.push(`status_text is ${t.status_text.length} chars — keep it to 1-2 sentences; move detail into the body`);
   }
 
@@ -363,17 +383,21 @@ if (qi !== -1) {
 }
 
 // Default: the board. `--status <s>` narrows to one status. `--all` shows everything.
+// A legacy alias (`todo`/`plan`/`needs-decision`) is accepted and normalized to its
+// canonical target, so `fray --status todo` shows `planned` threads.
 const si = process.argv.indexOf('--status');
-const only = si !== -1 ? process.argv[si + 1] : null;
-const showAll = process.argv.includes('--all');
-if (only && !STATUS.includes(only)) {
-  console.error(`unknown status "${only}" (expected one of: ${STATUS.join(', ')})`);
+const onlyRaw = si !== -1 ? process.argv[si + 1] : null;
+if (onlyRaw && !isValidStatus(onlyRaw)) {
+  console.error(`unknown status "${onlyRaw}" (expected one of: ${ACCEPTED_STATUSES.join(', ')})`);
   process.exit(2);
 }
+const only = onlyRaw ? normalizeStatus(onlyRaw) : null; // canonical filter value
+const showAll = process.argv.includes('--all');
 
-// Statuses hidden from the default board (non-actionable). Read defensively from
-// config.mjs STATUS so an absent status is simply skipped.
-const HIDDEN_BY_DEFAULT = new Set(['todo', 'done', 'dismissed'].filter((s) => STATUS.includes(s)));
+// Statuses hidden from the default board (non-actionable): the PARKED `planned` phase + the
+// terminals. `planning` (active design) is SURFACED, so it is NOT hidden. Read defensively
+// from config.mjs STATUS so an absent status is simply skipped.
+const HIDDEN_BY_DEFAULT = new Set(['planned', 'done', 'dismissed'].filter((s) => STATUS.includes(s)));
 
 // When `--all` or `--status <s>` is given, show the requested set; otherwise show
 // only the live/actionable statuses.
@@ -388,24 +412,25 @@ out.push(`fray board — autonomous_mode: ${cfg.autonomousMode ? 'on' : 'off'}${
 if (allErrors.length) out.push(`\n⚠ VALIDATION ERRORS:\n${allErrors.join('\n')}`);
 if (allWarnings.length) out.push(`\n⚠ DROP-RISK WARNINGS (advisory):\n${allWarnings.join('\n')}`);
 
-// ⚖ PENDING DECISIONS — the COMPUTED human-decision queue: every `needs-decision` thread,
-// surfaced by its FULL status_text (the concise open question). HOISTED to the top of the
-// board (not buried mid-status-list) and rendered UNTRUNCATED — the terminal is wide and the
-// question must be fully readable. Nothing is stored: this is filtered live from the scanned
-// threads, the same compute-don't-cache principle as the rest of the board. Shown in the
-// live/default + `--all` views and when `--status needs-decision` is requested; suppressed
-// for any OTHER single-status filter (the user asked for a different slice). needs-decision
-// is rendered ONLY here — it is skipped in the per-status group loop below to avoid duplication.
-if (!only || only === 'needs-decision') {
-  const pendingDecisions = threads.filter((t) => t.status === 'needs-decision');
+// ⚖ AWAITING YOU — the COMPUTED queue of every `blocked` thread (blocked / awaiting-human-
+// decision / waiting-on-external — `blocked` absorbs the old `needs-decision`), surfaced by its
+// FULL status_text (the concise blocker / open question). HOISTED to the top of the board (not
+// buried mid-status-list) and rendered UNTRUNCATED — the terminal is wide and the question must
+// be fully readable. Nothing is stored: filtered live from the scanned threads, the same
+// compute-don't-cache principle as the rest of the board. Shown in the live/default + `--all`
+// views and when `--status blocked` (or the legacy `needs-decision` alias) is requested;
+// suppressed for any OTHER single-status filter. `blocked` is rendered ONLY here — it is
+// skipped in the per-status group loop below to avoid duplication.
+if (!only || only === 'blocked') {
+  const pendingDecisions = threads.filter((t) => t.status === 'blocked');
   if (pendingDecisions.length) {
-    out.push(`\n## ⚖ pending decisions (${pendingDecisions.length}) — awaiting your call`);
+    out.push(`\n## ⚖ blocked (${pendingDecisions.length}) — awaiting your call`);
     for (const t of pendingDecisions) renderThread(t, out);
   }
 }
 
 for (const s of showStatuses) {
-  if (s === 'needs-decision') continue; // rendered in the dedicated ⚖ pending decisions section above
+  if (s === 'blocked') continue; // rendered in the dedicated ⚖ awaiting-you section above
   const group = threads.filter((t) => t.status === s);
   if (!group.length) continue;
   out.push(`\n## ${s} (${group.length})`);

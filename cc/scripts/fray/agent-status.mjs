@@ -125,12 +125,15 @@ export function findAgentOutputAge(agentId, now = Date.now()) {
  *                                       null when there is no readable output file.
  * @param {boolean} a.threadTerminal    is the owning thread's status done/dismissed?
  * @param {boolean} [a.threadActive]    is the owning thread's status exactly `active`? Only
- *                                       `active` threads are "being worked", so only they
- *                                       can have an UNRECONCILED/idle agent. Deliberately-
- *                                       PARKED phases (plan/todo/needs-decision/blocked/
- *                                       enqueued) with done agents are EXPECTED, not a
- *                                       drift signal — never flagged. (Defaults true for
- *                                       backward-compat when a caller doesn't pass it.)
+ *                                       `active` threads are "being worked" by an agent, so
+ *                                       only they can have an UNRECONCILED/idle agent. Other
+ *                                       non-terminal phases (planning/planned/enqueued/blocked)
+ *                                       with a done/absent agent are EXPECTED, not a drift
+ *                                       signal — never flagged. NOTE `planning` is human-or-
+ *                                       architect-driven design and may legitimately have NO
+ *                                       live agent, so it is deliberately NOT `active` here and
+ *                                       never triggers the no-live-agent warning. (Defaults
+ *                                       true for backward-compat when a caller doesn't pass it.)
  * @param {boolean} [a.threadDownstream] does the thread have a PR landing via the merge
  *                                       cascade (`.fray/merge-queue.jsonl`)? Such a thread is
  *                                       legitimately `active` while it merges — the producing
@@ -151,10 +154,11 @@ export function deriveAgentState({ ageMin, threadTerminal, threadActive = true, 
   // A reconciled thread is the orchestrator's deliberate "I folded this" signal — the
   // only mutable bit in the whole loop, and it lives on the THREAD, not the agent.
   if (threadTerminal) return 'terminal';
-  // PARKED (non-terminal but not `active`: plan/todo/needs-decision/blocked/enqueued)
-  // is also a deliberate orchestrator state — a stale/done agent on a parked thread is
-  // EXPECTED (the work finished, the thread awaits a human/dep), NOT a drop. Only an
-  // `active` thread is "being worked right now", so only it can have a drift-signal agent.
+  // A non-`active` non-terminal phase (planning/planned/enqueued/blocked) is also a
+  // deliberate orchestrator state — a stale/done/absent agent on such a thread is EXPECTED
+  // (the work finished, the thread awaits a human/dep, or `planning` is human-driven with no
+  // agent at all), NOT a drop. Only an `active` thread is "being worked right now" by an
+  // agent, so only it can have a drift-signal agent.
   if (!threadActive) return 'terminal';
   // DOWNSTREAM: a PR is landing for this thread via the cascade — it is active for the
   // merge, not a stuck agent. The producing agent has finished + been reconciled; suppress.

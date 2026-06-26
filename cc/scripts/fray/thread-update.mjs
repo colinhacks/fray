@@ -9,19 +9,21 @@
 // plugin is enabled). The project root is resolved from CLAUDE_PROJECT_DIR (exported to
 // bin/hook processes), matching how bin/fray + index.mjs find the project's .fray/.
 //
-// Enforced invariant: setting `status: needs-decision` REQUIRES a non-empty status_text
-// (the decision write-up) — supplied via --status-text or already present on the thread.
-// The decisions queue DERIVES from these status_text fields (see decisions.mjs), so a
-// needs-decision thread without a write-up would surface as an empty queue row. After
-// every edit this tool prints the FULL decisions queue (collectDecisions) so a pending
-// decision is never silently buried.
+// Enforced invariant: setting `status: blocked` REQUIRES a non-empty status_text (the
+// blocker / decision write-up) — supplied via --status-text or already present on the thread.
+// The ⚖ awaiting-you queue DERIVES from these status_text fields (see decisions.mjs), so a
+// blocked thread without a write-up would surface as an empty queue row. After every edit this
+// tool prints the FULL queue (collectDecisions) so a pending blocker is never silently buried.
+// Legacy status spellings (todo/plan/needs-decision) are ACCEPTED and normalized to canonical
+// on write (e.g. `--status needs-decision` writes `status: blocked`).
 import { readFileSync, writeFileSync, existsSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { collectDecisions } from './decisions.mjs';
-import { STATUS } from './config.mjs';
+import { STATUS, ACCEPTED_STATUSES, isValidStatus, normalizeStatus } from './config.mjs';
 
 // The status vocabulary is the SINGLE shared source from config.mjs (the same set the
 // board validates against) — importing it keeps the updater and the board from drifting.
+// The usage line shows the CANONICAL set; the legacy aliases are accepted but not advertised.
 const STATUSES = STATUS;
 const PATCH_SEP = '===>>';
 // The decision write-up lives in the `status_text` frontmatter key — the single canonical
@@ -41,7 +43,8 @@ function die(msg) {
 
 const usage = `usage: fray-update <slug> [options]
   --status <s>              set status; one of: ${STATUSES.join(' · ')}
-                            (needs-decision REQUIRES a status_text write-up)
+                            (legacy todo/plan/needs-decision accepted → normalized to canonical)
+                            (blocked REQUIRES a status_text write-up)
   --status-text "<text>"    set the status_text field (decision write-up / gloss)
   --set key=value           set any other frontmatter scalar (repeatable)
   --patch "<find>${PATCH_SEP}<replace>"  body find/replace, must match EXACTLY once (repeatable, applied in order, atomic)
@@ -152,17 +155,19 @@ function main() {
   const { fm, body } = splitFrontmatter(original);
   if (fm === null) die(`thread ${args.slug}.md has no YAML frontmatter block`);
 
-  // --- Validate status + the needs-decision/status_text invariant BEFORE writing ---
-  if (args.status !== undefined && !STATUSES.includes(args.status)) {
-    die(`invalid status "${args.status}"; must be one of: ${STATUSES.join(' · ')}`);
+  // --- Validate status + the blocked/status_text invariant BEFORE writing ---
+  // Accept canonical OR a legacy alias, then NORMALIZE to canonical so the on-disk value is
+  // always canonical going forward (e.g. `--status needs-decision` writes `status: blocked`).
+  if (args.status !== undefined && !isValidStatus(args.status)) {
+    die(`invalid status "${args.status}"; must be one of: ${ACCEPTED_STATUSES.join(' · ')}`);
   }
-  const effectiveStatus = args.status ?? undefined;
-  if (effectiveStatus === 'needs-decision') {
+  const canonicalStatus = args.status !== undefined ? normalizeStatus(args.status) : undefined;
+  if (canonicalStatus === 'blocked') {
     const willHaveStatusText = args.status_text !== undefined
       ? isStatusTextNonEmpty(`"${args.status_text}"`) || args.status_text.trim().length > 0
       : isStatusTextNonEmpty(getStatusText(fm));
     if (!willHaveStatusText) {
-      die('status needs-decision REQUIRES a decision write-up — pass --status-text "<text>" (or set it on the thread first)');
+      die('status blocked REQUIRES a write-up of the blocker — pass --status-text "<text>" (or set it on the thread first)');
     }
   }
 
@@ -189,7 +194,7 @@ function main() {
 
   // --- Apply frontmatter edits ---
   let lastUpdateExplicit = false;
-  if (args.status !== undefined) fmSet(fm, 'status', args.status);
+  if (args.status !== undefined) fmSet(fm, 'status', canonicalStatus); // write CANONICAL, never the legacy alias
   if (args.status_text !== undefined) setStatusText(fm, args.status_text);
   for (const kv of args.sets) {
     const eq = kv.indexOf('=');

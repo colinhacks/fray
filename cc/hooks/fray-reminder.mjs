@@ -15,7 +15,17 @@
 // hook must not disrupt the prompt) — any failure → inject nothing.
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { frayActive, loadConfig, STATUS, TERMINAL, PARKED } from '../scripts/fray/config.mjs';
+import {
+  frayActive,
+  loadConfig,
+  TERMINAL,
+  PARKED,
+  normalizeStatus,
+  isValidStatus,
+  readLastReconcile,
+  reconcileThresholdMin,
+  isReconcileStale,
+} from '../scripts/fray/config.mjs';
 
 // Token-saving: skip entirely inside sub-agent contexts. The hook stdin carries
 // `agent_id` ONLY when fired inside a sub-agent (UserPromptSubmit shouldn't fire there
@@ -52,8 +62,8 @@ function parseDepends(src) {
 
 /**
  * Strip surrounding double-quotes (and their escapes) from a frontmatter scalar — the same
- * shape the board's quoter writes. Used to surface a needs-decision thread's status_text
- * (the concise open question) in the per-turn pending-decision queue, UNTRUNCATED.
+ * shape the board's quoter writes. Used to surface a blocked thread's status_text
+ * (the concise blocker / open question) in the per-turn awaiting-you queue, UNTRUNCATED.
  * @param {string | undefined} raw
  * @returns {string}
  */
@@ -91,11 +101,13 @@ try {
   const mode = cfg.autonomousMode ? 'on' : 'off';
 
   // fray: thread pulse + per-message frontmatter VALIDATION (so a malformed thread
-  // surfaces immediately, not whenever I happen to look). STATUS/TERMINAL come from the
-  // shared module — same source the tool's `--validate` uses. Unrecognized fields are
+  // surfaces immediately, not whenever I happen to look). The vocab + normalization
+  // (isValidStatus / normalizeStatus / TERMINAL / PARKED) come from the shared module —
+  // the same source the tool's `--validate` uses, so the hook and board never drift, and a
+  // legacy alias is accepted + bucketed canonically here too. Unrecognized fields are
   // allowed by design — only required fields + the status vocab are checked.
   /** @type {string[]} */
-  const pending = []; // `<slug>[status]` for every non-terminal, non-PARKED thread — compact, one line, names included so a stalled thread is caught BY NAME (not just a count). PARKED phases (`plan`/`todo`) are deliberately EXCLUDED from the per-turn nag (they are real, board-visible work, just not auto-surfaced) — only genuinely-actionable/in-flight statuses (enqueued/active/blocked/needs-decision) nag. Full detail stays in the `fray` board, NOT injected per-message.
+  const pending = []; // `<slug>[status]` for every SURFACED thread (non-terminal, non-PARKED) — compact, one line, names included so a stalled thread is caught BY NAME (not just a count). The PARKED `planned` phase is deliberately EXCLUDED from the per-turn nag (it is real, board-visible work, just not auto-surfaced) — only genuinely-actionable/in-flight statuses (planning/enqueued/active/blocked) nag. Full detail stays in the `fray` board, NOT injected per-message.
   /** @type {string[]} */
   const queued = []; // non-terminal threads that still carry a `QUEUED` follow-up marker — surfaced BY NAME so the drain-the-queue step can't be skipped (missing these is totally unacceptable).
   /** @type {string[]} */
@@ -110,10 +122,11 @@ try {
       if (!f.endsWith('.md') || f.startsWith('_')) continue; // `_`-prefixed = non-thread meta
       const id = f.replace(/\.md$/, '');
       const src = readFileSync(join(dir, '.fray', f), 'utf8');
-      const st = src.match(/^status:\s*(\S+)/m)?.[1];
+      const rawSt = src.match(/^status:\s*(\S+)/m)?.[1];
+      const st = normalizeStatus(rawSt); // canonical (legacy todo/plan/needs-decision → canonical); unknown passes through
       if (!/^title:\s*\S/m.test(src)) errors.push(`${id}: missing title`);
-      if (!st) errors.push(`${id}: missing status`);
-      else if (!STATUS.includes(st)) errors.push(`${id}: invalid status "${st}"`);
+      if (!rawSt) errors.push(`${id}: missing status`);
+      else if (!isValidStatus(rawSt)) errors.push(`${id}: invalid status "${rawSt}"`);
       scanned.push({ id, status: st, deps: parseDepends(src), src, status_text: unquote(src.match(/^status_text:\s*(.*)$/m)?.[1]) });
     }
   } catch {
@@ -123,16 +136,16 @@ try {
   /** @type {string[]} */
   const dropRisk = []; // `enqueued` threads whose depends_on are ALL terminal — they SHOULD have auto-fired and didn't. The canonical silent-stall shape; surfaced BY NAME so it can't be skipped by reflex.
   /** @type {{slug:string,status_text:string}[]} */
-  const decisions = []; // every `needs-decision` thread — the COMPUTED pending-decision queue, surfaced each turn by its FULL status_text (the concise open question). Nothing stored; derived live from the scan.
+  const decisions = []; // every `blocked` thread — the COMPUTED awaiting-you queue, surfaced each turn by its FULL status_text (the concise blocker / open question). Nothing stored; derived live from the scan. (`blocked` absorbs the old `needs-decision`.)
   for (const t of scanned) {
-    // PARKED (`plan`/`todo`) is non-terminal but deliberately NOT auto-nagged — it is parked
+    // PARKED (`planned`) is non-terminal but deliberately NOT auto-nagged — it is parked
     // work the orchestrator pulls up via the `fray` board on its own schedule, not every turn.
-    // Only the genuinely-actionable/in-flight statuses (enqueued/active/blocked/needs-decision)
+    // Only the genuinely-actionable/in-flight statuses (planning/enqueued/active/blocked)
     // reach the per-turn pending list + its sub-checks (queued/drop-risk/decisions).
     if (!TERMINAL.includes(t.status ?? '') && !PARKED.includes(t.status ?? '')) {
       pending.push(`${t.id}[${t.status ?? '?'}]`);
       if (/\bQUEUED\b/.test(t.src)) queued.push(t.id);
-      if (t.status === 'needs-decision') decisions.push({ slug: t.id, status_text: t.status_text });
+      if (t.status === 'blocked') decisions.push({ slug: t.id, status_text: t.status_text });
       // Drop-risk: enqueued WITH declared deps, ALL of which are terminal (the
       // auto-trigger fired but nothing dispatched it). A dep that is an unknown slug
       // is NOT terminal → not flagged (conservative; avoids crying wolf on a typo).
@@ -146,7 +159,7 @@ try {
     `FRAY — ${pending.length} pending: ${pending.join(', ') || 'none'}. Advance or reconcile EACH this turn; if you went deep on ONE thread, don't let the others silently stall (run \`fray\` for detail). Returns are a strict INBOX — drain the OLDEST first, ONE at a time, never batch; an empty/progress-only return is an INCOMPLETE handoff (record needs-retry + re-dispatch, do NOT mark done). When you fold a return: DRAIN that thread's queued follow-ups (\`## Steps\` items marked QUEUED — dispatch on <agent>'s return) + MOVE any answered Open question into Decisions (a DECIDED thing lives under ## Decisions, NEVER Open questions). done/dismissed threads are TERMINAL + KEPT — never delete them. ALWAYS STEER — DON'T RE-DISPATCH (TOP-PRIORITY RULE): SendMessage works on running AND completed sub-agents. To add context / redirect / fold scope into a file an agent owns, answer a question it raised, or RESUME an agent the instant a temporary blocker (a HOLD, a transient CI failure, a now-available input) clears — MESSAGE/RESUME that agent (by name or agentId). NEVER let an agent die and cold-redispatch a fresh replacement (loses its runbook + context), never spawn a clobbering sibling, never kill-and-respawn (orphans WIP). Only fall back to marking it\`enqueued\` (naming the agent it waits on) and dispatch the instant that agent returns; never spawn a clobbering sibling or kill-and-respawn.` +
     (queued.length ? `  ⚠ UN-DRAINED QUEUED FOLLOW-UPS in ${queued.length} thread(s): ${queued.join(', ')}. THE INSTANT any of their agents returns, RE-READ that thread .md (don't reconcile from memory) and DISPATCH the actionable QUEUED items as sub-agents THIS turn (a mandated self-review/integration pass IS one — dispatch it). Surface, never silently drop, the human-gated/post-launch ones. Skipping this is the #1 failure.` : '') +
     (dropRisk.length ? `  ⚠⚠ DROP-RISK THREADS in ${dropRisk.length} thread(s): ${dropRisk.join(', ')}. These are \`enqueued\` with ALL their \`depends_on\` now TERMINAL — their auto-trigger fired and they were NEVER dispatched (the exact silent-stall this guard exists to kill). RE-READ each thread .md THIS turn and DISPATCH/ADVANCE it — do NOT skip past this. If one is genuinely not ready, move it back to \`todo\` or fix its \`depends_on\`; leaving it \`enqueued\` with cleared deps is a bug.` : '') +
-    (decisions.length ? `  ⚖ ${decisions.length} PENDING DECISION(S) awaiting your call (computed from \`needs-decision\` threads — nothing stored): ${decisions.map((d) => `[${d.slug}] ${d.status_text || '(no write-up — add a one-line status_text)'}`).join('  ·  ')}. SURFACE these to the human (full context, numbered — see the skill) and do NOT silently sit on them; each is recommend-only until answered. On resolution, record the call in the thread's \`## Decisions\` body and flip status OUT of needs-decision.` : '') +
+    (decisions.length ? `  ⚖ ${decisions.length} BLOCKED — AWAITING YOUR CALL (computed from \`blocked\` threads — nothing stored): ${decisions.map((d) => `[${d.slug}] ${d.status_text || '(no write-up — add a one-line status_text)'}`).join('  ·  ')}. SURFACE these to the human (full context, numbered — see the skill) and do NOT silently sit on them; each awaits a human decision / answer / external event. On resolution, record the call in the thread's \`## Decisions\` body and flip status OUT of blocked.` : '') +
     (errors.length ? `  ⚠ VALIDATION ERRORS (fix now): ${errors.join('; ')}` : '');
 
   const modeLine =
@@ -168,7 +181,27 @@ try {
     /* fail-open — no stranded surfacing rather than risk the prompt */
   }
 
-  emit(`${modeLine}  ${status}${stranded}`);
+  // ANTI-DRIFT RECONCILE FORCING-FUNCTION. The board is computed from per-thread frontmatter,
+  // so a thread whose status drifted from reality (a PR merged but the thread never flipped)
+  // is surfaced as live truth until something re-grounds it. We persist a last-complete-
+  // reconcile timestamp (`.fray/.last-reconcile`); when it goes stale, emit a LOUD instruction
+  // to spin up a reconcile sub-agent. FAST by design: only timestamp math here — the actual
+  // PR-liveness checking is the dispatched sub-agent's job, NEVER this every-turn hook (no
+  // network/gh calls). A missing timestamp counts as stale (instruct a first reconcile).
+  let reconcileBlock = '';
+  try {
+    const lastMs = readLastReconcile(dir);
+    const thresholdMin = reconcileThresholdMin(cfg);
+    if (isReconcileStale(lastMs, thresholdMin)) {
+      const ago = lastMs == null ? 'never recorded' : `${Math.round((Date.now() - lastMs) / 60_000)}m ago`;
+      reconcileBlock =
+        `⚠ BOARD RECONCILE STALE (${ago}) — the board may not reflect reality (a thread's status can drift from the actual code/PRs). Spin up a reconcile sub-agent NOW: re-ground EVERY non-terminal thread against ground truth (PR merged? symbol exists? work shipped?), flip drifted statuses to match, then record the reconcile by running \`fray reconcile\` (stamps \`.fray/.last-reconcile\`). Do this before trusting the pending list below.\n\n`;
+    }
+  } catch {
+    /* fail-open — skip the reconcile nag rather than risk the prompt */
+  }
+
+  emit(`${reconcileBlock}${modeLine}  ${status}${stranded}`);
 } catch {
   // Fail-open: a broken hook must not disrupt the prompt. The static doctrine now lives in
   // SessionStart (session-seed.mjs), so there is nothing safe to fall back to here — inject

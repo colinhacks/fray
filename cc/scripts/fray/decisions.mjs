@@ -1,14 +1,17 @@
 #!/usr/bin/env node
 // @ts-check
 // Decisions view, DERIVED from fray threads (no static store). Scans the project's
-// .fray/*.md, selects threads with `status: needs-decision`, and prints each thread's
-// slug + its FULL status_text (the decision write-up) — the rich inline-reading view that
-// complements the one-line-per-thread board (scripts/fray/index.mjs).
+// .fray/*.md, selects threads with canonical `status: blocked` (which absorbs the legacy
+// `needs-decision` — a thread still carrying `status: needs-decision` normalizes to blocked
+// and is still selected), and prints each thread's slug + its FULL status_text (the blocker /
+// decision write-up) — the rich inline-reading view that complements the one-line-per-thread
+// board (scripts/fray/index.mjs).
 //
 // Self-contained + importable: `collectDecisions()` is reused by the thread updater
 // (thread-update.mjs) to print the queue after every edit, and by `fray decisions`.
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, basename } from 'node:path';
+import { normalizeStatus } from './config.mjs';
 
 // The project root comes from the environment, NOT this script's own path: the tool
 // ships inside the fray PLUGIN (and after a marketplace install lives in
@@ -58,7 +61,7 @@ export function collectDecisions() {
       continue;
     }
     const fm = parseFrontmatter(text);
-    if (!fm || fm.status !== 'needs-decision') continue;
+    if (!fm || normalizeStatus(fm.status) !== 'blocked') continue;
     const rawText = fm[STATUS_TEXT_KEY];
     out.push({ slug: basename(f, '.md'), status_text: unquote(rawText) });
   }

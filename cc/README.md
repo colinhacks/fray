@@ -87,13 +87,14 @@ There is **no stored board** and **no unified ledger** — both would be caches 
 The plugin puts a `fray` command on the Bash tool's PATH. It reads the current project's `.fray/` and computes the live view:
 
 ```bash
-fray               # the live board (active / enqueued / blocked / needs-decision)
+fray               # the live board (planning / active / enqueued / blocked)
 fray --all         # every thread, every status
-fray --status todo # one status
+fray --status planned # one status (legacy aliases todo/plan/needs-decision accepted)
 fray --search <q>  # find a thread by id / title / body text
+fray reconcile     # stamp .fray/.last-reconcile = now (record a completed board reconcile)
 fray --validate    # validate all thread frontmatter; exit 1 on error (used by the hook + CI)
 fray --json        # machine-readable {config, threads, errors, warnings}
-fray decisions     # the rich write-up of every needs-decision thread (the decision queue)
+fray decisions     # the rich write-up of every blocked thread (the awaiting-you queue)
 ```
 
 Thread **dependencies** are expressed in frontmatter (`depends_on: [<other-slug>]`); the board computes when every dependency has gone terminal and flips the thread to `▶ READY — dispatch now`.
@@ -104,18 +105,20 @@ Thread **dependencies** are expressed in frontmatter (`depends_on: [<other-slug>
 
 ```bash
 fray-update <slug> --status active                      # set status (validated against the vocab)
-fray-update <slug> --status needs-decision \
-  --status-text "<the decision write-up>"               # needs-decision REQUIRES a write-up
+fray-update <slug> --status blocked \
+  --status-text "<the blocker write-up>"                # blocked REQUIRES a write-up
 fray-update <slug> --set key=value                      # set any other frontmatter scalar
 fray-update <slug> --patch "<find>===>><replace>"       # body find/replace, must match exactly once
 fray-update <slug> --append "<text>"                    # append to the body
 ```
 
-It enforces the invariant that **`status: needs-decision` requires a non-empty `status_text`** (the queue derives from it), auto-stamps `last_update`, and prints the full decision queue after every edit so a pending decision is never buried.
+It enforces the invariant that **`status: blocked` requires a non-empty `status_text`** (the awaiting-you queue derives from it), auto-stamps `last_update`, and prints the full queue after every edit so a pending blocker is never buried.
 
 ### Status vocabulary
 
-`todo · enqueued · active · blocked · needs-decision · done · dismissed`
+`planning · planned · enqueued · active · blocked · done · dismissed`
+
+`planning` is active design discussion (surfaced in the nag); `planned` is parked, scoped-but-unworked (not nagged); `blocked` is blocked / awaiting-human-decision / waiting-on-external (surfaced + hoisted into the ⚖ awaiting-you queue). Legacy `todo` / `plan` / `needs-decision` are still accepted as read-aliases (normalized to `planned` / `planned` / `blocked`).
 
 `done` and `dismissed` are terminal and **kept forever** — each is its own file, excluded from the board and the per-turn pending list by status, so a finished thread is zero bloat. (No "clean up" step; that's the whole point of per-file threads.)
 
@@ -126,7 +129,7 @@ The plugin wires six lifecycle hooks. All of them are gated on the activation ch
 | Hook | Event | Job |
 | :-- | :-- | :-- |
 | `agent-dispatch` | `PreToolUse(Agent)` | Enforces **background** dispatch (denies any foreground Agent call), auto-appends an **orchestration epilogue** to every sub-agent prompt (so it hands back the next links in the chain), gates `THREAD:`-tagged dispatches on the thread file existing, and logs a dispatch ledger. |
-| `fray-reminder` | `UserPromptSubmit` | The per-turn pulse: lists pending threads **by name**, validates frontmatter, flags un-drained queued follow-ups, surfaces any **stranded active thread** (active, but its newest agent looks dropped — high-confidence only), and switches doctrine for autonomous mode. |
+| `fray-reminder` | `UserPromptSubmit` | The per-turn pulse: lists pending threads **by name**, validates frontmatter, flags un-drained queued follow-ups, surfaces any **stranded active thread** (active, but its newest agent looks dropped — high-confidence only), emits a **board-reconcile-stale** instruction when the board hasn't been re-grounded within the threshold, and switches doctrine for autonomous mode. |
 | `session-seed` | `SessionStart` | Seeds the static orchestrator role + hygiene doctrine once per session (and a re-grounding after compaction). Also detects whether Claude Code's experimental **agent teams** is enabled (fray's steering core depends on it) and, if not, injects a one-time-per-session notice with the exact global-enable steps. |
 | `fray-stop-reminder` | `Stop` | Refuses to let the orchestrator go idle while a sub-agent rest sits unreconciled; surfaces stranded active threads + soft idle notes. |
 | `fray-subagent-rest` | `SubagentStop` | Records each sub-agent rest so the Stop guard can catch an un-folded return. |
@@ -166,10 +169,10 @@ fray/
 │   └── fray-subagent-rest.mjs
 ├── scripts/
 │   └── fray/
-│       ├── index.mjs         # the board + validator (+ on/off/status/decisions subcommands)
-│       ├── config.mjs        # shared config parse + activation gate + status vocab
+│       ├── index.mjs         # the board + validator (+ on/off/status/decisions/reconcile subcommands)
+│       ├── config.mjs        # shared config parse + activation gate + status vocab + reconcile-staleness
 │       ├── thread-update.mjs # structured atomic thread editor (frontmatter + body)
-│       ├── decisions.mjs     # the needs-decision queue, derived from threads
+│       ├── decisions.mjs     # the blocked / awaiting-you queue, derived from threads
 │       ├── agent-liveness.mjs
 │       └── agent-status.mjs  # shared derived-state logic (board + Stop hook)
 ├── bin/
