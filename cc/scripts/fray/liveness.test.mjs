@@ -14,7 +14,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, utimesSync, rmSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { deriveAgentState, DEFAULT_DROPPED_MIN, DEFAULT_IDLE_MIN } from './agent-status.mjs';
-import { newestBindingByThread, downstreamThreads, restedAgentIds } from './agent-bindings.mjs';
+import { newestBindingByThread, downstreamThreads, restedAgentIds, newBoundRestsSince } from './agent-bindings.mjs';
 import { agentLivenessLines, strandedThreadLines } from './agent-liveness.mjs';
 
 // ── deriveAgentState — the pure derivation ──────────────────────────────────────
@@ -75,6 +75,33 @@ test('downstreamThreads + restedAgentIds parse their logs (fail-open on missing)
     writeFileSync(join(dir, '.fray', '.rested-agents.jsonl'), JSON.stringify({ agent_id: 'A1', thread: 't' }) + '\nbad json\n');
     assert.ok(downstreamThreads(dir).has('shipping-thread'));
     assert.ok(restedAgentIds(dir).has('A1'), 'parses valid lines, skips malformed ones');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('newBoundRestsSince: a nested/unbound sub-agent rest does NOT nag; a bound rest DOES', () => {
+  const dir = tmpProject();
+  try {
+    // The orchestrator dispatched ONE thread-owning agent → it is bound. A worker the
+    // orchestrator dispatched then spawned its OWN self-review sub-agent (no THREAD tag →
+    // no binding → unbound), which also rested. Plus an anon (no-id) rest.
+    writeFileSync(join(dir, '.fray', '.agent-bindings.jsonl'),
+      JSON.stringify({ ts: '2026-06-26T10:00:00.000Z', agent_id: 'BOUND', thread: 'mythread', label: 'L' }) + '\n');
+    writeFileSync(join(dir, '.fray', '.rested-agents.jsonl'),
+      JSON.stringify({ ts: '2026-06-26T11:00:00.000Z', agent_id: 'BOUND', thread: 'mythread' }) + '\n' +
+      JSON.stringify({ ts: '2026-06-26T11:05:00.000Z', agent_id: 'NESTED_unbound', thread: null }) + '\n' +
+      JSON.stringify({ ts: '2026-06-26T11:06:00.000Z', agent_id: null, thread: null }) + '\n');
+
+    const r = newBoundRestsSince(dir, 0, []);
+    assert.equal(r.count, 1, 'only the thread-bound rest counts — nested + anon are excluded');
+    assert.deepEqual(r.agents, ['BOUND'], 'the bound agent is the sole nag target');
+    assert.deepEqual(r.threads, ['mythread'], 'its thread is named for the reconcile pointer');
+
+    // Loop-safety: once surfaced, the bound agent's repeat rest does not re-nag.
+    assert.equal(newBoundRestsSince(dir, 0, ['BOUND']).count, 0, 'seen-set dedupes a resuming bound agent');
+    // sinceMs gates: a bound rest at-or-before the watermark does not re-count.
+    assert.equal(newBoundRestsSince(dir, Date.parse('2026-06-26T11:00:00.000Z'), []).count, 0, 'rest not newer than the watermark is excluded');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

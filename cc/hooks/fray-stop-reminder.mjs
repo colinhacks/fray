@@ -5,14 +5,18 @@
  *
  *   (A) REST-RECONCILIATION GUARD (the #1 recurring failure). A background sub-agent
  *       coming to REST is recorded by the SubagentStop hook (fray-subagent-rest.mjs)
- *       in `.fray/.rested-agents.jsonl`. If any rest has happened since we last
- *       surfaced one, REFUSE to let the orchestrator go idle until it has reconciled
- *       them — fold findings into the thread, drain the queued follow-ups, and verify
- *       the agent is genuinely DONE (a rest is NOT "done": an agent can rest mid-step
- *       and rest repeatedly). This bypasses the cleanup cooldown (rests are urgent),
- *       but is loop-safe: it fires only on NOT-YET-SURFACED agents (deduped by agent-id,
- *       so a resuming agent's repeat rests don't re-nag), newer than the last surface,
- *       and never twice in a row (stop_hook_active).
+ *       in `.fray/.rested-agents.jsonl`. If a rest of an agent the ORCHESTRATOR DISPATCHED
+ *       has happened since we last surfaced one, REFUSE to let it go idle until it has
+ *       reconciled them — fold findings into the thread, drain the queued follow-ups, and
+ *       verify the agent is genuinely DONE (a rest is NOT "done": an agent can rest mid-step
+ *       and rest repeatedly). Only THREAD-BOUND rests count (`newBoundRestsSince`): anything
+ *       with no THREAD binding — a NESTED sub-agent a WORKER spawned (e.g. its own self-review
+ *       pass, which folds into the parent's report) OR an untagged orchestrator one-shot (no
+ *       thread to reconcile) — is excluded; only an agent dispatched onto a thread can nag.
+ *       This bypasses the cleanup cooldown (rests are urgent), but is loop-safe: it fires only
+ *       on NOT-YET-SURFACED bound agents (deduped by agent-id, so a resuming agent's repeat
+ *       rests don't re-nag), newer than the last surface, and never twice in a row
+ *       (stop_hook_active).
  *
  *   (B) CLEANUP NUDGE. Otherwise, the original gentle nudge to make sure threads
  *       touched this session reflect current truth — rate-limited by a cooldown and
@@ -36,11 +40,11 @@
 import { readFileSync, writeFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { frayActive } from '../scripts/fray/config.mjs';
+import { newBoundRestsSince } from '../scripts/fray/agent-bindings.mjs';
 
 const PROJECT_DIR = process.env.CLAUDE_PROJECT_DIR || process.cwd();
 const FRAY_DIR = join(PROJECT_DIR, '.fray');
 const STATE_FILE = join(FRAY_DIR, '.stop-reminder-state.json');
-const REST_LOG = join(FRAY_DIR, '.rested-agents.jsonl');
 
 /** Allow the stop (no output = no block). */
 function allow() {
@@ -89,12 +93,13 @@ function readKnobs() {
 }
 
 /**
- * State: { last_fired, last_rest_surfaced, surfaced_agents, last_anon_ts } — the epoch-ms
- * markers (default 0), a SEEN-SET of agent-ids already surfaced, and an anon-rest timestamp
- * high-water mark. Together they make each rest count AT MOST ONCE: a single background agent
- * rests (and re-fires its rest record) MANY times, so counting raw lines re-nags for handled
- * work. id'd rests dedupe via the seen-set (capped on write so it can't grow unbounded);
- * rests with no agent-id dedupe via `last_anon_ts` (only anon rests newer than the mark count).
+ * State: { last_fired, last_rest_surfaced, surfaced_agents } — the epoch-ms markers
+ * (default 0) plus a SEEN-SET of agent-ids already surfaced. Together they make each
+ * BOUND rest count AT MOST ONCE: a single background agent rests (and re-fires its rest
+ * record) MANY times, so counting raw lines re-nags for handled work. The seen-set dedupes
+ * a resuming agent's repeat rests (capped on write so it can't grow unbounded). Only
+ * THREAD-BOUND (orchestrator-dispatched) rests are ever counted — see `newBoundRestsSince`
+ * in agent-bindings.mjs — so anon/unbound nested rests need no dedupe track at all.
  */
 function readState() {
   try {
@@ -103,10 +108,9 @@ function readState() {
       last_fired: s.last_fired || 0,
       last_rest_surfaced: s.last_rest_surfaced || 0,
       surfaced_agents: Array.isArray(s.surfaced_agents) ? s.surfaced_agents : [],
-      last_anon_ts: s.last_anon_ts || 0,
     };
   } catch {
-    return { last_fired: 0, last_rest_surfaced: 0, surfaced_agents: [], last_anon_ts: 0 };
+    return { last_fired: 0, last_rest_surfaced: 0, surfaced_agents: [] };
   }
 }
 
@@ -119,55 +123,9 @@ function writeState(patch) {
   }
 }
 
-/**
- * Find sub-agent rests recorded strictly after `sinceMs` whose agent-id has NOT yet
- * been surfaced (`surfacedAgents`). Returns the count plus the DISTINCT new agent-ids,
- * so the caller can both nag with a real number and grow the seen-set.
- *
- * DEDUPE on two tracks so a rest is counted at most ONCE:
- *   - id'd rests: a line whose `agent_id` is already in `surfacedAgents` is skipped, so a
- *     resuming agent's repeat rests don't re-nag; only genuinely-new agent-ids count.
- *   - anon rests (no `agent_id` — untagged one-shots, payloads that omit the id): can't be
- *     keyed by id, so they're deduped by a TIMESTAMP high-water mark (`lastAnonTs`). Only
- *     anon rests strictly newer than the last surfaced anon ts count; the newest such ts is
- *     returned so the caller can advance the mark. Without this, an anon rest re-counts on
- *     every fire until the time window rolls past it — the exact re-nag dedupe exists to kill.
- * A real rest is never silently dropped: a not-yet-seen id or a newer-than-mark anon both count.
- */
-function newRestsSince(sinceMs, surfacedAgents, lastAnonTs) {
-  const seen = new Set(surfacedAgents);
-  const newAgents = new Set();
-  const threads = new Set(); // bound thread slugs of the newly-counted rests, to name in the nudge
-  let anonCount = 0;
-  let maxAnonTs = lastAnonTs; // advance the anon high-water mark to the newest anon rest seen
-  try {
-    const lines = readFileSync(REST_LOG, 'utf8').split('\n');
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const rec = JSON.parse(line);
-        const ts = Date.parse(rec.ts);
-        if (!Number.isFinite(ts) || ts <= sinceMs) continue;
-        const id = rec.agent_id;
-        if (id) {
-          if (!seen.has(id)) {
-            newAgents.add(id);
-            if (rec.thread) threads.add(rec.thread);
-          }
-        } else if (ts > lastAnonTs) {
-          anonCount++;
-          if (rec.thread) threads.add(rec.thread);
-          if (ts > maxAnonTs) maxAnonTs = ts;
-        }
-      } catch {
-        /* skip malformed line */
-      }
-    }
-  } catch {
-    /* no log → no rests */
-  }
-  return { count: newAgents.size + anonCount, agents: [...newAgents], threads: [...threads], maxAnonTs };
-}
+// Counting sub-agent rests lives in `newBoundRestsSince` (agent-bindings.mjs): it counts
+// ONLY rests of THREAD-BOUND (orchestrator-dispatched) agents, excluding nested/worker-spawned
+// and anon rests the orchestrator never dispatched and cannot reconcile. Imported above.
 
 /** Was any thread file (`.fray/*.md`) touched since `sinceMs`? */
 function threadTouchedSince(sinceMs) {
@@ -230,7 +188,7 @@ async function main() {
   if (payload.stop_hook_active === true) return allow();
 
   const now = Date.now();
-  const { last_fired, last_rest_surfaced, surfaced_agents, last_anon_ts } = readState();
+  const { last_fired, last_rest_surfaced, surfaced_agents } = readState();
 
   // (C) AGENT-LIVENESS lines — idle/frozen/unreaped dispatched sub-agents. Computed
   // once, fail-open ([] on any error). Appended to whichever reminder fires below,
@@ -247,10 +205,11 @@ async function main() {
   const livenessBlock = liveness.length ? '\n\nfray agent-liveness:\n' + liveness.join('\n') : '';
 
   // (A) REST-RECONCILIATION GUARD — highest priority, bypasses the cleanup cooldown.
-  // Fire only on rests from agents NOT yet surfaced (deduped by agent-id) AND newer
-  // than the last surface, so each genuinely-new rest forces exactly one reconciliation
-  // prompt (loop-safe with Guard 1) without re-nagging a resuming agent's repeat rests.
-  const { count: newRests, agents: newAgentIds, threads: newRestThreads, maxAnonTs } = newRestsSince(last_rest_surfaced, surfaced_agents, last_anon_ts);
+  // Fire only on rests from THREAD-BOUND (orchestrator-dispatched) agents NOT yet surfaced
+  // (deduped by agent-id) AND newer than the last surface, so each genuinely-new rest of an
+  // agent the orchestrator OWNS forces exactly one reconciliation prompt (loop-safe with
+  // Guard 1). Nested/worker-spawned and anon rests are excluded by `newBoundRestsSince`.
+  const { count: newRests, agents: newAgentIds, threads: newRestThreads } = newBoundRestsSince(PROJECT_DIR, last_rest_surfaced, surfaced_agents);
   // Cooldown: don't re-block on EVERY rest — under multi-session work the rest log
   // fills with OTHER sessions' subagent stops, which would otherwise block our idle
   // every couple minutes. A real completion of OUR agent re-invokes us via its
@@ -262,7 +221,7 @@ async function main() {
     // long-lived board can't let the persisted set grow without bound (keep the most
     // recent ids — older ones are long-since reconciled).
     const merged = [...surfaced_agents, ...newAgentIds].slice(-200);
-    writeState({ last_rest_surfaced: now, last_fired: now, surfaced_agents: merged, last_anon_ts: maxAnonTs });
+    writeState({ last_rest_surfaced: now, last_fired: now, surfaced_agents: merged });
     return block(restReminder(newRests, newRestThreads) + livenessBlock, USER_NOTE);
   }
 

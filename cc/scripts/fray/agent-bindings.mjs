@@ -228,3 +228,60 @@ export function restedAgentIds(projectDir) {
   }
   return out;
 }
+
+/**
+ * Count sub-agent rests recorded strictly after `sinceMs` that the ORCHESTRATOR actually
+ * dispatched — i.e. THREAD-BOUND agents — and have NOT yet been surfaced. This is what the
+ * Stop-hook rest guard nags on.
+ *
+ * THE FILTER (the fix for the over-aggressive nag): a rest counts ONLY if its `agent_id`
+ * appears in the bindings ledger (`.agent-bindings.jsonl`), which the agent-bind hook writes
+ * ONLY for a `THREAD:`-tagged orchestrator dispatch. The real predicate is "has a THREAD
+ * binding"; everything without one is excluded — none of it is orchestrator-facing reconcile work:
+ *   - NESTED / worker-spawned sub-agents (e.g. a landing agent's own fresh-context self-review
+ *     sub-agents): no THREAD tag → no binding → unbound. Their results fold into the parent's
+ *     report; they are the worker's internal business. This is the class that drove the nag.
+ *   - UNTAGGED orchestrator one-shots: also unbound (no thread), and they have no `.fray/<slug>.md`
+ *     to fold into — the result returns as the tool result, with nothing to reconcile.
+ *   - ANON rests (no `agent_id`): inherently unbindable, so never the orchestrator's to reconcile.
+ * The bound, THREAD-owned agent that genuinely rested and hasn't been folded STILL counts — the
+ * legitimate signal is preserved, just made precise.
+ *
+ * DEDUPE: an `agent_id` already in `surfacedAgents` is skipped, so a resuming bound agent's
+ * repeat rests don't re-nag; only genuinely-new bound ids count. Returns the count plus the
+ * DISTINCT new bound agent-ids and their thread slugs, so the caller can nag with a real number,
+ * grow the seen-set, and name the threads. Fail-open: any error → zero count.
+ * @param {string} projectDir
+ * @param {number} sinceMs
+ * @param {string[]} [surfacedAgents]
+ * @returns {{ count: number, agents: string[], threads: string[] }}
+ */
+export function newBoundRestsSince(projectDir, sinceMs, surfacedAgents = []) {
+  const seen = new Set(surfacedAgents);
+  const bound = new Set(readBindings(projectDir).map((b) => b.agent_id));
+  /** @type {Set<string>} */
+  const newAgents = new Set();
+  /** @type {Set<string>} */
+  const threads = new Set();
+  try {
+    const raw = readFileSync(join(projectDir, '.fray', '.rested-agents.jsonl'), 'utf8');
+    for (const line of raw.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const rec = JSON.parse(line);
+        const ts = Date.parse(rec.ts);
+        if (!Number.isFinite(ts) || ts <= sinceMs) continue;
+        const id = rec.agent_id;
+        // bound-only: skip anon (no id), already-surfaced, and unbound (nested/worker-spawned).
+        if (!id || seen.has(id) || !bound.has(id)) continue;
+        newAgents.add(id);
+        if (rec.thread) threads.add(String(rec.thread));
+      } catch {
+        /* skip a malformed line */
+      }
+    }
+  } catch {
+    /* no rest log → no rests */
+  }
+  return { count: newAgents.size, agents: [...newAgents], threads: [...threads] };
+}
