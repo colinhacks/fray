@@ -41,6 +41,8 @@ import {
   currentSessionId,
   frayActive,
   writeLastReconcile,
+  revalidateState,
+  formatEta,
 } from './config.mjs';
 import { newestBindingByThread, downstreamThreads, restedAgentIds } from './agent-bindings.mjs';
 import { deriveAgentState, findAgentOutputAge, IDLE_MIN, DROPPED_MIN } from './agent-status.mjs';
@@ -217,6 +219,11 @@ const threads = frayEntries
     // it still lands in the `(invalid status)` group below.
     const status = normalizeStatus(fm?.status) ?? '?';
     const dependsOn = parseList(fm?.depends_on);
+    // REVALIDATE timer — the parsed `revalidate_at`/`last_checked` state (null when unset/
+    // malformed). `revalidateMalformed` is set when the field is PRESENT but didn't parse, so
+    // a typo'd timestamp surfaces as a non-fatal warning below rather than silently never firing.
+    const revalidate = revalidateState(fm?.revalidate_at, fm?.last_checked);
+    const revalidateMalformed = Boolean(fm?.revalidate_at) && !revalidate;
     const next = nextStep(src);
     const threadTerminal = TERMINAL.includes(status);
     const threadActive = status === 'active'; // only `active` threads flag dropped/idle agents; parked phases are expected to hold done agents
@@ -239,6 +246,8 @@ const threads = frayEntries
       status_text: fm?.status_text ?? '',
       next,
       dependsOn,
+      revalidate,
+      revalidateMalformed,
       agents,
       text: src,
       errors,
@@ -288,6 +297,13 @@ function renderThread(t, out) {
       ? `    ⏳ blocked on: ${b.join(', ')}`
       : `    ▶ READY — dependencies clear, dispatch now`);
   }
+  // REVALIDATE timer status — `⏰ revalidate due` once the timer fired (re-poll the external
+  // state), or a quiet `next check in <eta>` while parked, so the board reflects the timer.
+  if (t.revalidate) {
+    out.push(t.revalidate.due
+      ? `    ⏰ revalidate due — re-poll the external state (last checked ${t.revalidate.lastChecked || 'never'})`
+      : `    ⏰ next check in ${formatEta(t.revalidate.etaMin)} (last checked ${t.revalidate.lastChecked || 'never'})`);
+  }
   // Dispatched-agent liveness — DERIVED (newest-agent output age + thread status + rest log),
   // never stored. Newest agent only; downstream (mid-merge) threads already suppressed.
   for (const a of t.agents) {
@@ -329,6 +345,13 @@ for (const t of threads) {
   // open question), surfaced UNTRUNCATED on the board + reminder — never warn on or clip it.
   if (t.status !== 'blocked' && t.status_text && t.status_text.length > 280) {
     t.warnings.push(`status_text is ${t.status_text.length} chars — keep it to 1-2 sentences; move detail into the body`);
+  }
+
+  // Present-but-unparseable `revalidate_at`: the hook degrades it to not-set (fail-safe), but
+  // a typo'd timestamp means the timer will NEVER fire — surface it as a non-fatal warning so
+  // the bad value is caught instead of silently stranding the thread.
+  if (t.revalidateMalformed) {
+    t.warnings.push('revalidate_at present but not a parseable ISO-8601 timestamp — the timer will NOT fire; fix it (e.g. 2026-06-27T18:00:00Z) or remove the field');
   }
 
   // Soft warning: non-terminal threads without a status_text have no at-a-glance board note.

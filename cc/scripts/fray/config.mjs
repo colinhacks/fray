@@ -431,3 +431,57 @@ export function isReconcileStale(lastMs, thresholdMin, now = Date.now()) {
   if (lastMs == null) return true;
   return now - lastMs > thresholdMin * 60_000;
 }
+
+// ── REVALIDATE — time-based recheck for threads waiting on EXTERNAL state ──────────
+// A thread `blocked` on something with no in-session auto-trigger (an external-repo PR
+// awaiting a maintainer, an un-watchable CI, a third-party response) would otherwise sit
+// silently or need a brittle live-polling shell (which dies on session end). Instead it
+// carries a DURABLE `revalidate_at: <ISO8601 UTC>` frontmatter timestamp: while that time
+// is in the FUTURE the thread is "parked on a timer" (quiet — NOT in the per-turn nag); once
+// `now ≥ revalidate_at` it is "due" and the fray-reminder hook + board surface it LOUDLY for
+// a recheck. The optional `last_checked: <ISO8601>` records the previous poll. This is the
+// SINGLE source of the timer semantics, shared by the hook and the board so they never drift.
+
+/**
+ * @typedef {Object} RevalidateState
+ * @property {number} atMs          `revalidate_at` parsed to epoch-ms.
+ * @property {string|null} lastChecked  the raw `last_checked` scalar, or null when unset.
+ * @property {boolean} due          whether `now ≥ revalidate_at` (the thread is due for recheck).
+ * @property {number} etaMin        minutes until due (negative once due); for the board's "next check in".
+ */
+
+/**
+ * Compute a thread's {@link RevalidateState} from its raw frontmatter scalars. ROBUST BY
+ * CONTRACT: a missing / empty / unparseable `revalidate_at` → `null` ("no timer set"), never
+ * a throw — so a thread WITHOUT the field behaves exactly as it always has, and a malformed
+ * value degrades to not-set rather than crashing the hook. (The board separately surfaces a
+ * present-but-unparseable value as a non-fatal warning so a typo'd timestamp isn't silently
+ * swallowed.) Quotes are stripped to match the frontmatter quoter; `Date.parse` accepts the
+ * ISO-8601 UTC form fray writes.
+ * @param {string|undefined|null} revalidateAtRaw  raw `revalidate_at` scalar (ISO-8601 UTC)
+ * @param {string|undefined|null} lastCheckedRaw   raw optional `last_checked` scalar
+ * @param {number} [now]
+ * @returns {RevalidateState | null}
+ */
+export function revalidateState(revalidateAtRaw, lastCheckedRaw, now = Date.now()) {
+  if (revalidateAtRaw == null) return null;
+  const v = String(revalidateAtRaw).trim().replace(/^["']|["']$/g, '');
+  if (!v) return null;
+  const atMs = Date.parse(v);
+  if (!Number.isFinite(atMs)) return null; // malformed → treat as not-set (never crash)
+  const lcRaw = lastCheckedRaw == null ? '' : String(lastCheckedRaw).trim().replace(/^["']|["']$/g, '');
+  return { atMs, lastChecked: lcRaw || null, due: now >= atMs, etaMin: Math.round((atMs - now) / 60_000) };
+}
+
+/**
+ * Humanize a minutes-until-due into a compact ETA (`45m`, `7h`, `2d`) for the board's
+ * "next check in" line. Clamps negatives (an already-due timer) to `0m`.
+ * @param {number} etaMin
+ * @returns {string}
+ */
+export function formatEta(etaMin) {
+  const m = Math.max(0, etaMin);
+  if (m < 60) return `${m}m`;
+  if (m < 60 * 24) return `${Math.round(m / 60)}h`;
+  return `${Math.round(m / (60 * 24))}d`;
+}

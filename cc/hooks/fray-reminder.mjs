@@ -25,6 +25,7 @@ import {
   readLastReconcile,
   reconcileThresholdMin,
   isReconcileStale,
+  revalidateState,
 } from '../scripts/fray/config.mjs';
 
 // Token-saving: skip entirely inside sub-agent contexts. The hook stdin carries
@@ -115,7 +116,7 @@ try {
   // First pass collects every thread's status + depends_on so the drop-risk check
   // (an `enqueued` thread whose deps are ALL terminal) can resolve cross-thread dep
   // statuses — a single-pass scan can't, since a dep may be a thread not yet seen.
-  /** @type {{id:string,status:string|undefined,deps:string[],src:string,status_text:string}[]} */
+  /** @type {{id:string,status:string|undefined,deps:string[],src:string,status_text:string,revalidate_at:string|undefined,last_checked:string|undefined}[]} */
   const scanned = [];
   try {
     for (const f of readdirSync(join(dir, '.fray'))) {
@@ -127,7 +128,12 @@ try {
       if (!/^title:\s*\S/m.test(src)) errors.push(`${id}: missing title`);
       if (!rawSt) errors.push(`${id}: missing status`);
       else if (!isValidStatus(rawSt)) errors.push(`${id}: invalid status "${rawSt}"`);
-      scanned.push({ id, status: st, deps: parseDepends(src), src, status_text: unquote(src.match(/^status_text:\s*(.*)$/m)?.[1]) });
+      scanned.push({
+        id, status: st, deps: parseDepends(src), src,
+        status_text: unquote(src.match(/^status_text:\s*(.*)$/m)?.[1]),
+        revalidate_at: src.match(/^revalidate_at:\s*(.*)$/m)?.[1],
+        last_checked: src.match(/^last_checked:\s*(.*)$/m)?.[1],
+      });
     }
   } catch {
     /* no .fray dir yet */
@@ -137,12 +143,28 @@ try {
   const dropRisk = []; // `enqueued` threads whose depends_on are ALL terminal — they SHOULD have auto-fired and didn't. The canonical silent-stall shape; surfaced BY NAME so it can't be skipped by reflex.
   /** @type {{slug:string,status_text:string}[]} */
   const decisions = []; // every `blocked` thread — the COMPUTED awaiting-you queue, surfaced each turn by its FULL status_text (the concise blocker / open question). Nothing stored; derived live from the scan. (`blocked` absorbs the old `needs-decision`.)
+  /** @type {{slug:string,hint:string,lastChecked:string|null}[]} */
+  const revalidateDue = []; // non-terminal threads whose `revalidate_at` is now ≤ now — the timer fired; re-poll the external state. Surfaced LOUDLY by name (the durable replacement for a live-polling watcher shell).
   for (const t of scanned) {
+    if (TERMINAL.includes(t.status ?? '')) continue;
+    // REVALIDATE TIMER OWNS SURFACING. A non-terminal thread carrying a (parseable)
+    // `revalidate_at` is governed entirely by its timer, NOT the normal per-turn nag: while
+    // the time is in the FUTURE it is parked + QUIET (suppressed from pending/decisions — it
+    // waits on external state, not a human decision this turn); once DUE it surfaces ONCE in
+    // the dedicated REVALIDATE block below. Either way it is excluded from pending/queued/
+    // decisions/drop-risk so the timer is its single surfacing channel (no double-nag). A
+    // malformed timestamp → revalidateState null → falls through to normal surfacing (fail-safe:
+    // a typo'd timer surfaces as ordinary blocked rather than going silent).
+    const rv = revalidateState(t.revalidate_at, t.last_checked);
+    if (rv) {
+      if (rv.due) revalidateDue.push({ slug: t.id, hint: t.status_text, lastChecked: rv.lastChecked });
+      continue;
+    }
     // PARKED (`planned`) is non-terminal but deliberately NOT auto-nagged — it is parked
     // work the orchestrator pulls up via the `fray` board on its own schedule, not every turn.
     // Only the genuinely-actionable/in-flight statuses (planning/enqueued/active/blocked)
     // reach the per-turn pending list + its sub-checks (queued/drop-risk/decisions).
-    if (!TERMINAL.includes(t.status ?? '') && !PARKED.includes(t.status ?? '')) {
+    if (!PARKED.includes(t.status ?? '')) {
       pending.push(`${t.id}[${t.status ?? '?'}]`);
       if (/\bQUEUED\b/.test(t.src)) queued.push(t.id);
       if (t.status === 'blocked') decisions.push({ slug: t.id, status_text: t.status_text });
@@ -160,6 +182,7 @@ try {
     (queued.length ? `  ⚠ UN-DRAINED QUEUED FOLLOW-UPS in ${queued.length} thread(s): ${queued.join(', ')}. THE INSTANT any of their agents returns, RE-READ that thread .md (don't reconcile from memory) and DISPATCH the actionable QUEUED items as sub-agents THIS turn (a mandated self-review/integration pass IS one — dispatch it). Surface, never silently drop, the human-gated/post-launch ones. Skipping this is the #1 failure.` : '') +
     (dropRisk.length ? `  ⚠⚠ DROP-RISK THREADS in ${dropRisk.length} thread(s): ${dropRisk.join(', ')}. These are \`enqueued\` with ALL their \`depends_on\` now TERMINAL — their auto-trigger fired and they were NEVER dispatched (the exact silent-stall this guard exists to kill). RE-READ each thread .md THIS turn and DISPATCH/ADVANCE it — do NOT skip past this. If one is genuinely not ready, move it back to \`todo\` or fix its \`depends_on\`; leaving it \`enqueued\` with cleared deps is a bug.` : '') +
     (decisions.length ? `  ⚖ ${decisions.length} BLOCKED — AWAITING YOUR CALL (computed from \`blocked\` threads — nothing stored): ${decisions.map((d) => `[${d.slug}] ${d.status_text || '(no write-up — add a one-line status_text)'}`).join('  ·  ')}. SURFACE these to the human (full context, numbered — see the skill) and do NOT silently sit on them; each awaits a human decision / answer / external event. On resolution, record the call in the thread's \`## Decisions\` body and flip status OUT of blocked.` : '') +
+    (revalidateDue.length ? `  ⏰ ${revalidateDue.length} REVALIDATE DUE — re-poll the external state NOW (CHANGED → act/unblock; UNCHANGED → bump \`revalidate_at\` forward 6–12h + stamp \`last_checked: <now>\`; re-arm until terminal): ${revalidateDue.map((r) => `⏰ REVALIDATE DUE: ${r.slug} — ${r.hint || 're-poll the external state'} (last checked ${r.lastChecked || 'never'})`).join('  ·  ')}.` : '') +
     (errors.length ? `  ⚠ VALIDATION ERRORS (fix now): ${errors.join('; ')}` : '');
 
   const modeLine =
