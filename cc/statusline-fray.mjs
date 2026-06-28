@@ -114,13 +114,13 @@ try {
 
   let line = parts.join(` ${sep} `);
 
-  // ── fray segment (only when active for this session): active + blocked, no icons ──
+  // ── fray segment (only when active for this session): "fray enabled · N active · N blocked" ──
   if (frayActive(projectDir, sessionId)) {
     const { active, blocked } = scanBoard(projectDir);
-    const fray = [];
+    const fray = [`${dim('fray')} enabled`]; // "enabled" non-dim (default fg) to signal fray is ON
     fray.push(active > 0 ? cyan(`${active} active`) : dim('0 active'));
     fray.push(blocked > 0 ? amber(`${blocked} blocked`) : dim('0 blocked'));
-    line += `   ${dim('fray')} ${fray.join(` ${sep} `)}`;
+    line += `   ${fray.join(` ${sep} `)}`;
   }
 
   process.stdout.write(line);
