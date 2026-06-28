@@ -5,20 +5,23 @@
 // orchestrator goes idle, so headline wins / decisions / blockers can't scroll out of
 // reach or get buried under status churn.
 //
-// Contract (mirrors fray-stop-reminder, the known-good channel):
-//   - User-facing text rides `systemMessage` (a calm line, not a red "Stop hook error:" wall).
-//   - Model-facing text rides `hookSpecificOutput.additionalContext`.
-//   - We BLOCK (decision:block) ONLY when there are OPEN items not yet surfaced, so a new
-//     notification interrupts idle exactly ONCE to guarantee the human sees it; we then stamp
-//     surfaced:true so it never loops. Items persist (status:open) until DISMISSED.
-//   - DISMISSAL IS THE ORCHESTRATOR'S JOB, not the human's: the human talks to the
-//     orchestrator, not a terminal. When the human addresses an item in conversation, the
-//     orchestrator runs `fray-notify dismiss <id>` on their behalf once it's properly handled.
+// DESIGN (the point of this hook): the human reads the queue HERE, from a rich, sectioned
+// markdown `systemMessage` — NOT from the orchestrator regurgitating it in chat. So:
+//   - We do NOT block. `systemMessage` is a universal output field shown to the user even
+//     when the hook exits 0 without `decision: block` (confirmed against the hooks docs), so
+//     a non-blocking surface reaches the human WITHOUT forcing the orchestrator into another
+//     turn — which is exactly what stops it from re-typing the items back at the human.
+//   - We surface each open item EXACTLY ONCE: stamp `surfaced:true` after showing, so a new
+//     notification interrupts idle one time, then persists quietly (status:open) until the
+//     orchestrator dismisses it on the human's behalf.
+//   - We emit NO model-facing `additionalContext` and NO "relay this" instruction. The
+//     orchestrator's standing rule (in the fray skill) is: do NOT repeat the queue in chat;
+//     just `fray-notify dismiss <id>` once the human addresses an item in conversation.
 //   - Coexists safely with any other Stop hook (and a project-local copy): they share the
 //     queue file's `surfaced` flag, so whichever fires first stamps it and the other no-ops.
 //   - Any error → allow the stop (never wedge the session on a notify bug).
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { readQueue, writeQueue, renderMarkdown } from '../scripts/fray/notify-shared.mjs';
 
 function allow() {
   process.exit(0);
@@ -27,20 +30,8 @@ function allow() {
 try {
   const root = process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const queue = join(root, '.fray', 'notify-queue.jsonl');
-  if (!existsSync(queue)) allow();
 
-  const items = readFileSync(queue, 'utf8')
-    .split('\n')
-    .filter((l) => l.trim())
-    .map((l) => {
-      try {
-        return JSON.parse(l);
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean);
-
+  const items = readQueue(queue);
   const open = items.filter((i) => i.status === 'open');
   if (!open.length) allow();
 
@@ -48,27 +39,11 @@ try {
   if (!unsurfaced.length) allow(); // already shown once; persists quietly until dismissed
 
   for (const i of items) if (i.status === 'open' && !i.surfaced) i.surfaced = true;
-  writeFileSync(queue, items.map((i) => JSON.stringify(i)).join('\n') + '\n');
+  writeQueue(queue, items);
 
-  const line = (i) => `• [${i.kind}] ${i.text}  (id ${i.id})`;
-  const userMsg =
-    `📌 ${open.length} pending notification${open.length > 1 ? 's' : ''} for you ` +
-    `(I'll dismiss each once you've addressed it):\n` +
-    open.map(line).join('\n');
-  const modelMsg =
-    `Durable notification queue has ${unsurfaced.length} NEW item(s). Relay them to the human ` +
-    `verbatim in your next message (they're surfaced via systemMessage already), then you may rest. ` +
-    `DISMISSAL IS YOUR JOB: the human has no terminal — when they address an item in conversation, ` +
-    `run \`fray-notify dismiss <id>\` on their behalf once it's properly handled. Open items:\n` +
-    open.map(line).join('\n');
-
-  process.stdout.write(
-    JSON.stringify({
-      decision: 'block',
-      hookSpecificOutput: { hookEventName: 'Stop', additionalContext: modelMsg },
-      systemMessage: userMsg,
-    }) + '\n',
-  );
+  // Non-blocking surface: show the human the full open queue (sectioned markdown), let the
+  // orchestrator rest. No additionalContext — nothing instructs the model to relay it.
+  process.stdout.write(JSON.stringify({ systemMessage: renderMarkdown(open) }) + '\n');
   process.exit(0);
 } catch {
   allow();
