@@ -1,0 +1,18 @@
+#!/usr/bin/env node
+// @ts-check
+/**
+ * fray-notify — the durable notification-queue CLI. This shim is on the Bash tool's PATH
+ * while the plugin is enabled, so `fray-notify add|list|dismiss …` works as a bare command
+ * from any cwd. It execs the bundled script (scripts/fray/notify.mjs), which writes the
+ * PROJECT's `.fray/notify-queue.jsonl` (resolved from CLAUDE_PROJECT_DIR).
+ *
+ * Resolving the script: this file lives at <plugin>/bin/fray-notify, so the script is at
+ * ../scripts/fray/notify.mjs relative to THIS file — independent of cwd and of where the
+ * plugin is installed. Imported via a file:// URL so argv/process.env flow straight through.
+ */
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { dirname, join } from 'node:path';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const script = join(here, '..', 'scripts', 'fray', 'notify.mjs');
+await import(pathToFileURL(script).href);

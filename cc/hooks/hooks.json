@@ -28,6 +28,11 @@
         "hooks": [
           { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/fray-stop-reminder.mjs\"" }
         ]
+      },
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/fray-notify-surface.mjs\"" }
+        ]
       }
     ],
     "SubagentStop": [
