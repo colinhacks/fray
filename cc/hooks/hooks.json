@@ -40,6 +40,11 @@
         "hooks": [
           { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/fray-subagent-rest.mjs\"" }
         ]
+      },
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/fray-rest-guard.mjs\"" }
+        ]
       }
     ],
     "SessionStart": [
