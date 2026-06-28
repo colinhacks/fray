@@ -13,7 +13,7 @@
 // session, so re-paying it every prompt was pure waste.
 // Emits hookSpecificOutput.additionalContext (model-only). Robust: never throws (a broken
 // hook must not disrupt the prompt) — any failure → inject nothing.
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   frayActive,
@@ -116,20 +116,27 @@ try {
   // First pass collects every thread's status + depends_on so the drop-risk check
   // (an `enqueued` thread whose deps are ALL terminal) can resolve cross-thread dep
   // statuses — a single-pass scan can't, since a dep may be a thread not yet seen.
-  /** @type {{id:string,status:string|undefined,deps:string[],src:string,status_text:string,revalidate_at:string|undefined,last_checked:string|undefined}[]} */
+  /** @type {{id:string,status:string|undefined,deps:string[],src:string,status_text:string,revalidate_at:string|undefined,last_checked:string|undefined,mtimeMs:number}[]} */
   const scanned = [];
   try {
     for (const f of readdirSync(join(dir, '.fray'))) {
       if (!f.endsWith('.md') || f.startsWith('_')) continue; // `_`-prefixed = non-thread meta
       const id = f.replace(/\.md$/, '');
-      const src = readFileSync(join(dir, '.fray', f), 'utf8');
+      const fp = join(dir, '.fray', f);
+      const src = readFileSync(fp, 'utf8');
+      // FRESHNESS via file mtime — no written flag to maintain; the filesystem already
+      // tracks the last edit. Surfaced per-thread below so a thread that CLAIMS active but
+      // hasn't been touched in a while is visibly STALE (the anti-drop signal for "I trusted
+      // a thread that was 45m stale"). 0 = stat race → no age shown (fail-quiet).
+      let mtimeMs = 0;
+      try { mtimeMs = statSync(fp).mtimeMs; } catch { /* stat race → unknown */ }
       const rawSt = src.match(/^status:\s*(\S+)/m)?.[1];
       const st = normalizeStatus(rawSt); // canonical (legacy todo/plan/needs-decision → canonical); unknown passes through
       if (!/^title:\s*\S/m.test(src)) errors.push(`${id}: missing title`);
       if (!rawSt) errors.push(`${id}: missing status`);
       else if (!isValidStatus(rawSt)) errors.push(`${id}: invalid status "${rawSt}"`);
       scanned.push({
-        id, status: st, deps: parseDepends(src), src,
+        id, status: st, deps: parseDepends(src), src, mtimeMs,
         status_text: unquote(src.match(/^status_text:\s*(.*)$/m)?.[1]),
         revalidate_at: src.match(/^revalidate_at:\s*(.*)$/m)?.[1],
         last_checked: src.match(/^last_checked:\s*(.*)$/m)?.[1],
@@ -139,6 +146,20 @@ try {
     /* no .fray dir yet */
   }
   const statusOf = new Map(scanned.map((t) => [t.id, t.status]));
+  // Freshness rendering: compact "edited Nm/Nh/Nd ago" per thread + a ⚠STALE flag for an
+  // active/enqueued thread untouched longer than STALE_MIN (its agent likely rested mid-work
+  // or the thread drifted from reality). blocked/planning legitimately sit, so they show age
+  // but are never marked stale.
+  const now = Date.now();
+  const STALE_MIN = 25;
+  /** @param {number} m mtimeMs (0 = unknown) @returns {string} */
+  const ageLabel = (m) => {
+    if (!m) return '';
+    const min = Math.round((now - m) / 60_000);
+    if (min < 90) return `${min}m`;
+    const h = (now - m) / 3_600_000;
+    return h < 24 ? `${h.toFixed(h < 10 ? 1 : 0)}h` : `${Math.round(h / 24)}d`;
+  };
   /** @type {string[]} */
   const dropRisk = []; // `enqueued` threads whose depends_on are ALL terminal — they SHOULD have auto-fired and didn't. The canonical silent-stall shape; surfaced BY NAME so it can't be skipped by reflex.
   /** @type {{slug:string,status_text:string}[]} */
@@ -165,7 +186,10 @@ try {
     // Only the genuinely-actionable/in-flight statuses (planning/enqueued/active/blocked)
     // reach the per-turn pending list + its sub-checks (queued/drop-risk/decisions).
     if (!PARKED.includes(t.status ?? '')) {
-      pending.push(`${t.id}[${t.status ?? '?'}]`);
+      const age = ageLabel(t.mtimeMs);
+      const isStale = (t.status === 'active' || t.status === 'enqueued') &&
+        t.mtimeMs > 0 && now - t.mtimeMs > STALE_MIN * 60_000;
+      pending.push(`${t.id}[${t.status ?? '?'}${age ? ', ' + age : ''}${isStale ? ' ⚠STALE' : ''}]`);
       if (/\bQUEUED\b/.test(t.src)) queued.push(t.id);
       if (t.status === 'blocked') decisions.push({ slug: t.id, status_text: t.status_text });
       // Drop-risk: enqueued WITH declared deps, ALL of which are terminal (the
@@ -178,7 +202,7 @@ try {
     }
   }
   const status =
-    `FRAY — ${pending.length} pending: ${pending.join(', ') || 'none'}. Advance or reconcile EACH this turn; if you went deep on ONE thread, don't let the others silently stall (run \`fray\` for detail). Returns are a strict INBOX — drain the OLDEST first, ONE at a time, never batch; an empty/progress-only return is an INCOMPLETE handoff (record needs-retry + re-dispatch, do NOT mark done). When you fold a return: DRAIN that thread's queued follow-ups (\`## Steps\` items marked QUEUED — dispatch on <agent>'s return) + MOVE any answered Open question into Decisions (a DECIDED thing lives under ## Decisions, NEVER Open questions). done/dismissed threads are TERMINAL + KEPT — never delete them. ALWAYS STEER — DON'T RE-DISPATCH (TOP-PRIORITY RULE): SendMessage works on running AND completed sub-agents. To add context / redirect / fold scope into a file an agent owns, answer a question it raised, or RESUME an agent the instant a temporary blocker (a HOLD, a transient CI failure, a now-available input) clears — MESSAGE/RESUME that agent (by name or agentId). NEVER let an agent die and cold-redispatch a fresh replacement (loses its runbook + context), never spawn a clobbering sibling, never kill-and-respawn (orphans WIP). Only fall back to marking it\`enqueued\` (naming the agent it waits on) and dispatch the instant that agent returns; never spawn a clobbering sibling or kill-and-respawn.` +
+    `FRAY — ${pending.length} pending: ${pending.join(', ') || 'none'}. Advance or reconcile EACH this turn; if you went deep on ONE thread, don't let the others silently stall (run \`fray\` for detail). Each thread shows when its file was last edited; a \`⚠STALE\` marker = an active/enqueued thread untouched >${STALE_MIN}m (its agent likely rested mid-work or its status drifted from reality) — RE-READ that thread + verify it actually progressed (check its PR/agent) before trusting its text. Returns are a strict INBOX — drain the OLDEST first, ONE at a time, never batch; an empty/progress-only return is an INCOMPLETE handoff (record needs-retry + re-dispatch, do NOT mark done). When you fold a return: DRAIN that thread's queued follow-ups (\`## Steps\` items marked QUEUED — dispatch on <agent>'s return) + MOVE any answered Open question into Decisions (a DECIDED thing lives under ## Decisions, NEVER Open questions). done/dismissed threads are TERMINAL + KEPT — never delete them. ALWAYS STEER — DON'T RE-DISPATCH (TOP-PRIORITY RULE): SendMessage works on running AND completed sub-agents. To add context / redirect / fold scope into a file an agent owns, answer a question it raised, or RESUME an agent the instant a temporary blocker (a HOLD, a transient CI failure, a now-available input) clears — MESSAGE/RESUME that agent (by name or agentId). NEVER let an agent die and cold-redispatch a fresh replacement (loses its runbook + context), never spawn a clobbering sibling, never kill-and-respawn (orphans WIP). Only fall back to marking it\`enqueued\` (naming the agent it waits on) and dispatch the instant that agent returns; never spawn a clobbering sibling or kill-and-respawn.` +
     (queued.length ? `  ⚠ UN-DRAINED QUEUED FOLLOW-UPS in ${queued.length} thread(s): ${queued.join(', ')}. THE INSTANT any of their agents returns, RE-READ that thread .md (don't reconcile from memory) and DISPATCH the actionable QUEUED items as sub-agents THIS turn (a mandated self-review/integration pass IS one — dispatch it). Surface, never silently drop, the human-gated/post-launch ones. Skipping this is the #1 failure.` : '') +
     (dropRisk.length ? `  ⚠⚠ DROP-RISK THREADS in ${dropRisk.length} thread(s): ${dropRisk.join(', ')}. These are \`enqueued\` with ALL their \`depends_on\` now TERMINAL — their auto-trigger fired and they were NEVER dispatched (the exact silent-stall this guard exists to kill). RE-READ each thread .md THIS turn and DISPATCH/ADVANCE it — do NOT skip past this. If one is genuinely not ready, move it back to \`todo\` or fix its \`depends_on\`; leaving it \`enqueued\` with cleared deps is a bug.` : '') +
     (decisions.length ? `  ⚖ ${decisions.length} BLOCKED — AWAITING YOUR CALL (computed from \`blocked\` threads — nothing stored): ${decisions.map((d) => `[${d.slug}] ${d.status_text || '(no write-up — add a one-line status_text)'}`).join('  ·  ')}. SURFACE these to the human (full context, numbered — see the skill) and do NOT silently sit on them; each awaits a human decision / answer / external event. On resolution, record the call in the thread's \`## Decisions\` body and flip status OUT of blocked.` : '') +
