@@ -8,9 +8,18 @@
  * backgrounds a build / test / CI-watch / install / monitor and then RESTS — going
  * idle and handing control back — BEFORE the task is actually done, on the theory
  * that "the waiter will notify me." It won't reliably; the task strands and the
- * orchestrator must manually resume it. When the agent's final message is a
- * high-confidence "parking on a waiter/monitor" tell (detectWaiterRest), this hook
- * BLOCKS the stop and redirects the agent to poll the op INLINE and finish.
+ * orchestrator must manually resume it.
+ *
+ * Detection is TWO signals, OR-ed (defense in depth; both in rest-detect.mjs):
+ *   - STRUCTURAL (primary, high-confidence) — detectStructuralRest: the agent's LAST
+ *     tool_use was a BACKGROUND-LAUNCH (a run_in_background Bash/Agent/Task, or a
+ *     Monitor/ScheduleWakeup waiter/timer). Keys on what the agent DID (tool name +
+ *     run_in_background param), so it is immune to the phrasing drift that makes a
+ *     prose matcher fragile.
+ *   - PROSE (fallback) — detectWaiterRest: the original phrasing matcher on the final
+ *     assistant text, kept as a secondary net for what the structural signal misses.
+ * Either fires → this hook BLOCKS the stop and redirects the agent to poll the op
+ * INLINE and finish.
  *
  * SubagentStop block contract (verified against Claude Code hooks docs, 2026-06-28):
  * top-level `{ "decision": "block", "reason": "<fed to the subagent>" }`. The reason
@@ -36,7 +45,7 @@
 import { appendFileSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { frayActive } from '../scripts/fray/config.mjs';
-import { detectWaiterRest, lastAssistantText } from '../scripts/fray/rest-detect.mjs';
+import { detectWaiterRest, lastAssistantText, detectStructuralRest } from '../scripts/fray/rest-detect.mjs';
 
 const PROJECT_DIR = process.env.CLAUDE_PROJECT_DIR || process.cwd();
 const FRAY_DIR = join(PROJECT_DIR, '.fray');
@@ -100,9 +109,15 @@ try {
     }
   }
 
-  // Read the agent's LAST assistant message and judge it. No text / no match → allow.
-  const text = lastAssistantText(payload.transcript_path);
-  if (!detectWaiterRest(text)) allow();
+  // TWO SIGNALS, OR-ed (defense in depth — see rest-detect.mjs):
+  //   STRUCTURAL (primary): the agent's last tool_use was a background-launch
+  //     (run_in_background Bash/Agent/Task, or a Monitor/ScheduleWakeup waiter/timer).
+  //     Immune to phrasing drift — keys on what the agent DID.
+  //   PROSE (fallback): the original phrasing matcher on the final assistant text.
+  // Neither fires → allow (fail open).
+  const structural = detectStructuralRest(payload.transcript_path);
+  const prose = !structural && detectWaiterRest(lastAssistantText(payload.transcript_path));
+  if (!structural && !prose) allow();
 
   // High-confidence waiter-rest → BLOCK and record the block (loop-guard ledger).
   if (agentId) {

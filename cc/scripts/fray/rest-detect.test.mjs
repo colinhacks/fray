@@ -9,7 +9,16 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { detectWaiterRest } from './rest-detect.mjs';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  detectWaiterRest,
+  isBackgroundLaunch,
+  detectStructuralRestFromToolUses,
+  detectStructuralRest,
+  lastToolUse,
+} from './rest-detect.mjs';
 
 // The six REAL resting messages from production — all FALSE rests that must BLOCK.
 const REAL_RESTS = [
@@ -60,4 +69,96 @@ test('only the tail is judged — a long, clearly-done report that merely MENTIO
     'I set up a background CI watcher earlier to monitor the run. '.repeat(20) +
     '\n\nVerdict: the run finished green; PR #99 merged. Follow-ups: none. Done.';
   assert.equal(detectWaiterRest(longReport), false);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STRUCTURAL signal — keys on the TOOL-USE history (real transcript schemas).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Block shapes grounded in REAL transcripts (verified 2026-06-28).
+const bgBash = { type: 'tool_use', name: 'Bash', input: { command: 'cargo build &', run_in_background: true } };
+const bgAgent = { type: 'tool_use', name: 'Agent', input: { subagent_type: 'x', prompt: 'go', run_in_background: true } };
+const monitor = { type: 'tool_use', name: 'Monitor', input: { command: 'until grep ...; do sleep 5; done', timeout_ms: 600000 } };
+const wakeup = { type: 'tool_use', name: 'ScheduleWakeup', input: { delaySeconds: 1800, reason: 'backstop', prompt: '<<x>>' } };
+const fgBash = { type: 'tool_use', name: 'Bash', input: { command: 'cat out.txt', run_in_background: false } };
+const fgRead = { type: 'tool_use', name: 'Read', input: { file_path: '/x' } };
+const fgEdit = { type: 'tool_use', name: 'Edit', input: { file_path: '/x', old_string: 'a', new_string: 'b' } };
+
+test('isBackgroundLaunch — classifies real bg-launch tool_use shapes', () => {
+  for (const b of [bgBash, bgAgent, monitor, wakeup]) {
+    assert.equal(isBackgroundLaunch(b), true, `should be a bg-launch: ${b.name}`);
+  }
+  for (const b of [fgBash, fgRead, fgEdit]) {
+    assert.equal(isBackgroundLaunch(b), false, `should NOT be a bg-launch: ${b.name}`);
+  }
+  // fail-closed on junk
+  for (const b of [null, undefined, {}, { type: 'text', text: 'hi' }, { type: 'tool_use' }]) {
+    assert.equal(isBackgroundLaunch(b), false);
+  }
+});
+
+test('structural — BLOCKS when the LAST tool_use is a background-launch', () => {
+  // backgrounded a build and then ended the turn
+  assert.equal(detectStructuralRestFromToolUses([fgRead, fgEdit, bgBash]), true);
+  // armed a Monitor as the last action
+  assert.equal(detectStructuralRestFromToolUses([fgBash, monitor]), true);
+  // armed a ScheduleWakeup as the last action
+  assert.equal(detectStructuralRestFromToolUses([wakeup]), true);
+  // dispatched a background sub-agent and rested
+  assert.equal(detectStructuralRestFromToolUses([fgEdit, bgAgent]), true);
+});
+
+test('structural — ALLOWS a genuine finish (last tool_use is foreground work)', () => {
+  // backgrounded EARLY, then polled inline + committed → last action is a foreground Bash
+  assert.equal(detectStructuralRestFromToolUses([bgBash, fgBash, fgBash]), false);
+  // finished on an Edit / Read
+  assert.equal(detectStructuralRestFromToolUses([bgAgent, fgEdit]), false);
+  assert.equal(detectStructuralRestFromToolUses([monitor, fgRead]), false);
+  // no tool_use at all (pure text deliverable) → never blocks
+  assert.equal(detectStructuralRestFromToolUses([]), false);
+  assert.equal(detectStructuralRestFromToolUses(null), false);
+});
+
+test('lastToolUse + detectStructuralRest — read a real-shaped transcript .jsonl', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fray-rest-'));
+  try {
+    // Transcript schema mirrors production: each assistant content-block is its own
+    // event line; an assistant turn carries message.content as an array; the bg-launch
+    // is the last tool_use, followed by tool_result + a final text "rest" message.
+    const ev = (o) => JSON.stringify(o);
+    const blocked = join(dir, 'blocked.jsonl');
+    writeFileSync(
+      blocked,
+      [
+        ev({ type: 'assistant', message: { role: 'assistant', content: [fgEdit] } }),
+        ev({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: 'ok' }] } }),
+        ev({ type: 'assistant', message: { role: 'assistant', content: [bgBash] } }),
+        ev({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: 'started bg' }] } }),
+        ev({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Kicked off the build; standing by.' }] } }),
+      ].join('\n') + '\n',
+    );
+    assert.equal(isBackgroundLaunch(lastToolUse(blocked)), true);
+    assert.equal(detectStructuralRest(blocked), true);
+
+    // A genuine finish: bg-launch early, then inline poll (foreground) is the last tool_use.
+    const allowed = join(dir, 'allowed.jsonl');
+    writeFileSync(
+      allowed,
+      [
+        ev({ type: 'assistant', message: { role: 'assistant', content: [bgBash] } }),
+        ev({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: 'started' }] } }),
+        ev({ type: 'assistant', message: { role: 'assistant', content: [fgBash] } }),
+        ev({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: 'BUILD DONE' }] } }),
+        ev({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Build green. Done.' }] } }),
+      ].join('\n') + '\n',
+    );
+    assert.equal(detectStructuralRest(allowed), false);
+
+    // Fail-open: missing / unreadable transcript → false (no block).
+    assert.equal(detectStructuralRest(join(dir, 'nope.jsonl')), false);
+    assert.equal(detectStructuralRest(null), false);
+    assert.equal(detectStructuralRest(undefined), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
