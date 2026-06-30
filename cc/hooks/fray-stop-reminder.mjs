@@ -18,9 +18,11 @@
  *       rests don't re-nag), newer than the last surface, and never twice in a row
  *       (stop_hook_active).
  *
- *   (B) CLEANUP NUDGE. Otherwise, the original gentle nudge to make sure threads
- *       touched this session reflect current truth — rate-limited by a cooldown and
- *       gated on a thread file actually having been touched.
+ *   (B) CLEANUP + POP-ONE NUDGE. Otherwise, nudge a reconcile of threads touched this
+ *       session AND THEN to pop the single next `blocked` thread off the queue and present
+ *       that ONE blockage to the human with full context (fray's serialized one-at-a-time
+ *       decision rhythm — never a whole-list dump). Rate-limited by a cooldown and gated on
+ *       a thread file actually having been touched.
  *
  * OUTPUT CHANNEL (see `block()`): both jobs BLOCK via `decision: block` but carry the
  * model-facing text in `hookSpecificOutput.additionalContext` (NOT `reason`) plus a calm
@@ -150,11 +152,11 @@ function threadTouchedSince(sinceMs) {
 // an alarming block. The hook only needs to POINT at the work; the skill carries the how.
 function restReminder(n, threads = []) {
   const where = threads.length ? ` (thread(s): ${threads.join(', ')})` : '';
-  return `fray: ${n} new sub-agent rest(s) since you last reconciled${where} — reconcile each (oldest first, re-read its thread, drain its queue, verify it actually landed) or stop if all are already handled.`;
+  return `fray: ${n} new sub-agent rest(s) since you last reconciled${where} — reconcile each (oldest first, re-read its thread, drain its queue, verify it actually landed). THEN, if any thread is blocked awaiting the human, POP THE SINGLE next one, re-read it so you fully understand it, and present THAT ONE blockage with full context + your rec — one blockage at a time, never a whole-list dump.`;
 }
 
 const CLEANUP_REMINDER =
-  'fray: before going idle, make sure the threads you worked on this session reflect current truth (drain returned follow-ups, flip finished threads to done) — or just stop if they already do.';
+  'fray: before going idle — (1) reconcile the threads you touched this session (drain follow-ups, flip finished → done); (2) THEN pop the SINGLE next blocked thread off the queue, RE-READ it so you fully understand the blockage, and present THAT ONE to the user with complete context + your recommendation — one blockage at a time, NEVER a concise dump of the whole blocked list (that overwhelms, under-informs each item, and scrolls out of the chat). Nothing blocked / all already surfaced this round → just stop.';
 
 // Calm one-liner shown to the USER (the `systemMessage` channel) alongside whichever
 // block fires, so the surface reads as a gentle fray reminder rather than a bare error.
