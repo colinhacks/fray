@@ -16,7 +16,11 @@
  *       This bypasses the cleanup cooldown (rests are urgent), but is loop-safe: it fires only
  *       on NOT-YET-SURFACED bound agents (deduped by agent-id, so a resuming agent's repeat
  *       rests don't re-nag), newer than the last surface, and never twice in a row
- *       (stop_hook_active).
+ *       (stop_hook_active). It ALSO hands the orchestrator the CONTENTS of each just-finished
+ *       agent's bound thread (capped excerpt via threadExcerptsBlock) so it can square the
+ *       agent's REPORTED results against what the thread now says — the orchestrator's own Stop
+ *       hook is the channel that lands thread text in the ORCHESTRATOR's context (a SubagentStop
+ *       hook's additionalContext would continue the SUB-AGENT's turn, the wrong surface).
  *
  *   (B) CLEANUP + POP-ONE NUDGE. Otherwise, nudge a reconcile of threads touched this
  *       session AND THEN to pop the single next `blocked` thread off the queue and present
@@ -43,6 +47,7 @@ import { readFileSync, writeFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { frayActive } from '../scripts/fray/config.mjs';
 import { newBoundRestsSince } from '../scripts/fray/agent-bindings.mjs';
+import { threadExcerptsBlock } from '../scripts/fray/thread-excerpt.mjs';
 
 const PROJECT_DIR = process.env.CLAUDE_PROJECT_DIR || process.cwd();
 const FRAY_DIR = join(PROJECT_DIR, '.fray');
@@ -224,7 +229,12 @@ async function main() {
     // recent ids — older ones are long-since reconciled).
     const merged = [...surfaced_agents, ...newAgentIds].slice(-200);
     writeState({ last_rest_surfaced: now, last_fired: now, surfaced_agents: merged });
-    return block(restReminder(newRests, newRestThreads) + livenessBlock, USER_NOTE);
+    // Hand the orchestrator the CONTENTS of each just-finished agent's bound thread, so it
+    // can square the agent's reported results against what the thread now says — instead of
+    // re-reading each file by hand. Capped + fail-open: '' when nothing is readable, so the
+    // bare rest pointer (which still names the threads) is the floor.
+    const threadContents = threadExcerptsBlock(PROJECT_DIR, newRestThreads);
+    return block(restReminder(newRests, newRestThreads) + threadContents + livenessBlock, USER_NOTE);
   }
 
   // (B) CLEANUP NUDGE — original behavior, rate-limited + activity-gated. The
