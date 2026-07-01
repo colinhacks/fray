@@ -197,6 +197,23 @@ function writeSessionJsonl(root: string, relativeFile: string, messages: any[]) 
   fs.writeFileSync(file, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
 }
 
+const statusRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fray-status-vocab-"));
+fs.mkdirSync(path.join(statusRoot, ".fray"), { recursive: true });
+fs.writeFileSync(path.join(statusRoot, ".fray", "planning-thread.md"), `---\ntitle: "Planning thread"\nstatus: planning\n---\n\n## Next step\nKeep designing.\n`);
+fs.writeFileSync(path.join(statusRoot, ".fray", "legacy-todo.md"), `---\ntitle: "Legacy todo"\nstatus: todo\n---\n\n## Next step\nStart later.\n`);
+const hStatusVocab = makeHarness(statusRoot);
+const statusValidation = await hStatusVocab.tool("fray_validate", {});
+assert.equal(statusValidation.content[0].text, "fray validation OK", "planning and legacy aliases validate cleanly");
+const statusBoard = await hStatusVocab.tool("fray_status", {});
+assert.match(statusBoard.content[0].text, /## planning \(1\)[\s\S]*planning-thread/, "planning is a canonical board bucket");
+assert.match(statusBoard.content[0].text, /## planned \(1\)[\s\S]*legacy-todo/, "legacy todo normalizes into the planned bucket");
+const filteredAliasBoard = await hStatusVocab.tool("fray_status", { status: "todo" });
+assert.match(filteredAliasBoard.content[0].text, /## planned \(1\)[\s\S]*legacy-todo/, "status filters accept legacy aliases");
+await hStatusVocab.tool("fray_create_thread", { slug: "created-default", title: "Created default", goal: "Create a parked thread", nextStep: "Dispatch when ready." });
+assert.match(fs.readFileSync(path.join(statusRoot, ".fray", "created-default.md"), "utf8"), /^status: planned$/m, "fray_create_thread defaults parked work to canonical planned");
+await hStatusVocab.tool("fray_create_thread", { slug: "created-alias", title: "Created alias", goal: "Create a blocked thread", status: "needs-decision", nextStep: "Answer the question." });
+assert.match(fs.readFileSync(path.join(statusRoot, ".fray", "created-alias.md"), "utf8"), /^status: blocked$/m, "fray_create_thread normalizes legacy status arguments before writing");
+
 const liveStateResolution = resolveRunFinalOutput(
   os.tmpdir(),
   { sessionFile: undefined },
@@ -437,6 +454,7 @@ assert.equal(hExtRecovery.sent.length, 1, "recovered external completion queues 
 assertOnlyFollowUpDelivery(hExtRecovery.sent, "external recovery reminder scheduling");
 
 const externalLaunchRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fray-external-launch-"));
+fs.mkdirSync(path.join(externalLaunchRoot, ".fray"), { recursive: true });
 const hExtLaunch = makeHarness(externalLaunchRoot);
 const explicitExternalFinal = path.join(externalLaunchRoot, ".fray", "backlog.findings", "explicit-external-final.md");
 const launchedExternal = await hExtLaunch.tool("fray_launch_external", {
@@ -461,6 +479,7 @@ assert.ok(hExtLaunch.sent.length >= 1, "settled external launches queue native f
 assertOnlyFollowUpDelivery(hExtLaunch.sent, "external launch reminder scheduling");
 
 const claudeLogFallbackRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fray-claude-log-fallback-"));
+fs.mkdirSync(path.join(claudeLogFallbackRoot, ".fray"), { recursive: true });
 const hClaudeLogFallback = makeHarness(claudeLogFallbackRoot);
 const launchedClaudeLogFallback = await hClaudeLogFallback.tool("fray_launch_external", {
   label: "claude stdout fallback",

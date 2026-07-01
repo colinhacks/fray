@@ -22,6 +22,8 @@ Maintain a visible queue for unhandled completions. If Pi exposes a native todo-
 
 User feedback about Fray itself is not chat-only memory. Persist methodology changes in `skills/fray/SKILL.md`, tool behavior in the extension/prompts, and operator-facing guidance in this README/docs before moving on; steer any live Fray-tooling child already working in the affected area.
 
+Thread frontmatter uses the latest Fray/Freya canonical statuses: `planning`, `planned`, `active`, `blocked`, `done`, and `dismissed`. The Pi extension accepts legacy `todo`, `plan`, `deferred`, `enqueued`, and `needs-decision` values on read and normalizes them into the canonical board buckets; new Pi-created threads write canonical `planned`/`blocked` rather than the old aliases.
+
 Detached ad hoc runners use `fray_launch_external({ thread?, label, runner, prompt?, command?, args?, cwd?, timeoutMs?, env?, finalOutputPath? })`. Built-in runners are `codex`, `claude`, and `custom`; Fray returns immediately with a run ID, PID, log path, final-output path, and findings path, then records completion in `.fray/runs.jsonl` and surfaces it through the normal native follow-up queue. External runs are recovered on reload/status from their status/final-output/log files.
 
 Unthreaded dispatches attach to `.fray/backlog.md`, which is the central control surface for backlog-owned work. `.fray/backlog.findings/` may contain raw artifacts, but accepted summaries belong in `.fray/backlog.md`.

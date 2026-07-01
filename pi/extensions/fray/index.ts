@@ -40,8 +40,15 @@ const Type = {
   },
 };
 
-const STATUS = ["todo", "active", "needs-decision", "blocked", "deferred", "done", "dismissed"] as const;
-const LEGACY_STATUS: Record<string, string> = { planned: "todo", enqueued: "todo" };
+export const STATUS = ["planning", "planned", "active", "blocked", "done", "dismissed"] as const;
+const STATUS_ALIASES: Record<string, string> = {
+  todo: "planned",
+  plan: "planned",
+  deferred: "planned",
+  enqueued: "blocked",
+  "needs-decision": "blocked",
+};
+export const ACCEPTED_STATUSES = [...STATUS, ...Object.keys(STATUS_ALIASES)] as const;
 const TERMINAL = new Set(["done", "dismissed"]);
 const DEFAULT_TOOLS = ["read", "bash", "edit", "write"];
 const READ_ONLY_TOOLS = ["read", "grep", "find", "ls", "bash"];
@@ -300,6 +307,18 @@ function sectionFirstLine(src: string, heading: string): string {
   return "";
 }
 
+function normalizeStatus(raw: string | undefined | null): string | undefined | null {
+  if (raw == null) return raw;
+  const status = String(raw).trim();
+  return STATUS_ALIASES[status] || status;
+}
+
+function isValidStatus(raw: string | undefined | null): boolean {
+  if (raw == null) return false;
+  const status = String(raw).trim();
+  return STATUS.includes(status as any) || Object.prototype.hasOwnProperty.call(STATUS_ALIASES, status);
+}
+
 function readThreads(root: string): Thread[] {
   const dir = path.join(root, ".fray");
   try {
@@ -317,9 +336,9 @@ function readThreads(root: string): Thread[] {
         else {
           if (!fm.title) errors.push("missing required field: title");
           if (!fm.status) errors.push("missing required field: status");
-          else if (!STATUS.includes((LEGACY_STATUS[fm.status] || fm.status) as any)) errors.push(`invalid status ${JSON.stringify(fm.status)}`);
+          else if (!isValidStatus(fm.status)) errors.push(`invalid status ${JSON.stringify(fm.status)} (expected one of: ${ACCEPTED_STATUSES.join(", ")})`);
         }
-        const status = fm?.status ? (LEGACY_STATUS[fm.status] || fm.status) : "?";
+        const status = fm?.status ? (normalizeStatus(fm.status) || "?") : "?";
         return { id, title: fm?.title || "", status, next: sectionFirstLine(text, "Next step"), updatedAt, queued: /\bQUEUED\b/.test(text), text, errors };
       });
   } catch {
@@ -330,6 +349,7 @@ function readThreads(root: string): Thread[] {
 function formatBoard(root: string, only?: string): string {
   const cfg = loadConfig(root);
   const threads = readThreads(root);
+  const onlyStatus = only ? normalizeStatus(only) || only : undefined;
   const unhandled = readRuns(root).filter((r) => SETTLED_RUN_STATUSES.has(r.status || "") && !r.reconciled);
   const live = liveChildRuns(root);
   const out = [`fray board - autonomous_mode: ${cfg.autonomousMode ? "on" : "off"} - live:${live.length} unhandled:${unhandled.length}`];
@@ -337,7 +357,7 @@ function formatBoard(root: string, only?: string): string {
   if (errors.length) out.push(`\nVALIDATION ERRORS:\n${errors.map((e) => `  ${e}`).join("\n")}`);
   if (live.length) out.push(`\n## running children (${live.length})\n${live.map((r) => `- ${r.id} [${r.intent}] ${r.thread ? `${r.thread}: ` : ""}${r.label} — ${r.status}`).join("\n")}`);
   if (unhandled.length) out.push(`\n## unhandled child results (${unhandled.length})\n${unhandled.map((r) => `- ${r.id} [${r.status}] ${r.thread ? `${r.thread}: ` : ""}${r.label}${r.findingsPath ? ` -> ${r.findingsPath}` : ""}`).join("\n")}`);
-  for (const status of only ? [only] : STATUS) {
+  for (const status of onlyStatus ? [onlyStatus] : STATUS) {
     const group = threads.filter((t) => t.status === status);
     if (!group.length) continue;
     out.push(`\n## ${status} (${group.length})`);
@@ -2287,8 +2307,8 @@ export default function FrayExtension(pi: ExtensionAPI) {
       const file = threadPath(root, params.slug);
       if (fs.existsSync(file)) throw new Error(`.fray/${params.slug}.md already exists`);
       const initialDispatches = (params.initialDispatches || []) as DispatchArgs[];
-      const status = params.status || (initialDispatches.length ? "active" : "todo");
-      if (!STATUS.includes(status as any)) throw new Error(`status must be one of: ${STATUS.join(", ")}`);
+      const status = normalizeStatus(params.status || (initialDispatches.length ? "active" : "planned"));
+      if (!isValidStatus(status)) throw new Error(`status must be one of: ${ACCEPTED_STATUSES.join(", ")}`);
       const steps = (params.steps || []).map((s: string) => `- [ ] ${s}`).join("\n") || (initialDispatches.length ? "- [ ] Handle dispatched child results." : "- [ ] Dispatch the first bounded child run.");
       const text = `---\ntitle: ${JSON.stringify(params.title)}\nstatus: ${status}\nlast_update: ${new Date().toISOString().slice(0, 10)}\n---\n\n## Goal\n${params.goal}\n\n## Status\n${initialDispatches.length ? "Thread created; initial child runs dispatching." : "Thread created; no child runs dispatched yet."}\n\n## Decisions\n${params.decisions || "none yet"}\n\n## Open questions\n${params.openQuestions || "none"}\n\n## Steps / follow-up queue\n${steps}\n\n## Next step\n${params.nextStep}\n`;
       fs.writeFileSync(file, text);
