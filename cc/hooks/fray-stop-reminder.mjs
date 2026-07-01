@@ -120,9 +120,10 @@ function readState() {
       last_rest_surfaced: s.last_rest_surfaced || 0,
       surfaced_agents: Array.isArray(s.surfaced_agents) ? s.surfaced_agents : [],
       last_surfaced_blocked: typeof s.last_surfaced_blocked === 'string' ? s.last_surfaced_blocked : '',
+      last_blocked_surfaced: s.last_blocked_surfaced || 0,
     };
   } catch {
-    return { last_fired: 0, last_rest_surfaced: 0, surfaced_agents: [], last_surfaced_blocked: '' };
+    return { last_fired: 0, last_rest_surfaced: 0, surfaced_agents: [], last_surfaced_blocked: '', last_blocked_surfaced: 0 };
   }
 }
 
@@ -180,7 +181,9 @@ function nextBlockedBlock(projectDir, lastSurfaced) {
     const ex = threadExcerpt(projectDir, pick.slug);
     if (!ex) return { block: '', slug: pick.slug };
     const n = q.length;
-    const header = `\n\nfray ⚖ next blocked thread — POP THIS ONE (${n} awaiting you; presenting 1, the rest stay queued). Present it in FULL with your recommendation; if it has multiple open questions, batch them (up to 4 in one AskUserQuestion, or back-to-back) and synthesize. Contents:\n`;
+    const others = q.filter((d) => d.slug !== pick.slug).map((d) => d.slug);
+    const queueLine = others.length ? ` The other ${others.length} stay queued (not now): ${others.join(', ')}.` : '';
+    const header = `\n\nfray ⚖ next blocked thread — POP THIS ONE (${n} awaiting you; presenting 1).${queueLine}\nThread file: .fray/${pick.slug}.md — record the human's call in its ## Decisions and flip it out of blocked once answered. Contents:\n`;
     return { block: header + ex, slug: pick.slug };
   } catch {
     return { block: '', slug: null };
@@ -198,6 +201,12 @@ function restReminder(n, threads = []) {
 
 const CLEANUP_REMINDER =
   'fray: before going idle — (1) reconcile the threads you touched this session (drain follow-ups, flip finished → done); (2) THEN pop the SINGLE next blocked thread off the queue, RE-READ it so you fully understand the blockage, and present THAT ONE to the user with complete context + your recommendation — one blockage at a time, NEVER a concise dump of the whole blocked list (that overwhelms, under-informs each item, and scrolls out of the chat). Nothing blocked / all already surfaced this round → just stop.';
+
+// The POP-ONE-BLOCKED nudge — carries the next blocked thread's CONTENTS inline (appended by
+// the caller). Fires each idle-cycle INDEPENDENT of the cleanup cooldown, so the human can
+// churn the decision queue one at a time.
+const POP_BLOCKED_REMINDER =
+  'fray: before going idle — reconcile any thread you touched (drain its follow-ups, flip finished → done), THEN present the blocked thread below to the user IN FULL: what it is, what nub does today, what the alternatives/reference tools do, the exact decision, and your recommendation. One blockage at a time. If it carries multiple open questions, BATCH them (up to 4 in one AskUserQuestion, or back-to-back) and synthesize the answers yourself — do not drip one per turn. Contents:';
 
 // Calm one-liner shown to the USER (the `systemMessage` channel) alongside whichever
 // block fires, so the surface reads as a gentle fray reminder rather than a bare error.
@@ -231,7 +240,7 @@ async function main() {
   if (payload.stop_hook_active === true) return allow();
 
   const now = Date.now();
-  const { last_fired, last_rest_surfaced, surfaced_agents, last_surfaced_blocked } = readState();
+  const { last_fired, last_rest_surfaced, surfaced_agents, last_surfaced_blocked, last_blocked_surfaced } = readState();
 
   // (C) AGENT-LIVENESS lines — idle/frozen/unreaped dispatched sub-agents. Computed
   // once, fail-open ([] on any error). Appended to whichever reminder fires below,
@@ -272,12 +281,30 @@ async function main() {
     // After reconciling the rest, also pop the next blocked thread's contents inline (the
     // rest reminder tells the orchestrator to do this; hand it the text so it needn't Read).
     const nb = nextBlockedBlock(PROJECT_DIR, last_surfaced_blocked);
-    writeState({ last_rest_surfaced: now, last_fired: now, surfaced_agents: merged, ...(nb.slug ? { last_surfaced_blocked: nb.slug } : {}) });
+    writeState({ last_rest_surfaced: now, last_fired: now, surfaced_agents: merged, ...(nb.slug ? { last_surfaced_blocked: nb.slug, last_blocked_surfaced: now } : {}) });
     return block(restReminder(newRests, newRestThreads) + threadContents + nb.block + livenessBlock, USER_NOTE);
   }
 
-  // (B) CLEANUP NUDGE — original behavior, rate-limited + activity-gated. The
-  // liveness lines piggyback on the same cooldown so they can't loop the orchestrator.
+  // (B0) POP-ONE BLOCKED — surface the next pending human DECISION each idle-cycle, INDEPENDENT
+  // of the cleanup cooldown below (that gate is for reconcile nudges; the blocked-decision queue
+  // must surface promptly so the human can churn through it — this is the fix for "the pop-prompt
+  // never fired because a cleanup nudge already spent the 30-min cooldown"). stop_hook_active
+  // (Guard 1 above) already prevents an in-continuation re-loop; the repeat-guard here stops a
+  // SINGLE lingering decision from re-nagging every idle, while MULTIPLE blocked threads rotate
+  // one-per-idle (nextBlockedBlock cycles past last_surfaced_blocked → a different slug fires each time).
+  {
+    const nb = nextBlockedBlock(PROJECT_DIR, last_surfaced_blocked);
+    const BLOCKED_REPEAT_MS = 600_000; // don't re-show the SAME single blocked thread within 10 min
+    const isDifferent = nb.slug && nb.slug !== last_surfaced_blocked; // a rotated/new blocked thread
+    const staleEnough = now - last_blocked_surfaced > BLOCKED_REPEAT_MS; // the one lingering thread aged out
+    if (nb.slug && (isDifferent || staleEnough)) {
+      writeState({ last_surfaced_blocked: nb.slug, last_blocked_surfaced: now });
+      return block(POP_BLOCKED_REMINDER + nb.block + livenessBlock, USER_NOTE);
+    }
+  }
+
+  // (B) CLEANUP NUDGE — reconcile threads touched this session (no blocked thread was due
+  // above). Rate-limited + activity-gated; liveness piggybacks on the same cooldown.
   if (last_fired > 0 && now - last_fired < cooldownSeconds * 1000) return allow();
   if (last_fired > 0 && !threadTouchedSince(last_fired)) {
     // No thread touched → no cleanup nudge. But idle/unreaped agents are still worth
@@ -289,9 +316,8 @@ async function main() {
     return allow();
   }
 
-  const nb = nextBlockedBlock(PROJECT_DIR, last_surfaced_blocked);
-  writeState({ last_fired: now, ...(nb.slug ? { last_surfaced_blocked: nb.slug } : {}) });
-  return block(CLEANUP_REMINDER + nb.block + livenessBlock, USER_NOTE);
+  writeState({ last_fired: now });
+  return block(CLEANUP_REMINDER + livenessBlock, USER_NOTE);
 }
 
 main().catch(() => allow());
