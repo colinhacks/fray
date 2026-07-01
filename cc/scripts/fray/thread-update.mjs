@@ -168,11 +168,16 @@ function main() {
   // Machine/timer-blocked threads carry a mechanism field instead and need no write-up. We look
   // at the fields being SET this call PLUS what's already on the thread.
   if (canonicalStatus === 'blocked') {
-    const setKeys = new Set(args.sets.map((kv) => kv.slice(0, kv.indexOf('=')).trim()));
+    // A key counts as a machine field only when its EFFECTIVE post-write value is non-empty —
+    // the `--set` value if this call sets the key, else what's already on disk. Checking mere
+    // key-PRESENCE would let `--set blocking_threads=[]` / `--set revalidate_at=` bypass the
+    // invariant and write a human-blocked thread with no status_text (the empty ⚖-queue row the
+    // invariant exists to forbid). Empty string, `[]`, and `[ ]` are all "no machine field."
     const hasMachineField = ['blocking_threads', 'depends_on', 'revalidate_at'].some((k) => {
-      if (setKeys.has(k)) return true;
-      const v = fmGet(fm, k);
-      return v !== undefined && v.trim() !== '' && v.trim() !== '[]';
+      const setKv = args.sets.find((kv) => kv.slice(0, kv.indexOf('=')).trim() === k);
+      const raw = setKv !== undefined ? setKv.slice(setKv.indexOf('=') + 1) : fmGet(fm, k);
+      const v = (raw ?? '').trim().replace(/^["']|["']$/g, '').trim();
+      return v !== '' && v.replace(/\s+/g, '') !== '[]';
     });
     if (!hasMachineField) {
       const willHaveStatusText = args.status_text !== undefined

@@ -696,3 +696,30 @@ export function classifyDep(raw) {
   }
   return { kind: 'thread', slug: s };
 }
+
+/**
+ * Parse a thread's dependency array from RAW file source. Reads `blocking_threads:` (the
+ * 2026-07-01 rename) OR `depends_on:` (still accepted as a read-alias FIELD), and handles BOTH
+ * the inline-array form (`[a, b]`) and the YAML block form (`- a` on following indented lines) —
+ * the flat `key: value` frontmatter reader drops block-form list items, so dep-reading MUST go
+ * through this src-level parser, not the flat map. This is the SINGLE source of dep-parse truth
+ * shared by the board (`index.mjs`) and the reminder hook (`fray-reminder.mjs`) so the two can
+ * never disagree on whether a thread is machine- vs human-blocked (the statusline keeps its own
+ * inlined copy — it is deployed standalone and cannot import from the plugin). Entries may be
+ * bare thread slugs OR typed external gates; classification is {@link classifyDep}'s job.
+ * @param {string} src
+ * @returns {string[]}
+ */
+export function parseDeps(src) {
+  for (const field of ['blocking_threads', 'depends_on']) {
+    const inline = String(src).match(new RegExp(`^${field}:\\s*\\[([^\\]]*)\\]`, 'm'));
+    if (inline) {
+      return inline[1].split(',').map((s) => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
+    }
+    const block = String(src).match(new RegExp(`^${field}:\\s*\\n((?:[ \\t]+-[ \\t]*.+\\n?)+)`, 'm'));
+    if (block) {
+      return block[1].split('\n').map((l) => l.replace(/^[ \t]+-[ \t]*/, '').trim().replace(/^["']|["']$/g, '')).filter(Boolean);
+    }
+  }
+  return [];
+}

@@ -109,3 +109,24 @@ test('board: a thread whose ONLY deps are external is parked, not a drop-risk', 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// The board reads deps from RAW src via the SHARED parser, so a BLOCK-FORM (multi-line YAML
+// list) `blocking_threads` classifies as MACHINE-blocked — NOT wrongly hoisted into the ⚖
+// human-blocked queue. (Regression: the flat frontmatter reader dropped block-form list items.)
+test('board: a BLOCK-FORM blocking_threads is machine-blocked, resolves its dep, not human-blocked', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fray-dep-block-'));
+  try {
+    mkdirSync(join(dir, '.fray'), { recursive: true });
+    writeFileSync(join(dir, '.fray', 'dep.md'), '---\ntitle: d\nstatus: active\nstatus_text: x\n---\nb\n');
+    writeFileSync(join(dir, '.fray', 'waiter.md'),
+      '---\ntitle: w\nstatus: blocked\nstatus_text: x\nblocking_threads:\n  - dep\n---\nb\n');
+    const { threads, errors } = board(dir);
+    const t = byId(threads);
+    assert.equal(errors.length, 0, 'block-form dep resolves — no dangling error');
+    assert.deepEqual(t['waiter'].threadDeps, ['dep'], 'the block-form list item is captured');
+    assert.equal(t['waiter'].humanBlocked, false, 'a resolved machine dep is NOT human-blocked');
+    assert.equal(t['waiter'].mechanism, 'threads', 'the resolution mechanism is threads');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

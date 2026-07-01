@@ -28,6 +28,7 @@ import {
   isReconcileStale,
   revalidateState,
   classifyDep,
+  parseDeps,
   currentSessionId,
   touchSessionHeartbeat,
 } from '../scripts/fray/config.mjs';
@@ -44,29 +45,6 @@ try {
   transcriptPath = hi.transcript_path;
 } catch {
   /* no stdin / not JSON → assume main session, proceed */
-}
-
-/**
- * Parse a thread's dependency array into a list of raw entries. Reads `blocking_threads:` (the
- * 2026-07-01 rename) OR `depends_on:` (still accepted as a read-alias field). Accepts both the
- * inline-array form (`[a, b]`) and the YAML block form (`- a` lines). Entries may be bare thread
- * slugs OR typed external gates (`pr:`/`ci:`/`external:`) — classification is the caller's job.
- * Dependency-free, intentionally narrow — matches the shapes fray actually writes.
- * @param {string} src
- * @returns {string[]}
- */
-function parseDepends(src) {
-  for (const field of ['blocking_threads', 'depends_on']) {
-    const inline = src.match(new RegExp(`^${field}:\\s*\\[([^\\]]*)\\]`, 'm'));
-    if (inline) {
-      return inline[1].split(',').map((s) => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
-    }
-    const block = src.match(new RegExp(`^${field}:\\s*\\n((?:[ \\t]+-[ \\t]*.+\\n?)+)`, 'm'));
-    if (block) {
-      return block[1].split('\n').map((l) => l.replace(/^[ \t]+-[ \t]*/, '').trim().replace(/^["']|["']$/g, '')).filter(Boolean);
-    }
-  }
-  return [];
 }
 
 /**
@@ -148,7 +126,7 @@ try {
       if (!rawSt) errors.push(`${id}: missing status`);
       else if (!isValidStatus(rawSt)) errors.push(`${id}: invalid status "${rawSt}"`);
       scanned.push({
-        id, status: st, deps: parseDepends(src), src, mtimeMs,
+        id, status: st, deps: parseDeps(src), src, mtimeMs,
         status_text: unquote(src.match(/^status_text:\s*(.*)$/m)?.[1]),
         revalidate_at: src.match(/^revalidate_at:\s*(.*)$/m)?.[1],
         last_checked: src.match(/^last_checked:\s*(.*)$/m)?.[1],

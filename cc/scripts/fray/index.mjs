@@ -48,6 +48,7 @@ import {
   revalidateState,
   formatEta,
   classifyDep,
+  parseDeps,
   blockMechanism,
   isHumanBlocked,
   touchSessionHeartbeat,
@@ -72,23 +73,6 @@ const FRAY_DIR = join(PROJECT_DIR, '.fray');
 // STATUS/TERMINAL are imported from ./config.mjs — the single shared source the hooks
 // also use, so the vocab can never drift between the tool and the reminder hook.
 const REQUIRED = ['title', 'status']; // created / last_update are optional.
-
-/**
- * Parse a YAML inline-array value (`[a, b, c]` or empty `[]`) into a string list.
- * Bare scalars (`a` / `"a"`) are tolerated and wrapped as a single-element list.
- * Self-contained by design: each entry is a THREAD SLUG that the board already
- * scans — `depends_on` references other thread files, never an external registry.
- * @param {string | undefined} raw
- * @returns {string[]}
- */
-function parseList(raw) {
-  if (!raw) return [];
-  const inner = raw.trim().replace(/^\[|\]$/g, '');
-  return inner
-    .split(',')
-    .map((s) => s.trim().replace(/^["']|["']$/g, ''))
-    .filter(Boolean);
-}
 
 /**
  * Parse a top-of-file `--- … ---` YAML frontmatter block (flat `key: value` only).
@@ -330,7 +314,10 @@ const threads = frayEntries
     // `depends_on` stays accepted as a read-alias FIELD so old threads still resolve. Both mean
     // the same array — bare THREAD-slug deps (drive READY/auto-fire + dangling validation) plus
     // typed EXTERNAL gates `pr:`/`ci:`/`external:` (park the thread as "waiting on"; never dangle).
-    const dependsOn = parseList(fm?.blocking_threads ?? fm?.depends_on);
+    // Read deps from RAW src (not the flat frontmatter map) so a block-form YAML list is not
+    // dropped — the shared parser is what keeps the board's machine/human classification in
+    // lock-step with the reminder hook (both call the SAME parseDeps).
+    const dependsOn = parseDeps(src);
     const classified = dependsOn.map(classifyDep);
     const threadDeps = classified.filter((d) => d.kind === 'thread').map((d) => d.slug);
     /** @type {{type:string,label:string}[]} */
@@ -423,12 +410,19 @@ function renderThread(t, out) {
   if (t.threadDeps.length) {
     const b = blockers(t);
     // READY only when thread deps AND external deps are all clear — a pending external gate
-    // still parks the thread even after its in-board thread deps go terminal.
-    out.push(b.length
+    // still parks the thread even after its in-board thread deps go terminal. When a
+    // `revalidate_at` timer is ALSO set (the mis-configured >1-mechanism case the validator
+    // warns about), the timer is the GOVERNING mechanism (precedence timer > threads), so the
+    // timer block below owns the surfacing — never claim `▶ READY` here or the board would print
+    // a "dispatch now" line contradicting the parked timer.
+    const readyBlocked = b.length
       ? `    ⏳ blocked on: ${b.join(', ')}`
       : t.externalDeps.length
         ? `    ⏳ thread deps clear — still waiting on external`
-        : `    ▶ READY — dependencies clear, dispatch now`);
+        : t.mechanism === 'timer'
+          ? null // a timer governs — the ⏰ line below is the single surfacing
+          : `    ▶ READY — dependencies clear, dispatch now`;
+    if (readyBlocked) out.push(readyBlocked);
   }
   // EXTERNAL deps park the thread; surface them as a "waiting on" line (they resolve via a
   // `revalidate_at` re-poll or a manual edit, never auto-fired from the board).
