@@ -248,13 +248,23 @@ async function main() {
   // Dynamic import so a missing/broken helper can never crash the hook before
   // main()'s catch (a static import failure would).
   let liveness = [];
+  let liveCount = 0;
   try {
-    const { agentLivenessLines } = await import('../scripts/fray/agent-liveness.mjs');
-    liveness = agentLivenessLines({ transcriptPath: payload.transcript_path, projectDir: PROJECT_DIR, now });
+    const mod = await import('../scripts/fray/agent-liveness.mjs');
+    liveness = mod.agentLivenessLines({ transcriptPath: payload.transcript_path, projectDir: PROJECT_DIR, now });
+    liveCount = mod.runningAgentCount({ transcriptPath: payload.transcript_path, projectDir: PROJECT_DIR, now });
   } catch {
     liveness = [];
+    liveCount = 0;
   }
   const livenessBlock = liveness.length ? '\n\nfray agent-liveness:\n' + liveness.join('\n') : '';
+  // Force-nudge-on-live-agents: NO hook fires during the "Waiting for N background agents"
+  // idle-wait, so the Stop is the only moment to surface it. When agents are actively in
+  // flight, append a gentle steer pointer to whatever block fires — the orchestrator can
+  // SendMessage-steer them NOW rather than sit idle. Informational (never its own block).
+  const liveAgentsNote = liveCount > 0
+    ? `\n\nfray: ${liveCount} background agent(s) still working — you can SendMessage-steer them now (fold in scope / answer a question / redirect) rather than idling; steer, don't cold-redispatch.`
+    : '';
 
   // (A) REST-RECONCILIATION GUARD — highest priority, bypasses the cleanup cooldown.
   // Fire only on rests from THREAD-BOUND (orchestrator-dispatched) agents NOT yet surfaced
@@ -282,7 +292,7 @@ async function main() {
     // rest reminder tells the orchestrator to do this; hand it the text so it needn't Read).
     const nb = nextBlockedBlock(PROJECT_DIR, last_surfaced_blocked);
     writeState({ last_rest_surfaced: now, last_fired: now, surfaced_agents: merged, ...(nb.slug ? { last_surfaced_blocked: nb.slug, last_blocked_surfaced: now } : {}) });
-    return block(restReminder(newRests, newRestThreads) + threadContents + nb.block + livenessBlock, USER_NOTE);
+    return block(restReminder(newRests, newRestThreads) + threadContents + nb.block + livenessBlock + liveAgentsNote, USER_NOTE);
   }
 
   // (B0) POP-ONE BLOCKED — surface the next pending human DECISION each idle-cycle, INDEPENDENT
@@ -299,7 +309,7 @@ async function main() {
     const staleEnough = now - last_blocked_surfaced > BLOCKED_REPEAT_MS; // the one lingering thread aged out
     if (nb.slug && (isDifferent || staleEnough)) {
       writeState({ last_surfaced_blocked: nb.slug, last_blocked_surfaced: now });
-      return block(POP_BLOCKED_REMINDER + nb.block + livenessBlock, USER_NOTE);
+      return block(POP_BLOCKED_REMINDER + nb.block + livenessBlock + liveAgentsNote, USER_NOTE);
     }
   }
 
@@ -307,17 +317,20 @@ async function main() {
   // above). Rate-limited + activity-gated; liveness piggybacks on the same cooldown.
   if (last_fired > 0 && now - last_fired < cooldownSeconds * 1000) return allow();
   if (last_fired > 0 && !threadTouchedSince(last_fired)) {
-    // No thread touched → no cleanup nudge. But idle/unreaped agents are still worth
-    // surfacing on their own (off the same cooldown above, which we already passed).
-    if (liveness.length) {
+    // No thread touched → no cleanup nudge. But idle/unreaped agents (liveness lines) OR
+    // still-in-flight agents (liveCount) are worth surfacing on their own — this is the
+    // force-nudge that converts a silent "Waiting for N background agents" idle into ONE
+    // gentle steer pointer (off the same cooldown above, which we already passed).
+    if (liveness.length || liveCount > 0) {
       writeState({ last_fired: now });
-      return block('fray agent-liveness:\n' + liveness.join('\n'), USER_NOTE);
+      const body = (liveness.length ? 'fray agent-liveness:\n' + liveness.join('\n') : '') + liveAgentsNote;
+      return block(body.trimStart(), USER_NOTE);
     }
     return allow();
   }
 
   writeState({ last_fired: now });
-  return block(CLEANUP_REMINDER + livenessBlock, USER_NOTE);
+  return block(CLEANUP_REMINDER + livenessBlock + liveAgentsNote, USER_NOTE);
 }
 
 main().catch(() => allow());

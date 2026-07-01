@@ -33,7 +33,7 @@ Fray child transcripts are created as normal Pi session files and their path is 
 Install globally from this live checkout:
 
 ```sh
-pi install /Users/colinmcd94/Documents/projects/fray
+pi install /Users/colinmcd94/Documents/projects/fray/pi
 ```
 
 Pi stores local package paths by reference, so edits here are picked up by new Pi sessions or `/reload`.

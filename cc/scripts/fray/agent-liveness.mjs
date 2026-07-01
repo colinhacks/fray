@@ -179,6 +179,58 @@ export function agentLivenessLines({ transcriptPath, projectDir, now = Date.now(
 }
 
 /**
+ * Count of dispatched agents currently RUNNING — the "Waiting for N background agents" case.
+ * An agent counts as running when: it's the NEWEST binding for its thread, it has NOT rested
+ * (no completion recorded → still in flight, not paused/done), its thread isn't terminal, and
+ * it isn't a long-dead stale binding. "Not rested" is the primary signal — a rest is the ONLY
+ * completion mark, so its absence means the agent is still in flight; age is a secondary guard:
+ * count when the output is fresh (age < DROPPED_MIN) OR there's no output file yet (age == null →
+ * JUST launched, definitely running), and drop only the clearly-stale (quiet past DROPPED_MIN and
+ * never rested → agentLivenessLines already flags that as 'dropped', so we don't double-count it
+ * as "working"). This is DISTINCT from agentLivenessLines (which flags STRANDED active threads);
+ * here we count live in-flight work so the Stop hook can surface "N still working" before the
+ * unhookable idle-wait. Fail-open → 0. Never throws.
+ * @param {{transcriptPath?: string|null, projectDir: string, now?: number}} args
+ * @returns {number}
+ */
+export function runningAgentCount({ transcriptPath, projectDir, now = Date.now() }) {
+  try {
+    const tasksDir = deriveTasksDir(transcriptPath);
+    const frayDir = join(projectDir, '.fray');
+    const newest = newestBindingByThread(projectDir);
+    const rested = restedAgentIds(projectDir);
+    let files;
+    try {
+      files = readdirSync(frayDir).filter((f) => f.endsWith('.md') && !f.startsWith('_'));
+    } catch {
+      return 0;
+    }
+    let count = 0;
+    const seen = new Set();
+    for (const f of files) {
+      const slug = f.replace(/\.md$/, '');
+      const binding = newest.get(slug);
+      if (!binding || seen.has(binding.id)) continue; // one count per agent even if it serves >1 thread
+      seen.add(binding.id);
+      let src;
+      try {
+        src = readFileSync(join(frayDir, f), 'utf8');
+      } catch {
+        continue;
+      }
+      const threadStatus = src.match(/^status:\s*(\S+)/m)?.[1] ?? '';
+      if (TERMINAL_THREAD.has(threadStatus)) continue; // done/dismissed → not running
+      if (rested.has(binding.id)) continue; // rested = completed/paused → the orchestrator already gets a notification
+      const ageMin = agentAge(binding.id, tasksDir, now);
+      if (ageMin == null || ageMin < DROPPED_MIN) count++; // just-launched (no output yet) or fresh enough → in flight; stale-and-never-rested is left to agentLivenessLines' 'dropped'
+    }
+    return count;
+  } catch {
+    return 0;
+  }
+}
+
+/**
  * The high-confidence subset of {@link agentLivenessLines}: ONLY the "ACTIVE THREAD, NO LIVE
  * AGENT" lines. Used by the per-turn reminder, where surfacing the soft idle notes every prompt
  * would be noise — but a genuinely stranded active thread SHOULD nag every turn until reconciled
