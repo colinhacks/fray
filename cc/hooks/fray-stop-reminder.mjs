@@ -26,7 +26,10 @@
  *       session AND THEN to pop the single next `blocked` thread off the queue and present
  *       that ONE blockage to the human with full context (fray's serialized one-at-a-time
  *       decision rhythm — never a whole-list dump). Rate-limited by a cooldown and gated on
- *       a thread file actually having been touched.
+ *       a thread file actually having been touched. BOTH nudges now HAND the orchestrator the
+ *       CONTENTS of that next blocked thread inline (nextBlockedBlock → threadExcerpt), so it
+ *       presents the blockage without a Read tool call; the pick CYCLES the blocked queue
+ *       (last_surfaced_blocked) so successive stops surface different ones, one at a time.
  *
  * OUTPUT CHANNEL (see `block()`): both jobs BLOCK via `decision: block` but carry the
  * model-facing text in `hookSpecificOutput.additionalContext` (NOT `reason`) plus a calm
@@ -47,7 +50,8 @@ import { readFileSync, writeFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { frayActive } from '../scripts/fray/config.mjs';
 import { newBoundRestsSince } from '../scripts/fray/agent-bindings.mjs';
-import { threadExcerptsBlock } from '../scripts/fray/thread-excerpt.mjs';
+import { threadExcerptsBlock, threadExcerpt } from '../scripts/fray/thread-excerpt.mjs';
+import { collectDecisions } from '../scripts/fray/decisions.mjs';
 
 const PROJECT_DIR = process.env.CLAUDE_PROJECT_DIR || process.cwd();
 const FRAY_DIR = join(PROJECT_DIR, '.fray');
@@ -115,9 +119,10 @@ function readState() {
       last_fired: s.last_fired || 0,
       last_rest_surfaced: s.last_rest_surfaced || 0,
       surfaced_agents: Array.isArray(s.surfaced_agents) ? s.surfaced_agents : [],
+      last_surfaced_blocked: typeof s.last_surfaced_blocked === 'string' ? s.last_surfaced_blocked : '',
     };
   } catch {
-    return { last_fired: 0, last_rest_surfaced: 0, surfaced_agents: [] };
+    return { last_fired: 0, last_rest_surfaced: 0, surfaced_agents: [], last_surfaced_blocked: '' };
   }
 }
 
@@ -149,6 +154,37 @@ function threadTouchedSince(sinceMs) {
     /* no .fray dir → no threads → no nudge */
   }
   return false;
+}
+
+/**
+ * POP-ONE surfacing: pick the single next `blocked` thread and return its CONTENTS inline,
+ * so the orchestrator can present that ONE blockage to the human WITHOUT a Read tool call.
+ * This is the pop-one-at-a-time rhythm the nudges instruct — now with the thread text
+ * actually in the orchestrator's context, matching the rest path's threadExcerptsBlock.
+ *
+ * "Next" cycles the queue: prefer a blocked thread OTHER than the one surfaced last fire
+ * (so across successive stops the human sees them one-at-a-time rather than the same one
+ * repeatedly); fall back to the first when there's only one or the last isn't found.
+ * Returns { block, slug } — block is '' and slug null on empty queue / any error (fail-open).
+ * @param {string} projectDir
+ * @param {string} lastSurfaced
+ * @returns {{ block: string, slug: string|null }}
+ */
+function nextBlockedBlock(projectDir, lastSurfaced) {
+  try {
+    const q = collectDecisions(); // [{slug, status_text}] of every `blocked` thread
+    if (!q.length) return { block: '', slug: null };
+    const idx = lastSurfaced ? q.findIndex((d) => d.slug === lastSurfaced) : -1;
+    // Rotate to the one AFTER last-surfaced (wraps); if last isn't in the queue, take the first.
+    const pick = q[idx === -1 ? 0 : (idx + 1) % q.length];
+    const ex = threadExcerpt(projectDir, pick.slug);
+    if (!ex) return { block: '', slug: pick.slug };
+    const n = q.length;
+    const header = `\n\nfray ⚖ next blocked thread — POP THIS ONE (${n} awaiting you; presenting 1, the rest stay queued). Present it in FULL with your recommendation; if it has multiple open questions, batch them (up to 4 in one AskUserQuestion, or back-to-back) and synthesize. Contents:\n`;
+    return { block: header + ex, slug: pick.slug };
+  } catch {
+    return { block: '', slug: null };
+  }
 }
 
 // TERSE model-facing nudges. The FULL reconcile discipline (drain-oldest-first,
@@ -195,7 +231,7 @@ async function main() {
   if (payload.stop_hook_active === true) return allow();
 
   const now = Date.now();
-  const { last_fired, last_rest_surfaced, surfaced_agents } = readState();
+  const { last_fired, last_rest_surfaced, surfaced_agents, last_surfaced_blocked } = readState();
 
   // (C) AGENT-LIVENESS lines — idle/frozen/unreaped dispatched sub-agents. Computed
   // once, fail-open ([] on any error). Appended to whichever reminder fires below,
@@ -228,13 +264,16 @@ async function main() {
     // long-lived board can't let the persisted set grow without bound (keep the most
     // recent ids — older ones are long-since reconciled).
     const merged = [...surfaced_agents, ...newAgentIds].slice(-200);
-    writeState({ last_rest_surfaced: now, last_fired: now, surfaced_agents: merged });
     // Hand the orchestrator the CONTENTS of each just-finished agent's bound thread, so it
     // can square the agent's reported results against what the thread now says — instead of
     // re-reading each file by hand. Capped + fail-open: '' when nothing is readable, so the
     // bare rest pointer (which still names the threads) is the floor.
     const threadContents = threadExcerptsBlock(PROJECT_DIR, newRestThreads);
-    return block(restReminder(newRests, newRestThreads) + threadContents + livenessBlock, USER_NOTE);
+    // After reconciling the rest, also pop the next blocked thread's contents inline (the
+    // rest reminder tells the orchestrator to do this; hand it the text so it needn't Read).
+    const nb = nextBlockedBlock(PROJECT_DIR, last_surfaced_blocked);
+    writeState({ last_rest_surfaced: now, last_fired: now, surfaced_agents: merged, ...(nb.slug ? { last_surfaced_blocked: nb.slug } : {}) });
+    return block(restReminder(newRests, newRestThreads) + threadContents + nb.block + livenessBlock, USER_NOTE);
   }
 
   // (B) CLEANUP NUDGE — original behavior, rate-limited + activity-gated. The
@@ -250,8 +289,9 @@ async function main() {
     return allow();
   }
 
-  writeState({ last_fired: now });
-  return block(CLEANUP_REMINDER + livenessBlock, USER_NOTE);
+  const nb = nextBlockedBlock(PROJECT_DIR, last_surfaced_blocked);
+  writeState({ last_fired: now, ...(nb.slug ? { last_surfaced_blocked: nb.slug } : {}) });
+  return block(CLEANUP_REMINDER + nb.block + livenessBlock, USER_NOTE);
 }
 
 main().catch(() => allow());
