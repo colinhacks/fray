@@ -397,8 +397,16 @@ export function lastReconcilePath(projectDir) {
 export function readLastReconcile(projectDir) {
   try {
     const raw = readFileSync(lastReconcilePath(projectDir), 'utf8').trim();
-    const n = parseInt(raw, 10);
-    return Number.isFinite(n) ? n : null;
+    // Canonical form is epoch-ms (what writeLastReconcile emits). Match it strictly — a bare
+    // parseInt would accept an ISO string like "2026-07-01T..." as 2026 (parseInt stops at the
+    // '-'), yielding a ~56-year-stale age that nags every turn. Agents demonstrably hand-write
+    // this file instead of running `fray reconcile`, so also accept a parseable ISO date.
+    if (/^\d+$/.test(raw)) {
+      const n = parseInt(raw, 10);
+      return Number.isFinite(n) ? n : null;
+    }
+    const t = Date.parse(raw);
+    return Number.isFinite(t) ? t : null;
   } catch {
     return null;
   }
