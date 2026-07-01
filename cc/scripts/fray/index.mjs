@@ -30,7 +30,7 @@
  * Computed on demand from the scanned statuses — there is no stored dependency graph.
  */
 
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   loadConfig,
@@ -48,7 +48,13 @@ import {
   revalidateState,
   formatEta,
   classifyDep,
+  touchSessionHeartbeat,
+  clearSessionHeartbeat,
+  readSessionHeartbeat,
+  ownerStaleMin,
+  sessionLive,
 } from './config.mjs';
+import { readOwner, setOwner, effectiveOwnership } from './ownership.mjs';
 import { newestBindingByThread, downstreamThreads, restedAgentIds } from './agent-bindings.mjs';
 import { deriveAgentState, findAgentOutputAge, IDLE_MIN, DROPPED_MIN } from './agent-status.mjs';
 import { collectDecisions } from './decisions.mjs';
@@ -132,9 +138,100 @@ function nextStep(src) {
     }
     const state = sub === 'on' || sub === 'enable' ? 'on' : 'off';
     const path = setSessionOverride(PROJECT_DIR, sid, state);
+    // Heartbeat: `on` stamps it (this session is live + can own threads NOW); `off` clears it
+    // (the session stops participating → its owned threads become orphaned/claimable at once).
+    if (state === 'on') touchSessionHeartbeat(PROJECT_DIR, sid);
+    else clearSessionHeartbeat(PROJECT_DIR, sid);
     console.log(`fray: ${state === 'on' ? 'ENABLED' : 'DISABLED'} for this session (${sid}).`);
     console.log(`  sentinel: ${path}`);
     console.log(`  revert to default (dormant) with: fray reset`);
+    process.exit(0);
+  }
+  // `fray claim <slug> [--force]` / `fray disown <slug> [--force]` / `fray owners [--gc]` —
+  // per-thread session OWNERSHIP. Claiming is EASY when a thread is unowned or its owner is
+  // DEAD (heartbeat stale/absent); claiming a thread owned by a DIFFERENT, still-LIVE session
+  // is DISCOURAGED and requires `--force`. Ownership is stored as `owner_session:` frontmatter,
+  // written only by these explicit gestures — never by an automatic hook (see ownership.mjs).
+  if (sub === 'claim' || sub === 'disown' || sub === 'owners') {
+    const rest = process.argv.slice(3);
+    const force = rest.includes('--force');
+    const gc = rest.includes('--gc');
+    const slug = rest.find((a) => !a.startsWith('-'));
+    const sid = currentSessionId();
+    const cfgO = loadConfig(PROJECT_DIR);
+    const staleMin = ownerStaleMin(cfgO);
+    const id8 = (s) => (s ? s.slice(0, 9) : '(none)');
+    const seenAgo = (owner) => {
+      const hb = readSessionHeartbeat(PROJECT_DIR, owner);
+      return hb == null ? 'never' : `${Math.round((Date.now() - hb) / 60_000)}m ago`;
+    };
+
+    if (sub === 'owners') {
+      // Full per-thread ownership view. `--gc` additionally CLEARS every orphaned owner (the
+      // explicit reconciliation-path clear — safe because it is orchestrator-driven, not a hook).
+      let entries;
+      try {
+        entries = readdirSync(FRAY_DIR).filter((f) => f.endsWith('.md') && !f.startsWith('_')).sort();
+      } catch {
+        console.log(`No .fray/ in ${PROJECT_DIR}.`);
+        process.exit(0);
+      }
+      let cleared = 0;
+      console.log(`fray owners — this session: ${id8(sid)} · owner-stale window: ${staleMin}m\n`);
+      for (const f of entries) {
+        const s = f.replace(/\.md$/, '');
+        const owner = readOwner(PROJECT_DIR, s);
+        const live = owner ? sessionLive(PROJECT_DIR, owner, staleMin) : false;
+        const st = effectiveOwnership(owner, sid, live);
+        let note = 'unowned';
+        if (st === 'mine') note = `yours (${id8(owner)})`;
+        else if (st === 'other-live') note = `session ${id8(owner)} — LIVE, last seen ${seenAgo(owner)}`;
+        else if (st === 'orphaned') note = `session ${id8(owner)} — DEAD (last seen ${seenAgo(owner)})${gc ? ' → cleared' : ' → claimable'}`;
+        if (st === 'orphaned' && gc) {
+          try { setOwner(PROJECT_DIR, s, null); cleared++; } catch { /* best-effort */ }
+        }
+        console.log(`  ${s} — ${note}`);
+      }
+      if (gc) console.log(`\ncleared ${cleared} orphaned owner${cleared === 1 ? '' : 's'}.`);
+      process.exit(0);
+    }
+
+    // claim / disown both need a slug + a session id + the thread to exist.
+    if (!sid) { console.error(`fray ${sub}: no session id (CLAUDE_CODE_SESSION_ID unset).`); process.exit(1); }
+    if (!slug) { console.error(`usage: fray ${sub} <slug> [--force]`); process.exit(1); }
+    if (!existsSync(join(FRAY_DIR, `${slug}.md`))) { console.error(`fray ${sub}: no thread .fray/${slug}.md`); process.exit(1); }
+    const owner = readOwner(PROJECT_DIR, slug);
+    const live = owner ? sessionLive(PROJECT_DIR, owner, staleMin) : false;
+    const st = effectiveOwnership(owner, sid, live);
+
+    if (sub === 'claim') {
+      if (st === 'mine') {
+        touchSessionHeartbeat(PROJECT_DIR, sid);
+        console.log(`fray: ${slug} is already yours (${id8(sid)}).`);
+        process.exit(0);
+      }
+      if (st === 'other-live' && !force) {
+        console.error(`fray: ${slug} is owned by a DIFFERENT, LIVE session ${id8(owner)} (last seen ${seenAgo(owner)}).`);
+        console.error(`  Another session is on this thread — coordinate first. To take it anyway: fray claim ${slug} --force`);
+        process.exit(1);
+      }
+      try { setOwner(PROJECT_DIR, slug, sid); } catch (e) { console.error(`fray claim: ${e instanceof Error ? e.message : e}`); process.exit(1); }
+      touchSessionHeartbeat(PROJECT_DIR, sid);
+      const from = st === 'unowned' ? 'was unowned'
+        : st === 'orphaned' ? `previous owner ${id8(owner)} was DEAD (last seen ${seenAgo(owner)})`
+          : `FORCE-taken from LIVE session ${id8(owner)}`;
+      console.log(`fray: CLAIMED ${slug} for this session (${id8(sid)}) — ${from}.`);
+      process.exit(0);
+    }
+
+    // disown
+    if (st === 'unowned') { console.log(`fray: ${slug} is not owned — nothing to disown.`); process.exit(0); }
+    if (st === 'other-live' && !force) {
+      console.error(`fray: ${slug} is owned by a DIFFERENT, LIVE session ${id8(owner)}. To release it anyway: fray disown ${slug} --force`);
+      process.exit(1);
+    }
+    try { setOwner(PROJECT_DIR, slug, null); } catch (e) { console.error(`fray disown: ${e instanceof Error ? e.message : e}`); process.exit(1); }
+    console.log(`fray: released ownership of ${slug}${st === 'orphaned' ? ` (cleared dead owner ${id8(owner)})` : ''}.`);
     process.exit(0);
   }
   // `fray reconcile` — RECORD a completed board reconcile by stamping `.fray/.last-reconcile`
@@ -183,6 +280,11 @@ function nextStep(src) {
 
 // .fray/config.yml globals — parsed by the shared, type-safe loadConfig (autonomous_mode + state).
 const cfg = loadConfig(PROJECT_DIR);
+// Session-ownership context for the board: THIS session's id (from CLAUDE_CODE_SESSION_ID,
+// present in Bash tool calls) + the owner-staleness window. Used to annotate each thread with
+// its effective ownership (mine / another live session's / orphaned) — DERIVED, never stored.
+const CURRENT_SID = currentSessionId();
+const OWNER_STALE_MIN = ownerStaleMin(cfg);
 
 // No `.fray/` here → fray is not active in this project. Print a friendly pointer instead
 // of crashing on a missing directory (the board ships globally and may be run anywhere).
@@ -260,6 +362,7 @@ const threads = frayEntries
       dependsOn,
       threadDeps,
       externalDeps,
+      owner: fm?.owner_session || null,
       revalidate,
       revalidateMalformed,
       agents,
@@ -321,6 +424,22 @@ function renderThread(t, out) {
   // `revalidate_at` re-poll or a manual edit, never auto-fired from the board).
   if (t.externalDeps.length) {
     out.push(`    ⏳ waiting on: ${t.externalDeps.map((d) => d.label).join(', ')}`);
+  }
+  // SESSION OWNERSHIP — annotate ONLY the actionable coordination cases (owned by another live
+  // session → don't touch; orphaned → claimable). `mine`/`unowned` stay unmarked to keep the
+  // board lean (`fray owners` gives the full per-thread view). Derived from the owner's
+  // heartbeat freshness, never a stored flag.
+  if (t.owner) {
+    const ownerLive = sessionLive(PROJECT_DIR, t.owner, OWNER_STALE_MIN);
+    const st = effectiveOwnership(t.owner, CURRENT_SID, ownerLive);
+    const id8 = t.owner.slice(0, 9);
+    if (st === 'other-live') {
+      const hb = readSessionHeartbeat(PROJECT_DIR, t.owner);
+      const ago = hb == null ? 'unknown' : `${Math.round((Date.now() - hb) / 60_000)}m ago`;
+      out.push(`    👤 owned by another LIVE session ${id8} (last seen ${ago}) — don't touch; \`fray claim ${t.id} --force\` to take it`);
+    } else if (st === 'orphaned') {
+      out.push(`    👤 orphaned — owner session ${id8} is dead; \`fray claim ${t.id}\` to take it`);
+    }
   }
   // REVALIDATE timer status — `⏰ revalidate due` once the timer fired (re-poll the external
   // state), or a quiet `next check in <eta>` while parked, so the board reflects the timer.

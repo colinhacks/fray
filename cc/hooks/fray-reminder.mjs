@@ -27,6 +27,8 @@ import {
   isReconcileStale,
   revalidateState,
   classifyDep,
+  currentSessionId,
+  touchSessionHeartbeat,
 } from '../scripts/fray/config.mjs';
 
 // Token-saving: skip entirely inside sub-agent contexts. The hook stdin carries
@@ -97,6 +99,10 @@ try {
   // Inject NOTHING unless the project is opted in (`.fray/` exists AND not disabled), so
   // a virgin repo sees zero fray noise. The `/fray` skill bootstraps `.fray/` to activate.
   if (!frayActive(dir, sessionId)) process.exit(0);
+  // SESSION-OWNERSHIP HEARTBEAT — refresh this (fray-active) session's liveness mark each turn.
+  // Ownership liveness is DERIVED from heartbeat freshness (config.mjs sessionLive), so a live
+  // session must beat while it works; a dead session's beat goes stale → its threads orphan.
+  touchSessionHeartbeat(dir, currentSessionId(sessionId));
   // autonomous_mode lives in .fray/config.yml — parsed by the shared, type-safe loadConfig.
   // The board/status view is COMPUTED by the tool, never stored.
   const cfg = loadConfig(dir);

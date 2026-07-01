@@ -79,6 +79,121 @@ export function clearSessionOverride(projectDir, sessionId) {
   }
 }
 
+// ── PER-SESSION LIVENESS HEARTBEAT — the crux of thread OWNERSHIP ───────────────────
+// A fray thread can be OWNED by a session (frontmatter `owner_session: <id>`), so several
+// sessions can share one repo, each driving its own set of threads (see ownership.mjs). The
+// failure to avoid: a thread owned by a session that then TERMINATES → nobody can touch it.
+// Claude Code's `SessionEnd` hook is a best-effort eager signal but is NOT guaranteed on a
+// crash / kill / terminal-close (verified against the hooks docs), so it cannot be the SOLE
+// liveness signal. The robust fallback is a HEARTBEAT: every fray-active session stamps a
+// `.seen` sidecar each turn, and ownership liveness is DERIVED from its freshness (never a
+// stored "alive" flag — same compute-don't-store discipline as agent liveness). A dead owner's
+// heartbeat goes stale → its threads read as ORPHANED → freely claimable. The heartbeat lives
+// ALONGSIDE the on/off sentinel under `.fray/.session-state/` (a sibling `<id>.seen` file), so
+// it composes with — and never collides with — the activation sentinel `<id>`.
+
+/**
+ * Path to a session's liveness heartbeat sidecar: `.fray/.session-state/<sid>.seen`.
+ * @param {string} projectDir
+ * @param {string} sessionId
+ * @returns {string}
+ */
+export function sessionHeartbeatPath(projectDir, sessionId) {
+  return join(projectDir, '.fray', '.session-state', `${sessionId}.seen`);
+}
+
+/**
+ * Stamp `sessionId`'s heartbeat to `ts` (default now) — the "this session is alive NOW" mark
+ * refreshed each turn by the UserPromptSubmit + SessionStart hooks. Creates the state dir as
+ * needed. Best-effort: any write error is swallowed (a missed beat just risks one stale read).
+ * @param {string} projectDir
+ * @param {string} sessionId
+ * @param {number} [ts]
+ */
+export function touchSessionHeartbeat(projectDir, sessionId, ts = Date.now()) {
+  if (!projectDir || !sessionId) return;
+  try {
+    const dir = join(projectDir, '.fray', '.session-state');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${sessionId}.seen`), String(ts) + '\n');
+  } catch {
+    /* best-effort — a missed heartbeat is tolerated by the staleness window */
+  }
+}
+
+/**
+ * Read `sessionId`'s last-heartbeat epoch-ms, or `null` when absent/unreadable/garbage.
+ * @param {string} projectDir
+ * @param {string} sessionId
+ * @returns {number|null}
+ */
+export function readSessionHeartbeat(projectDir, sessionId) {
+  if (!projectDir || !sessionId) return null;
+  try {
+    const raw = readFileSync(sessionHeartbeatPath(projectDir, sessionId), 'utf8').trim();
+    if (/^\d+$/.test(raw)) {
+      const n = parseInt(raw, 10);
+      return Number.isFinite(n) ? n : null;
+    }
+    const t = Date.parse(raw); // tolerate a hand-written ISO stamp
+    return Number.isFinite(t) ? t : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Remove `sessionId`'s heartbeat (mark it dead IMMEDIATELY). Called by the SessionEnd hook
+ * (graceful exit) and by `fray off`/`fray reset`. No-op if absent.
+ * @param {string} projectDir
+ * @param {string} sessionId
+ */
+export function clearSessionHeartbeat(projectDir, sessionId) {
+  if (!projectDir || !sessionId) return;
+  try {
+    rmSync(sessionHeartbeatPath(projectDir, sessionId), { force: true });
+  } catch {
+    /* already gone */
+  }
+}
+
+/** Default owner-staleness window (minutes): how long since a session's last heartbeat before
+ *  its owned threads are treated as ORPHANED (auto-claimable without `--force`). Generous on
+ *  purpose — an idle-at-prompt session heartbeats only on activity, so a short window would
+ *  mis-declare a live-but-idle session dead. `--force` covers the "I KNOW it's dead, take it
+ *  now" case, so the window only governs the no-force auto-claim threshold. */
+export const DEFAULT_OWNER_STALE_MIN = 180;
+
+/**
+ * Resolve the owner-staleness window (minutes) from config's `state.owner_stale_min`, falling
+ * back to {@link DEFAULT_OWNER_STALE_MIN}. Non-positive / unparseable → the default.
+ * @param {FrayConfig} cfg
+ * @returns {number}
+ */
+export function ownerStaleMin(cfg) {
+  const raw = cfg?.state?.owner_stale_min;
+  const n = parseInt(String(raw ?? ''), 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_OWNER_STALE_MIN;
+}
+
+/**
+ * Is `sessionId` currently LIVE — heartbeat present AND within `staleMin`, AND not explicitly
+ * turned OFF this session? DERIVED (never a stored flag). A session with no heartbeat, a stale
+ * one, or an `off` sentinel is dead (its owned threads are orphaned / claimable).
+ * @param {string} projectDir
+ * @param {string} sessionId
+ * @param {number} staleMin
+ * @param {number} [now]
+ * @returns {boolean}
+ */
+export function sessionLive(projectDir, sessionId, staleMin, now = Date.now()) {
+  if (!projectDir || !sessionId) return false;
+  if (sessionOverride(projectDir, sessionId) === 'off') return false; // explicitly silenced → not owning
+  const hb = readSessionHeartbeat(projectDir, sessionId);
+  if (hb == null) return false;
+  return now - hb <= staleMin * 60_000;
+}
+
 /**
  * Resolve the canonical session id for the CURRENT process: the env the hooks +
  * tool calls share (`CLAUDE_CODE_SESSION_ID`), with an optional explicit override

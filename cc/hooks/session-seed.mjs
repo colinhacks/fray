@@ -19,7 +19,7 @@
 // broken hook must not disrupt the session).
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { frayActive } from '../scripts/fray/config.mjs';
+import { frayActive, currentSessionId, touchSessionHeartbeat } from '../scripts/fray/config.mjs';
 
 /**
  * Is Claude Code's EXPERIMENTAL AGENT TEAMS feature enabled for this session?
@@ -71,6 +71,9 @@ if (input.agent_id ?? input.agentId) process.exit(0);
 // NOTHING unless the project is opted in (`.fray/` exists AND not disabled), so a virgin
 // repo gets no fray doctrine. The `/fray` skill bootstraps `.fray/` to activate fray here.
 if (!frayActive(process.env.CLAUDE_PROJECT_DIR ?? '.', input.session_id)) process.exit(0);
+// SESSION-OWNERSHIP HEARTBEAT — stamp liveness on session start/resume/clear/compact, so this
+// session reads as alive (and can own threads) from turn one, before its first UserPromptSubmit.
+touchSessionHeartbeat(process.env.CLAUDE_PROJECT_DIR ?? '.', currentSessionId(input.session_id));
 
 // The static orchestrator role + hygiene doctrine. Lifted VERBATIM from fray-reminder.mjs
 // (the former authoritative copy) — it does not change within a session, so it seeds ONCE
