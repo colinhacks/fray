@@ -84,10 +84,11 @@ function block(modelText, userNote) {
   process.exit(0);
 }
 
-/** Read the two stop_reminder knobs straight from the flat config.yml. */
+/** Read the stop_reminder knobs + autonomous_mode straight from the flat config.yml. */
 function readKnobs() {
   let enabled = true;
   let cooldownSeconds = 1800;
+  let autonomous = false;
   try {
     const src = readFileSync(join(FRAY_DIR, 'config.yml'), 'utf8');
     const onOff = src.match(/^stop_reminder:\s*(\S+)/m);
@@ -97,10 +98,15 @@ function readKnobs() {
     }
     const cd = src.match(/^stop_reminder_cooldown_seconds:\s*(\d+)/m);
     if (cd) cooldownSeconds = parseInt(cd[1], 10);
+    const am = src.match(/^autonomous_mode:\s*(\S+)/m);
+    if (am) {
+      const v = am[1].toLowerCase();
+      if (v === 'on' || v === 'true' || v === 'yes') autonomous = true;
+    }
   } catch {
     /* defaults */
   }
-  return { enabled, cooldownSeconds };
+  return { enabled, cooldownSeconds, autonomous };
 }
 
 /**
@@ -232,7 +238,7 @@ async function main() {
     return allow();
   }
 
-  const { enabled, cooldownSeconds } = readKnobs();
+  const { enabled, cooldownSeconds, autonomous } = readKnobs();
   if (!enabled) return allow();
 
   // Guard 1 (applies to BOTH concerns): never block a stop that is itself a
@@ -295,21 +301,22 @@ async function main() {
     return block(restReminder(newRests, newRestThreads) + threadContents + nb.block + livenessBlock + liveAgentsNote, USER_NOTE);
   }
 
-  // (B0) POP-ONE BLOCKED — surface the next pending human DECISION each idle-cycle, INDEPENDENT
-  // of the cleanup cooldown below (that gate is for reconcile nudges; the blocked-decision queue
-  // must surface promptly so the human can churn through it — this is the fix for "the pop-prompt
-  // never fired because a cleanup nudge already spent the 30-min cooldown"). stop_hook_active
-  // (Guard 1 above) already prevents an in-continuation re-loop; the repeat-guard here stops a
-  // SINGLE lingering decision from re-nagging every idle, while MULTIPLE blocked threads rotate
-  // one-per-idle (nextBlockedBlock cycles past last_surfaced_blocked → a different slug fires each time).
-  {
-    const nb = nextBlockedBlock(PROJECT_DIR, last_surfaced_blocked);
-    const BLOCKED_REPEAT_MS = 600_000; // don't re-show the SAME single blocked thread within 10 min
-    const isDifferent = nb.slug && nb.slug !== last_surfaced_blocked; // a rotated/new blocked thread
-    const staleEnough = now - last_blocked_surfaced > BLOCKED_REPEAT_MS; // the one lingering thread aged out
-    if (nb.slug && (isDifferent || staleEnough)) {
-      writeState({ last_surfaced_blocked: nb.slug, last_blocked_surfaced: now });
-      return block(POP_BLOCKED_REMINDER + nb.block + livenessBlock + liveAgentsNote, USER_NOTE);
+  // (B0) POP-ONE BLOCKED — surface the next pending human DECISION, STRICTLY rate-limited.
+  // THE STORM FIX (1.19.4): the prior gate fired whenever the surfaced slug DIFFERED from last
+  // time — but nextBlockedBlock deliberately ROTATES to a different slug each fire, so with ≥2
+  // blocked threads `isDifferent` was ALWAYS true and this blocked EVERY idle, cycling the whole
+  // blocked queue endlessly (the "unnecessary number of stop hooks" the user hit). Now gated on a
+  // single hard cooldown: at most ONE blocked-decision surface per POP_COOLDOWN, still rotating
+  // one-per-fire through the queue. SUPPRESSED entirely in autonomous mode — a self-driving
+  // orchestrator sets its own decision cadence and must not be nagged for human input each idle.
+  if (!autonomous) {
+    const POP_COOLDOWN_MS = 1_200_000; // ≥20 min between blocked-decision surfaces
+    if (now - last_blocked_surfaced > POP_COOLDOWN_MS) {
+      const nb = nextBlockedBlock(PROJECT_DIR, last_surfaced_blocked);
+      if (nb.slug) {
+        writeState({ last_surfaced_blocked: nb.slug, last_blocked_surfaced: now });
+        return block(POP_BLOCKED_REMINDER + nb.block + livenessBlock + liveAgentsNote, USER_NOTE);
+      }
     }
   }
 
