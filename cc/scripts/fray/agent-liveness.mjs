@@ -179,6 +179,54 @@ export function agentLivenessLines({ transcriptPath, projectDir, now = Date.now(
 }
 
 /**
+ * The SHARED in-flight predicate: is a bound agent still live (not paused/done, not stale)?
+ * "Not rested" is the primary signal — a rest is the ONLY completion mark, so its absence
+ * means still-in-flight; age is the secondary guard — fresh output (age < DROPPED_MIN) OR no
+ * output file yet (age == null → just launched). A quiet-past-DROPPED_MIN + never-rested agent
+ * is the 'dropped' case agentLivenessLines flags, so it is NOT counted live here. Terminal-thread
+ * exclusion is the caller's job (this predicate only judges the agent). One code path shared by
+ * runningAgentCount and liveBoundAgentForThread so the two never drift.
+ * @param {string} agentId
+ * @param {string|null} tasksDir
+ * @param {Set<string>} rested
+ * @param {number} now
+ * @returns {boolean}
+ */
+function isAgentInFlight(agentId, tasksDir, rested, now) {
+  if (rested.has(agentId)) return false;
+  const ageMin = agentAge(agentId, tasksDir, now);
+  return ageMin == null || ageMin < DROPPED_MIN;
+}
+
+/**
+ * The single LIVE agent bound to `slug`, or null. "Live" = the thread's NEWEST binding, on a
+ * non-terminal thread, still in flight per {@link isAgentInFlight} (not rested, not stale). Same
+ * logic/thresholds as {@link runningAgentCount}, scoped to one thread — the thread-edit-steer
+ * hook uses it to decide whether an orchestrator edit needs a SendMessage steer.
+ * @param {{slug: string, transcriptPath?: string|null, projectDir: string, now?: number}} args
+ * @returns {{id: string, label: string|null} | null}
+ */
+export function liveBoundAgentForThread({ slug, transcriptPath, projectDir, now = Date.now() }) {
+  try {
+    const binding = newestBindingByThread(projectDir).get(slug);
+    if (!binding) return null;
+    let src;
+    try {
+      src = readFileSync(join(projectDir, '.fray', `${slug}.md`), 'utf8');
+    } catch {
+      return null; // no thread file → nothing to steer
+    }
+    const threadStatus = src.match(/^status:\s*(\S+)/m)?.[1] ?? '';
+    if (TERMINAL_THREAD.has(threadStatus)) return null; // done/dismissed → no live agent
+    const tasksDir = deriveTasksDir(transcriptPath);
+    if (!isAgentInFlight(binding.id, tasksDir, restedAgentIds(projectDir), now)) return null;
+    return { id: binding.id, label: binding.label };
+  } catch {
+    return null; // fail-open
+  }
+}
+
+/**
  * Count of dispatched agents currently RUNNING — the "Waiting for N background agents" case.
  * An agent counts as running when: it's the NEWEST binding for its thread, it has NOT rested
  * (no completion recorded → still in flight, not paused/done), its thread isn't terminal, and
@@ -220,9 +268,7 @@ export function runningAgentCount({ transcriptPath, projectDir, now = Date.now()
       }
       const threadStatus = src.match(/^status:\s*(\S+)/m)?.[1] ?? '';
       if (TERMINAL_THREAD.has(threadStatus)) continue; // done/dismissed → not running
-      if (rested.has(binding.id)) continue; // rested = completed/paused → the orchestrator already gets a notification
-      const ageMin = agentAge(binding.id, tasksDir, now);
-      if (ageMin == null || ageMin < DROPPED_MIN) count++; // just-launched (no output yet) or fresh enough → in flight; stale-and-never-rested is left to agentLivenessLines' 'dropped'
+      if (isAgentInFlight(binding.id, tasksDir, rested, now)) count++; // shared predicate (not rested + fresh/just-launched)
     }
     return count;
   } catch {

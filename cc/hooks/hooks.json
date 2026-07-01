@@ -14,6 +14,12 @@
         "hooks": [
           { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/agent-bind.mjs\"" }
         ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/fray-thread-edit-steer.mjs\"" }
+        ]
       }
     ],
     "UserPromptSubmit": [
