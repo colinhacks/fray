@@ -494,3 +494,48 @@ export function formatEta(etaMin) {
   if (m < 60 * 24) return `${Math.round(m / 60)}h`;
   return `${Math.round(m / (60 * 24))}d`;
 }
+
+// ── depends_on classification — thread-slug deps vs typed EXTERNAL deps ─────────────
+// `depends_on` was historically an array of THREAD SLUGS only. It is now LOOSENED to also
+// express dependencies on state OUTSIDE the fray board — a GitHub PR/issue, an external CI
+// run, or a free-form gate — via a `<type>:<ref>` PREFIX on the entry. Backward-compat is the
+// contract: a BARE entry (no recognized prefix) stays a thread slug and behaves exactly as
+// before. A thread slug is a filename base and cannot contain a colon, so a recognized
+// `<type>:` prefix is unambiguous. The two kinds drive DIFFERENT board behavior:
+//   - THREAD deps drive READY/blocked — the board auto-fires the thread when every thread dep
+//     goes terminal, and the validator flags a dangling thread-slug dep.
+//   - EXTERNAL deps PARK the thread ("waiting on <ext>") — they have no in-board terminal
+//     signal, so they resolve via `revalidate_at` re-polling or a manual edit (drop the dep).
+//     They are NEVER flagged as dangling (there is nothing in `.fray/` to resolve them to).
+
+/**
+ * Recognized EXTERNAL dep types. An entry prefixed with one of these is an external dep;
+ * `external` is the free-form catch-all. An UNRECOGNIZED prefix is deliberately NOT treated
+ * as external — it stays a thread slug so a typo surfaces via the dangling-dep validator
+ * (rather than silently becoming an inert external gate).
+ * @type {readonly string[]}
+ */
+export const EXTERNAL_DEP_TYPES = ['pr', 'issue', 'ci', 'external'];
+
+/**
+ * @typedef {{kind:'thread', slug:string}} ThreadDep
+ * @typedef {{kind:'external', type:string, label:string}} ExternalDep
+ */
+
+/**
+ * Classify one raw `depends_on` entry. A `<type>:<ref>` prefix with a RECOGNIZED type
+ * ({@link EXTERNAL_DEP_TYPES}) → an external dep (label is the full entry, e.g.
+ * `pr:vercel/turborepo#13187`); anything else → a thread-slug dep (the backward-compatible
+ * default). Never throws.
+ * @param {string} raw
+ * @returns {ThreadDep | ExternalDep}
+ */
+export function classifyDep(raw) {
+  const s = String(raw ?? '').trim();
+  const c = s.indexOf(':');
+  if (c > 0) {
+    const type = s.slice(0, c).toLowerCase();
+    if (EXTERNAL_DEP_TYPES.includes(type)) return { kind: 'external', type, label: s };
+  }
+  return { kind: 'thread', slug: s };
+}

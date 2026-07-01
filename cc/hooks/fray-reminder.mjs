@@ -26,6 +26,7 @@ import {
   reconcileThresholdMin,
   isReconcileStale,
   revalidateState,
+  classifyDep,
 } from '../scripts/fray/config.mjs';
 
 // Token-saving: skip entirely inside sub-agent contexts. The hook stdin carries
@@ -192,11 +193,16 @@ try {
       pending.push(`${t.id}[${t.status ?? '?'}${age ? ', ' + age : ''}${isStale ? ' ⚠STALE' : ''}]`);
       if (/\bQUEUED\b/.test(t.src)) queued.push(t.id);
       if (t.status === 'blocked') decisions.push({ slug: t.id, status_text: t.status_text });
-      // Drop-risk: enqueued WITH declared deps, ALL of which are terminal (the
+      // Drop-risk: enqueued WITH declared THREAD deps, ALL of which are terminal (the
       // auto-trigger fired but nothing dispatched it). A dep that is an unknown slug
-      // is NOT terminal → not flagged (conservative; avoids crying wolf on a typo).
-      if (t.status === 'enqueued' && t.deps.length > 0 &&
-          t.deps.every((d) => TERMINAL.includes(statusOf.get(d) ?? '?'))) {
+      // is NOT terminal → not flagged (conservative; avoids crying wolf on a typo). A
+      // pending EXTERNAL dep (`pr:`/`ci:`/`external:`…) legitimately parks the thread, so
+      // its presence suppresses the drop-risk flag entirely.
+      const classified = t.deps.map(classifyDep);
+      const threadDeps = classified.filter((d) => d.kind === 'thread').map((d) => d.slug);
+      const hasExternalDep = classified.some((d) => d.kind === 'external');
+      if (t.status === 'enqueued' && threadDeps.length > 0 && !hasExternalDep &&
+          threadDeps.every((d) => TERMINAL.includes(statusOf.get(d) ?? '?'))) {
         dropRisk.push(t.id);
       }
     }

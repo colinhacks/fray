@@ -18,12 +18,16 @@
  *   fray --validate    # print ONLY validation errors; exit 1 if any (for the hook / CI). --check is an alias.
  *   fray --json        # machine-readable {config, threads, errors} — ALWAYS complete, never filtered
  *
- * Thread DEPENDENCIES are expressed entirely in per-thread frontmatter — an optional
- * `depends_on: [slug, ...]` array naming OTHER THREAD SLUGS (the same files the board
- * already scans; NOT an external registry). When every target is terminal (done/
- * dismissed) the board prints `▶ READY — dependencies clear, dispatch now`; otherwise
- * it lists the outstanding blockers. Computed on demand from the scanned statuses —
- * there is no stored dependency graph.
+ * DEPENDENCIES live entirely in per-thread frontmatter — an optional `depends_on: [entry, …]`
+ * array. Each entry is one of two kinds (see `classifyDep` in config.mjs):
+ *   - a BARE THREAD SLUG (`other-thread`) — an in-board dep. When every thread-slug dep is
+ *     terminal (done/dismissed) the board prints `▶ READY — dispatch now`; otherwise it lists
+ *     the outstanding blockers. A dangling slug (no `.fray/<slug>.md`) is a validation error.
+ *   - a TYPED EXTERNAL dep (`pr:owner/repo#N` / `issue:…` / `ci:…` / `external:<desc>`) — a gate
+ *     OUTSIDE the board. It PARKS the thread (`⏳ waiting on: <ext>`), is never a dangling error,
+ *     and resolves via `revalidate_at` re-polling or a manual edit — the board never auto-fires
+ *     it. Backward-compatible: a bare entry is always a thread slug.
+ * Computed on demand from the scanned statuses — there is no stored dependency graph.
  */
 
 import { readFileSync, readdirSync } from 'node:fs';
@@ -43,6 +47,7 @@ import {
   writeLastReconcile,
   revalidateState,
   formatEta,
+  classifyDep,
 } from './config.mjs';
 import { newestBindingByThread, downstreamThreads, restedAgentIds } from './agent-bindings.mjs';
 import { deriveAgentState, findAgentOutputAge, IDLE_MIN, DROPPED_MIN } from './agent-status.mjs';
@@ -219,6 +224,13 @@ const threads = frayEntries
     // it still lands in the `(invalid status)` group below.
     const status = normalizeStatus(fm?.status) ?? '?';
     const dependsOn = parseList(fm?.depends_on);
+    // Split `depends_on` into THREAD-slug deps (drive READY/blocked + dangling validation) and
+    // typed EXTERNAL deps (park the thread as "waiting on <ext>"; never a dangling error). A
+    // bare entry is a thread slug — backward-compatible with every pre-existing thread.
+    const classified = dependsOn.map(classifyDep);
+    const threadDeps = classified.filter((d) => d.kind === 'thread').map((d) => d.slug);
+    /** @type {{type:string,label:string}[]} */
+    const externalDeps = classified.filter((d) => d.kind === 'external').map((d) => ({ type: d.type, label: d.label }));
     // REVALIDATE timer — the parsed `revalidate_at`/`last_checked` state (null when unset/
     // malformed). `revalidateMalformed` is set when the field is PRESENT but didn't parse, so
     // a typo'd timestamp surfaces as a non-fatal warning below rather than silently never firing.
@@ -246,6 +258,8 @@ const threads = frayEntries
       status_text: fm?.status_text ?? '',
       next,
       dependsOn,
+      threadDeps,
+      externalDeps,
       revalidate,
       revalidateMalformed,
       agents,
@@ -256,26 +270,28 @@ const threads = frayEntries
     };
   });
 
-// `depends_on` references other THREAD SLUGS — validate they resolve. A dangling
-// slug (no matching `.fray/<slug>.md`) is a warning, surfaced like any frontmatter
-// error so the orchestrator notices the stale dependency. Everything is COMPUTED
-// from the scanned set; there is no external registry to consult.
+// THREAD-slug deps reference other threads — validate they resolve. A dangling slug (no
+// matching `.fray/<slug>.md`) is an error, surfaced like any frontmatter error so the
+// orchestrator notices the stale dependency. EXTERNAL deps (`pr:`/`ci:`/`external:`…) are
+// NOT checked — there is nothing in `.fray/` to resolve them to. Everything is COMPUTED from
+// the scanned set; there is no external registry to consult.
 const slugs = new Set(threads.map((t) => t.id));
 const statusOf = new Map(threads.map((t) => [t.id, t.status]));
 for (const t of threads) {
-  for (const dep of t.dependsOn) {
+  for (const dep of t.threadDeps) {
     if (!slugs.has(dep)) t.errors.push(`depends_on references unknown thread "${dep}"`);
   }
 }
 
 /**
- * A thread's blockers: the subset of its `depends_on` targets not yet terminal.
- * Empty ⇒ all dependencies clear. Unknown slugs are skipped here (already an error).
- * @param {{ dependsOn: string[] }} t
+ * A thread's blockers: the subset of its THREAD-slug `depends_on` targets not yet terminal.
+ * Empty ⇒ all thread deps clear. Unknown slugs are skipped here (already an error). External
+ * deps are NOT blockers in this sense — they park the thread separately (see renderThread).
+ * @param {{ threadDeps: string[] }} t
  * @returns {string[]}
  */
 function blockers(t) {
-  return t.dependsOn.filter((dep) => slugs.has(dep) && !TERMINAL.includes(statusOf.get(dep) ?? '?'));
+  return t.threadDeps.filter((dep) => slugs.has(dep) && !TERMINAL.includes(statusOf.get(dep) ?? '?'));
 }
 
 /**
@@ -291,11 +307,20 @@ function renderThread(t, out) {
   out.push(`- ${t.id} — ${t.title}`);
   if (t.status_text) out.push(`    » ${t.status_text}`);
   out.push(`    → ${t.next}`);
-  if (t.dependsOn.length) {
+  if (t.threadDeps.length) {
     const b = blockers(t);
+    // READY only when thread deps AND external deps are all clear — a pending external gate
+    // still parks the thread even after its in-board thread deps go terminal.
     out.push(b.length
       ? `    ⏳ blocked on: ${b.join(', ')}`
-      : `    ▶ READY — dependencies clear, dispatch now`);
+      : t.externalDeps.length
+        ? `    ⏳ thread deps clear — still waiting on external`
+        : `    ▶ READY — dependencies clear, dispatch now`);
+  }
+  // EXTERNAL deps park the thread; surface them as a "waiting on" line (they resolve via a
+  // `revalidate_at` re-poll or a manual edit, never auto-fired from the board).
+  if (t.externalDeps.length) {
+    out.push(`    ⏳ waiting on: ${t.externalDeps.map((d) => d.label).join(', ')}`);
   }
   // REVALIDATE timer status — `⏰ revalidate due` once the timer fired (re-poll the external
   // state), or a quiet `next check in <eta>` while parked, so the board reflects the timer.
@@ -334,7 +359,9 @@ for (const t of threads) {
   //     post-`planned` drop shape: a ready thread whose transient blocker (correctly
   //     encoded in `depends_on`) has cleared, yet it still sits enqueued. The board
   //     computes this from frontmatter, so it CANNOT be skipped by reflex.
-  if (t.status === 'enqueued' && t.dependsOn.length > 0 && blockers(t).length === 0) {
+  //     A pending EXTERNAL dep legitimately parks the thread, so it is NOT a drop-risk — the
+  //     heuristic requires thread deps present, all clear, AND no external gate outstanding.
+  if (t.status === 'enqueued' && t.threadDeps.length > 0 && blockers(t).length === 0 && t.externalDeps.length === 0) {
     t.dropRisk = true;
     t.warnings.push('drop risk: `enqueued` but ALL `depends_on` are terminal — it should have auto-fired; re-read the thread and dispatch/advance it now');
   }
@@ -386,7 +413,8 @@ if (process.argv.includes('--validate') || process.argv.includes('--check')) {
 if (process.argv.includes('--json')) {
   const dump = threads.map(({ text, ...t }) => {
     const b = blockers(t);
-    return { ...t, blockers: b, ready: t.dependsOn.length > 0 && b.length === 0 };
+    // READY = thread deps present + all clear + no external gate outstanding.
+    return { ...t, blockers: b, ready: t.threadDeps.length > 0 && b.length === 0 && t.externalDeps.length === 0 };
   });
   console.log(JSON.stringify({ config: cfg, threads: dump, errors: allErrors, warnings: allWarnings }, null, 2));
   process.exit(0);
