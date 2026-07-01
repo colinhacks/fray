@@ -153,20 +153,21 @@ export function frayActive(projectDir, sessionId) {
  *   `enqueued` + `depends_on` (which auto-fires on the board), encoded in frontmatter, never
  *   as prose in `## Next step`. (This is the RENAME of the old `todo`, and it also absorbs
  *   the old first-class `plan` status.)
- * - `enqueued` — basically ready to go; AUTO-FIRES when its `depends_on` clear. Held until a
- *   NAMED in-flight agent/thread (in `depends_on`) completes — a sequencing dependency
- *   (same-file serialization, or it needs the prior agent's output). Distinct from
- *   `blocked`: an `enqueued` thread has a concrete auto-trigger, it is NOT waiting on a
- *   human. PREFER messaging the in-flight agent to fold the work in over
- *   enqueuing-then-dispatching, when the work fits that agent's scope (steer-in-flight beats
- *   spawn-fresh). SURFACED in the nag.
+ * - `enqueued` — held until a TRIGGER fires (NOT a human decision). Two trigger kinds:
+ *   (1) an IN-SESSION dep via `depends_on` — AUTO-FIRES when a named in-flight fray
+ *   thread/agent goes terminal (same-file serialization, or needs the prior agent's output);
+ *   (2) an EXTERNAL-world wait via `revalidate_at` — a timer re-polls an upstream PR/CI/
+ *   third-party you can't watch (our work shipped, waiting on someone outside the session).
+ *   EITHER way it is NOT waiting on a human, so it is EXCLUDED from the `⚖ awaiting you`
+ *   queue. PREFER messaging the in-flight agent over enqueuing-then-dispatching when the work
+ *   fits that agent's scope. SURFACED in the nag (depends_on form); revalidate form is quiet
+ *   until due.
  * - `active` — building NOW; a live agent is on it. SURFACED. A just-decided, ready-to-run
  *   thread goes here when you dispatch it this turn.
- * - `blocked` — CANONICAL for blocked / awaiting-human-decision / waiting-on-external:
- *   cannot proceed without a human decision, an answer, or an external event with no
- *   in-session auto-trigger. SURFACED, and hoisted into the board's `⚖ awaiting you` queue
- *   by its status_text. (This ABSORBS the old `needs-decision` status — that spelling is no
- *   longer canonical; it reads as `blocked`.)
+ * - `blocked` — awaiting a HUMAN DECISION, and ONLY that: cannot proceed until the maintainer
+ *   decides/answers/approves. SURFACED, and hoisted into the board's `⚖ awaiting you` queue by
+ *   its status_text. A NON-human trigger wait (in-session dep, or an external party like an
+ *   upstream PR/CI) is `enqueued`, NEVER `blocked`. (ABSORBS the old `needs-decision`.)
  * - `done` / `dismissed` — TERMINAL (completed / decided-against): kept, never deleted,
  *   excluded from the active board's pending views.
  * @type {readonly string[]}

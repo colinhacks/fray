@@ -46,7 +46,7 @@ import {
 } from './config.mjs';
 import { newestBindingByThread, downstreamThreads, restedAgentIds } from './agent-bindings.mjs';
 import { deriveAgentState, findAgentOutputAge, IDLE_MIN, DROPPED_MIN } from './agent-status.mjs';
-import { collectDecisions, isExternalBlock } from './decisions.mjs';
+import { collectDecisions } from './decisions.mjs';
 
 // The project root comes from the environment, NOT from this script's own path: the
 // board ships inside the fray PLUGIN (and, after a marketplace install, lives in
@@ -161,26 +161,16 @@ function nextStep(src) {
   // the thread updater prints after each edit; surfaced here as a board subcommand for an
   // on-demand read.
   if (sub === 'decisions') {
-    const all = collectDecisions();
-    const human = all.filter((d) => !isExternalBlock(d.blocked_on));
-    const external = all.filter((d) => isExternalBlock(d.blocked_on));
-    if (all.length === 0) {
+    const items = collectDecisions();
+    if (items.length === 0) {
       console.log('✓ no pending decisions');
     } else {
-      if (human.length) {
-        console.log(`⚖ ${human.length} decision(s) awaiting you:\n`);
-        human.forEach((d, i) => {
-          console.log(`[${d.slug}]`);
-          console.log(d.status_text || '(no status_text written up)');
-          if (i < human.length - 1) console.log('');
-        });
-      } else {
-        console.log('✓ no decisions awaiting you');
-      }
-      if (external.length) {
-        console.log(`\n⏳ ${external.length} awaiting external (upstream/CI — tracked, NOT your call):`);
-        external.forEach((d) => console.log(`  [${d.slug}] ${d.blocked_on ? `(${d.blocked_on}) ` : ''}${d.status_text || ''}`.trimEnd()));
-      }
+      console.log(`⚖ ${items.length} decision(s) awaiting you:\n`);
+      items.forEach((d, i) => {
+        console.log(`[${d.slug}]`);
+        console.log(d.status_text || '(no status_text written up)');
+        if (i < items.length - 1) console.log('');
+      });
     }
     process.exit(0);
   }
@@ -445,8 +435,9 @@ out.push(`fray board — autonomous_mode: ${cfg.autonomousMode ? 'on' : 'off'}${
 if (allErrors.length) out.push(`\n⚠ VALIDATION ERRORS:\n${allErrors.join('\n')}`);
 if (allWarnings.length) out.push(`\n⚠ DROP-RISK WARNINGS (advisory):\n${allWarnings.join('\n')}`);
 
-// ⚖ AWAITING YOU — the COMPUTED queue of every `blocked` thread (blocked / awaiting-human-
-// decision / waiting-on-external — `blocked` absorbs the old `needs-decision`), surfaced by its
+// ⚖ AWAITING YOU — the COMPUTED queue of every `blocked` thread (blocked = awaiting a HUMAN
+// DECISION only — `blocked` absorbs the old `needs-decision`; a non-human trigger wait is
+// `enqueued`, never here), surfaced by its
 // FULL status_text (the concise blocker / open question). HOISTED to the top of the board (not
 // buried mid-status-list) and rendered UNTRUNCATED — the terminal is wide and the question must
 // be fully readable. Nothing is stored: filtered live from the scanned threads, the same
