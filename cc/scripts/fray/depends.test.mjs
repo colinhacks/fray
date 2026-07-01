@@ -1,13 +1,15 @@
 // @ts-check
 /**
- * fray — `depends_on` classification tests: THREAD-slug deps (backward-compatible) vs typed
+ * fray — `blocking_threads` classification tests: THREAD-slug deps (backward-compatible) vs typed
  * EXTERNAL deps (`pr:`/`issue:`/`ci:`/`external:`). Run with `node --test cc/scripts/fray/`.
+ * The `depends_on` field is still read as an alias for `blocking_threads` — one test below pins
+ * that legacy path end-to-end; the rest use the canonical `blocking_threads` + `status: blocked`.
  *
  * Covers both layers:
  *   1. The pure `classifyDep` — bare → thread; recognized prefix → external; unrecognized
  *      prefix → thread (so a typo still surfaces as a dangling dep).
  *   2. The board's read path (`--json` / `--validate`): external deps NEVER dangle, they park
- *      the thread (ready=false while pending), and they suppress the enqueued drop-risk;
+ *      the thread (ready=false while pending), and they suppress the machine-blocked drop-risk;
  *      thread-slug deps keep their existing READY/blocked/dangling behavior byte-for-byte.
  */
 import { test } from 'node:test';
@@ -47,10 +49,11 @@ test('classifyDep: an UNRECOGNIZED prefix stays a thread slug (a typo must still
   assert.deepEqual(classifyDep('gh:foo'), { kind: 'thread', slug: 'gh:foo' });
 });
 
-test('board: a thread-slug dep keeps existing READY/dangling behavior (backward-compat)', () => {
+test('board: the LEGACY `enqueued` + `depends_on` alias path keeps READY/dangling behavior', () => {
   const dir = mkdtempSync(join(tmpdir(), 'fray-dep-thread-'));
   try {
     mkdirSync(join(dir, '.fray'), { recursive: true });
+    // Deliberately on the legacy aliases (`status: enqueued`, `depends_on`) — pins backward-compat.
     writeFileSync(join(dir, '.fray', 'dep-done.md'), '---\ntitle: d\nstatus: done\nstatus_text: x\n---\nb\n');
     writeFileSync(join(dir, '.fray', 'waiter.md'), '---\ntitle: w\nstatus: enqueued\nstatus_text: x\ndepends_on: [dep-done]\n---\nb\n');
     writeFileSync(join(dir, '.fray', 'dangles.md'), '---\ntitle: g\nstatus: enqueued\nstatus_text: x\ndepends_on: [nope]\n---\nb\n');
@@ -68,15 +71,15 @@ test('board: an EXTERNAL dep parks the thread (ready=false), never dangles, and 
   const dir = mkdtempSync(join(tmpdir(), 'fray-dep-ext-'));
   try {
     mkdirSync(join(dir, '.fray'), { recursive: true });
-    // enqueued, thread dep terminal, but a pending external PR gate → NOT ready, NOT drop-risk.
+    // blocked, thread dep terminal, but a pending external PR gate → NOT ready, NOT drop-risk.
     writeFileSync(join(dir, '.fray', 'dep-done.md'), '---\ntitle: d\nstatus: done\nstatus_text: x\n---\nb\n');
     writeFileSync(join(dir, '.fray', 'parked.md'),
-      '---\ntitle: p\nstatus: enqueued\nstatus_text: x\ndepends_on: [dep-done, pr:vercel/turborepo#13187, external:design-signoff]\n---\nb\n');
+      '---\ntitle: p\nstatus: blocked\nstatus_text: x\nblocking_threads: [dep-done, pr:vercel/turborepo#13187, external:design-signoff]\n---\nb\n');
     const validate = execFileSync(process.execPath, [INDEX, '--validate'], {
       env: { ...process.env, CLAUDE_PROJECT_DIR: dir }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
     });
     assert.match(validate, /frontmatter OK/, 'external deps are not frontmatter errors');
-    assert.doesNotMatch(validate, /drop risk/, 'a pending external gate suppresses the enqueued drop-risk warning');
+    assert.doesNotMatch(validate, /drop risk/, 'a pending external gate suppresses the machine-blocked drop-risk warning');
 
     const { threads, errors } = board(dir);
     const t = byId(threads);
@@ -95,13 +98,13 @@ test('board: a thread whose ONLY deps are external is parked, not a drop-risk', 
   try {
     mkdirSync(join(dir, '.fray'), { recursive: true });
     writeFileSync(join(dir, '.fray', 'ci-wait.md'),
-      '---\ntitle: c\nstatus: enqueued\nstatus_text: x\ndepends_on: [ci:release-build]\n---\nb\n');
+      '---\ntitle: c\nstatus: blocked\nstatus_text: x\nblocking_threads: [ci:release-build]\n---\nb\n');
     const { threads, errors } = board(dir);
     const t = byId(threads);
     assert.equal(errors.length, 0);
     assert.deepEqual(t['ci-wait'].threadDeps, []);
     assert.equal(t['ci-wait'].ready, false, 'no thread deps + external gate → not READY');
-    assert.equal(t['ci-wait'].dropRisk, false, 'external-only enqueued thread is legitimately parked');
+    assert.equal(t['ci-wait'].dropRisk, false, 'external-only blocked thread is legitimately parked');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

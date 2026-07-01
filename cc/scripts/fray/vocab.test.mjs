@@ -5,9 +5,11 @@
  *
  * Covers the two coupled changes:
  *   1. The canonical status set + the FOREVER read-aliases (todo/plan → planned,
- *      needs-decision → blocked) — at the pure-function level AND end-to-end through the
- *      board's `--json` read path (a legacy `status:` thread must validate + bucket
- *      canonically).
+ *      enqueued/needs-decision → blocked, the UNIFIED waiting model) — at the pure-function
+ *      level AND end-to-end through the board's `--json` read path (a legacy `status:` thread
+ *      must validate + bucket canonically). A `blocked` thread's RESOLUTION-MECHANISM field
+ *      (none → human, `blocking_threads` → threads, `revalidate_at` → timer) decides its
+ *      color/urgency/ordering — verified through the board + statusline.
  *   2. The anti-drift reconcile forcing-function — the staleness primitive, the
  *      timestamp round-trip, and the per-turn hook emitting the LOUD instruction when the
  *      last-reconcile is stale (and staying quiet when it is fresh).
@@ -37,18 +39,18 @@ const REMINDER = join(HERE, '..', '..', 'hooks', 'fray-reminder.mjs');
 const STATUSLINE = join(HERE, '..', '..', 'statusline-fray.mjs');
 
 // ── status vocab — pure functions ────────────────────────────────────────────────
-test('STATUS is the canonical set in lifecycle order — needs-decision IS canonical; todo/plan are NOT', () => {
-  assert.deepEqual(STATUS, ['planning', 'planned', 'enqueued', 'active', 'needs-decision', 'blocked', 'done', 'dismissed']);
-  assert.ok(STATUS.includes('needs-decision'), 'needs-decision is canonical again (the human-decision bucket)');
-  for (const legacy of ['todo', 'plan']) {
-    assert.ok(!STATUS.includes(legacy), `${legacy} must not be canonical`);
+test('STATUS is the unified canonical set — blocked absorbed enqueued + needs-decision', () => {
+  assert.deepEqual(STATUS, ['planning', 'planned', 'active', 'blocked', 'done', 'dismissed']);
+  for (const gone of ['enqueued', 'needs-decision', 'todo', 'plan']) {
+    assert.ok(!STATUS.includes(gone), `${gone} is a read-alias, NOT canonical`);
   }
 });
 
-test('normalizeStatus maps the legacy aliases and passes canonical/unknown through', () => {
+test('normalizeStatus collapses the legacy aliases into the unified vocab', () => {
   assert.equal(normalizeStatus('todo'), 'planned');
   assert.equal(normalizeStatus('plan'), 'planned');
-  assert.equal(normalizeStatus('needs-decision'), 'needs-decision', 'needs-decision is canonical now (not aliased to blocked)');
+  assert.equal(normalizeStatus('enqueued'), 'blocked', 'enqueued collapsed into the unified blocked');
+  assert.equal(normalizeStatus('needs-decision'), 'blocked', 'needs-decision collapsed into the unified blocked');
   for (const s of STATUS) assert.equal(normalizeStatus(s), s, `${s} is canonical → unchanged`);
   assert.equal(normalizeStatus('bogus'), 'bogus', 'unknown passes through for the caller to reject');
   assert.equal(normalizeStatus(undefined), undefined);
@@ -89,8 +91,8 @@ test('writeLastReconcile/readLastReconcile round-trip; absent reads null', () =>
   }
 });
 
-// ── end-to-end: legacy `todo` normalizes; `needs-decision` validates as canonical ─────
-test('board --json: `status: todo` normalizes to planned; `needs-decision` is canonical', () => {
+// ── end-to-end: legacy `todo`/`needs-decision` normalize through the board read path ─────
+test('board --json: legacy `todo`→planned; `needs-decision`→blocked (human-blocked)', () => {
   const dir = mkdtempSync(join(tmpdir(), 'fray-board-'));
   try {
     mkdirSync(join(dir, '.fray'), { recursive: true });
@@ -103,51 +105,59 @@ test('board --json: `status: todo` normalizes to planned; `needs-decision` is ca
     const { threads, errors } = JSON.parse(out);
     const byId = Object.fromEntries(threads.map((t) => [t.id, t]));
     assert.equal(byId['legacy-todo'].status, 'planned', 'todo buckets as planned');
-    assert.equal(byId['legacy-nd'].status, 'needs-decision', 'needs-decision is canonical (the human-decision bucket)');
+    assert.equal(byId['legacy-nd'].status, 'blocked', 'needs-decision normalizes to the unified blocked');
+    assert.equal(byId['legacy-nd'].humanBlocked, true, 'a needs-decision thread (no machine field) is human-blocked');
     assert.equal(errors.length, 0, 'a legacy/canonical status is NOT a validation error');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-// ── 2026-07-01 vocab: needs-decision = ⚖ awaiting-you; blocked = de-emphasized non-human wait ──
-test('board: ⚖ hoists needs-decision (not blocked); blocked renders LAST among live groups', () => {
+// ── 2026-07-01 unified model: the ⚖ queue is HUMAN-blocked; machine-blocked renders LAST ──
+test('board: ⚖ hoists human-blocked (no machine field); machine-blocked renders LAST', () => {
   const dir = mkdtempSync(join(tmpdir(), 'fray-vocab-'));
   try {
     mkdirSync(join(dir, '.fray'), { recursive: true });
-    writeFileSync(join(dir, '.fray', 'decide.md'), '---\ntitle: d\nstatus: needs-decision\nstatus_text: "which default?"\n---\n## Next step\nask\n');
+    // human-blocked — no blocking_threads / revalidate_at → the ⚖ awaiting-you queue.
+    writeFileSync(join(dir, '.fray', 'decide.md'), '---\ntitle: d\nstatus: blocked\nstatus_text: "which default?"\n---\n## Next step\nask\n');
     writeFileSync(join(dir, '.fray', 'build.md'), '---\ntitle: b\nstatus: active\nstatus_text: "on it"\n---\n## Next step\ngo\n');
-    writeFileSync(join(dir, '.fray', 'wait.md'), '---\ntitle: w\nstatus: blocked\nstatus_text: "awaiting PR #42"\n---\n## Next step\nwait\n');
+    // machine-blocked — waits on a still-active thread → rendered in the blocked group, NOT ⚖.
+    writeFileSync(join(dir, '.fray', 'dep.md'), '---\ntitle: dep\nstatus: active\nstatus_text: "running"\n---\n## Next step\ngo\n');
+    writeFileSync(join(dir, '.fray', 'wait.md'), '---\ntitle: w\nstatus: blocked\nstatus_text: "waiting on dep"\nblocking_threads: [dep]\n---\n## Next step\nwait\n');
     const out = execFileSync(process.execPath, [INDEX], { env: { ...process.env, CLAUDE_PROJECT_DIR: dir }, encoding: 'utf8' });
-    // The ⚖ awaiting-you queue is needs-decision, NOT blocked.
-    assert.match(out, /⚖ needs-decision \(1\) — awaiting your call/);
-    assert.doesNotMatch(out, /⚖ blocked/, 'blocked is no longer the awaiting-you queue');
-    // Order: needs-decision (hoisted) before active before blocked (last).
-    const iNd = out.indexOf('needs-decision');
+    // The ⚖ awaiting-you queue is HUMAN-blocked only — decide is in, wait is NOT.
+    assert.match(out, /⚖ awaiting you \(1\) — human-blocked/);
+    assert.match(out, /which default\?/, 'the human-blocked thread is surfaced by its status_text');
+    assert.doesNotMatch(out, /⚖ awaiting you \(2\)/, 'machine-blocked wait is NOT in the ⚖ queue');
+    // Order: ⚖ (human-blocked) before active before the blocked group (machine-blocked, last).
+    const iAwaiting = out.indexOf('⚖ awaiting you');
     const iActive = out.indexOf('## active');
     const iBlocked = out.indexOf('## blocked');
-    assert.ok(iNd < iActive && iActive < iBlocked, `order needs-decision → active → blocked (got ${iNd},${iActive},${iBlocked})`);
+    assert.ok(iAwaiting < iActive && iActive < iBlocked, `order awaiting-you → active → blocked (got ${iAwaiting},${iActive},${iBlocked})`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('statusline: needs-decision is YELLOW (33), active cyan (36), blocked GRAY (90)', () => {
+test('statusline: human-blocked YELLOW (33) awaiting-you, active cyan (36), machine-blocked GRAY (90)', () => {
   const dir = mkdtempSync(join(tmpdir(), 'fray-sl-'));
   const sess = 'sess-sl';
+  const future = new Date(Date.now() + 3_600_000).toISOString();
   try {
     mkdirSync(join(dir, '.fray', '.session-state'), { recursive: true });
     writeFileSync(join(dir, '.fray', '.session-state', sess), 'on\n');
-    writeFileSync(join(dir, '.fray', 'd.md'), '---\ntitle: d\nstatus: needs-decision\nstatus_text: x\n---\nb\n');
+    // human-blocked (no machine field) → yellow awaiting-you.
+    writeFileSync(join(dir, '.fray', 'd.md'), '---\ntitle: d\nstatus: blocked\nstatus_text: x\n---\nb\n');
     writeFileSync(join(dir, '.fray', 'a.md'), '---\ntitle: a\nstatus: active\nstatus_text: x\n---\nb\n');
-    writeFileSync(join(dir, '.fray', 'w.md'), '---\ntitle: w\nstatus: blocked\nstatus_text: x\n---\nb\n');
+    // machine-blocked (a timer field) → gray blocked, NOT awaiting-you.
+    writeFileSync(join(dir, '.fray', 'w.md'), `---\ntitle: w\nstatus: blocked\nstatus_text: x\nrevalidate_at: ${future}\n---\nb\n`);
     const out = execFileSync(process.execPath, [STATUSLINE], {
       input: JSON.stringify({ workspace: { project_dir: dir, current_dir: dir }, session_id: sess }),
       env: { ...process.env }, encoding: 'utf8',
     });
-    assert.match(out, /\x1b\[33m1 needs-decision\x1b\[0m/, 'needs-decision is yellow (33)');
+    assert.match(out, /\x1b\[33m1 awaiting-you\x1b\[0m/, 'human-blocked is yellow (33) awaiting-you');
     assert.match(out, /\x1b\[36m1 active\x1b\[0m/, 'active is cyan (36)');
-    assert.match(out, /\x1b\[90m1 blocked\x1b\[0m/, 'blocked is gray (90)');
+    assert.match(out, /\x1b\[90m1 blocked\x1b\[0m/, 'machine-blocked is gray (90)');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

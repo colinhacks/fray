@@ -7,7 +7,7 @@ description: Run a dueling-sub-agents DIALECTIC to resolve a hard or contested d
 
 A structured debate that stress-tests a hard call before you trust a conclusion. An **L1 orchestrator** runs two **L2 debater sub-agents**, each assigned ONE side, and relays their arguments back and forth — each round demanding the debater *steelman* the opponent's latest, then *refute* it with researched counterpoints. It ends only when one side is genuinely CONVINCED on the merits, or the single **crux** the decision hinges on is isolated. The point: every claim is adversarially researched and countered, so no idea survives on assertion alone.
 
-This composes with fray — a dialectic is a good way to work a `needs-decision` thread whose call is genuinely contested. Run it, then present the synthesis (or the isolated crux) to the human.
+This composes with fray — a dialectic is a good way to work a human-`blocked` thread whose call is genuinely contested. Run it, then present the synthesis (or the isolated crux) to the human.
 
 ## When to use — and when NOT
 

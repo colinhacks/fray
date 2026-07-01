@@ -62,7 +62,7 @@ state:                 # optional cross-cutting "what's true now" globals
 ## Requirements & caveats
 
 - **fray relies on Claude Code's EXPERIMENTAL agent-teams feature** (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`). The always-steer core of the methodology — messaging a *running* sub-agent, warm-resuming a *completed* one, answering a question an agent raised mid-flight — depends on the `SendMessage` tool, which only exists when agent-teams is enabled. Verify with `echo $CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`.
-  - **Without agent-teams:** the board, the dispatch enforcement + epilogue, the rest/stop reconciliation guards, and the whole thread model still work. You lose only live steering and warm-resume, and fall back to the `enqueued` + `depends_on` sequencing model. It is experimental and harness-dependent — don't assume it's on.
+  - **Without agent-teams:** the board, the dispatch enforcement + epilogue, the rest/stop reconciliation guards, and the whole thread model still work. You lose only live steering and warm-resume, and fall back to the `blocked` + `blocking_threads` sequencing model. It is experimental and harness-dependent — don't assume it's on.
 - **Node is required** to run the hooks and the `fray` board command. They're dependency-free, pure-Node `.mjs` scripts — no `npm install`, no transpiler.
 - The hooks **fail open**: any error, missing file, or unparseable input → they do nothing rather than disrupt your session. A broken fray never traps you.
 
@@ -87,9 +87,9 @@ There is **no stored board** and **no unified ledger** — both would be caches 
 The plugin puts a `fray` command on the Bash tool's PATH. It reads the current project's `.fray/` and computes the live view:
 
 ```bash
-fray               # the live board (planning / active / enqueued / blocked)
+fray               # the live board (planning / active / blocked)
 fray --all         # every thread, every status
-fray --status planned # one status (legacy aliases todo/plan/needs-decision accepted)
+fray --status planned # one status (legacy aliases todo/plan/enqueued/needs-decision accepted)
 fray --search <q>  # find a thread by id / title / body text
 fray reconcile     # stamp .fray/.last-reconcile = now (record a completed board reconcile)
 fray --validate    # validate all thread frontmatter; exit 1 on error (used by the hook + CI)
@@ -97,7 +97,7 @@ fray --json        # machine-readable {config, threads, errors, warnings}
 fray decisions     # the rich write-up of every blocked thread (the awaiting-you queue)
 ```
 
-Thread **dependencies** are expressed in frontmatter (`depends_on: [<other-slug>]`); the board computes when every dependency has gone terminal and flips the thread to `▶ READY — dispatch now`.
+Thread **dependencies** are expressed in frontmatter (`blocking_threads: [<other-slug>]`; `depends_on` is still read as an alias); the board computes when every thread-slug dependency has gone terminal and flips the thread to `▶ READY — dispatch now`. Typed `pr:`/`issue:`/`ci:`/`external:` entries are external gates that park the thread instead of auto-firing.
 
 ### The thread updater
 
@@ -106,19 +106,21 @@ Thread **dependencies** are expressed in frontmatter (`depends_on: [<other-slug>
 ```bash
 fray-update <slug> --status active                      # set status (validated against the vocab)
 fray-update <slug> --status blocked \
-  --status-text "<the blocker write-up>"                # blocked REQUIRES a write-up
+  --status-text "<the decision needed>"                 # human-blocked REQUIRES a write-up
+fray-update <slug> --status blocked \
+  --set blocking_threads="[other-slug]"                 # machine-blocked on another thread (auto-fires)
 fray-update <slug> --set key=value                      # set any other frontmatter scalar
 fray-update <slug> --patch "<find>===>><replace>"       # body find/replace, must match exactly once
 fray-update <slug> --append "<text>"                    # append to the body
 ```
 
-It enforces the invariant that **`status: blocked` requires a non-empty `status_text`** (the awaiting-you queue derives from it), auto-stamps `last_update`, and prints the full queue after every edit so a pending blocker is never buried.
+It enforces the invariant that a **human-`blocked` thread** (`status: blocked` with no `blocking_threads`/`revalidate_at` mechanism) **requires a non-empty `status_text`** (the awaiting-you queue derives from it) — a machine-blocked thread carrying a mechanism field is exempt. It auto-stamps `last_update` and prints the full queue after every edit so a pending blocker is never buried.
 
 ### Status vocabulary
 
-`planning · planned · enqueued · active · blocked · done · dismissed`
+`planning · planned · active · blocked · done · dismissed`
 
-`planning` is active design discussion (surfaced in the nag); `planned` is parked, scoped-but-unworked (not nagged); `blocked` is blocked / awaiting-human-decision / waiting-on-external (surfaced + hoisted into the ⚖ awaiting-you queue). Legacy `todo` / `plan` / `needs-decision` are still accepted as read-aliases (normalized to `planned` / `planned` / `blocked`).
+`planning` is active design discussion (surfaced in the nag); `planned` is parked, scoped-but-unworked (not nagged); `blocked` is the unified "cannot run right now" state — its **resolution-mechanism field** decides how it unblocks: no field = awaiting a HUMAN decision (surfaced + hoisted into the ⚖ awaiting-you queue, yellow), `blocking_threads` = waiting on other threads / an external gate (gray, auto-fires when thread-slug deps clear), `revalidate_at` = a re-poll timer (gray). Legacy `todo` / `plan` / `enqueued` / `needs-decision` are still accepted as read-aliases (normalized to `planned` / `planned` / `blocked` / `blocked`).
 
 `done` and `dismissed` are terminal and **kept forever** — each is its own file, excluded from the board and the per-turn pending list by status, so a finished thread is zero bloat. (No "clean up" step; that's the whole point of per-file threads.)
 

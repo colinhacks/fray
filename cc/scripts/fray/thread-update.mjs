@@ -9,13 +9,14 @@
 // plugin is enabled). The project root is resolved from CLAUDE_PROJECT_DIR (exported to
 // bin/hook processes), matching how bin/fray + index.mjs find the project's .fray/.
 //
-// Enforced invariant: setting `status: needs-decision` REQUIRES a non-empty status_text (the
-// decision write-up) — supplied via --status-text or already present on the thread. The
-// ⚖ awaiting-you queue DERIVES from these status_text fields (see decisions.mjs), so a
-// needs-decision thread without a write-up would surface as an empty queue row. After every
-// edit this tool prints the FULL queue (collectDecisions) so a pending decision is never
-// silently buried. Legacy status spellings (todo/plan) are ACCEPTED and normalized to canonical
-// on write. (`blocked` = a non-human wait; it does NOT require a write-up.)
+// Enforced invariant: setting `status: blocked` on a HUMAN-blocked thread (no `blocking_threads`/
+// `depends_on` and no `revalidate_at`) REQUIRES a non-empty status_text (the decision write-up).
+// The ⚖ awaiting-you queue DERIVES from those status_text fields (see decisions.mjs), so a
+// human-blocked thread without a write-up would surface as an empty queue row. A MACHINE/timer-
+// blocked thread carries its mechanism field instead and needs no write-up. After every edit
+// this tool prints the FULL queue (collectDecisions) so a pending decision is never silently
+// buried. Legacy status spellings (todo/plan → planned; enqueued/needs-decision → blocked) are
+// ACCEPTED and normalized to canonical on write.
 import { readFileSync, writeFileSync, existsSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { collectDecisions } from './decisions.mjs';
@@ -43,8 +44,8 @@ function die(msg) {
 
 const usage = `usage: fray-update <slug> [options]
   --status <s>              set status; one of: ${STATUSES.join(' · ')}
-                            (legacy todo/plan/needs-decision accepted → normalized to canonical)
-                            (blocked REQUIRES a status_text write-up)
+                            (legacy todo/plan/enqueued/needs-decision accepted → normalized to canonical)
+                            (human-blocked — blocked with no blocking_threads/revalidate_at — REQUIRES a status_text)
   --status-text "<text>"    set the status_text field (decision write-up / gloss)
   --set key=value           set any other frontmatter scalar (repeatable)
   --patch "<find>${PATCH_SEP}<replace>"  body find/replace, must match EXACTLY once (repeatable, applied in order, atomic)
@@ -155,19 +156,31 @@ function main() {
   const { fm, body } = splitFrontmatter(original);
   if (fm === null) die(`thread ${args.slug}.md has no YAML frontmatter block`);
 
-  // --- Validate status + the blocked/status_text invariant BEFORE writing ---
+  // --- Validate status + the human-blocked/status_text invariant BEFORE writing ---
   // Accept canonical OR a legacy alias, then NORMALIZE to canonical so the on-disk value is
-  // always canonical going forward (e.g. `--status needs-decision` writes `status: blocked`).
+  // always canonical going forward (e.g. `--status needs-decision`/`enqueued` writes `blocked`).
   if (args.status !== undefined && !isValidStatus(args.status)) {
     die(`invalid status "${args.status}"; must be one of: ${ACCEPTED_STATUSES.join(' · ')}`);
   }
   const canonicalStatus = args.status !== undefined ? normalizeStatus(args.status) : undefined;
-  if (canonicalStatus === 'needs-decision') {
-    const willHaveStatusText = args.status_text !== undefined
-      ? isStatusTextNonEmpty(`"${args.status_text}"`) || args.status_text.trim().length > 0
-      : isStatusTextNonEmpty(getStatusText(fm));
-    if (!willHaveStatusText) {
-      die('status needs-decision REQUIRES a write-up of the decision needed — pass --status-text "<text>" (or set it on the thread first)');
+  // A HUMAN-blocked thread (status blocked with NO `blocking_threads`/`depends_on` and NO
+  // `revalidate_at`) IS the ⚖ awaiting-you queue entry, so it REQUIRES a status_text write-up.
+  // Machine/timer-blocked threads carry a mechanism field instead and need no write-up. We look
+  // at the fields being SET this call PLUS what's already on the thread.
+  if (canonicalStatus === 'blocked') {
+    const setKeys = new Set(args.sets.map((kv) => kv.slice(0, kv.indexOf('=')).trim()));
+    const hasMachineField = ['blocking_threads', 'depends_on', 'revalidate_at'].some((k) => {
+      if (setKeys.has(k)) return true;
+      const v = fmGet(fm, k);
+      return v !== undefined && v.trim() !== '' && v.trim() !== '[]';
+    });
+    if (!hasMachineField) {
+      const willHaveStatusText = args.status_text !== undefined
+        ? isStatusTextNonEmpty(`"${args.status_text}"`) || args.status_text.trim().length > 0
+        : isStatusTextNonEmpty(getStatusText(fm));
+      if (!willHaveStatusText) {
+        die('a HUMAN-blocked thread (blocked with no blocking_threads/revalidate_at) REQUIRES a write-up of the decision needed — pass --status-text "<text>", or add a `blocking_threads`/`revalidate_at` mechanism if the block is non-human');
+      }
     }
   }
 

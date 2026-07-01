@@ -134,8 +134,8 @@ test('fray-reminder: DUE thread surfaces REVALIDATE DUE; FUTURE-timer thread is 
     writeFileSync(join(dir, '.fray', 'pr-due.md'), `---\ntitle: due\nstatus: blocked\nstatus_text: "awaiting jdx review"\nrevalidate_at: ${past}\nlast_checked: 2026-06-01T00:00:00Z\n---\nbody\n`);
     // PARKED: a `blocked` thread parked on a future timer — must be QUIET this turn.
     writeFileSync(join(dir, '.fray', 'pr-parked.md'), `---\ntitle: parked\nstatus: blocked\nstatus_text: "awaiting other PR"\nrevalidate_at: ${future}\n---\nbody\n`);
-    // CONTROL: a `needs-decision` thread with no timer — surfaces in the ⚖ awaiting-you queue.
-    writeFileSync(join(dir, '.fray', 'plain.md'), '---\ntitle: plain\nstatus: needs-decision\nstatus_text: "needs a human call"\n---\nbody\n');
+    // CONTROL: a human-`blocked` thread (no timer, no deps) — surfaces in the ⚖ awaiting-you queue.
+    writeFileSync(join(dir, '.fray', 'plain.md'), '---\ntitle: plain\nstatus: blocked\nstatus_text: "needs a human call"\n---\nbody\n');
 
     const out = runReminder(dir, sess);
 
@@ -149,8 +149,8 @@ test('fray-reminder: DUE thread surfaces REVALIDATE DUE; FUTURE-timer thread is 
     // The due thread is owned by the timer, so it is NOT also in the ⚖ awaiting-you queue.
     assert.doesNotMatch(out, /\[pr-due\]/, 'a due thread is not double-surfaced in the decisions queue');
 
-    // The control thread (needs-decision, no timer) surfaces in the ⚖ NEEDS-DECISION queue.
-    assert.match(out, /\[plain\] needs a human call/, 'a needs-decision thread surfaces as awaiting-you');
+    // The control thread (human-blocked, no timer) surfaces in the ⚖ awaiting-you queue.
+    assert.match(out, /\[plain\] needs a human call/, 'a human-blocked thread surfaces as awaiting-you');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

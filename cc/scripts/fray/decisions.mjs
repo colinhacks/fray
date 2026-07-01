@@ -1,17 +1,18 @@
 #!/usr/bin/env node
 // @ts-check
-// Decisions view, DERIVED from fray threads (no static store). Scans the project's
-// .fray/*.md, selects threads with canonical `status: needs-decision` (the human-decision
-// bucket — as of 2026-07-01 this is `needs-decision`, NOT `blocked`; `blocked` now means a
-// non-human wait and is NOT a pending decision), and prints each thread's slug + its FULL
-// status_text (the decision write-up) — the rich inline-reading view that complements the
+// Decisions view, DERIVED from fray threads (no static store). Scans the project's .fray/*.md
+// and selects the HUMAN-blocked threads — `status: blocked` with NEITHER a `blocking_threads`/
+// `depends_on` field NOR a `revalidate_at` timer (the unified waiting model, 2026-07-01: a
+// blocked thread's mechanism field decides whether it awaits YOU). Those two machine mechanisms
+// wait on non-human work and are NOT pending decisions. Prints each selected thread's slug + its
+// FULL status_text (the decision write-up) — the rich inline-reading view that complements the
 // one-line-per-thread board (scripts/fray/index.mjs).
 //
 // Self-contained + importable: `collectDecisions()` is reused by the thread updater
 // (thread-update.mjs) to print the queue after every edit, and by `fray decisions`.
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, basename } from 'node:path';
-import { normalizeStatus } from './config.mjs';
+import { normalizeStatus, isHumanBlocked, revalidateState } from './config.mjs';
 
 // The project root comes from the environment, NOT this script's own path: the tool
 // ships inside the fray PLUGIN (and after a marketplace install lives in
@@ -61,7 +62,12 @@ export function collectDecisions() {
       continue;
     }
     const fm = parseFrontmatter(text);
-    if (!fm || normalizeStatus(fm.status) !== 'needs-decision') continue;
+    if (!fm || normalizeStatus(fm.status) !== 'blocked') continue;
+    // HUMAN-blocked only: no `blocking_threads`/`depends_on` field AND no (parseable) timer.
+    const depsRaw = (fm.blocking_threads ?? fm.depends_on ?? '').trim().replace(/^\[|\]$/g, '').trim();
+    const hasBlockingThreads = depsRaw.length > 0;
+    const hasTimer = Boolean(revalidateState(fm.revalidate_at, fm.last_checked));
+    if (!isHumanBlocked({ hasBlockingThreads, hasTimer })) continue;
     const rawText = fm[STATUS_TEXT_KEY];
     out.push({ slug: basename(f, '.md'), status_text: unquote(rawText) });
   }

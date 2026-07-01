@@ -11,22 +11,22 @@
  *
  * Usage (the `fray` command is the bin/ shim that runs this script against the
  * project's `.fray/`, regardless of cwd or where the plugin is installed):
- *   fray               # print the LIVE board (needs-decision/active/planning/enqueued/blocked; planned hidden)
+ *   fray               # print the LIVE board (⚖ awaiting-you + active/planning/blocked; planned hidden)
  *   fray --all         # print all threads (every status)
- *   fray --status planned # print only threads in one status (legacy aliases todo/plan accepted)
+ *   fray --status planned # print only threads in one status (aliases todo/plan/enqueued/needs-decision accepted)
  *   fray reconcile     # stamp .fray/.last-reconcile = now (records a completed board reconcile)
  *   fray --validate    # print ONLY validation errors; exit 1 if any (for the hook / CI). --check is an alias.
  *   fray --json        # machine-readable {config, threads, errors} — ALWAYS complete, never filtered
  *
- * DEPENDENCIES live entirely in per-thread frontmatter — an optional `depends_on: [entry, …]`
- * array. Each entry is one of two kinds (see `classifyDep` in config.mjs):
- *   - a BARE THREAD SLUG (`other-thread`) — an in-board dep. When every thread-slug dep is
- *     terminal (done/dismissed) the board prints `▶ READY — dispatch now`; otherwise it lists
- *     the outstanding blockers. A dangling slug (no `.fray/<slug>.md`) is a validation error.
- *   - a TYPED EXTERNAL dep (`pr:owner/repo#N` / `issue:…` / `ci:…` / `external:<desc>`) — a gate
- *     OUTSIDE the board. It PARKS the thread (`⏳ waiting on: <ext>`), is never a dangling error,
- *     and resolves via `revalidate_at` re-polling or a manual edit — the board never auto-fires
- *     it. Backward-compatible: a bare entry is always a thread slug.
+ * A `blocked` thread's RESOLUTION MECHANISM (which frontmatter field is set) drives its color +
+ * placement — see `blockMechanism` in config.mjs. HUMAN-blocked (no machine field) → the hoisted
+ * `⚖ awaiting you` queue. MACHINE-blocked → the de-emphasized `blocked` group. The two machine
+ * fields:
+ *   - `blocking_threads: [entry, …]` (the RENAME of `depends_on`, still accepted as a read-alias
+ *     FIELD). Each entry (see `classifyDep`): a BARE THREAD SLUG auto-fires `▶ READY` when it goes
+ *     terminal (a dangling slug is a validation error); a TYPED EXTERNAL gate `pr:owner/repo#N` /
+ *     `issue:…` / `ci:…` / `external:<desc>` PARKS the thread (`⏳ waiting on: <ext>`, never dangles).
+ *   - `revalidate_at: <ISO>` — an external TIMER; parked quiet until due, then surfaces for recheck.
  * Computed on demand from the scanned statuses — there is no stored dependency graph.
  */
 
@@ -48,6 +48,8 @@ import {
   revalidateState,
   formatEta,
   classifyDep,
+  blockMechanism,
+  isHumanBlocked,
   touchSessionHeartbeat,
   clearSessionHeartbeat,
   readSessionHeartbeat,
@@ -258,10 +260,9 @@ function nextStep(src) {
     console.log(`  override: ${ov ?? 'none (default — DORMANT; run `fray on` to activate)'}`);
     process.exit(0);
   }
-  // `fray decisions` — the rich inline-reading view of every `blocked` thread's FULL
-  // write-up (collectDecisions; `blocked` absorbs the old `needs-decision`). The same queue
-  // the thread updater prints after each edit; surfaced here as a board subcommand for an
-  // on-demand read.
+  // `fray decisions` — the rich inline-reading view of every HUMAN-blocked thread's FULL
+  // write-up (collectDecisions — `blocked` with no `blocking_threads`/`revalidate_at`). The same
+  // queue the thread updater prints after each edit; surfaced here as a board subcommand.
   if (sub === 'decisions') {
     const items = collectDecisions();
     if (items.length === 0) {
@@ -325,10 +326,11 @@ const threads = frayEntries
     // (and is surfaced) as its canonical target. Unknown/garbage passes through unchanged so
     // it still lands in the `(invalid status)` group below.
     const status = normalizeStatus(fm?.status) ?? '?';
-    const dependsOn = parseList(fm?.depends_on);
-    // Split `depends_on` into THREAD-slug deps (drive READY/blocked + dangling validation) and
-    // typed EXTERNAL deps (park the thread as "waiting on <ext>"; never a dangling error). A
-    // bare entry is a thread slug — backward-compatible with every pre-existing thread.
+    // The dependency field is `blocking_threads` (the RENAME of `depends_on`, 2026-07-01);
+    // `depends_on` stays accepted as a read-alias FIELD so old threads still resolve. Both mean
+    // the same array — bare THREAD-slug deps (drive READY/auto-fire + dangling validation) plus
+    // typed EXTERNAL gates `pr:`/`ci:`/`external:` (park the thread as "waiting on"; never dangle).
+    const dependsOn = parseList(fm?.blocking_threads ?? fm?.depends_on);
     const classified = dependsOn.map(classifyDep);
     const threadDeps = classified.filter((d) => d.kind === 'thread').map((d) => d.slug);
     /** @type {{type:string,label:string}[]} */
@@ -338,6 +340,11 @@ const threads = frayEntries
     // a typo'd timestamp surfaces as a non-fatal warning below rather than silently never firing.
     const revalidate = revalidateState(fm?.revalidate_at, fm?.last_checked);
     const revalidateMalformed = Boolean(fm?.revalidate_at) && !revalidate;
+    // The RESOLUTION MECHANISM of a `blocked` thread (meaningless for other statuses): human
+    // (⚖/yellow) vs threads/timer (gray). Both fields present → the validator warns; derivation
+    // picks timer > threads > human. `humanBlocked` is the ⚖ awaiting-you predicate.
+    const mechanism = blockMechanism({ hasBlockingThreads: dependsOn.length > 0, hasTimer: Boolean(revalidate) });
+    const humanBlocked = status === 'blocked' && isHumanBlocked({ hasBlockingThreads: dependsOn.length > 0, hasTimer: Boolean(revalidate) });
     const next = nextStep(src);
     const threadTerminal = TERMINAL.includes(status);
     const threadActive = status === 'active'; // only `active` threads flag dropped/idle agents; parked phases are expected to hold done agents
@@ -362,6 +369,9 @@ const threads = frayEntries
       dependsOn,
       threadDeps,
       externalDeps,
+      mechanism,
+      humanBlocked,
+      hasBlockingThreads: dependsOn.length > 0,
       owner: fm?.owner_session || null,
       revalidate,
       revalidateMalformed,
@@ -369,7 +379,7 @@ const threads = frayEntries
       text: src,
       errors,
       /** @type {string[]} */ warnings: [],
-      dropRisk: false, // set true when the enqueued-but-all-deps-terminal heuristic fires
+      dropRisk: false, // set true when the blocked-machine-but-all-deps-terminal heuristic fires
     };
   });
 
@@ -382,7 +392,7 @@ const slugs = new Set(threads.map((t) => t.id));
 const statusOf = new Map(threads.map((t) => [t.id, t.status]));
 for (const t of threads) {
   for (const dep of t.threadDeps) {
-    if (!slugs.has(dep)) t.errors.push(`depends_on references unknown thread "${dep}"`);
+    if (!slugs.has(dep)) t.errors.push(`blocking_threads references unknown thread "${dep}"`);
   }
 }
 
@@ -473,23 +483,33 @@ function renderThread(t, out) {
 for (const t of threads) {
   if (TERMINAL.includes(t.status)) continue; // terminal threads are done — never a drop-risk
 
-  // (1) DROP-RISK: an `enqueued` thread that DECLARES `depends_on` but ALL of them are
-  //     terminal — its auto-trigger fired and it was never dispatched. This is the
-  //     post-`planned` drop shape: a ready thread whose transient blocker (correctly
-  //     encoded in `depends_on`) has cleared, yet it still sits enqueued. The board
-  //     computes this from frontmatter, so it CANNOT be skipped by reflex.
-  //     A pending EXTERNAL dep legitimately parks the thread, so it is NOT a drop-risk — the
-  //     heuristic requires thread deps present, all clear, AND no external gate outstanding.
-  if (t.status === 'enqueued' && t.threadDeps.length > 0 && blockers(t).length === 0 && t.externalDeps.length === 0) {
+  // (1) DROP-RISK: a `blocked` thread with the THREADS mechanism (`blocking_threads` set) whose
+  //     thread deps are ALL terminal — its auto-trigger fired and it was never dispatched. A
+  //     pending EXTERNAL gate or a live timer legitimately parks it, so the heuristic requires
+  //     thread deps present, all clear, no external gate outstanding, AND no `revalidate_at`.
+  if (t.status === 'blocked' && t.threadDeps.length > 0 && blockers(t).length === 0 && t.externalDeps.length === 0 && !t.revalidate) {
     t.dropRisk = true;
-    t.warnings.push('drop risk: `enqueued` but ALL `depends_on` are terminal — it should have auto-fired; re-read the thread and dispatch/advance it now');
+    t.warnings.push('drop risk: `blocked` on `blocking_threads` that are ALL terminal — it should have auto-fired; re-read the thread and dispatch/advance it now');
+  }
+
+  // (1b) ONE MECHANISM PER BLOCKED THREAD — warn on ambiguity. A `blocked` thread should carry
+  //      exactly one resolution mechanism; both `blocking_threads` AND `revalidate_at` set is
+  //      ambiguous (which unblocks it?). And a HUMAN-blocked thread (neither field) MUST have a
+  //      status_text — it IS the ⚖ awaiting-you queue entry, so an empty one is an empty row.
+  if (t.status === 'blocked') {
+    if (t.hasBlockingThreads && t.revalidate) {
+      t.warnings.push('blocked with BOTH `blocking_threads` and `revalidate_at` — set exactly ONE resolution mechanism (the board treats it as the timer)');
+    }
+    if (t.humanBlocked && !t.status_text) {
+      t.warnings.push('HUMAN-blocked (no `blocking_threads`/`revalidate_at`) but no status_text — write the decision needed; it IS the ⚖ awaiting-you queue entry');
+    }
   }
 
   // status_text is a 1-2 sentence English status note (frontmatter); flag overlong ones —
   // anything past ~2 sentences belongs in the body, not the at-a-glance board field.
-  // EXEMPT needs-decision: its status_text IS the ⚖ awaiting-you queue entry (the concise
-  // decision needed), surfaced UNTRUNCATED on the board + reminder — never warn on or clip it.
-  if (t.status !== 'needs-decision' && t.status_text && t.status_text.length > 280) {
+  // EXEMPT a HUMAN-blocked thread: its status_text IS the ⚖ awaiting-you queue entry (the
+  // concise decision needed), surfaced UNTRUNCATED on the board + reminder — never warn/clip it.
+  if (!t.humanBlocked && t.status_text && t.status_text.length > 280) {
     t.warnings.push(`status_text is ${t.status_text.length} chars — keep it to 1-2 sentences; move detail into the body`);
   }
 
@@ -582,34 +602,33 @@ out.push(`fray board — autonomous_mode: ${cfg.autonomousMode ? 'on' : 'off'}${
 if (allErrors.length) out.push(`\n⚠ VALIDATION ERRORS:\n${allErrors.join('\n')}`);
 if (allWarnings.length) out.push(`\n⚠ DROP-RISK WARNINGS (advisory):\n${allWarnings.join('\n')}`);
 
-// ⚖ AWAITING YOU — the COMPUTED queue of every `needs-decision` thread (the ONLY human-decision
-// bucket — a non-human trigger wait is `enqueued`/`blocked`, never here), surfaced by its FULL
-// status_text (the concise decision needed). HOISTED to the top of the board (not buried
-// mid-status-list) and rendered UNTRUNCATED — the terminal is wide and the question must be
-// fully readable. Nothing is stored: filtered live from the scanned threads, the same
-// compute-don't-cache principle as the rest of the board. Shown in the live/default + `--all`
-// views and when `--status needs-decision` is requested; suppressed for any OTHER single-status
-// filter. `needs-decision` is rendered ONLY here — it is skipped in the per-status group loop
-// below to avoid duplication.
-if (!only || only === 'needs-decision') {
-  const pendingDecisions = threads.filter((t) => t.status === 'needs-decision');
+// ⚖ AWAITING YOU — the COMPUTED queue of every HUMAN-blocked thread (`blocked` with NO
+// `blocking_threads` and NO `revalidate_at` → only the maintainer can unblock it), surfaced by
+// its FULL status_text (the concise decision needed). HOISTED to the top of the board (not
+// buried mid-status-list) and rendered UNTRUNCATED. The machine/timer-blocked threads are NOT
+// here — they wait on non-human work and render (gray, last) in the `blocked` group below.
+// Nothing is stored: filtered live from the scanned threads. Shown in the live/default + `--all`
+// views and when `--status blocked` (or its `needs-decision`/`enqueued` aliases) is requested.
+if (!only || only === 'blocked') {
+  const pendingDecisions = threads.filter((t) => t.humanBlocked);
   if (pendingDecisions.length) {
-    out.push(`\n## ⚖ needs-decision (${pendingDecisions.length}) — awaiting your call`);
+    out.push(`\n## ⚖ awaiting you (${pendingDecisions.length}) — human-blocked`);
     for (const t of pendingDecisions) renderThread(t, out);
   }
 }
 
-// Per-status groups, in SURFACE-PRIORITY order (needs-decision hoisted above; then active,
-// planning, enqueued, and blocked LAST/de-emphasized) — not raw STATUS order — so the board
-// reads needs-decision → active → … → blocked top-to-bottom.
-const GROUP_ORDER = ['active', 'planning', 'enqueued', 'blocked', 'planned'];
+// Per-status groups, in SURFACE-PRIORITY order (⚖ human-blocked hoisted above; then active,
+// planning, and machine/timer-`blocked` LAST/de-emphasized) — not raw STATUS order — so the
+// board reads awaiting-you → active → planning → blocked top-to-bottom.
+const GROUP_ORDER = ['active', 'planning', 'blocked', 'planned'];
 const orderedStatuses = [...showStatuses].sort((a, b) => {
   const ia = GROUP_ORDER.indexOf(a); const ib = GROUP_ORDER.indexOf(b);
   return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
 });
 for (const s of orderedStatuses) {
-  if (s === 'needs-decision') continue; // rendered in the dedicated ⚖ awaiting-you section above
-  const group = threads.filter((t) => t.status === s);
+  // `blocked` renders ONLY its MACHINE/timer threads here — the HUMAN-blocked ones are in the
+  // ⚖ section above (skip them to avoid duplication).
+  const group = threads.filter((t) => t.status === s && !t.humanBlocked);
   if (!group.length) continue;
   out.push(`\n## ${s} (${group.length})`);
   for (const t of group) renderThread(t, out);

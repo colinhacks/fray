@@ -23,13 +23,13 @@
  *       hook's additionalContext would continue the SUB-AGENT's turn, the wrong surface).
  *
  *   (B) CLEANUP + POP-ONE NUDGE. Otherwise, nudge a reconcile of threads touched this
- *       session AND THEN to pop the single next `needs-decision` thread off the queue and
+ *       session AND THEN to pop the single next human-blocked thread off the queue and
  *       present that ONE decision to the human with full context (fray's serialized
  *       one-at-a-time decision rhythm — never a whole-list dump). The ⚖ queue is
- *       `needs-decision` ONLY — `blocked` (a NON-human wait) is never popped, and when there
- *       are no needs-decision threads the hook does NOT nag about blocked ones (nothing for the
+ *       human-blocked ONLY — `blocked` (a NON-human wait) is never popped, and when there
+ *       are no human-blocked threads the hook does NOT nag about blocked ones (nothing for the
  *       human to do). Rate-limited by a cooldown and gated on a thread file actually having been
- *       touched. BOTH nudges HAND the orchestrator the CONTENTS of that next needs-decision
+ *       touched. BOTH nudges HAND the orchestrator the CONTENTS of that next human-blocked
  *       thread inline (nextDecisionBlock → threadExcerpt), so it presents the decision without a
  *       Read tool call; the pick CYCLES the queue (last_surfaced_blocked) so successive stops
  *       surface different ones, one at a time.
@@ -167,15 +167,15 @@ function threadTouchedSince(sinceMs) {
 }
 
 /**
- * POP-ONE surfacing: pick the single next `needs-decision` thread and return its CONTENTS
+ * POP-ONE surfacing: pick the single next human-blocked thread and return its CONTENTS
  * inline, so the orchestrator can present that ONE decision to the human WITHOUT a Read tool
  * call. This is the pop-one-at-a-time rhythm the nudges instruct — with the thread text
  * actually in the orchestrator's context, matching the rest path's threadExcerptsBlock.
  *
- * "Next" cycles the queue: prefer a needs-decision thread OTHER than the one surfaced last fire
+ * "Next" cycles the queue: prefer a human-blocked thread OTHER than the one surfaced last fire
  * (so across successive stops the human sees them one-at-a-time rather than the same one
  * repeatedly); fall back to the first when there's only one or the last isn't found. Returns
- * { block, slug } — block is '' and slug null on an EMPTY queue (no needs-decision threads →
+ * { block, slug } — block is '' and slug null on an EMPTY queue (no human-blocked threads →
  * nothing to pop, and `blocked` threads are deliberately never popped) or any error (fail-open).
  * @param {string} projectDir
  * @param {string} lastSurfaced
@@ -183,7 +183,7 @@ function threadTouchedSince(sinceMs) {
  */
 function nextDecisionBlock(projectDir, lastSurfaced) {
   try {
-    const q = collectDecisions(); // `needs-decision` threads = threads awaiting the MAINTAINER's decision
+    const q = collectDecisions(); // human-blocked threads = threads awaiting the MAINTAINER's decision
     if (!q.length) return { block: '', slug: null };
     const idx = lastSurfaced ? q.findIndex((d) => d.slug === lastSurfaced) : -1;
     // Rotate to the one AFTER last-surfaced (wraps); if last isn't in the queue, take the first.
@@ -193,7 +193,7 @@ function nextDecisionBlock(projectDir, lastSurfaced) {
     const n = q.length;
     const others = q.filter((d) => d.slug !== pick.slug).map((d) => d.slug);
     const queueLine = others.length ? ` The other ${others.length} stay queued (not now): ${others.join(', ')}.` : '';
-    const header = `\n\nfray ⚖ next needs-decision thread — POP THIS ONE (${n} awaiting you; presenting 1).${queueLine}\nThread file: .fray/${pick.slug}.md — record the human's call in its ## Decisions and flip it out of needs-decision once answered. Contents:\n`;
+    const header = `\n\nfray ⚖ next human-blocked thread — POP THIS ONE (${n} awaiting you; presenting 1).${queueLine}\nThread file: .fray/${pick.slug}.md — record the human's call in its ## Decisions and resolve it once answered (add a mechanism field, or → active/done). Contents:\n`;
     return { block: header + ex, slug: pick.slug };
   } catch {
     return { block: '', slug: null };
@@ -210,13 +210,13 @@ function restReminder(n, threads = []) {
 }
 
 const CLEANUP_REMINDER =
-  'fray: before going idle — (1) reconcile the threads you touched this session (drain follow-ups, flip finished → done); (2) THEN pop the SINGLE next needs-decision thread off the queue, RE-READ it so you fully understand the decision, and present THAT ONE to the user with complete context + your recommendation — one at a time, NEVER a concise dump of the whole queue (that overwhelms, under-informs each item, and scrolls out of the chat). No needs-decision threads / all already surfaced this round → just stop (don\'t nag about `blocked` threads — those wait on non-human work).';
+  'fray: before going idle — (1) reconcile the threads you touched this session (drain follow-ups, flip finished → done); (2) THEN pop the SINGLE next human-blocked thread off the queue, RE-READ it so you fully understand the decision, and present THAT ONE to the user with complete context + your recommendation — one at a time, NEVER a concise dump of the whole queue (that overwhelms, under-informs each item, and scrolls out of the chat). No human-blocked threads / all already surfaced this round → just stop (don\'t nag about `blocked` threads — those wait on non-human work).';
 
-// The POP-ONE nudge — carries the next needs-decision thread's CONTENTS inline (appended by
+// The POP-ONE nudge — carries the next human-blocked thread's CONTENTS inline (appended by
 // the caller). Fires each idle-cycle INDEPENDENT of the cleanup cooldown, so the human can
 // churn the decision queue one at a time.
 const POP_BLOCKED_REMINDER =
-  'fray: before going idle — reconcile any thread you touched (drain its follow-ups, flip finished → done), THEN present the needs-decision thread below to the user IN FULL: what it is, the current state, the alternatives, the exact decision, and your recommendation. One decision at a time. If it carries multiple open questions, BATCH them (up to 4 in one AskUserQuestion, or back-to-back) and synthesize the answers yourself — do not drip one per turn. Contents:';
+  'fray: before going idle — reconcile any thread you touched (drain its follow-ups, flip finished → done), THEN present the human-blocked thread below to the user IN FULL: what it is, the current state, the alternatives, the exact decision, and your recommendation. One decision at a time. If it carries multiple open questions, BATCH them (up to 4 in one AskUserQuestion, or back-to-back) and synthesize the answers yourself — do not drip one per turn. Contents:';
 
 // Calm one-liner shown to the USER (the `systemMessage` channel) alongside whichever
 // block fires, so the surface reads as a gentle fray reminder rather than a bare error.
@@ -308,7 +308,7 @@ async function main() {
   // (B0) POP-ONE NEEDS-DECISION — surface the next pending human DECISION, STRICTLY rate-limited.
   // THE STORM FIX (1.19.4): the prior gate fired whenever the surfaced slug DIFFERED from last
   // time — but nextDecisionBlock deliberately ROTATES to a different slug each fire, so with ≥2
-  // needs-decision threads `isDifferent` was ALWAYS true and this blocked EVERY idle, cycling the
+  // human-blocked threads `isDifferent` was ALWAYS true and this blocked EVERY idle, cycling the
   // whole queue endlessly (the "unnecessary number of stop hooks" the user hit). Now gated on a
   // single hard cooldown: at most ONE decision surface per POP_COOLDOWN, still rotating
   // one-per-fire through the queue. SUPPRESSED entirely in autonomous mode — a self-driving

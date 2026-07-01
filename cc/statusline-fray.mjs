@@ -6,10 +6,11 @@
 // MODEL-ONLY — never rendered in the TUI). This is the user-visible surface for the fray
 // board: a tasteful base line (dir · branch · model · context%) and, WHEN fray is active
 // for this session, the live board summary — the states that actually matter, in priority
-// order: NEEDS-DECISION (awaiting the human — YELLOW/prominent), ACTIVE (a live driver is on
-// it now — cyan), and BLOCKED (waiting on a NON-human thing: another thread, a PR/CI, an
-// external merge — GRAY/de-emphasized, deliberately quiet). Everything else
-// (planning/planned/enqueued/terminal) is intentionally not counted here.
+// order: AWAITING-YOU (human-blocked — YELLOW/prominent), ACTIVE (a live driver is on it now
+// — cyan), and BLOCKED (machine/timer-blocked: waiting on another thread, a PR/CI, an external
+// gate, or a revalidate timer — GRAY/de-emphasized, deliberately quiet). A `blocked` thread's
+// RESOLUTION MECHANISM (which field is set) decides awaiting-you vs blocked, not a status word.
+// Everything else (planning/planned/terminal) is intentionally not counted here.
 //
 // CANONICAL SOURCE: this file lives in the fray repo at `cc/statusline-fray.mjs`. It is
 // DEPLOYED (copied verbatim) to `~/.claude/statusline-fray.mjs`, the stable path the
@@ -56,33 +57,56 @@ function frayActive(projectDir, sessionId) {
 
 const TERMINAL = new Set(['done', 'dismissed']);
 
+/** Normalize a raw `status:` to canonical — inlined (this file is deployed standalone, no
+ *  imports from the plugin). Legacy `enqueued`/`needs-decision` → `blocked`; `todo`/`plan` →
+ *  `planned`. The human/machine split for `blocked` is derived from the mechanism FIELDS below,
+ *  not the word, so a legacy `enqueued` (has deps → machine) or `needs-decision` (no field →
+ *  human) classifies correctly. */
+function normStatus(s) {
+  if (s === 'enqueued' || s === 'needs-decision') return 'blocked';
+  if (s === 'todo' || s === 'plan') return 'planned';
+  return s;
+}
+
 /**
- * Scan `.fray/*.md` once and count the three live states that matter:
- *   needsDecision — awaiting the HUMAN (the ⚖ queue). YELLOW/prominent.
- *   active        — a driver (agent or the merge-cascade) is on it right now.
- *   blocked       — waiting on a NON-human thing (another thread, a PR/CI, an external merge).
- * Everything else (planning/planned/enqueued/terminal) is deliberately not counted.
+ * Scan `.fray/*.md` once and count the three live states that matter, in the unified waiting
+ * model (2026-07-01): a `blocked` thread's RESOLUTION MECHANISM (which field is set) decides its
+ * urgency, not the status word.
+ *   awaitingYou — HUMAN-blocked (`blocked` with no `blocking_threads`/`depends_on`/`revalidate_at`).
+ *                 YELLOW/prominent — the maintainer must act.
+ *   active      — a driver (agent or the merge-cascade) is on it right now. CYAN.
+ *   blocked     — MACHINE/timer-blocked (has a `blocking_threads`/`revalidate_at` mechanism).
+ *                 GRAY/de-emphasized — waiting on non-human work.
+ * Everything else (planning/planned/terminal) is not counted.
  * @param {string} projectDir
- * @returns {{ needsDecision: number, active: number, blocked: number }}
+ * @returns {{ awaitingYou: number, active: number, blocked: number }}
  */
 function scanBoard(projectDir) {
-  let needsDecision = 0;
+  let awaitingYou = 0;
   let active = 0;
   let blocked = 0;
   for (const f of readdirSync(join(projectDir, '.fray'))) {
     if (!f.endsWith('.md') || f.startsWith('_')) continue;
-    let st;
+    let src;
     try {
-      st = readFileSync(join(projectDir, '.fray', f), 'utf8').match(/^status:\s*(\S+)/m)?.[1];
+      src = readFileSync(join(projectDir, '.fray', f), 'utf8');
     } catch {
       continue;
     }
-    if (!st || TERMINAL.has(st)) continue;
-    if (st === 'needs-decision') needsDecision++;
-    else if (st === 'active') active++;
-    else if (st === 'blocked') blocked++;
+    const raw = src.match(/^status:\s*(\S+)/m)?.[1];
+    if (!raw) continue;
+    const st = normStatus(raw);
+    if (TERMINAL.has(st)) continue;
+    if (st === 'active') { active++; continue; }
+    if (st === 'blocked') {
+      const depsM = src.match(/^(?:blocking_threads|depends_on):\s*(.+)$/m);
+      const hasDeps = depsM ? depsM[1].trim() !== '' && depsM[1].trim() !== '[]' : false;
+      const hasTimer = /^revalidate_at:\s*\S/m.test(src);
+      if (hasDeps || hasTimer) blocked++;
+      else awaitingYou++;
+    }
   }
-  return { needsDecision, active, blocked };
+  return { awaitingYou, active, blocked };
 }
 
 /**
@@ -119,13 +143,14 @@ try {
 
   let line = parts.join(` ${sep} `);
 
-  // ── fray segment (only when active): "fray enabled · N needs-decision · N active · N blocked" ──
-  // Priority order + colors: needs-decision is YELLOW (grab the eye — the human must act); active
-  // is cyan; blocked is GRAY (de-emphasized — it's just waiting on other threads/PRs, not urgent).
+  // ── fray segment (only when active): "fray enabled · N awaiting-you · N active · N blocked" ──
+  // Priority order + colors keyed on the RESOLUTION MECHANISM, not a status word: awaiting-you
+  // (human-blocked) is YELLOW (grab the eye — the human must act); active is cyan; blocked
+  // (machine/timer-blocked) is GRAY (de-emphasized — waiting on other threads/PRs, not urgent).
   if (frayActive(projectDir, sessionId)) {
-    const { needsDecision, active, blocked } = scanBoard(projectDir);
+    const { awaitingYou, active, blocked } = scanBoard(projectDir);
     const fray = [`${dim('fray')} enabled`]; // "enabled" non-dim (default fg) to signal fray is ON
-    fray.push(needsDecision > 0 ? amber(`${needsDecision} needs-decision`) : dim('0 needs-decision'));
+    fray.push(awaitingYou > 0 ? amber(`${awaitingYou} awaiting-you`) : dim('0 awaiting-you'));
     fray.push(active > 0 ? cyan(`${active} active`) : dim('0 active'));
     fray.push(blocked > 0 ? gray(`${blocked} blocked`) : dim('0 blocked'));
     line += `   ${fray.join(` ${sep} `)}`;

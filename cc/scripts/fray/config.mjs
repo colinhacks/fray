@@ -250,70 +250,55 @@ export function frayActive(projectDir, sessionId) {
 }
 
 /**
- * The CANONICAL thread-status vocabulary — listed in LIFECYCLE order. This is the ONLY
- * set written to disk going forward; the legacy spellings (`todo`/`plan`/`needs-decision`)
- * are accepted on read via {@link STATUS_ALIASES} + {@link normalizeStatus}, never as a
- * canonical value.
- * - `planning` — ACTIVE design discussion happening RIGHT NOW: the thread's deliverable is
- *   the DESIGN/approach itself, not an implementation. Its `## Open questions` are driving
- *   the work; you'd work it WITH the human or dispatch a Plan/architect agent — NEVER an
- *   implementer (nothing is settled to build yet). SURFACED in the per-turn nag (it is the
- *   active-equivalent for a plan). THE TRANSITION RULE: a `planning` thread flips to
- *   `planned` at a design stopping point — the instant the design is parked or locked and
- *   active discussion pauses (or straight to `active` if you dispatch the implementer).
- * - `planned` — PARKED: scoped/designed but NOT actively worked. The "thought-through, has
- *   a doc, not yet scheduled" bucket — no defer-reason ceremony. NOT surfaced in the nag
- *   (the board shows it; the per-turn pulse stays quiet). CRUCIAL: a ready thread waiting
- *   on a TRANSIENT blocker (a PR merge, a prior agent's output) is NOT `planned` — it is
- *   `enqueued` + `depends_on` (which auto-fires on the board), encoded in frontmatter, never
- *   as prose in `## Next step`. (This is the RENAME of the old `todo`, and it also absorbs
- *   the old first-class `plan` status.)
- * - `enqueued` — held until a TRIGGER fires (NOT a human decision). Two trigger kinds:
- *   (1) an IN-SESSION dep via `depends_on` — AUTO-FIRES when a named in-flight fray
- *   thread/agent goes terminal (same-file serialization, or needs the prior agent's output);
- *   (2) an EXTERNAL-world wait via `revalidate_at` — a timer re-polls an upstream PR/CI/
- *   third-party you can't watch (our work shipped, waiting on someone outside the session).
- *   EITHER way it is NOT waiting on a human, so it is EXCLUDED from the `⚖ awaiting you`
- *   queue. PREFER messaging the in-flight agent over enqueuing-then-dispatching when the work
- *   fits that agent's scope. SURFACED in the nag (depends_on form); revalidate form is quiet
- *   until due.
- * - `active` — building NOW; a live agent is on it. SURFACED. A just-decided, ready-to-run
- *   thread goes here when you dispatch it this turn.
- * - `needs-decision` — awaiting a HUMAN DECISION/ACTION, and ONLY that: cannot proceed until the
- *   maintainer decides/answers/approves. THE top-priority, human-facing bucket — SURFACED FIRST,
- *   hoisted into the board's `⚖ awaiting you` queue by its status_text, YELLOW on the status line,
- *   and the ONLY thing the Stop hook pops. (REINTRODUCED 2026-07-01 — it is the human-decision
- *   role that `blocked` briefly held under the 1.19.7 "blocked = decision-only" standardization,
- *   now split back out so `blocked` can mean the non-human wait below.)
- * - `blocked` — waiting on something that is NOT the human: a running fray thread, a pending
- *   PR/CI, an external merge. It should NOT clamor for attention — GRAY on the status line,
- *   de-emphasized on the board (rendered LAST among live groups), and EXCLUDED from the
- *   `⚖ awaiting you` queue + the Stop-hook pop (there is nothing for the human to DO). It is the
- *   general "waiting on non-human work" bucket; `enqueued` is its specialization that the board
- *   can AUTO-FIRE (it carries a `depends_on`/`revalidate_at` trigger). Prefer `enqueued` when a
- *   concrete trigger exists; use `blocked` for a coarse non-human wait with no board trigger.
- *   (REDEFINED 2026-07-01 — it NO LONGER means "awaiting you"; that role moved to
- *   `needs-decision`.)
+ * The CANONICAL thread-status vocabulary — listed in LIFECYCLE order. This is the ONLY set
+ * written to disk going forward; legacy spellings (`todo`/`plan`/`enqueued`/`needs-decision`)
+ * are accepted on read via {@link STATUS_ALIASES} + {@link normalizeStatus}, never written.
+ *
+ * THE UNIFIED WAITING MODEL (2026-07-01): the status word answers exactly ONE question — CAN
+ * THIS RUN? — and nothing else. Every "waiting" flavor collapses into `blocked`; HOW a blocked
+ * thread unblocks is an ORTHOGONAL RESOLUTION-MECHANISM field, and the board derives color,
+ * urgency, ordering, and auto-fire from WHICH field is set — not from the status word (see
+ * {@link blockMechanism}). This kills the old `enqueued`-vs-`blocked` ambiguity with zero loss
+ * of expressiveness: the human(yellow)/machine(gray) split just moved from the WORD to the FIELD.
+ *
+ * - `planning` — ACTIVE design discussion happening RIGHT NOW: the deliverable is the DESIGN
+ *   itself, not an implementation. Open questions in motion; worked WITH the human or a Plan/
+ *   architect agent, NEVER an implementer. SURFACED. Flips to `planned` at a design stopping
+ *   point (or straight to `active` when you dispatch the build).
+ * - `planned` — PARKED: scoped/designed but NOT actively worked. NOT surfaced in the nag (the
+ *   board shows it; the pulse stays quiet). A thread waiting on a TRANSIENT blocker is NOT
+ *   `planned` — it is `blocked` + the right mechanism field. (RENAME of the old `todo`; also
+ *   absorbs the old `plan`.)
+ * - `active` — building NOW; a live agent is on it. SURFACED.
+ * - `blocked` — CANNOT run right now. HOW it unblocks is the mechanism field ({@link
+ *   blockMechanism}), EXACTLY ONE of:
+ *     (1) HUMAN — no machine field set → only the maintainer can unblock it (a question/call).
+ *         YELLOW, hoisted to the top of the `⚖ awaiting you` queue, surfaced in the nag by its
+ *         `status_text` (untruncated), the ONLY thing the Stop hook pops. (Old `needs-decision`.)
+ *     (2) `blocking_threads: [slug, …]` — blocked on other THREADS going terminal. GRAY,
+ *         de-emphasized, AUTO-FIRES: the instant every listed thread is done/dismissed the board
+ *         flips it `▶ READY — dispatch now` (+ the DROP-RISK callout). (Old `enqueued`; the field
+ *         is the RENAME of `depends_on`, which is still accepted as a read-alias field. Entries
+ *         may also be typed EXTERNAL gates `pr:`/`ci:`/`external:` — those park, they don't fire.)
+ *     (3) `revalidate_at: <ISO>` (+ `last_checked`) — blocked on an external event with a TIMER.
+ *         GRAY/dim, parked + quiet until due, then surfaces loudly for a recheck.
+ *   The machine mechanisms (2, 3) do NOT clamor for attention — GRAY, rendered LAST among live
+ *   groups, EXCLUDED from the `⚖ awaiting you` queue + the Stop-hook pop.
  * - `done` / `dismissed` — TERMINAL (completed / decided-against): kept, never deleted,
  *   excluded from the active board's pending views.
  * @type {readonly string[]}
  */
-export const STATUS = ['planning', 'planned', 'enqueued', 'active', 'needs-decision', 'blocked', 'done', 'dismissed'];
+export const STATUS = ['planning', 'planned', 'active', 'blocked', 'done', 'dismissed'];
 
 /**
  * BACK-COMPAT READ ALIASES — legacy status spellings, accepted FOREVER on read (never a
- * validation error) and normalized to their canonical target. A thread file still carrying
- * `status: todo` / `status: plan` validates fine and is bucketed as `planned`. The CLI
- * normalizes these to canonical on write.
- *
- * NOTE (2026-07-01): `needs-decision` is NO LONGER an alias — it is CANONICAL again (the
- * human-decision bucket). A thread carrying `status: needs-decision` now validates + buckets as
- * itself. The reverse migration is manual: threads written `status: blocked` under the brief
- * 1.19.7 "blocked = awaiting-you" regime should be re-triaged (genuinely-awaiting-human →
- * `needs-decision`; waiting-on-a-PR/thread → keep `blocked`/`enqueued`).
+ * validation error) and normalized to their canonical target. `todo`/`plan` → `planned`;
+ * `enqueued`/`needs-decision` → `blocked` (both collapsed into the unified `blocked` + a
+ * mechanism field on 2026-07-01). A thread still carrying any of these validates fine and
+ * buckets as its canonical target; the CLI writes the canonical word.
  * @type {Readonly<Record<string,string>>}
  */
-export const STATUS_ALIASES = { todo: 'planned', plan: 'planned' };
+export const STATUS_ALIASES = { todo: 'planned', plan: 'planned', enqueued: 'blocked', 'needs-decision': 'blocked' };
 
 /**
  * The full set ACCEPTED by the validator: canonical statuses plus the read-aliases. Used
@@ -367,15 +352,54 @@ export const TERMINAL = ['done', 'dismissed'];
 export const PARKED = ['planned'];
 
 /**
- * The SURFACED (auto-nagged) subset of canonical {@link STATUS}: the genuinely
- * actionable/in-flight statuses the per-turn + stop hooks list by name — in PRIORITY order
- * `needs-decision` (awaiting you — first), `active`, `planning` (active design), `enqueued`,
- * `blocked` (non-human wait — last/de-emphasized). Everything else (`planned` + the terminals)
- * is excluded from the nag. Equals `STATUS − PARKED − TERMINAL`, kept explicit so the intent —
- * AND the surface order — is readable.
+ * The SURFACED (auto-nagged) subset of canonical {@link STATUS} — the actionable/in-flight
+ * statuses, in PRIORITY order. Note `blocked` is ONE word covering both the yellow (human) and
+ * gray (machine/timer) cases; the per-turn nag splits them by {@link blockMechanism}, surfacing
+ * HUMAN-blocked prominently (the ⚖ queue) and keeping machine/timer-blocked quiet until ready or
+ * due. Order here places `blocked` early because a HUMAN-blocked thread is top-priority; a
+ * machine-blocked one is de-emphasized by the mechanism logic, not by the word. Equals
+ * `STATUS − PARKED − TERMINAL`.
  * @type {readonly string[]}
  */
-export const SURFACED = ['needs-decision', 'active', 'planning', 'enqueued', 'blocked'];
+export const SURFACED = ['blocked', 'active', 'planning'];
+
+// ── the RESOLUTION MECHANISM of a `blocked` thread — the crux of the unified waiting model ──
+// A `blocked` thread carries EXACTLY ONE mechanism describing HOW it unblocks; the board derives
+// color / urgency / ordering / auto-fire from this, NOT from the status word. Precedence when
+// mis-configured with more than one machine field: timer > threads > human (and the validator
+// warns on the ambiguity). This is a PURE function of already-parsed booleans so both the board
+// and the hooks compute it identically.
+
+/**
+ * @typedef {'human'|'threads'|'timer'} BlockMechanism
+ */
+
+/**
+ * Derive a blocked thread's resolution mechanism from which fields are set.
+ *   - `timer`   — a (parseable) `revalidate_at` is present → re-poll on a timer. GRAY/dim.
+ *   - `threads` — `blocking_threads`/`depends_on` is non-empty → auto-fires when its thread
+ *                 deps go terminal (external gate entries park it). GRAY.
+ *   - `human`   — neither → only the maintainer can unblock it. YELLOW, the ⚖ awaiting-you queue.
+ * @param {{hasBlockingThreads?: boolean, hasTimer?: boolean}} f
+ * @returns {BlockMechanism}
+ */
+export function blockMechanism({ hasBlockingThreads, hasTimer }) {
+  if (hasTimer) return 'timer';
+  if (hasBlockingThreads) return 'threads';
+  return 'human';
+}
+
+/**
+ * Is a `blocked` thread a HUMAN-decision block (the ⚖ awaiting-you case)? True ⟺ its mechanism
+ * is `human` — no `blocking_threads`/`depends_on` and no `revalidate_at`. The single predicate
+ * the board / decisions / reminder / stop-hook / statusline share so "awaiting you" can never
+ * drift between them.
+ * @param {{hasBlockingThreads?: boolean, hasTimer?: boolean}} f
+ * @returns {boolean}
+ */
+export function isHumanBlocked(f) {
+  return blockMechanism(f) === 'human';
+}
 
 /**
  * @typedef {Object} FrayConfig
