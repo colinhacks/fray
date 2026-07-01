@@ -11,9 +11,9 @@
  *
  * Usage (the `fray` command is the bin/ shim that runs this script against the
  * project's `.fray/`, regardless of cwd or where the plugin is installed):
- *   fray               # print the LIVE board (planning/active/enqueued/blocked only; planned is hidden)
+ *   fray               # print the LIVE board (needs-decision/active/planning/enqueued/blocked; planned hidden)
  *   fray --all         # print all threads (every status)
- *   fray --status planned # print only threads in one status (legacy aliases todo/plan/needs-decision accepted)
+ *   fray --status planned # print only threads in one status (legacy aliases todo/plan accepted)
  *   fray reconcile     # stamp .fray/.last-reconcile = now (records a completed board reconcile)
  *   fray --validate    # print ONLY validation errors; exit 1 if any (for the hook / CI). --check is an alias.
  *   fray --json        # machine-readable {config, threads, errors} — ALWAYS complete, never filtered
@@ -487,9 +487,9 @@ for (const t of threads) {
 
   // status_text is a 1-2 sentence English status note (frontmatter); flag overlong ones —
   // anything past ~2 sentences belongs in the body, not the at-a-glance board field.
-  // EXEMPT blocked: its status_text IS the ⚖ awaiting-you queue entry (the concise blocker /
-  // open question), surfaced UNTRUNCATED on the board + reminder — never warn on or clip it.
-  if (t.status !== 'blocked' && t.status_text && t.status_text.length > 280) {
+  // EXEMPT needs-decision: its status_text IS the ⚖ awaiting-you queue entry (the concise
+  // decision needed), surfaced UNTRUNCATED on the board + reminder — never warn on or clip it.
+  if (t.status !== 'needs-decision' && t.status_text && t.status_text.length > 280) {
     t.warnings.push(`status_text is ${t.status_text.length} chars — keep it to 1-2 sentences; move detail into the body`);
   }
 
@@ -582,26 +582,33 @@ out.push(`fray board — autonomous_mode: ${cfg.autonomousMode ? 'on' : 'off'}${
 if (allErrors.length) out.push(`\n⚠ VALIDATION ERRORS:\n${allErrors.join('\n')}`);
 if (allWarnings.length) out.push(`\n⚠ DROP-RISK WARNINGS (advisory):\n${allWarnings.join('\n')}`);
 
-// ⚖ AWAITING YOU — the COMPUTED queue of every `blocked` thread (blocked = awaiting a HUMAN
-// DECISION only — `blocked` absorbs the old `needs-decision`; a non-human trigger wait is
-// `enqueued`, never here), surfaced by its
-// FULL status_text (the concise blocker / open question). HOISTED to the top of the board (not
-// buried mid-status-list) and rendered UNTRUNCATED — the terminal is wide and the question must
-// be fully readable. Nothing is stored: filtered live from the scanned threads, the same
+// ⚖ AWAITING YOU — the COMPUTED queue of every `needs-decision` thread (the ONLY human-decision
+// bucket — a non-human trigger wait is `enqueued`/`blocked`, never here), surfaced by its FULL
+// status_text (the concise decision needed). HOISTED to the top of the board (not buried
+// mid-status-list) and rendered UNTRUNCATED — the terminal is wide and the question must be
+// fully readable. Nothing is stored: filtered live from the scanned threads, the same
 // compute-don't-cache principle as the rest of the board. Shown in the live/default + `--all`
-// views and when `--status blocked` (or the legacy `needs-decision` alias) is requested;
-// suppressed for any OTHER single-status filter. `blocked` is rendered ONLY here — it is
-// skipped in the per-status group loop below to avoid duplication.
-if (!only || only === 'blocked') {
-  const pendingDecisions = threads.filter((t) => t.status === 'blocked');
+// views and when `--status needs-decision` is requested; suppressed for any OTHER single-status
+// filter. `needs-decision` is rendered ONLY here — it is skipped in the per-status group loop
+// below to avoid duplication.
+if (!only || only === 'needs-decision') {
+  const pendingDecisions = threads.filter((t) => t.status === 'needs-decision');
   if (pendingDecisions.length) {
-    out.push(`\n## ⚖ blocked (${pendingDecisions.length}) — awaiting your call`);
+    out.push(`\n## ⚖ needs-decision (${pendingDecisions.length}) — awaiting your call`);
     for (const t of pendingDecisions) renderThread(t, out);
   }
 }
 
-for (const s of showStatuses) {
-  if (s === 'blocked') continue; // rendered in the dedicated ⚖ awaiting-you section above
+// Per-status groups, in SURFACE-PRIORITY order (needs-decision hoisted above; then active,
+// planning, enqueued, and blocked LAST/de-emphasized) — not raw STATUS order — so the board
+// reads needs-decision → active → … → blocked top-to-bottom.
+const GROUP_ORDER = ['active', 'planning', 'enqueued', 'blocked', 'planned'];
+const orderedStatuses = [...showStatuses].sort((a, b) => {
+  const ia = GROUP_ORDER.indexOf(a); const ib = GROUP_ORDER.indexOf(b);
+  return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+});
+for (const s of orderedStatuses) {
+  if (s === 'needs-decision') continue; // rendered in the dedicated ⚖ awaiting-you section above
   const group = threads.filter((t) => t.status === s);
   if (!group.length) continue;
   out.push(`\n## ${s} (${group.length})`);

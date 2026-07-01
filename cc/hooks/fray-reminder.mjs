@@ -20,6 +20,7 @@ import {
   loadConfig,
   TERMINAL,
   PARKED,
+  SURFACED,
   normalizeStatus,
   isValidStatus,
   readLastReconcile,
@@ -170,7 +171,7 @@ try {
   /** @type {string[]} */
   const dropRisk = []; // `enqueued` threads whose depends_on are ALL terminal — they SHOULD have auto-fired and didn't. The canonical silent-stall shape; surfaced BY NAME so it can't be skipped by reflex.
   /** @type {{slug:string,status_text:string}[]} */
-  const decisions = []; // every `blocked` thread — the COMPUTED awaiting-you queue, surfaced each turn by its FULL status_text (the concise blocker / open question). Nothing stored; derived live from the scan. (`blocked` absorbs the old `needs-decision`.)
+  const decisions = []; // every `needs-decision` thread — the COMPUTED awaiting-you queue, surfaced each turn by its FULL status_text (the concise decision needed). Nothing stored; derived live from the scan. (As of 2026-07-01 this is `needs-decision`, NOT `blocked`; `blocked` is now a non-human wait and does NOT surface here.)
   /** @type {{slug:string,hint:string,lastChecked:string|null}[]} */
   const revalidateDue = []; // non-terminal threads whose `revalidate_at` is now ≤ now — the timer fired; re-poll the external state. Surfaced LOUDLY by name (the durable replacement for a live-polling watcher shell).
   for (const t of scanned) {
@@ -198,7 +199,7 @@ try {
         t.mtimeMs > 0 && now - t.mtimeMs > STALE_MIN * 60_000;
       pending.push(`${t.id}[${t.status ?? '?'}${age ? ', ' + age : ''}${isStale ? ' ⚠STALE' : ''}]`);
       if (/\bQUEUED\b/.test(t.src)) queued.push(t.id);
-      if (t.status === 'blocked') decisions.push({ slug: t.id, status_text: t.status_text });
+      if (t.status === 'needs-decision') decisions.push({ slug: t.id, status_text: t.status_text });
       // Drop-risk: enqueued WITH declared THREAD deps, ALL of which are terminal (the
       // auto-trigger fired but nothing dispatched it). A dep that is an unknown slug
       // is NOT terminal → not flagged (conservative; avoids crying wolf on a typo). A
@@ -213,11 +214,19 @@ try {
       }
     }
   }
+  // Order the pending list by SURFACE PRIORITY (needs-decision → active → planning → enqueued →
+  // blocked), so the per-turn nag reads the same top-priority-first order as the board.
+  const rankOf = (label) => {
+    const st = label.match(/\[([a-z][a-z-]*)/)?.[1] ?? '';
+    const i = SURFACED.indexOf(st);
+    return i === -1 ? 99 : i;
+  };
+  pending.sort((a, b) => rankOf(a) - rankOf(b));
   const status =
     `FRAY — ${pending.length} pending: ${pending.join(', ') || 'none'}. Advance or reconcile EACH this turn; if you went deep on ONE thread, don't let the others silently stall (run \`fray\` for detail). Each thread shows when its file was last edited; a \`⚠STALE\` marker = an active/enqueued thread untouched >${STALE_MIN}m (its agent likely rested mid-work or its status drifted from reality) — RE-READ that thread + verify it actually progressed (check its PR/agent) before trusting its text. Returns are a strict INBOX — drain the OLDEST first, ONE at a time, never batch; an empty/progress-only return is an INCOMPLETE handoff (record needs-retry + re-dispatch, do NOT mark done). When you fold a return: DRAIN that thread's queued follow-ups (\`## Steps\` items marked QUEUED — dispatch on <agent>'s return) + MOVE any answered Open question into Decisions (a DECIDED thing lives under ## Decisions, NEVER Open questions). done/dismissed threads are TERMINAL + KEPT — never delete them. ALWAYS STEER — DON'T RE-DISPATCH (TOP-PRIORITY RULE): SendMessage works on running AND completed sub-agents. To add context / redirect / fold scope into a file an agent owns, answer a question it raised, or RESUME an agent the instant a temporary blocker (a HOLD, a transient CI failure, a now-available input) clears — MESSAGE/RESUME that agent (by name or agentId). NEVER let an agent die and cold-redispatch a fresh replacement (loses its runbook + context), never spawn a clobbering sibling, never kill-and-respawn (orphans WIP). Only fall back to marking it\`enqueued\` (naming the agent it waits on) and dispatch the instant that agent returns; never spawn a clobbering sibling or kill-and-respawn.` +
     (queued.length ? `  ⚠ UN-DRAINED QUEUED FOLLOW-UPS in ${queued.length} thread(s): ${queued.join(', ')}. THE INSTANT any of their agents returns, RE-READ that thread .md (don't reconcile from memory) and DISPATCH the actionable QUEUED items as sub-agents THIS turn (a mandated self-review/integration pass IS one — dispatch it). Surface, never silently drop, the human-gated/post-launch ones. Skipping this is the #1 failure.` : '') +
     (dropRisk.length ? `  ⚠⚠ DROP-RISK THREADS in ${dropRisk.length} thread(s): ${dropRisk.join(', ')}. These are \`enqueued\` with ALL their \`depends_on\` now TERMINAL — their auto-trigger fired and they were NEVER dispatched (the exact silent-stall this guard exists to kill). RE-READ each thread .md THIS turn and DISPATCH/ADVANCE it — do NOT skip past this. If one is genuinely not ready, move it back to \`todo\` or fix its \`depends_on\`; leaving it \`enqueued\` with cleared deps is a bug.` : '') +
-    (decisions.length ? `  ⚖ ${decisions.length} BLOCKED — AWAITING YOUR CALL (computed from \`blocked\` threads — nothing stored): ${decisions.map((d) => `[${d.slug}] ${d.status_text || '(no write-up — add a one-line status_text)'}`).join('  ·  ')}. SURFACE these to the human (full context, numbered — see the skill) and do NOT silently sit on them; each awaits a human decision / answer / external event. On resolution, record the call in the thread's \`## Decisions\` body and flip status OUT of blocked.` : '') +
+    (decisions.length ? `  ⚖ ${decisions.length} NEEDS-DECISION — AWAITING YOUR CALL (computed from \`needs-decision\` threads — nothing stored): ${decisions.map((d) => `[${d.slug}] ${d.status_text || '(no write-up — add a one-line status_text)'}`).join('  ·  ')}. SURFACE these to the human FIRST (full context, numbered — see the skill) and do NOT silently sit on them; each awaits a human decision / answer. On resolution, record the call in the thread's \`## Decisions\` body and flip status OUT of needs-decision. (\`blocked\` threads are a NON-human wait — they do NOT appear here and are not for you to action.)` : '') +
     (revalidateDue.length ? `  ⏰ ${revalidateDue.length} REVALIDATE DUE — re-poll the external state NOW (CHANGED → act/unblock; UNCHANGED → bump \`revalidate_at\` forward 6–12h + stamp \`last_checked: <now>\`; re-arm until terminal): ${revalidateDue.map((r) => `⏰ REVALIDATE DUE: ${r.slug} — ${r.hint || 're-poll the external state'} (last checked ${r.lastChecked || 'never'})`).join('  ·  ')}.` : '') +
     (errors.length ? `  ⚠ VALIDATION ERRORS (fix now): ${errors.join('; ')}` : '');
 

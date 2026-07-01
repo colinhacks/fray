@@ -279,24 +279,41 @@ export function frayActive(projectDir, sessionId) {
  *   until due.
  * - `active` — building NOW; a live agent is on it. SURFACED. A just-decided, ready-to-run
  *   thread goes here when you dispatch it this turn.
- * - `blocked` — awaiting a HUMAN DECISION, and ONLY that: cannot proceed until the maintainer
- *   decides/answers/approves. SURFACED, and hoisted into the board's `⚖ awaiting you` queue by
- *   its status_text. A NON-human trigger wait (in-session dep, or an external party like an
- *   upstream PR/CI) is `enqueued`, NEVER `blocked`. (ABSORBS the old `needs-decision`.)
+ * - `needs-decision` — awaiting a HUMAN DECISION/ACTION, and ONLY that: cannot proceed until the
+ *   maintainer decides/answers/approves. THE top-priority, human-facing bucket — SURFACED FIRST,
+ *   hoisted into the board's `⚖ awaiting you` queue by its status_text, YELLOW on the status line,
+ *   and the ONLY thing the Stop hook pops. (REINTRODUCED 2026-07-01 — it is the human-decision
+ *   role that `blocked` briefly held under the 1.19.7 "blocked = decision-only" standardization,
+ *   now split back out so `blocked` can mean the non-human wait below.)
+ * - `blocked` — waiting on something that is NOT the human: a running fray thread, a pending
+ *   PR/CI, an external merge. It should NOT clamor for attention — GRAY on the status line,
+ *   de-emphasized on the board (rendered LAST among live groups), and EXCLUDED from the
+ *   `⚖ awaiting you` queue + the Stop-hook pop (there is nothing for the human to DO). It is the
+ *   general "waiting on non-human work" bucket; `enqueued` is its specialization that the board
+ *   can AUTO-FIRE (it carries a `depends_on`/`revalidate_at` trigger). Prefer `enqueued` when a
+ *   concrete trigger exists; use `blocked` for a coarse non-human wait with no board trigger.
+ *   (REDEFINED 2026-07-01 — it NO LONGER means "awaiting you"; that role moved to
+ *   `needs-decision`.)
  * - `done` / `dismissed` — TERMINAL (completed / decided-against): kept, never deleted,
  *   excluded from the active board's pending views.
  * @type {readonly string[]}
  */
-export const STATUS = ['planning', 'planned', 'enqueued', 'active', 'blocked', 'done', 'dismissed'];
+export const STATUS = ['planning', 'planned', 'enqueued', 'active', 'needs-decision', 'blocked', 'done', 'dismissed'];
 
 /**
  * BACK-COMPAT READ ALIASES — legacy status spellings, accepted FOREVER on read (never a
  * validation error) and normalized to their canonical target. A thread file still carrying
- * `status: todo` / `status: plan` / `status: needs-decision` validates fine and is bucketed
- * as its canonical equivalent. The CLI normalizes these to canonical on write.
+ * `status: todo` / `status: plan` validates fine and is bucketed as `planned`. The CLI
+ * normalizes these to canonical on write.
+ *
+ * NOTE (2026-07-01): `needs-decision` is NO LONGER an alias — it is CANONICAL again (the
+ * human-decision bucket). A thread carrying `status: needs-decision` now validates + buckets as
+ * itself. The reverse migration is manual: threads written `status: blocked` under the brief
+ * 1.19.7 "blocked = awaiting-you" regime should be re-triaged (genuinely-awaiting-human →
+ * `needs-decision`; waiting-on-a-PR/thread → keep `blocked`/`enqueued`).
  * @type {Readonly<Record<string,string>>}
  */
-export const STATUS_ALIASES = { todo: 'planned', plan: 'planned', 'needs-decision': 'blocked' };
+export const STATUS_ALIASES = { todo: 'planned', plan: 'planned' };
 
 /**
  * The full set ACCEPTED by the validator: canonical statuses plus the read-aliases. Used
@@ -351,13 +368,14 @@ export const PARKED = ['planned'];
 
 /**
  * The SURFACED (auto-nagged) subset of canonical {@link STATUS}: the genuinely
- * actionable/in-flight statuses the per-turn + stop hooks list by name —
- * `planning` (active design), `enqueued`, `active`, `blocked`. Everything else
- * (`planned` + the terminals) is excluded from the nag. Equals
- * `STATUS − PARKED − TERMINAL`, kept explicit so the intent is readable.
+ * actionable/in-flight statuses the per-turn + stop hooks list by name — in PRIORITY order
+ * `needs-decision` (awaiting you — first), `active`, `planning` (active design), `enqueued`,
+ * `blocked` (non-human wait — last/de-emphasized). Everything else (`planned` + the terminals)
+ * is excluded from the nag. Equals `STATUS − PARKED − TERMINAL`, kept explicit so the intent —
+ * AND the surface order — is readable.
  * @type {readonly string[]}
  */
-export const SURFACED = ['planning', 'enqueued', 'active', 'blocked'];
+export const SURFACED = ['needs-decision', 'active', 'planning', 'enqueued', 'blocked'];
 
 /**
  * @typedef {Object} FrayConfig

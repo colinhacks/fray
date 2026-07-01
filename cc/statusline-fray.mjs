@@ -5,10 +5,11 @@
 // honored in plugin-shipped settings, and a UserPromptSubmit hook's additionalContext is
 // MODEL-ONLY — never rendered in the TUI). This is the user-visible surface for the fray
 // board: a tasteful base line (dir · branch · model · context%) and, WHEN fray is active
-// for this session, the live board summary — the two states that actually matter:
-// ACTIVE (a live driver is on it now) and BLOCKED (waiting on a human / CI / external
-// state, reason in the thread's status_text). Everything else (planning/planned/terminal)
-// is intentionally not counted here — it is not an actionable live state.
+// for this session, the live board summary — the states that actually matter, in priority
+// order: NEEDS-DECISION (awaiting the human — YELLOW/prominent), ACTIVE (a live driver is on
+// it now — cyan), and BLOCKED (waiting on a NON-human thing: another thread, a PR/CI, an
+// external merge — GRAY/de-emphasized, deliberately quiet). Everything else
+// (planning/planned/enqueued/terminal) is intentionally not counted here.
 //
 // CANONICAL SOURCE: this file lives in the fray repo at `cc/statusline-fray.mjs`. It is
 // DEPLOYED (copied verbatim) to `~/.claude/statusline-fray.mjs`, the stable path the
@@ -29,6 +30,7 @@ import { join, basename } from 'node:path';
 const dim = (s) => `\x1b[2m${s}\x1b[0m`;
 const amber = (s) => `\x1b[33m${s}\x1b[0m`;
 const cyan = (s) => `\x1b[36m${s}\x1b[0m`;
+const gray = (s) => `\x1b[90m${s}\x1b[0m`; // de-emphasized (blocked = non-human wait, shouldn't grab the eye)
 const sep = dim('·');
 
 /**
@@ -55,14 +57,16 @@ function frayActive(projectDir, sessionId) {
 const TERMINAL = new Set(['done', 'dismissed']);
 
 /**
- * Scan `.fray/*.md` once and count only the two live states that matter:
- *   active  — a driver (agent or the merge-cascade) is on it right now.
- *   blocked — waiting on a human / CI / external state (reason in status_text).
- * Everything else (planning/planned/terminal/legacy) is deliberately not counted.
+ * Scan `.fray/*.md` once and count the three live states that matter:
+ *   needsDecision — awaiting the HUMAN (the ⚖ queue). YELLOW/prominent.
+ *   active        — a driver (agent or the merge-cascade) is on it right now.
+ *   blocked       — waiting on a NON-human thing (another thread, a PR/CI, an external merge).
+ * Everything else (planning/planned/enqueued/terminal) is deliberately not counted.
  * @param {string} projectDir
- * @returns {{ active: number, blocked: number }}
+ * @returns {{ needsDecision: number, active: number, blocked: number }}
  */
 function scanBoard(projectDir) {
+  let needsDecision = 0;
   let active = 0;
   let blocked = 0;
   for (const f of readdirSync(join(projectDir, '.fray'))) {
@@ -74,10 +78,11 @@ function scanBoard(projectDir) {
       continue;
     }
     if (!st || TERMINAL.has(st)) continue;
-    if (st === 'active') active++;
+    if (st === 'needs-decision') needsDecision++;
+    else if (st === 'active') active++;
     else if (st === 'blocked') blocked++;
   }
-  return { active, blocked };
+  return { needsDecision, active, blocked };
 }
 
 /**
@@ -114,12 +119,15 @@ try {
 
   let line = parts.join(` ${sep} `);
 
-  // ── fray segment (only when active for this session): "fray enabled · N active · N blocked" ──
+  // ── fray segment (only when active): "fray enabled · N needs-decision · N active · N blocked" ──
+  // Priority order + colors: needs-decision is YELLOW (grab the eye — the human must act); active
+  // is cyan; blocked is GRAY (de-emphasized — it's just waiting on other threads/PRs, not urgent).
   if (frayActive(projectDir, sessionId)) {
-    const { active, blocked } = scanBoard(projectDir);
+    const { needsDecision, active, blocked } = scanBoard(projectDir);
     const fray = [`${dim('fray')} enabled`]; // "enabled" non-dim (default fg) to signal fray is ON
+    fray.push(needsDecision > 0 ? amber(`${needsDecision} needs-decision`) : dim('0 needs-decision'));
     fray.push(active > 0 ? cyan(`${active} active`) : dim('0 active'));
-    fray.push(blocked > 0 ? amber(`${blocked} blocked`) : dim('0 blocked'));
+    fray.push(blocked > 0 ? gray(`${blocked} blocked`) : dim('0 blocked'));
     line += `   ${fray.join(` ${sep} `)}`;
   }
 

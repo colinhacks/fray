@@ -9,13 +9,13 @@
 // plugin is enabled). The project root is resolved from CLAUDE_PROJECT_DIR (exported to
 // bin/hook processes), matching how bin/fray + index.mjs find the project's .fray/.
 //
-// Enforced invariant: setting `status: blocked` REQUIRES a non-empty status_text (the
-// blocker / decision write-up) — supplied via --status-text or already present on the thread.
-// The ⚖ awaiting-you queue DERIVES from these status_text fields (see decisions.mjs), so a
-// blocked thread without a write-up would surface as an empty queue row. After every edit this
-// tool prints the FULL queue (collectDecisions) so a pending blocker is never silently buried.
-// Legacy status spellings (todo/plan/needs-decision) are ACCEPTED and normalized to canonical
-// on write (e.g. `--status needs-decision` writes `status: blocked`).
+// Enforced invariant: setting `status: needs-decision` REQUIRES a non-empty status_text (the
+// decision write-up) — supplied via --status-text or already present on the thread. The
+// ⚖ awaiting-you queue DERIVES from these status_text fields (see decisions.mjs), so a
+// needs-decision thread without a write-up would surface as an empty queue row. After every
+// edit this tool prints the FULL queue (collectDecisions) so a pending decision is never
+// silently buried. Legacy status spellings (todo/plan) are ACCEPTED and normalized to canonical
+// on write. (`blocked` = a non-human wait; it does NOT require a write-up.)
 import { readFileSync, writeFileSync, existsSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { collectDecisions } from './decisions.mjs';
@@ -162,12 +162,12 @@ function main() {
     die(`invalid status "${args.status}"; must be one of: ${ACCEPTED_STATUSES.join(' · ')}`);
   }
   const canonicalStatus = args.status !== undefined ? normalizeStatus(args.status) : undefined;
-  if (canonicalStatus === 'blocked') {
+  if (canonicalStatus === 'needs-decision') {
     const willHaveStatusText = args.status_text !== undefined
       ? isStatusTextNonEmpty(`"${args.status_text}"`) || args.status_text.trim().length > 0
       : isStatusTextNonEmpty(getStatusText(fm));
     if (!willHaveStatusText) {
-      die('status blocked REQUIRES a write-up of the blocker — pass --status-text "<text>" (or set it on the thread first)');
+      die('status needs-decision REQUIRES a write-up of the decision needed — pass --status-text "<text>" (or set it on the thread first)');
     }
   }
 
