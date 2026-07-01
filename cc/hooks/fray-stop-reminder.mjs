@@ -51,7 +51,7 @@ import { join } from 'node:path';
 import { frayActive } from '../scripts/fray/config.mjs';
 import { newBoundRestsSince } from '../scripts/fray/agent-bindings.mjs';
 import { threadExcerptsBlock, threadExcerpt } from '../scripts/fray/thread-excerpt.mjs';
-import { collectDecisions } from '../scripts/fray/decisions.mjs';
+import { humanDecisions } from '../scripts/fray/decisions.mjs';
 
 const PROJECT_DIR = process.env.CLAUDE_PROJECT_DIR || process.cwd();
 const FRAY_DIR = join(PROJECT_DIR, '.fray');
@@ -179,7 +179,7 @@ function threadTouchedSince(sinceMs) {
  */
 function nextBlockedBlock(projectDir, lastSurfaced) {
   try {
-    const q = collectDecisions(); // [{slug, status_text}] of every `blocked` thread
+    const q = humanDecisions(); // `blocked` threads awaiting the MAINTAINER (external-blocked excluded)
     if (!q.length) return { block: '', slug: null };
     const idx = lastSurfaced ? q.findIndex((d) => d.slug === lastSurfaced) : -1;
     // Rotate to the one AFTER last-surfaced (wraps); if last isn't in the queue, take the first.
