@@ -221,9 +221,10 @@ function nextStep(src) {
     process.exit(0);
   }
   // `fray reconcile` — RECORD a completed board reconcile by stamping `.fray/.last-reconcile`
-  // to now. The per-turn fray-reminder hook nags when this timestamp goes stale; a reconcile
-  // sub-agent (or a human) runs this AFTER re-grounding every non-terminal thread against the
-  // actual code/PRs, to reset the staleness clock. Pure timestamp write — no board scan needed.
+  // to now. The reconcile nudge (Stop-hook rest path + per-turn backstop) fires when a thread
+  // moved since this stamp (dirty-gate) or a long backstop elapses; a reconcile sub-agent (or a
+  // human) runs this AS ITS LAST STEP, AFTER re-grounding + editing every non-terminal thread —
+  // stamping last is REQUIRED, or its own edits leave the board dirty. Pure timestamp write.
   if (sub === 'reconcile') {
     const f = writeLastReconcile(PROJECT_DIR);
     console.log('fray: board reconcile recorded — staleness clock reset.');

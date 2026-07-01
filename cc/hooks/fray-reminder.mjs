@@ -24,8 +24,9 @@ import {
   normalizeStatus,
   isValidStatus,
   readLastReconcile,
-  reconcileThresholdMin,
-  isReconcileStale,
+  reconcileBackstopMin,
+  shouldNagReconcile,
+  reconcileStampLastInstruction,
   revalidateState,
   classifyDep,
   parseDeps,
@@ -235,21 +236,38 @@ try {
     /* fail-open — no stranded surfacing rather than risk the prompt */
   }
 
-  // ANTI-DRIFT RECONCILE FORCING-FUNCTION. The board is computed from per-thread frontmatter,
-  // so a thread whose status drifted from reality (a PR merged but the thread never flipped)
-  // is surfaced as live truth until something re-grounds it. We persist a last-complete-
-  // reconcile timestamp (`.fray/.last-reconcile`); when it goes stale, emit a LOUD instruction
-  // to spin up a reconcile sub-agent. FAST by design: only timestamp math here — the actual
-  // PR-liveness checking is the dispatched sub-agent's job, NEVER this every-turn hook (no
-  // network/gh calls). A missing timestamp counts as stale (instruct a first reconcile).
+  // ANTI-DRIFT RECONCILE FORCING-FUNCTION (per-turn BACKSTOP render). The PRIMARY, causal home
+  // for the reconcile nudge is the Stop-hook rest path (fray-stop-reminder.mjs): a sub-agent
+  // coming to REST is the event that actually moves board truth (it edited threads / a PR moved),
+  // so the nudge fires THERE, in the orchestrator's own context, exactly when the board most
+  // likely drifted. (A SubagentStop hook can't do it — its additionalContext continues the
+  // SUB-AGENT's turn, the wrong surface.) This per-turn render is the SECOND line of defense: it
+  // catches drift the rest path can't — EXTERNAL drift (a PR merged / CI flipped with no thread
+  // edit and thus no rest to key off) and the FIRST-reconcile baseline — plus any thread the
+  // orchestrator edited itself without a dispatched agent. TWO-TRIGGER gate (shouldNagReconcile):
+  // (1) DIRTY — a NON-TERMINAL thread's mtime is NEWER than the last reconcile; (2) BACKSTOP — a
+  // long wall-clock fallback for file-invisible external drift. Silent when clean — no cry-wolf.
+  // FAST by design: only mtime/timestamp math (no network/gh). The per-thread mtimes were already
+  // stat'd into `scanned`; take the newest among non-terminal.
   let reconcileBlock = '';
   try {
     const lastMs = readLastReconcile(dir);
-    const thresholdMin = reconcileThresholdMin(cfg);
-    if (isReconcileStale(lastMs, thresholdMin)) {
+    const backstopMin = reconcileBackstopMin(cfg);
+    const nonTerminalMtimes = scanned
+      .filter((t) => !TERMINAL.includes(t.status ?? '') && t.mtimeMs > 0)
+      .map((t) => t.mtimeMs);
+    const newestNonTerminalMtimeMs = nonTerminalMtimes.length ? Math.max(...nonTerminalMtimes) : null;
+    const { nag, reason } = shouldNagReconcile({ newestNonTerminalMtimeMs, lastReconcileMs: lastMs, backstopMin });
+    if (nag) {
       const ago = lastMs == null ? 'never recorded' : `${Math.round((Date.now() - lastMs) / 60_000)}m ago`;
-      reconcileBlock =
-        `⚠ BOARD RECONCILE STALE (${ago}) — the board may not reflect reality (a thread's status can drift from the actual code/PRs). Spin up a reconcile sub-agent NOW: re-ground EVERY non-terminal thread against ground truth (PR merged? symbol exists? work shipped?), flip drifted statuses to match, then record the reconcile by running \`fray reconcile\` (stamps \`.fray/.last-reconcile\`). Do this before trusting the pending list below.\n\n`;
+      // Reason-aware framing so the orchestrator knows WHY it fired (and thus what to re-check).
+      const why =
+        reason === 'dirty'
+          ? `a NON-TERMINAL thread changed since the last reconcile (${ago}) — its status may no longer match reality; re-ground it`
+          : reason === 'backstop'
+            ? `${ago} since the last reconcile — external state (PRs merging / CI flipping) may have drifted WITHOUT any thread edit; re-ground the board`
+            : `no reconcile on record yet (${ago}) — establish the baseline`;
+      reconcileBlock = `⚠ BOARD RECONCILE STALE — ${why}. ${reconcileStampLastInstruction()} Do this before trusting the pending list below.\n\n`;
     }
   } catch {
     /* fail-open — skip the reconcile nag rather than risk the prompt */

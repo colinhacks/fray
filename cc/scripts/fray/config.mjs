@@ -517,25 +517,42 @@ export function loadConfig(projectDir) {
 // truth until SOMETHING re-grounds it. "Reconcile" historically only meant "fold agent
 // returns" — nothing forced a periodic re-grounding of the whole board against the actual
 // code/PRs. This forcing-function fixes that: a LAST-COMPLETE-RECONCILE timestamp persists
-// in `.fray/.last-reconcile` (gitignored runtime, like the rest of `.fray`); when it goes
-// stale the per-turn hook emits a LOUD instruction to spin up a reconcile sub-agent. The
-// hook does only timestamp math — the actual PR-liveness checking belongs to the dispatched
-// reconcile sub-agent, NOT the every-turn hook.
+// in `.fray/.last-reconcile` (gitignored runtime, like the rest of `.fray`); the per-turn
+// hook decides whether to nag via a TWO-TRIGGER gate (see shouldNagReconcile) and, when hot,
+// emits a LOUD instruction to spin up a reconcile sub-agent. The hook does only mtime/timestamp
+// math — the actual PR-liveness checking belongs to the dispatched reconcile sub-agent, NEVER
+// this every-turn hook.
+//
+// WHY TWO TRIGGERS (2026-07-01, replacing the pure elapsed-time gate). The old gate was pure
+// wall-clock (`now − last_reconcile > threshold`); it fired every turn once the clock ran out
+// EVEN WHEN NOTHING CHANGED, so the orchestrator tuned it out. The new gate fires only when
+// there is a real reason to re-ground:
+//   (1) DIRTY-GATE (primary, precise): the newest mtime among NON-TERMINAL threads is NEWER
+//       than the last reconcile → a thread moved since we last re-grounded, so re-ground it.
+//       Silent when nothing moved. This is the no-cry-wolf trigger.
+//   (2) EXTERNAL-DRIFT BACKSTOP (secondary): a LONG wall-clock backstop that exists purely to
+//       catch drift the dirty-gate structurally CANNOT see — a PR merging or CI flipping with
+//       NO thread edit (touches no file → bumps no mtime). Long by design so it never becomes
+//       the every-turn nag the dirty-gate replaced.
 
-/** Default staleness threshold (minutes) before the per-turn hook nags for a reconcile. */
-export const DEFAULT_RECONCILE_THRESHOLD_MIN = 15;
+/** Default EXTERNAL-DRIFT BACKSTOP (minutes): the long wall-clock fallback that catches drift
+ *  producing NO thread-file change (a PR merge, a CI flip). Long on purpose — the precise,
+ *  every-change trigger is the dirty-gate; this only backstops the file-invisible cases. */
+export const DEFAULT_RECONCILE_BACKSTOP_MIN = 120;
 
 /**
- * Resolve the reconcile-staleness threshold (minutes) from the parsed config's `state:`
- * block (`reconcile_threshold_min`), falling back to {@link DEFAULT_RECONCILE_THRESHOLD_MIN}.
- * A non-positive / unparseable value falls back too.
+ * Resolve the external-drift BACKSTOP (minutes) from the parsed config's `state:` block
+ * (`reconcile_threshold_min`), falling back to {@link DEFAULT_RECONCILE_BACKSTOP_MIN}. A
+ * non-positive / unparseable value falls back too. (The config KEY keeps its historical name
+ * `reconcile_threshold_min` — it now tunes the backstop half of the gate; the dirty-gate is a
+ * strict mtime comparison and is NOT time-configurable.)
  * @param {FrayConfig} cfg
  * @returns {number}
  */
-export function reconcileThresholdMin(cfg) {
+export function reconcileBackstopMin(cfg) {
   const raw = cfg?.state?.reconcile_threshold_min;
   const n = parseInt(String(raw ?? ''), 10);
-  return Number.isFinite(n) && n > 0 ? n : DEFAULT_RECONCILE_THRESHOLD_MIN;
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_RECONCILE_BACKSTOP_MIN;
 }
 
 /**
@@ -586,16 +603,45 @@ export function writeLastReconcile(projectDir, ts = Date.now()) {
 }
 
 /**
- * Is the board reconcile STALE? Pure timestamp math (no I/O) so it is trivially testable.
- * A missing timestamp (`lastMs == null`) counts as stale — instruct a FIRST reconcile.
- * @param {number|null} lastMs   the persisted last-reconcile epoch-ms (or null when absent)
- * @param {number} thresholdMin  staleness threshold in minutes
- * @param {number} [now]
- * @returns {boolean}
+ * @typedef {'first'|'dirty'|'backstop'|null} ReconcileNagReason
  */
-export function isReconcileStale(lastMs, thresholdMin, now = Date.now()) {
-  if (lastMs == null) return true;
-  return now - lastMs > thresholdMin * 60_000;
+
+/**
+ * THE RECONCILE-NAG GATE — pure (no I/O) so it is trivially testable. Decides whether the
+ * per-turn hook should nag for a reconcile, and WHY, via the two-trigger model above. Fires
+ * (nag=true) when ANY of:
+ *   - `first`    — no last-reconcile stamp (`lastReconcileMs == null`) → instruct a FIRST reconcile.
+ *   - `dirty`    — the newest NON-TERMINAL thread mtime is NEWER than the last reconcile → a
+ *                  thread moved since we re-grounded (the precise, no-cry-wolf trigger).
+ *   - `backstop` — `now − lastReconcile > backstopMin` → long wall-clock fallback for external
+ *                  drift (PR/CI) that changed no file. Checked only when NOT already dirty.
+ * Otherwise `{ nag: false, reason: null }` — SILENT when the board is clean, which is the point.
+ * A missing `newestNonTerminalMtimeMs` (null — no non-terminal threads, or none stat-able) simply
+ * can't trip the dirty-gate; `first`/`backstop` still apply.
+ * @param {{newestNonTerminalMtimeMs: number|null, lastReconcileMs: number|null, backstopMin: number, now?: number}} f
+ * @returns {{nag: boolean, reason: ReconcileNagReason}}
+ */
+export function shouldNagReconcile({ newestNonTerminalMtimeMs, lastReconcileMs, backstopMin, now = Date.now() }) {
+  if (lastReconcileMs == null) return { nag: true, reason: 'first' };
+  if (newestNonTerminalMtimeMs != null && newestNonTerminalMtimeMs > lastReconcileMs) {
+    return { nag: true, reason: 'dirty' };
+  }
+  if (now - lastReconcileMs > backstopMin * 60_000) return { nag: true, reason: 'backstop' };
+  return { nag: false, reason: null };
+}
+
+/**
+ * The STAMP-LAST instruction — shared by every surface that nudges a reconcile (the
+ * UserPromptSubmit backstop AND the Stop-hook rest path) so the ordering rule never drifts
+ * between them. The reconcile agent EDITS threads (flips drifted statuses), which bumps their
+ * mtime; if it stamped `.fray/.last-reconcile` BEFORE those edits, its own edits would leave
+ * the board dirty forever (the dirty-gate would re-fire next turn). So `fray reconcile` (the
+ * stamp) MUST be its LAST action, after every thread edit. Reconcile is a JUDGMENT task →
+ * dispatch at Opus, high effort.
+ * @returns {string}
+ */
+export function reconcileStampLastInstruction() {
+  return `AUTO-DISPATCH a BACKGROUND reconcile sub-agent (reflexively — don't deliberate; reconcile is a JUDGMENT task → Opus, high effort): re-ground EVERY non-terminal thread against ground truth (PR merged? symbol exists? work shipped?), flip drifted statuses to match, then — as its LAST step, AFTER every thread edit — run \`fray reconcile\` to stamp \`.fray/.last-reconcile\`. Stamping LAST is REQUIRED: the agent's own edits bump thread mtimes, so stamping before them leaves the board dirty forever.`;
 }
 
 // ── REVALIDATE — time-based recheck for threads waiting on EXTERNAL state ──────────

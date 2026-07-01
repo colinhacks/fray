@@ -28,9 +28,9 @@ import {
   isValidStatus,
   readLastReconcile,
   writeLastReconcile,
-  isReconcileStale,
-  reconcileThresholdMin,
-  DEFAULT_RECONCILE_THRESHOLD_MIN,
+  shouldNagReconcile,
+  reconcileBackstopMin,
+  DEFAULT_RECONCILE_BACKSTOP_MIN,
 } from './config.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -64,19 +64,56 @@ test('isValidStatus accepts canonical + aliases, rejects everything else', () =>
   assert.ok(!isValidStatus(undefined));
 });
 
-// ── reconcile forcing-function — pure functions + round-trip ──────────────────────
-test('isReconcileStale: null is stale (first reconcile), then threshold math', () => {
+// ── reconcile forcing-function — two-trigger gate + round-trip ────────────────────
+test('shouldNagReconcile: missing stamp → first reconcile', () => {
   const now = 1_000_000_000_000;
-  assert.equal(isReconcileStale(null, 15, now), true, 'no timestamp → treat as stale');
-  assert.equal(isReconcileStale(now - 14 * 60_000, 15, now), false, 'within threshold → fresh');
-  assert.equal(isReconcileStale(now - 16 * 60_000, 15, now), true, 'past threshold → stale');
+  const r = shouldNagReconcile({ newestNonTerminalMtimeMs: now - 5 * 60_000, lastReconcileMs: null, backstopMin: 120, now });
+  assert.deepEqual(r, { nag: true, reason: 'first' });
 });
 
-test('reconcileThresholdMin: default, config override, and bad values fall back', () => {
-  assert.equal(reconcileThresholdMin({ state: {} }), DEFAULT_RECONCILE_THRESHOLD_MIN);
-  assert.equal(reconcileThresholdMin({ state: { reconcile_threshold_min: '30' } }), 30);
-  assert.equal(reconcileThresholdMin({ state: { reconcile_threshold_min: 'nope' } }), DEFAULT_RECONCILE_THRESHOLD_MIN);
-  assert.equal(reconcileThresholdMin({ state: { reconcile_threshold_min: '0' } }), DEFAULT_RECONCILE_THRESHOLD_MIN, 'non-positive falls back');
+test('shouldNagReconcile: dirty-gate fires when a thread moved AFTER the last reconcile', () => {
+  const now = 1_000_000_000_000;
+  const last = now - 30 * 60_000;
+  // A non-terminal thread edited AFTER the stamp (well inside the backstop) → dirty, not backstop.
+  const r = shouldNagReconcile({ newestNonTerminalMtimeMs: last + 60_000, lastReconcileMs: last, backstopMin: 120, now });
+  assert.deepEqual(r, { nag: true, reason: 'dirty' });
+});
+
+test('shouldNagReconcile: clean board is SILENT (newest thread predates the reconcile, within backstop)', () => {
+  const now = 1_000_000_000_000;
+  const last = now - 30 * 60_000;
+  // Newest non-terminal edit was BEFORE the reconcile, and we're inside the backstop → no nag.
+  const r = shouldNagReconcile({ newestNonTerminalMtimeMs: last - 60_000, lastReconcileMs: last, backstopMin: 120, now });
+  assert.deepEqual(r, { nag: false, reason: null });
+});
+
+test('shouldNagReconcile: backstop fires on long elapsed even with NO thread change', () => {
+  const now = 1_000_000_000_000;
+  const last = now - 121 * 60_000; // past the 120m backstop
+  // Nothing moved (newest edit predates the reconcile), but the long backstop catches file-invisible drift.
+  const r = shouldNagReconcile({ newestNonTerminalMtimeMs: last - 5 * 60_000, lastReconcileMs: last, backstopMin: 120, now });
+  assert.deepEqual(r, { nag: true, reason: 'backstop' });
+});
+
+test('shouldNagReconcile: null newest-mtime (no non-terminal threads) can only trip first/backstop', () => {
+  const now = 1_000_000_000_000;
+  assert.deepEqual(
+    shouldNagReconcile({ newestNonTerminalMtimeMs: null, lastReconcileMs: now - 30 * 60_000, backstopMin: 120, now }),
+    { nag: false, reason: null },
+    'no threads to be dirty + within backstop → silent',
+  );
+  assert.deepEqual(
+    shouldNagReconcile({ newestNonTerminalMtimeMs: null, lastReconcileMs: now - 121 * 60_000, backstopMin: 120, now }),
+    { nag: true, reason: 'backstop' },
+    'no threads to be dirty but past backstop → backstop fires',
+  );
+});
+
+test('reconcileBackstopMin: default, config override, and bad values fall back', () => {
+  assert.equal(reconcileBackstopMin({ state: {} }), DEFAULT_RECONCILE_BACKSTOP_MIN);
+  assert.equal(reconcileBackstopMin({ state: { reconcile_threshold_min: '240' } }), 240);
+  assert.equal(reconcileBackstopMin({ state: { reconcile_threshold_min: 'nope' } }), DEFAULT_RECONCILE_BACKSTOP_MIN);
+  assert.equal(reconcileBackstopMin({ state: { reconcile_threshold_min: '0' } }), DEFAULT_RECONCILE_BACKSTOP_MIN, 'non-positive falls back');
 });
 
 test('writeLastReconcile/readLastReconcile round-trip; absent reads null', () => {
@@ -175,23 +212,31 @@ function runReminder(dir, sessionId) {
   return JSON.parse(raw).hookSpecificOutput?.additionalContext ?? '';
 }
 
-test('fray-reminder: a stale (and missing) last-reconcile triggers the instruction; a fresh one does not', () => {
+test('fray-reminder: the two-trigger reconcile gate — first / dirty / backstop fire; a clean board is silent', () => {
   const dir = mkdtempSync(join(tmpdir(), 'fray-hook-'));
   const sess = 'sess-recon';
+  const thread = join(dir, '.fray', 't.md');
+  const writeThread = () =>
+    writeFileSync(thread, 'title: t\nstatus: active\n\n## Status\nworking\n');
   try {
     mkdirSync(join(dir, '.fray', '.session-state'), { recursive: true });
     writeFileSync(join(dir, '.fray', '.session-state', sess), 'on\n'); // activate this session
+    writeThread(); // one non-terminal (active) thread on the board
 
-    // No timestamp yet → treated as stale → instruction present.
+    // No timestamp yet → FIRST reconcile → instruction present.
     assert.match(runReminder(dir, sess), /BOARD RECONCILE STALE/, 'missing timestamp → instruct a first reconcile');
 
-    // Stale timestamp (60m ago, default 15m threshold) → instruction present.
-    writeLastReconcile(dir, Date.now() - 60 * 60_000);
-    assert.match(runReminder(dir, sess), /BOARD RECONCILE STALE/, 'past threshold → stale instruction');
-
-    // Fresh timestamp (now) → instruction absent.
+    // Reconcile stamped AFTER the thread's last edit → clean board, within backstop → SILENT.
     writeLastReconcile(dir, Date.now());
-    assert.doesNotMatch(runReminder(dir, sess), /BOARD RECONCILE STALE/, 'within threshold → no instruction');
+    assert.doesNotMatch(runReminder(dir, sess), /BOARD RECONCILE STALE/, 'clean board within backstop → no instruction');
+
+    // A non-terminal thread edited AFTER the reconcile stamp → DIRTY → instruction present.
+    writeThread(); // bumps the thread's mtime past the stamp
+    assert.match(runReminder(dir, sess), /BOARD RECONCILE STALE/, 'thread moved since reconcile → dirty-gate fires');
+
+    // Nothing dirty (re-stamp), but past the 120m backstop → BACKSTOP → instruction present.
+    writeLastReconcile(dir, Date.now() - 121 * 60_000);
+    assert.match(runReminder(dir, sess), /BOARD RECONCILE STALE/, 'long elapsed with no thread change → backstop fires');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

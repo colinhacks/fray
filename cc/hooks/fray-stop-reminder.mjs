@@ -51,7 +51,7 @@
 
 import { readFileSync, writeFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { frayActive } from '../scripts/fray/config.mjs';
+import { frayActive, reconcileStampLastInstruction } from '../scripts/fray/config.mjs';
 import { newBoundRestsSince } from '../scripts/fray/agent-bindings.mjs';
 import { threadExcerptsBlock, threadExcerpt } from '../scripts/fray/thread-excerpt.mjs';
 import { collectDecisions } from '../scripts/fray/decisions.mjs';
@@ -206,7 +206,10 @@ function nextDecisionBlock(projectDir, lastSurfaced) {
 // an alarming block. The hook only needs to POINT at the work; the skill carries the how.
 function restReminder(n, threads = []) {
   const where = threads.length ? ` (thread(s): ${threads.join(', ')})` : '';
-  return `fray: ${n} new sub-agent rest(s) since you last reconciled${where} — reconcile each (oldest first, re-read its thread, drain its queue, verify it actually landed). THEN, if any thread NEEDS A DECISION from the human, POP THE SINGLE next one, re-read it so you fully understand it, and present THAT ONE decision with full context + your rec — one at a time, never a whole-list dump. (\`blocked\` threads are a non-human wait — nothing for the human to action.)`;
+  // A rest is the CAUSAL event that moves board truth (the agent edited threads / a PR moved), so
+  // this is the primary home for the reconcile forcing-function: after folding the rest, RE-GROUND
+  // the board and stamp it LAST (so the reconcile agent's own edits don't leave the board dirty).
+  return `fray: ${n} new sub-agent rest(s) since you last reconciled${where} — reconcile each (oldest first, re-read its thread, drain its queue, verify it actually landed). ${reconcileStampLastInstruction()} THEN, if any thread NEEDS A DECISION from the human, POP THE SINGLE next one, re-read it so you fully understand it, and present THAT ONE decision with full context + your rec — one at a time, never a whole-list dump. (\`blocked\` threads are a non-human wait — nothing for the human to action.)`;
 }
 
 const CLEANUP_REMINDER =
