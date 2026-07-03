@@ -129,15 +129,29 @@ function readState() {
       last_rest_surfaced: s.last_rest_surfaced || 0,
       surfaced_agents: Array.isArray(s.surfaced_agents) ? s.surfaced_agents : [],
       last_surfaced_blocked: typeof s.last_surfaced_blocked === 'string' ? s.last_surfaced_blocked : '',
-      last_blocked_surfaced: s.last_blocked_surfaced || 0,
+      // Per-thread dedup: slug -> { mtime, at }. A thread is only worth re-popping once its
+      // FILE has actually changed (mtime moved) since it was last shown — not on a timer.
+      // Replaces the old single-scalar last_blocked_surfaced/POP_COOLDOWN time gate, which
+      // couldn't tell "nothing changed" from "cooldown hasn't expired yet" and (via the rest
+      // path, which bypassed it entirely) re-popped an unchanged thread on every sub-agent rest.
+      surfaced_blocked: s.surfaced_blocked && typeof s.surfaced_blocked === 'object' ? s.surfaced_blocked : {},
     };
   } catch {
-    return { last_fired: 0, last_rest_surfaced: 0, surfaced_agents: [], last_surfaced_blocked: '', last_blocked_surfaced: 0 };
+    return { last_fired: 0, last_rest_surfaced: 0, surfaced_agents: [], last_surfaced_blocked: '', surfaced_blocked: {} };
   }
+}
+
+/** Cap a { slug: {mtime, at} } map to its N most-recently-surfaced entries (unbounded-growth guard, same intent as surfaced_agents.slice(-200)). */
+function capSurfacedBlocked(map, limit = 200) {
+  const entries = Object.entries(map);
+  if (entries.length <= limit) return map;
+  entries.sort((a, b) => (b[1]?.at || 0) - (a[1]?.at || 0));
+  return Object.fromEntries(entries.slice(0, limit));
 }
 
 function writeState(patch) {
   try {
+    if (patch.surfaced_blocked) patch = { ...patch, surfaced_blocked: capSurfacedBlocked(patch.surfaced_blocked) };
     const cur = readState();
     writeFileSync(STATE_FILE, JSON.stringify({ ...cur, ...patch }) + '\n');
   } catch {
@@ -166,37 +180,61 @@ function threadTouchedSince(sinceMs) {
   return false;
 }
 
+/** Current mtime (ms) of a thread's `.fray/<slug>.md`, or 0 if unreadable. */
+function threadMtime(projectDir, slug) {
+  try {
+    return statSync(join(projectDir, '.fray', `${slug}.md`)).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
 /**
- * POP-ONE surfacing: pick the single next human-blocked thread and return its CONTENTS
- * inline, so the orchestrator can present that ONE decision to the human WITHOUT a Read tool
- * call. This is the pop-one-at-a-time rhythm the nudges instruct — with the thread text
- * actually in the orchestrator's context, matching the rest path's threadExcerptsBlock.
+ * POP-ONE surfacing: pick the single next human-blocked thread WORTH SHOWING and return its
+ * CONTENTS inline, so the orchestrator can present that ONE decision to the human WITHOUT a
+ * Read tool call. This is the pop-one-at-a-time rhythm the nudges instruct — with the thread
+ * text actually in the orchestrator's context, matching the rest path's threadExcerptsBlock.
  *
- * "Next" cycles the queue: prefer a human-blocked thread OTHER than the one surfaced last fire
- * (so across successive stops the human sees them one-at-a-time rather than the same one
- * repeatedly); fall back to the first when there's only one or the last isn't found. Returns
- * { block, slug } — block is '' and slug null on an EMPTY queue (no human-blocked threads →
- * nothing to pop, and `blocked` threads are deliberately never popped) or any error (fail-open).
+ * "Worth showing" is FILE-CHANGE gated, not time gated: a thread is skipped if its `.md` file's
+ * mtime is IDENTICAL to the mtime recorded the last time it was surfaced (nothing changed since
+ * the human last saw it presented in full — re-showing it is pure noise, regardless of how much
+ * wall-clock time has passed or how many unrelated sub-agent rests fired in between). Among the
+ * threads that ARE worth showing (never-surfaced, or changed since last surfaced), cycle away
+ * from whichever was surfaced most recently so repeats present a *different* one first.
+ *
+ * Returns { block, slug, mtime } — block is '' and slug null when there is nothing worth
+ * surfacing (empty queue, or every candidate is an unchanged repeat) or on any error (fail-open).
+ * `mtime` is the picked thread's current mtime, for the caller to persist into `surfaced_blocked`.
  * @param {string} projectDir
  * @param {string} lastSurfaced
- * @returns {{ block: string, slug: string|null }}
+ * @param {Record<string, {mtime:number, at:number}>} surfacedBlocked
+ * @returns {{ block: string, slug: string|null, mtime: number }}
  */
-function nextDecisionBlock(projectDir, lastSurfaced) {
+function nextDecisionBlock(projectDir, lastSurfaced, surfacedBlocked) {
   try {
     const q = collectDecisions(); // human-blocked threads = threads awaiting the MAINTAINER's decision
-    if (!q.length) return { block: '', slug: null };
-    const idx = lastSurfaced ? q.findIndex((d) => d.slug === lastSurfaced) : -1;
-    // Rotate to the one AFTER last-surfaced (wraps); if last isn't in the queue, take the first.
-    const pick = q[idx === -1 ? 0 : (idx + 1) % q.length];
+    if (!q.length) return { block: '', slug: null, mtime: 0 };
+
+    const withMtime = q.map((d) => ({ ...d, mtime: threadMtime(projectDir, d.slug) }));
+    const worthShowing = withMtime.filter((d) => {
+      const prior = surfacedBlocked[d.slug];
+      return !prior || prior.mtime !== d.mtime; // never shown, or the file changed since
+    });
+    if (!worthShowing.length) return { block: '', slug: null, mtime: 0 };
+
+    const idx = lastSurfaced ? worthShowing.findIndex((d) => d.slug === lastSurfaced) : -1;
+    // Rotate to the one AFTER last-surfaced among the worth-showing set (wraps); if last isn't
+    // in that set (already shown+unchanged, or never surfaced), take the first worth-showing one.
+    const pick = worthShowing[idx === -1 ? 0 : (idx + 1) % worthShowing.length];
     const ex = threadExcerpt(projectDir, pick.slug);
-    if (!ex) return { block: '', slug: pick.slug };
+    if (!ex) return { block: '', slug: pick.slug, mtime: pick.mtime };
     const n = q.length;
     const others = q.filter((d) => d.slug !== pick.slug).map((d) => d.slug);
     const queueLine = others.length ? ` The other ${others.length} stay queued (not now): ${others.join(', ')}.` : '';
     const header = `\n\nfray ⚖ next human-blocked thread — POP THIS ONE (${n} awaiting you; presenting 1).${queueLine}\nThread file: .fray/${pick.slug}.md — record the human's call in its ## Decisions and resolve it once answered (add a mechanism field, or → active/done). Contents:\n`;
-    return { block: header + ex, slug: pick.slug };
+    return { block: header + ex, slug: pick.slug, mtime: pick.mtime };
   } catch {
-    return { block: '', slug: null };
+    return { block: '', slug: null, mtime: 0 };
   }
 }
 
@@ -253,7 +291,7 @@ async function main() {
   if (payload.stop_hook_active === true) return allow();
 
   const now = Date.now();
-  const { last_fired, last_rest_surfaced, surfaced_agents, last_surfaced_blocked, last_blocked_surfaced } = readState();
+  const { last_fired, last_rest_surfaced, surfaced_agents, last_surfaced_blocked, surfaced_blocked } = readState();
 
   // (C) AGENT-LIVENESS lines — idle/frozen/unreaped dispatched sub-agents. Computed
   // once, fail-open ([] on any error). Appended to whichever reminder fires below,
@@ -301,29 +339,33 @@ async function main() {
     // re-reading each file by hand. Capped + fail-open: '' when nothing is readable, so the
     // bare rest pointer (which still names the threads) is the floor.
     const threadContents = threadExcerptsBlock(PROJECT_DIR, newRestThreads);
-    // After reconciling the rest, also pop the next blocked thread's contents inline (the
-    // rest reminder tells the orchestrator to do this; hand it the text so it needn't Read).
-    const nb = nextDecisionBlock(PROJECT_DIR, last_surfaced_blocked);
-    writeState({ last_rest_surfaced: now, last_fired: now, surfaced_agents: merged, ...(nb.slug ? { last_surfaced_blocked: nb.slug, last_blocked_surfaced: now } : {}) });
+    // After reconciling the rest, also pop the next blocked thread's contents inline — but ONLY
+    // if something's actually worth showing (mtime-gated: see nextDecisionBlock). A rest event
+    // firing constantly (many sub-agents resting in a row) must NOT force a stale, unchanged
+    // decision back in front of the human just because a rest happened to coincide with it.
+    const nb = nextDecisionBlock(PROJECT_DIR, last_surfaced_blocked, surfaced_blocked);
+    writeState({
+      last_rest_surfaced: now,
+      last_fired: now,
+      surfaced_agents: merged,
+      ...(nb.slug ? { last_surfaced_blocked: nb.slug, surfaced_blocked: { ...surfaced_blocked, [nb.slug]: { mtime: nb.mtime, at: now } } } : {}),
+    });
     return block(restReminder(newRests, newRestThreads) + threadContents + nb.block + livenessBlock + liveAgentsNote, USER_NOTE);
   }
 
-  // (B0) POP-ONE NEEDS-DECISION — surface the next pending human DECISION, STRICTLY rate-limited.
-  // THE STORM FIX (1.19.4): the prior gate fired whenever the surfaced slug DIFFERED from last
-  // time — but nextDecisionBlock deliberately ROTATES to a different slug each fire, so with ≥2
-  // human-blocked threads `isDifferent` was ALWAYS true and this blocked EVERY idle, cycling the
-  // whole queue endlessly (the "unnecessary number of stop hooks" the user hit). Now gated on a
-  // single hard cooldown: at most ONE decision surface per POP_COOLDOWN, still rotating
-  // one-per-fire through the queue. SUPPRESSED entirely in autonomous mode — a self-driving
-  // orchestrator sets its own decision cadence and must not be nagged for human input each idle.
+  // (B0) POP-ONE NEEDS-DECISION — surface the next pending human DECISION worth showing.
+  // Gated purely on FILE CHANGE (nextDecisionBlock's mtime dedup), not a wall-clock cooldown:
+  // the old POP_COOLDOWN_MS (≥20 min between surfaces) was a workaround for not being able to
+  // tell "nothing changed" from "hasn't been long enough yet" — it still re-surfaced an unchanged
+  // thread once the timer lapsed, and (via the rest path above) could be bypassed entirely. Now:
+  // a thread surfaces at most once per state of its file, however many stops occur in between.
+  // SUPPRESSED entirely in autonomous mode — a self-driving orchestrator sets its own decision
+  // cadence and must not be nagged for human input each idle.
   if (!autonomous) {
-    const POP_COOLDOWN_MS = 1_200_000; // ≥20 min between decision surfaces
-    if (now - last_blocked_surfaced > POP_COOLDOWN_MS) {
-      const nb = nextDecisionBlock(PROJECT_DIR, last_surfaced_blocked);
-      if (nb.slug) {
-        writeState({ last_surfaced_blocked: nb.slug, last_blocked_surfaced: now });
-        return block(POP_BLOCKED_REMINDER + nb.block + livenessBlock + liveAgentsNote, USER_NOTE);
-      }
+    const nb = nextDecisionBlock(PROJECT_DIR, last_surfaced_blocked, surfaced_blocked);
+    if (nb.slug) {
+      writeState({ last_surfaced_blocked: nb.slug, surfaced_blocked: { ...surfaced_blocked, [nb.slug]: { mtime: nb.mtime, at: now } } });
+      return block(POP_BLOCKED_REMINDER + nb.block + livenessBlock + liveAgentsNote, USER_NOTE);
     }
   }
 
