@@ -157,7 +157,7 @@ function nextStep(src) {
       // explicit reconciliation-path clear — safe because it is orchestrator-driven, not a hook).
       let entries;
       try {
-        entries = readdirSync(FRAY_DIR).filter((f) => f.endsWith('.md') && !f.startsWith('_')).sort();
+        entries = readdirSync(FRAY_DIR).filter((f) => f.endsWith('.md') && !f.startsWith('_') && !f.startsWith('.')).sort();
       } catch {
         console.log(`No .fray/ in ${PROJECT_DIR}.`);
         process.exit(0);
@@ -292,7 +292,7 @@ const downstream = downstreamThreads(PROJECT_DIR);
 const restedIds = restedAgentIds(PROJECT_DIR);
 
 const threads = frayEntries
-  .filter((f) => f.endsWith('.md') && !f.startsWith('_')) // `_`-prefixed = non-thread meta (e.g. a stray _board.md)
+  .filter((f) => f.endsWith('.md') && !f.startsWith('_') && !f.startsWith('.')) // `_`-prefixed = non-thread meta (e.g. a stray _board.md); `.`-prefixed = hook-internal scratch (e.g. `.stop-context.md`), never a thread
   .sort()
   .map((f) => {
     const id = f.replace(/\.md$/, ''); // the filename slug IS the id

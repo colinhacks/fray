@@ -49,7 +49,7 @@ function unquote(raw) {
 export function collectDecisions() {
   let files;
   try {
-    files = readdirSync(frayDir).filter((f) => f.endsWith('.md'));
+    files = readdirSync(frayDir).filter((f) => f.endsWith('.md') && !f.startsWith('_') && !f.startsWith('.'));
   } catch {
     return [];
   }

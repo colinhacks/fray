@@ -86,7 +86,7 @@ function scanBoard(projectDir) {
   let active = 0;
   let blocked = 0;
   for (const f of readdirSync(join(projectDir, '.fray'))) {
-    if (!f.endsWith('.md') || f.startsWith('_')) continue;
+    if (!f.endsWith('.md') || f.startsWith('_') || f.startsWith('.')) continue;
     let src;
     try {
       src = readFileSync(join(projectDir, '.fray', f), 'utf8');

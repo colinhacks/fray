@@ -111,7 +111,7 @@ try {
   const scanned = [];
   try {
     for (const f of readdirSync(join(dir, '.fray'))) {
-      if (!f.endsWith('.md') || f.startsWith('_')) continue; // `_`-prefixed = non-thread meta
+      if (!f.endsWith('.md') || f.startsWith('_') || f.startsWith('.')) continue; // `_`-prefixed = non-thread meta; `.`-prefixed = hook-internal scratch (e.g. `.stop-context.md`)
       const id = f.replace(/\.md$/, '');
       const fp = join(dir, '.fray', f);
       const src = readFileSync(fp, 'utf8');

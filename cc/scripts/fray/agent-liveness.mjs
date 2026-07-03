@@ -135,7 +135,7 @@ export function agentLivenessLines({ transcriptPath, projectDir, now = Date.now(
 
     let files;
     try {
-      files = readdirSync(frayDir).filter((f) => f.endsWith('.md') && !f.startsWith('_'));
+      files = readdirSync(frayDir).filter((f) => f.endsWith('.md') && !f.startsWith('_') && !f.startsWith('.'));
     } catch {
       return dropped;
     }
@@ -249,7 +249,7 @@ export function runningAgentCount({ transcriptPath, projectDir, now = Date.now()
     const rested = restedAgentIds(projectDir);
     let files;
     try {
-      files = readdirSync(frayDir).filter((f) => f.endsWith('.md') && !f.startsWith('_'));
+      files = readdirSync(frayDir).filter((f) => f.endsWith('.md') && !f.startsWith('_') && !f.startsWith('.'));
     } catch {
       return 0;
     }

@@ -191,7 +191,7 @@ function writeState(patch) {
 /** Was any thread file (`.fray/*.md`) touched since `sinceMs`? */
 function threadTouchedSince(sinceMs) {
   try {
-    const files = readdirSync(FRAY_DIR).filter((f) => f.endsWith('.md'));
+    const files = readdirSync(FRAY_DIR).filter((f) => f.endsWith('.md') && !f.startsWith('_') && !f.startsWith('.'));
     for (const f of files) {
       try {
         if (statSync(join(FRAY_DIR, f)).mtimeMs > sinceMs) return true;
