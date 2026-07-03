@@ -39,6 +39,18 @@
  * `systemMessage`, so the user sees a gentle reminder, not a red "Stop hook error:" wall.
  * The nudges are 1-line POINTERS; the full reconcile discipline lives in the `fray` skill.
  *
+ * additionalContext IS THE VISIBLE TRANSCRIPT — keep it TERSE. There is no way to hand
+ * the model context without the user also seeing it rendered inline (Claude Code has no
+ * hidden side-channel for hookSpecificOutput.additionalContext), so a verbose payload
+ * here is a verbose payload in the user's chat log, every single fire. The fix is NOT to
+ * drop information — it's to relocate it: the bulky detail (board/thread excerpts, the
+ * full standing reminder prose, liveness lines) is written to a durable sidecar file
+ * (`.fray/.stop-context.md`, overwritten on every fire via `writeStopContext()`) that the
+ * model can `Read` on its own, while `additionalContext` stays a 1-2 line pointer with
+ * just enough to act on at a glance (counts + whether a human decision is pending + the
+ * file to read). The model loses nothing (Read access is unrestricted); the human's
+ * transcript stops being flooded.
+ *
  * THREE loop-guards (defense in depth): stop_hook_active; a per-concern cooldown/marker
  * in `.fray/.stop-reminder-state.json`; and the activity gate (cleanup nudge only).
  *
@@ -59,6 +71,19 @@ import { collectDecisions } from '../scripts/fray/decisions.mjs';
 const PROJECT_DIR = process.env.CLAUDE_PROJECT_DIR || process.cwd();
 const FRAY_DIR = join(PROJECT_DIR, '.fray');
 const STATE_FILE = join(FRAY_DIR, '.stop-reminder-state.json');
+// Sidecar for the verbose detail — see the OUTPUT CHANNEL note above. Overwritten (not
+// appended) on every block(): it holds only the CURRENT fire's detail, not a history.
+const STOP_CONTEXT_FILE = join(FRAY_DIR, '.stop-context.md');
+
+/** Overwrite the sidecar with this fire's full detail. Best-effort: the terse pointer
+ * in additionalContext still fires even if this write fails (e.g. .fray missing). */
+function writeStopContext(content) {
+  try {
+    writeFileSync(STOP_CONTEXT_FILE, content.trimStart() + '\n');
+  } catch {
+    /* best-effort */
+  }
+}
 
 /** Allow the stop (no output = no block). */
 function allow() {
@@ -350,7 +375,13 @@ async function main() {
       surfaced_agents: merged,
       ...(nb.slug ? { last_surfaced_blocked: nb.slug, surfaced_blocked: { ...surfaced_blocked, [nb.slug]: { mtime: nb.mtime, at: now } } } : {}),
     });
-    return block(restReminder(newRests, newRestThreads) + threadContents + nb.block + livenessBlock + liveAgentsNote, USER_NOTE);
+    writeStopContext(restReminder(newRests, newRestThreads) + threadContents + nb.block + livenessBlock + liveAgentsNote);
+    const threadNote = newRestThreads.length ? ` (${newRestThreads.join(', ')})` : '';
+    const decisionNote = nb.slug ? `; 1 decision awaiting you (${nb.slug})` : '';
+    return block(
+      `fray: ${newRests} sub-agent rest(s) to reconcile${threadNote}${decisionNote} — read .fray/.stop-context.md, then reconcile before going idle.`,
+      USER_NOTE,
+    );
   }
 
   // (B0) POP-ONE NEEDS-DECISION — surface the next pending human DECISION worth showing.
@@ -365,7 +396,11 @@ async function main() {
     const nb = nextDecisionBlock(PROJECT_DIR, last_surfaced_blocked, surfaced_blocked);
     if (nb.slug) {
       writeState({ last_surfaced_blocked: nb.slug, surfaced_blocked: { ...surfaced_blocked, [nb.slug]: { mtime: nb.mtime, at: now } } });
-      return block(POP_BLOCKED_REMINDER + nb.block + livenessBlock + liveAgentsNote, USER_NOTE);
+      writeStopContext(POP_BLOCKED_REMINDER + nb.block + livenessBlock + liveAgentsNote);
+      return block(
+        `fray ⚖: 1 decision awaiting you (${nb.slug}) — read .fray/.stop-context.md for the full writeup and present it to the user.`,
+        USER_NOTE,
+      );
     }
   }
 
@@ -380,13 +415,20 @@ async function main() {
     if (liveness.length || liveCount > 0) {
       writeState({ last_fired: now });
       const body = (liveness.length ? 'fray agent-liveness:\n' + liveness.join('\n') : '') + liveAgentsNote;
-      return block(body.trimStart(), USER_NOTE);
+      writeStopContext(body);
+      const staleNote = liveness.length ? `${liveness.length} stale/unreaped agent line(s)` : '';
+      const workingNote = liveCount > 0 ? `${liveCount} still working` : '';
+      return block(
+        `fray: ${[staleNote, workingNote].filter(Boolean).join(', ')} — read .fray/.stop-context.md.`,
+        USER_NOTE,
+      );
     }
     return allow();
   }
 
   writeState({ last_fired: now });
-  return block(CLEANUP_REMINDER + livenessBlock + liveAgentsNote, USER_NOTE);
+  writeStopContext(CLEANUP_REMINDER + livenessBlock + liveAgentsNote);
+  return block('fray: reconcile threads touched this session before going idle — read .fray/.stop-context.md.', USER_NOTE);
 }
 
 main().catch(() => allow());
