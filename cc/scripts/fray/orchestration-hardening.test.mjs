@@ -231,7 +231,18 @@ function longRunningFixture({ runtimeMin, outputAgeMin, status = 'active' }) {
     utimesSync(p, t, t);
   }
   const transcriptPath = join('/anything', projSlug, `${session}.jsonl`);
-  return { dir, sess: session, transcriptPath, agentId, cleanup: () => { rmSync(dir, { recursive: true, force: true }); rmSync(claudeRoot, { recursive: true, force: true }); } };
+  return { dir, sess: session, transcriptPath, agentId, outputPath: p, cleanup: () => { rmSync(dir, { recursive: true, force: true }); rmSync(claudeRoot, { recursive: true, force: true }); } };
+}
+
+/** Rewrite a fixture's binding so its agent's RUNTIME (now − dispatch ts) is `runtimeMin`, and
+ *  re-touch its output to `outputAgeMin` (keeps it fresh) — to simulate an idle-wait watcher aging
+ *  past a new drop-guard tier without re-creating the whole fixture (state persists across runs). */
+function ageFixture(fx, runtimeMin, outputAgeMin) {
+  const now = Date.now();
+  writeFileSync(join(fx.dir, '.fray', '.agent-bindings.jsonl'),
+    JSON.stringify({ ts: new Date(now - runtimeMin * 60_000).toISOString(), agent_id: fx.agentId, thread: 'watch', label: 'ci-watch' }) + '\n');
+  const t = (now - outputAgeMin * 60_000) / 1000;
+  utimesSync(fx.outputPath, t, t);
 }
 
 test('longRunningAgentLines: a long-running STILL-ALIVE agent gets a loud VERIFY DIRECTLY line', () => {
@@ -269,9 +280,45 @@ test('fray-stop-reminder: the drop-guard BLOCKS the idle with VERIFY DIRECTLY (t
     const r = runStop(fx.dir, fx.sess, { transcript_path: fx.transcriptPath });
     assert.equal(r.blocked, true, 'a long-running still-alive agent forces a stop block');
     assert.match(r.ctx, /VERIFY DIRECTLY/, 'the block tells the orchestrator to check the target itself');
-    // And it dedups: the same agent does not re-block the very next idle.
+    // And it dedups WITHIN a tier: the same agent at the same runtime does not re-block next idle.
     const r2 = runStop(fx.dir, fx.sess, { transcript_path: fx.transcriptPath });
-    assert.doesNotMatch(r2.ctx, /VERIFY DIRECTLY/, 'deduped by agent-id — blocks ONCE per newly-crossed agent');
+    assert.doesNotMatch(r2.ctx, /VERIFY DIRECTLY/, 'same tier → no re-block (minimum-nag)');
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test('fray-stop-reminder: the drop-guard RE-ARMS at coarse runtime multiples (a hung idle-wait watcher forces a SECOND block)', () => {
+  const fx = longRunningFixture({ runtimeMin: DEFAULT_LONG_RUNTIME_MIN + 5, outputAgeMin: 5 }); // tier 1 (~1×)
+  try {
+    mkdirSync(join(fx.dir, '.fray', '.session-state'), { recursive: true });
+    writeFileSync(join(fx.dir, '.fray', '.session-state', fx.sess), 'on\n');
+
+    // 1× → blocks (first crossing).
+    assert.match(runStop(fx.dir, fx.sess, { transcript_path: fx.transcriptPath }).ctx, /VERIFY DIRECTLY/, '1× → first block');
+    // Still tier 1 on a subsequent idle → NO re-block (a permanent-per-tier dedup keeps it minimum-nag).
+    assert.doesNotMatch(runStop(fx.dir, fx.sess, { transcript_path: fx.transcriptPath }).ctx, /VERIFY DIRECTLY/, 'still tier 1 → no re-block');
+    // The watcher stays hung and crosses ~2× → RE-ARMED → blocks AGAIN (the #327 idle-wait fix).
+    ageFixture(fx, 2 * DEFAULT_LONG_RUNTIME_MIN + 5, 5);
+    assert.match(runStop(fx.dir, fx.sess, { transcript_path: fx.transcriptPath }).ctx, /VERIFY DIRECTLY/, '2× → re-armed, blocks again');
+    // Still tier 2 → quiet again until ~3×.
+    assert.doesNotMatch(runStop(fx.dir, fx.sess, { transcript_path: fx.transcriptPath }).ctx, /VERIFY DIRECTLY/, 'still tier 2 → no re-block');
+    // Crosses ~3× → blocks a THIRD time.
+    ageFixture(fx, 3 * DEFAULT_LONG_RUNTIME_MIN + 5, 5);
+    assert.match(runStop(fx.dir, fx.sess, { transcript_path: fx.transcriptPath }).ctx, /VERIFY DIRECTLY/, '3× → re-armed again');
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test('fray-stop-reminder: a fresh sub-35m agent NEVER triggers the drop-guard (no VERIFY block)', () => {
+  const fx = longRunningFixture({ runtimeMin: 10, outputAgeMin: 2 }); // well under the 1× threshold
+  try {
+    mkdirSync(join(fx.dir, '.fray', '.session-state'), { recursive: true });
+    writeFileSync(join(fx.dir, '.fray', '.session-state', fx.sess), 'on\n');
+    // The stop may still block for OTHER reasons (e.g. a first-reconcile baseline), but NEVER with
+    // a drop-guard VERIFY line — the agent has not run long enough to be a hung-watcher suspect.
+    assert.doesNotMatch(runStop(fx.dir, fx.sess, { transcript_path: fx.transcriptPath }).ctx, /VERIFY DIRECTLY/, 'sub-threshold runtime → no drop-guard');
   } finally {
     fx.cleanup();
   }

@@ -301,10 +301,15 @@ export function strandedThreadLines(args) {
  * Runtime is measured from the binding `ts` (dispatch time), NOT output age — a watcher looks
  * "fresh" precisely because it is polling; the giveaway is the long total RUNTIME with no result.
  * Distinct from 'dropped' (stale + rested): the two bands don't overlap (this requires fresh
- * output, that requires stale). Structured return (slug/agentId/runtimeMin/line) so a consumer can
- * dedupe by agentId. Fail-open → [].
+ * output, that requires stale). Structured return (slug/agentId/runtimeMin/tier/line) so a consumer
+ * can dedupe by agentId AND re-arm per `tier` — `tier = floor(runtimeMin / LONG_RUNTIME_MIN)`, the
+ * coarse 1×/2×/3× runtime multiple. Re-arming per tier is load-bearing for a PURE idle-wait (no
+ * user prompts → the per-turn reminder never fires): a permanent agent-id dedup would block the
+ * idle exactly ONCE at ~1× and let a genuinely-hung watcher be rationalized as "still fine" forever
+ * (the #327 trap); re-blocking at each new tier forces a multi-hour hung watcher back into view
+ * while a normal long-but-progressing agent still only crosses a tier occasionally. Fail-open → [].
  * @param {{transcriptPath?: string|null, projectDir: string, now?: number}} args
- * @returns {{slug:string, agentId:string, runtimeMin:number, line:string}[]}
+ * @returns {{slug:string, agentId:string, runtimeMin:number, tier:number, line:string}[]}
  */
 export function longRunningAgentLines({ transcriptPath, projectDir, now = Date.now() }) {
   /** @type {{slug:string, agentId:string, runtimeMin:number, line:string}[]} */
@@ -346,6 +351,7 @@ export function longRunningAgentLines({ transcriptPath, projectDir, now = Date.n
         slug,
         agentId: binding.id,
         runtimeMin: Math.round(runtimeMin),
+        tier: Math.floor(runtimeMin / LONG_RUNTIME_MIN), // coarse 1×/2×/3× runtime multiple → per-tier re-arm
         line:
           `⚠ VERIFY DIRECTLY — ${slug}: agent ${who} has run ${Math.round(runtimeMin)}m with NO terminal result ` +
           `(last output ${Math.round(ageMin)}m ago, so it LOOKS alive). A watcher can HANG on a stuck/ghost CI check ` +

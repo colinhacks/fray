@@ -153,10 +153,17 @@ function readState() {
       last_fired: s.last_fired || 0,
       last_rest_surfaced: s.last_rest_surfaced || 0,
       surfaced_agents: Array.isArray(s.surfaced_agents) ? s.surfaced_agents : [],
-      // Drop-guard dedup: agent-ids already surfaced by the (A2) long-running "VERIFY DIRECTLY"
-      // block, so a still-running agent blocks the idle ONCE (not every idle). The per-turn
-      // reminder keeps nagging thereafter — this only rate-limits the Stop-hook block.
-      surfaced_verify: Array.isArray(s.surfaced_verify) ? s.surfaced_verify : [],
+      // Drop-guard dedup: `{ agentId: highestTierSurfaced }` — the coarse runtime multiple
+      // (1×/2×/3× LONG_RUNTIME_MIN) at which the (A2) "VERIFY DIRECTLY" block last fired for that
+      // agent. Re-arming PER TIER (not a permanent id dedup) is the #327 fix: on a pure idle-wait
+      // the per-turn reminder never fires, so a permanent dedup would block ONCE at ~1× and let a
+      // genuinely-hung watcher be rationalized as "still fine" forever. A legacy array (pre-tier
+      // v1.29.0 state) coerces to tier 1 per id so it never regresses to re-blocking a handled agent.
+      surfaced_verify: s.surfaced_verify && typeof s.surfaced_verify === 'object' && !Array.isArray(s.surfaced_verify)
+        ? s.surfaced_verify
+        : Array.isArray(s.surfaced_verify)
+          ? Object.fromEntries(s.surfaced_verify.map((id) => [id, 1]))
+          : {},
       last_surfaced_blocked: typeof s.last_surfaced_blocked === 'string' ? s.last_surfaced_blocked : '',
       // Per-thread dedup: slug -> { mtime, at }. A thread is only worth re-popping once its
       // FILE has actually changed (mtime moved) since it was last shown — not on a timer.
@@ -166,8 +173,15 @@ function readState() {
       surfaced_blocked: s.surfaced_blocked && typeof s.surfaced_blocked === 'object' ? s.surfaced_blocked : {},
     };
   } catch {
-    return { last_fired: 0, last_rest_surfaced: 0, surfaced_agents: [], surfaced_verify: [], last_surfaced_blocked: '', surfaced_blocked: {} };
+    return { last_fired: 0, last_rest_surfaced: 0, surfaced_agents: [], surfaced_verify: {}, last_surfaced_blocked: '', surfaced_blocked: {} };
   }
+}
+
+/** Cap the `{ agentId: tier }` drop-guard map to its N newest entries (insertion-order), bounding
+ *  a long-lived board's persisted state — same intent as surfaced_agents.slice(-200). */
+function capVerify(map, limit = 400) {
+  const entries = Object.entries(map);
+  return entries.length <= limit ? map : Object.fromEntries(entries.slice(-limit));
 }
 
 /** Cap a { slug: {mtime, at} } map to its N most-recently-surfaced entries (unbounded-growth guard, same intent as surfaced_agents.slice(-200)). */
@@ -380,11 +394,15 @@ async function main() {
   // result is the exact class that stranded PR #327: a `ci-watch` hung on a nameless ghost check
   // polls forever, looks alive, and "watcher running = fine" gets trusted for hours. The Stop is
   // the ONLY surface during the "Waiting for N background agents" idle-wait, so this is WHERE to
-  // force a direct check. Urgent → bypasses the cleanup cooldown; deduped by agent-id (surfaced_
-  // verify) so it blocks ONCE per newly-crossed agent (the per-turn reminder keeps nagging after).
-  const newLong = longRunning.filter((v) => v && v.agentId && !surfaced_verify.includes(v.agentId));
+  // force a direct check. Urgent → bypasses the cleanup cooldown. RE-ARM PER TIER: block whenever an
+  // agent's runtime crosses a NEW coarse multiple (`tier` = 1×/2×/3× LONG_RUNTIME_MIN) beyond the
+  // highest already surfaced for it. A permanent id dedup would block ONCE at ~1× and — on a pure
+  // idle-wait where the per-turn reminder never fires — let a multi-hour hung watcher be rationalized
+  // as "still fine" forever (the #327 trap). Coarse tiers keep it minimum-nag: a normal long-but-
+  // progressing agent crosses a tier only occasionally, not every idle.
+  const newLong = longRunning.filter((v) => v && v.agentId && v.tier > (surfaced_verify[v.agentId] || 0));
   if (newLong.length) {
-    const mergedVerify = [...surfaced_verify, ...newLong.map((v) => v.agentId)].slice(-200);
+    const mergedVerify = capVerify({ ...surfaced_verify, ...Object.fromEntries(newLong.map((v) => [v.agentId, v.tier])) });
     writeState({ surfaced_verify: mergedVerify, last_fired: now });
     writeStopContext(newLong.map((v) => v.line).join('\n') + livenessBlock + liveAgentsNote);
     return block(
