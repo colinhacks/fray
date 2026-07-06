@@ -30,9 +30,9 @@
  * the gate signal is unreadable we FAIL TOWARD RECORDING (a missed rest is the worse
  * failure — it silently hides exactly what the REST guard exists to catch).
  */
-import { appendFileSync, readFileSync, existsSync } from 'node:fs';
+import { appendFileSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { frayActive } from '../scripts/fray/config.mjs';
+import { frayActive, stampOwnerReconciled } from '../scripts/fray/config.mjs';
 import { threadForAgent } from '../scripts/fray/agent-bindings.mjs';
 
 const PROJECT_DIR = process.env.CLAUDE_PROJECT_DIR || process.cwd();
@@ -106,6 +106,19 @@ try {
     thread: thread || null,
   };
   appendFileSync(REST_LOG, JSON.stringify(rec) + '\n');
+
+  // STAMP-ON-AGENT-COMPLETION (write-ownership treadmill fix): the owning agent just edited its
+  // OWN thread, bumping its mtime. Record that mtime as "reconciled by its owner up to here" so the
+  // dirty-gate does NOT nag the orchestrator to re-ground a thread the agent itself just reconciled
+  // — only NON-owning drift (an orchestrator edit / a referenced PR-CI moving) should nag. Reading
+  // the thread's mtime NOW captures the post-edit state (the rest fires after the agent's turn).
+  if (thread) {
+    try {
+      stampOwnerReconciled(PROJECT_DIR, thread, statSync(join(FRAY_DIR, `${thread}.md`)).mtimeMs);
+    } catch {
+      /* fail-open — a missed stamp just risks one spurious reconcile nag */
+    }
+  }
 } catch {
   /* fail-open */
 }

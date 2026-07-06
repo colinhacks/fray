@@ -61,9 +61,9 @@
  * (default on); `stop_reminder_cooldown_seconds` (default 1800) is the CLEANUP rest window.
  */
 
-import { readFileSync, writeFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { frayActive, reconcileStampLastInstruction } from '../scripts/fray/config.mjs';
+import { frayActive, reconcileStampLastInstruction, computeBoardDrift, reconcileBackstopMin, loadConfig } from '../scripts/fray/config.mjs';
 import { newBoundRestsSince } from '../scripts/fray/agent-bindings.mjs';
 import { threadExcerptsBlock, threadExcerpt } from '../scripts/fray/thread-excerpt.mjs';
 import { collectDecisions } from '../scripts/fray/decisions.mjs';
@@ -153,6 +153,10 @@ function readState() {
       last_fired: s.last_fired || 0,
       last_rest_surfaced: s.last_rest_surfaced || 0,
       surfaced_agents: Array.isArray(s.surfaced_agents) ? s.surfaced_agents : [],
+      // Drop-guard dedup: agent-ids already surfaced by the (A2) long-running "VERIFY DIRECTLY"
+      // block, so a still-running agent blocks the idle ONCE (not every idle). The per-turn
+      // reminder keeps nagging thereafter — this only rate-limits the Stop-hook block.
+      surfaced_verify: Array.isArray(s.surfaced_verify) ? s.surfaced_verify : [],
       last_surfaced_blocked: typeof s.last_surfaced_blocked === 'string' ? s.last_surfaced_blocked : '',
       // Per-thread dedup: slug -> { mtime, at }. A thread is only worth re-popping once its
       // FILE has actually changed (mtime moved) since it was last shown — not on a timer.
@@ -162,7 +166,7 @@ function readState() {
       surfaced_blocked: s.surfaced_blocked && typeof s.surfaced_blocked === 'object' ? s.surfaced_blocked : {},
     };
   } catch {
-    return { last_fired: 0, last_rest_surfaced: 0, surfaced_agents: [], last_surfaced_blocked: '', surfaced_blocked: {} };
+    return { last_fired: 0, last_rest_surfaced: 0, surfaced_agents: [], surfaced_verify: [], last_surfaced_blocked: '', surfaced_blocked: {} };
   }
 }
 
@@ -187,23 +191,6 @@ function writeState(patch) {
 // Counting sub-agent rests lives in `newBoundRestsSince` (agent-bindings.mjs): it counts
 // ONLY rests of THREAD-BOUND (orchestrator-dispatched) agents, excluding nested/worker-spawned
 // and anon rests the orchestrator never dispatched and cannot reconcile. Imported above.
-
-/** Was any thread file (`.fray/*.md`) touched since `sinceMs`? */
-function threadTouchedSince(sinceMs) {
-  try {
-    const files = readdirSync(FRAY_DIR).filter((f) => f.endsWith('.md') && !f.startsWith('_') && !f.startsWith('.'));
-    for (const f of files) {
-      try {
-        if (statSync(join(FRAY_DIR, f)).mtimeMs > sinceMs) return true;
-      } catch {
-        /* skip unreadable */
-      }
-    }
-  } catch {
-    /* no .fray dir → no threads → no nudge */
-  }
-  return false;
-}
 
 /** Current mtime (ms) of a thread's `.fray/<slug>.md`, or 0 if unreadable. */
 function threadMtime(projectDir, slug) {
@@ -316,22 +303,26 @@ async function main() {
   if (payload.stop_hook_active === true) return allow();
 
   const now = Date.now();
-  const { last_fired, last_rest_surfaced, surfaced_agents, last_surfaced_blocked, surfaced_blocked } = readState();
+  const { last_fired, last_rest_surfaced, surfaced_agents, surfaced_verify, last_surfaced_blocked, surfaced_blocked } = readState();
 
   // (C) AGENT-LIVENESS lines — idle/frozen/unreaped dispatched sub-agents. Computed
   // once, fail-open ([] on any error). Appended to whichever reminder fires below,
   // and emitted on their own (rate-limited) when neither guard would otherwise fire.
-  // Dynamic import so a missing/broken helper can never crash the hook before
-  // main()'s catch (a static import failure would).
+  // `longRunning` is the (A2) DROP-GUARD input — long-running agents that may be hung
+  // watchers (structured {slug,agentId,line}). Dynamic import so a missing/broken helper
+  // can never crash the hook before main()'s catch (a static import failure would).
   let liveness = [];
   let liveCount = 0;
+  let longRunning = [];
   try {
     const mod = await import('../scripts/fray/agent-liveness.mjs');
     liveness = mod.agentLivenessLines({ transcriptPath: payload.transcript_path, projectDir: PROJECT_DIR, now });
     liveCount = mod.runningAgentCount({ transcriptPath: payload.transcript_path, projectDir: PROJECT_DIR, now });
+    longRunning = mod.longRunningAgentLines({ transcriptPath: payload.transcript_path, projectDir: PROJECT_DIR, now });
   } catch {
     liveness = [];
     liveCount = 0;
+    longRunning = [];
   }
   const livenessBlock = liveness.length ? '\n\nfray agent-liveness:\n' + liveness.join('\n') : '';
   // Force-nudge-on-live-agents: NO hook fires during the "Waiting for N background agents"
@@ -384,6 +375,24 @@ async function main() {
     );
   }
 
+  // (A2) WATCHER/AGENT DROP-GUARD — the #327 forcing function. A dispatched agent that has RUN
+  // past LONG_RUNTIME_MIN while STILL emitting output (looks alive) but with NO terminal thread
+  // result is the exact class that stranded PR #327: a `ci-watch` hung on a nameless ghost check
+  // polls forever, looks alive, and "watcher running = fine" gets trusted for hours. The Stop is
+  // the ONLY surface during the "Waiting for N background agents" idle-wait, so this is WHERE to
+  // force a direct check. Urgent → bypasses the cleanup cooldown; deduped by agent-id (surfaced_
+  // verify) so it blocks ONCE per newly-crossed agent (the per-turn reminder keeps nagging after).
+  const newLong = longRunning.filter((v) => v && v.agentId && !surfaced_verify.includes(v.agentId));
+  if (newLong.length) {
+    const mergedVerify = [...surfaced_verify, ...newLong.map((v) => v.agentId)].slice(-200);
+    writeState({ surfaced_verify: mergedVerify, last_fired: now });
+    writeStopContext(newLong.map((v) => v.line).join('\n') + livenessBlock + liveAgentsNote);
+    return block(
+      `fray ⚠ VERIFY DIRECTLY: ${newLong.length} long-running agent(s) with no terminal result (${newLong.map((v) => v.slug).join(', ')}) — a watcher can HANG on a ghost CI check; read .fray/.stop-context.md and check the target rollup YOURSELF, don't trust that it's still progressing.`,
+      USER_NOTE,
+    );
+  }
+
   // (B0) POP-ONE NEEDS-DECISION — surface the next pending human DECISION worth showing.
   // Gated purely on FILE CHANGE (nextDecisionBlock's mtime dedup), not a wall-clock cooldown:
   // the old POP_COOLDOWN_MS (≥20 min between surfaces) was a workaround for not being able to
@@ -404,31 +413,40 @@ async function main() {
     }
   }
 
-  // (B) CLEANUP NUDGE — reconcile threads touched this session (no blocked thread was due
-  // above). Rate-limited + activity-gated; liveness piggybacks on the same cooldown.
-  if (last_fired > 0 && now - last_fired < cooldownSeconds * 1000) return allow();
-  if (last_fired > 0 && !threadTouchedSince(last_fired)) {
-    // No thread touched → no cleanup nudge. But idle/unreaped agents (liveness lines) OR
-    // still-in-flight agents (liveCount) are worth surfacing on their own — this is the
-    // force-nudge that converts a silent "Waiting for N background agents" idle into ONE
-    // gentle steer pointer (off the same cooldown above, which we already passed).
+  // (B) CLEANUP — SELF-SATISFYING. Reaching here: no rest to fold, no drop-guard, no human
+  // decision due. Block ONLY on GENUINE remaining work — owner-filtered reconcile DRIFT
+  // (`computeBoardDrift`, which EXCLUDES owning-agent thread edits, change #1) or an un-drained
+  // QUEUED follow-up. A board whose only changes since the last reconcile were agents reconciling
+  // their OWN threads is CLEAN: the ⚖ queue was empty above, the stamp is effectively fresh, and
+  // there is no non-owning drift → let the stop through SILENTLY. This kills the treadmill where
+  // any thread touch (including write-ownership edits) blocked every idle. The cooldown still
+  // rate-limits the soft nudge so a genuinely-dirty board doesn't re-block every idle in a loop.
+  const backstopMin = reconcileBackstopMin(loadConfig(PROJECT_DIR));
+  const drift = computeBoardDrift(PROJECT_DIR, { backstopMin, now });
+  const genuineWork = drift.nag || drift.queuedSlugs.length > 0;
+
+  if (last_fired > 0 && now - last_fired < cooldownSeconds * 1000) return allow(); // cooldown-gate the soft nudge
+
+  if (!genuineWork) {
+    // No genuine reconcile work. Surface stranded/in-flight liveness on its own if present (the
+    // idle-wait force-nudge), else ALLOW SILENTLY — the self-satisfying stop.
     if (liveness.length || liveCount > 0) {
       writeState({ last_fired: now });
-      const body = (liveness.length ? 'fray agent-liveness:\n' + liveness.join('\n') : '') + liveAgentsNote;
-      writeStopContext(body);
+      writeStopContext((liveness.length ? 'fray agent-liveness:\n' + liveness.join('\n') : '') + liveAgentsNote);
       const staleNote = liveness.length ? `${liveness.length} stale/unreaped agent line(s)` : '';
       const workingNote = liveCount > 0 ? `${liveCount} still working` : '';
-      return block(
-        `fray: ${[staleNote, workingNote].filter(Boolean).join(', ')} — read .fray/.stop-context.md.`,
-        USER_NOTE,
-      );
+      return block(`fray: ${[staleNote, workingNote].filter(Boolean).join(', ')} — read .fray/.stop-context.md.`, USER_NOTE);
     }
     return allow();
   }
 
+  // GENUINE work → SCOPED reconcile / queued nudge (name the specific threads, not "everything").
   writeState({ last_fired: now });
-  writeStopContext(CLEANUP_REMINDER + livenessBlock + liveAgentsNote);
-  return block('fray: reconcile threads touched this session before going idle — read .fray/.stop-context.md.', USER_NOTE);
+  const parts = [];
+  if (drift.nag) parts.push(drift.dirtySlugs.length ? `re-ground ${drift.dirtySlugs.join(', ')}` : 're-ground the board (external drift)');
+  if (drift.queuedSlugs.length) parts.push(`drain queued follow-ups in ${drift.queuedSlugs.join(', ')}`);
+  writeStopContext(`${CLEANUP_REMINDER}\n\nGENUINE work before idle: ${parts.join('; ')}.` + livenessBlock + liveAgentsNote);
+  return block(`fray: before idle — ${parts.join('; ')} — read .fray/.stop-context.md.`, USER_NOTE);
 }
 
 main().catch(() => allow());

@@ -52,12 +52,20 @@ export const DEFAULT_IDLE_MIN = 10;
 export const DEFAULT_DROPPED_MIN = 45;
 // Back-compat alias for the old name; repointed to the new, generous default.
 export const DEFAULT_FROZEN_MIN = DEFAULT_DROPPED_MIN;
+// The WATCHER/AGENT DROP-GUARD threshold (min): a dispatched agent that has RUN this long while
+// still emitting output (looks alive) but has produced NO terminal thread result gets a LOUD
+// "verify directly" flag — the #327 forcing function (a `ci-watch` hung on a nameless ghost check
+// polls forever and looks alive while stranded; "watcher running = fine" then gets trusted). This
+// is DISTINCT from DROPPED_MIN (stale + rested = went quiet): the drop-guard targets the
+// looks-alive-but-maybe-hung band. Measured from the binding `ts` (dispatch time), not output age.
+export const DEFAULT_LONG_RUNTIME_MIN = 35;
 
 // Env-resolved thresholds, defined ONCE here so EVERY consumer (the Stop-hook liveness helper
 // AND the board) reads the same knobs and can never disagree. FRAY_FROZEN_MIN is honored as the
 // old alias for FRAY_DROPPED_MIN.
 export const IDLE_MIN = parseInt(process.env.FRAY_IDLE_MIN || '', 10) || DEFAULT_IDLE_MIN;
 export const DROPPED_MIN = parseInt(process.env.FRAY_DROPPED_MIN || process.env.FRAY_FROZEN_MIN || '', 10) || DEFAULT_DROPPED_MIN;
+export const LONG_RUNTIME_MIN = parseInt(process.env.FRAY_LONG_RUNTIME_MIN || '', 10) || DEFAULT_LONG_RUNTIME_MIN;
 
 /**
  * GROUND-TRUTH age of an agent's last activity, in minutes — globbed across ALL local

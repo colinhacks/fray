@@ -48,7 +48,7 @@
  */
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { deriveAgentState, findAgentOutputAge, IDLE_MIN, DROPPED_MIN } from './agent-status.mjs';
+import { deriveAgentState, findAgentOutputAge, IDLE_MIN, DROPPED_MIN, LONG_RUNTIME_MIN } from './agent-status.mjs';
 import { newestBindingByThread, downstreamThreads, restedAgentIds } from './agent-bindings.mjs';
 
 // Thread-level terminal statuses (frontmatter `status:`), matching scripts/fray TERMINAL.
@@ -286,4 +286,76 @@ export function runningAgentCount({ transcriptPath, projectDir, now = Date.now()
  */
 export function strandedThreadLines(args) {
   return agentLivenessLines(args).filter((l) => l.startsWith('⚠ ACTIVE THREAD'));
+}
+
+/**
+ * THE WATCHER/AGENT DROP-GUARD (2026-07-06, the #327 forcing function). For each `active`,
+ * non-downstream thread whose NEWEST agent was dispatched > LONG_RUNTIME_MIN ago AND is STILL
+ * emitting output (age < DROPPED_MIN → looks alive) yet has produced NO terminal thread result,
+ * emit a LOUD "VERIFY DIRECTLY" line. This is the case the existing 'dropped' signal CANNOT catch:
+ * a `ci-watch` hung on a nameless ghost check keeps polling, so its output stays fresh and it never
+ * looks stranded — it just never terminates, and "watcher running = fine" gets trusted for hours
+ * (PR #327 sat effectively-green + stranded). The forcing function turns "a watcher can hang" from
+ * a RULE into a hook-surfaced nudge: go check the target rollup YOURSELF.
+ *
+ * Runtime is measured from the binding `ts` (dispatch time), NOT output age — a watcher looks
+ * "fresh" precisely because it is polling; the giveaway is the long total RUNTIME with no result.
+ * Distinct from 'dropped' (stale + rested): the two bands don't overlap (this requires fresh
+ * output, that requires stale). Structured return (slug/agentId/runtimeMin/line) so a consumer can
+ * dedupe by agentId. Fail-open → [].
+ * @param {{transcriptPath?: string|null, projectDir: string, now?: number}} args
+ * @returns {{slug:string, agentId:string, runtimeMin:number, line:string}[]}
+ */
+export function longRunningAgentLines({ transcriptPath, projectDir, now = Date.now() }) {
+  /** @type {{slug:string, agentId:string, runtimeMin:number, line:string}[]} */
+  const out = [];
+  try {
+    const tasksDir = deriveTasksDir(transcriptPath);
+    const frayDir = join(projectDir, '.fray');
+    const newest = newestBindingByThread(projectDir);
+    const downstream = downstreamThreads(projectDir);
+    let files;
+    try {
+      files = readdirSync(frayDir).filter((f) => f.endsWith('.md') && !f.startsWith('_') && !f.startsWith('.'));
+    } catch {
+      return out;
+    }
+    for (const f of files) {
+      const slug = f.replace(/\.md$/, '');
+      const binding = newest.get(slug);
+      if (!binding) continue;
+      let src;
+      try {
+        src = readFileSync(join(frayDir, f), 'utf8');
+      } catch {
+        continue;
+      }
+      const threadStatus = src.match(/^status:\s*(\S+)/m)?.[1] ?? '';
+      if (threadStatus !== 'active') continue; // only an active thread can strand a running agent
+      if (downstream.has(slug)) continue; // PR landing via the cascade → legitimately long, suppress
+      const dispatchedMs = Date.parse(binding.ts ?? '');
+      if (!Number.isFinite(dispatchedMs)) continue; // no dispatch time → can't judge runtime
+      const runtimeMin = (now - dispatchedMs) / 60_000;
+      if (runtimeMin <= LONG_RUNTIME_MIN) continue; // not long-running yet
+      const ageMin = agentAge(binding.id, tasksDir, now);
+      // Must still LOOK alive (fresh output): a STALE agent is the 'dropped' case, not this one; a
+      // null age (no output file → likely a dead prior-session binding) can't confirm alive → skip.
+      if (ageMin == null || ageMin >= DROPPED_MIN) continue;
+      const who = `${binding.label ? `${binding.label} ` : ''}[${binding.id.slice(0, 9)}]`;
+      out.push({
+        slug,
+        agentId: binding.id,
+        runtimeMin: Math.round(runtimeMin),
+        line:
+          `⚠ VERIFY DIRECTLY — ${slug}: agent ${who} has run ${Math.round(runtimeMin)}m with NO terminal result ` +
+          `(last output ${Math.round(ageMin)}m ago, so it LOOKS alive). A watcher can HANG on a stuck/ghost CI check ` +
+          `(a nameless check-run that never reports) and look alive while stranded — check its PR/target rollup YOURSELF ` +
+          `(e.g. \`gh pr view <n> --json statusCheckRollup -q '.statusCheckRollup[]|select(.status!="COMPLETED")'\`) and act; ` +
+          `do NOT trust that it's still progressing.`,
+      });
+    }
+  } catch {
+    /* fail-open */
+  }
+  return out;
 }

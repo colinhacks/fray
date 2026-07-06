@@ -17,7 +17,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, utimesSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -230,13 +230,27 @@ test('fray-reminder: the two-trigger reconcile gate — first / dirty / backstop
     writeLastReconcile(dir, Date.now());
     assert.doesNotMatch(runReminder(dir, sess), /BOARD RECONCILE STALE/, 'clean board within backstop → no instruction');
 
-    // A non-terminal thread edited AFTER the reconcile stamp → DIRTY → instruction present.
+    // A non-terminal thread edited AFTER the reconcile stamp → DIRTY. But DEBOUNCED (change #5):
+    // the FIRST sighting starts the window and stays SILENT — a burst of return-folding must not
+    // nag every turn. The nudge fires only once the window ages past both thresholds.
+    const nagStatePath = join(dir, '.fray', '.reconcile-nag-state.json');
     writeThread(); // bumps the thread's mtime past the stamp
-    assert.match(runReminder(dir, sess), /BOARD RECONCILE STALE/, 'thread moved since reconcile → dirty-gate fires');
+    assert.doesNotMatch(runReminder(dir, sess), /BOARD RECONCILE STALE/, 'dirty first-sight is debounced → silent');
+    // Age the debounce window past both thresholds (>3m, >2 turns) → the dirty-gate now fires,
+    // and names the drifted thread (scoped staleness, change #3).
+    const st = JSON.parse(readFileSync(nagStatePath, 'utf8'));
+    writeFileSync(nagStatePath, JSON.stringify({ dirty_since_ms: Date.now() - 10 * 60_000, dirty_since_turn: 0, turns: st.turns }) + '\n');
+    const dirtyOut = runReminder(dir, sess);
+    assert.match(dirtyOut, /BOARD RECONCILE STALE/, 'dirty persisting past the debounce window fires');
+    assert.match(dirtyOut, /\bt\b/, 'the drifted thread `t` is named (scoped staleness)');
 
-    // Nothing dirty (re-stamp), but past the 120m backstop → BACKSTOP → instruction present.
+    // BACKSTOP is non-bursty → NOT debounced, fires immediately: age the thread OLDER than the
+    // stamp (so it is not dirty) and stamp past the 120m backstop, with a clean debounce window.
+    const oldT = (Date.now() - 200 * 60_000) / 1000;
+    utimesSync(thread, oldT, oldT);
     writeLastReconcile(dir, Date.now() - 121 * 60_000);
-    assert.match(runReminder(dir, sess), /BOARD RECONCILE STALE/, 'long elapsed with no thread change → backstop fires');
+    rmSync(nagStatePath, { force: true });
+    assert.match(runReminder(dir, sess), /BOARD RECONCILE STALE/, 'long elapsed with no thread change → backstop fires (not debounced)');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

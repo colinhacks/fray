@@ -11,7 +11,7 @@
  * plus the one nested `state:` block) — not a general YAML parser, just enough.
  */
 
-import { existsSync, readFileSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
 /**
@@ -638,10 +638,198 @@ export function shouldNagReconcile({ newestNonTerminalMtimeMs, lastReconcileMs, 
  * the board dirty forever (the dirty-gate would re-fire next turn). So `fray reconcile` (the
  * stamp) MUST be its LAST action, after every thread edit. Reconcile is a JUDGMENT task →
  * dispatch at Opus, high effort.
+ *
+ * SCOPED (2026-07-06): when the dirty-gate knows exactly WHICH thread(s) drifted, pass their
+ * slugs so the instruction says "re-ground <those>" instead of "re-ground EVERY non-terminal
+ * thread" — a precise nudge, not a whole-board sweep. An empty/absent scope keeps the full-sweep
+ * phrasing (the backstop/first-reconcile case, where drift is file-invisible so no slug is known).
+ * @param {string[]} [scopeSlugs]
  * @returns {string}
  */
-export function reconcileStampLastInstruction() {
-  return `AUTO-DISPATCH a BACKGROUND reconcile sub-agent (reflexively — don't deliberate; reconcile is a JUDGMENT task → Opus, high effort): re-ground EVERY non-terminal thread against ground truth (PR merged? symbol exists? work shipped?), flip drifted statuses to match, then — as its LAST step, AFTER every thread edit — run \`fray reconcile\` to stamp \`.fray/.last-reconcile\`. Stamping LAST is REQUIRED: the agent's own edits bump thread mtimes, so stamping before them leaves the board dirty forever.`;
+export function reconcileStampLastInstruction(scopeSlugs) {
+  const scope = Array.isArray(scopeSlugs) && scopeSlugs.length
+    ? `re-ground ${scopeSlugs.join(', ')} (plus any thread whose EXTERNAL state — a referenced PR/CI — moved)`
+    : 're-ground EVERY non-terminal thread';
+  return `AUTO-DISPATCH a BACKGROUND reconcile sub-agent (reflexively — don't deliberate; reconcile is a JUDGMENT task → Opus, high effort): ${scope} against ground truth (PR merged? symbol exists? work shipped?), flip drifted statuses to match, then — as its LAST step, AFTER every thread edit — run \`fray reconcile\` to stamp \`.fray/.last-reconcile\`. Stamping LAST is REQUIRED: the agent's own edits bump thread mtimes, so stamping before them leaves the board dirty forever.`;
+}
+
+// ── STAMP-ON-AGENT-COMPLETION — the write-ownership treadmill fix (2026-07-06) ──────
+// fray MANDATES write-ownership: a dispatched agent edits its OWN thread. But every such edit
+// bumps that thread's mtime past `.last-reconcile`, so the dirty-gate reads the board stale and
+// nags the orchestrator to re-ground a thread the agent JUST reconciled — the system fighting its
+// own design. Fix: when a thread-bound agent rests, the SubagentStop hook records the thread's
+// current mtime here as "reconciled by its owning agent up to this point." The dirty-gate then
+// treats a thread whose current mtime is NOT NEWER than its owner-mark as CLEAN (an owning-agent
+// edit is folded via the REST path, never the reconcile path). Only NON-owning drift — an
+// orchestrator edit, or external state moving a referenced PR/CI — trips the reconcile nag.
+
+/** Path to the per-thread owner-reconcile marks: `{ [slug]: mtimeMs }` under `.fray/`. */
+export function ownerReconciledPath(projectDir) {
+  return join(projectDir, '.fray', '.owner-reconciled.json');
+}
+
+/** Read the `{ [slug]: mtimeMs }` owner-reconcile map, or `{}` when absent/unreadable/garbage. */
+export function readOwnerReconciled(projectDir) {
+  try {
+    const o = JSON.parse(readFileSync(ownerReconciledPath(projectDir), 'utf8'));
+    return o && typeof o === 'object' && !Array.isArray(o) ? o : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Record that `slug`'s owning agent reconciled it AT `mtimeMs` (its thread file's mtime at rest).
+ * Merge-writes, capped so a long-lived board can't grow the map without bound. Best-effort.
+ * @param {string} projectDir @param {string} slug @param {number} mtimeMs
+ */
+export function stampOwnerReconciled(projectDir, slug, mtimeMs) {
+  if (!slug || !(mtimeMs > 0)) return;
+  try {
+    const map = readOwnerReconciled(projectDir);
+    map[slug] = mtimeMs;
+    const entries = Object.entries(map);
+    const capped = entries.length > 400
+      ? Object.fromEntries(entries.sort((a, b) => b[1] - a[1]).slice(0, 400))
+      : map;
+    mkdirSync(join(projectDir, '.fray'), { recursive: true });
+    writeFileSync(ownerReconciledPath(projectDir), JSON.stringify(capped) + '\n');
+  } catch {
+    /* best-effort — a missed stamp just risks one spurious reconcile nag */
+  }
+}
+
+/**
+ * Is a thread's current mtime already accounted for by its OWNING AGENT's reconcile mark? True ⟺
+ * a mark exists and the current mtime is NOT NEWER than it — i.e. the latest edit was the owning
+ * agent's own thread write (folded via the rest path), NOT orchestrator-facing drift. Such a
+ * thread must NOT trip the dirty-gate. Pure predicate so the reminder + stop hook agree.
+ * @param {number} currentMtimeMs @param {number|undefined} ownerMarkMs
+ * @returns {boolean}
+ */
+export function ownerCleanMtime(currentMtimeMs, ownerMarkMs) {
+  return typeof ownerMarkMs === 'number' && currentMtimeMs > 0 && currentMtimeMs <= ownerMarkMs;
+}
+
+/**
+ * STRUCTURED un-drained-queued-follow-up detection. The OLD test — `\bQUEUED\b` anywhere in the
+ * source — false-fired on historical CHECKED-OFF items and any prose mention. This matches ONLY an
+ * UNCHECKED todo checkbox (`- [ ]`) whose text carries the live-follow-up shape (a `QUEUED` marker
+ * or a "dispatch … return" instruction). A checked `- [x]` is DONE and never flags; prose never
+ * flags. (A future structured frontmatter field could replace this; the precise checkbox matcher
+ * needs no thread-authoring change.)
+ * @param {string} src
+ * @returns {boolean}
+ */
+export function hasQueuedFollowup(src) {
+  if (typeof src !== 'string') return false;
+  for (const line of src.split('\n')) {
+    const m = line.match(/^\s*[-*]\s*\[ \]\s+(.*)$/); // UNCHECKED checkbox only ("[ ]", never "[x]")
+    if (!m) continue;
+    if (/\bQUEUED\b/.test(m[1]) || /\bdispatch\b[^.]*\breturn\b/i.test(m[1])) return true;
+  }
+  return false;
+}
+
+/**
+ * ASSESS BOARD DRIFT — pure (no I/O), so it is trivially testable. Given per-thread records +
+ * the owner-reconcile marks + the last-reconcile stamp, returns whether the board needs
+ * re-grounding, WHY (via {@link shouldNagReconcile}), and the SPECIFIC drifted slugs (for the
+ * scoped nudge). A non-terminal thread contributes ONLY when it is not owner-clean — an
+ * owning-agent edit is not drift (see the STAMP-ON-AGENT-COMPLETION note above).
+ * @param {{records:{slug:string,status:string|undefined,mtimeMs:number}[], ownerReconciled:Record<string,number>, lastReconcileMs:number|null, backstopMin:number, now?:number}} a
+ * @returns {{nag:boolean, reason:ReconcileNagReason, dirtySlugs:string[]}}
+ */
+export function assessDrift({ records, ownerReconciled, lastReconcileMs, backstopMin, now = Date.now() }) {
+  let newest = null;
+  /** @type {string[]} */
+  const dirtySlugs = [];
+  for (const r of records) {
+    if (TERMINAL.includes(r.status ?? '')) continue;
+    if (!(r.mtimeMs > 0)) continue;
+    if (ownerCleanMtime(r.mtimeMs, ownerReconciled?.[r.slug])) continue; // owning-agent edit — not drift
+    if (lastReconcileMs == null || r.mtimeMs > lastReconcileMs) dirtySlugs.push(r.slug);
+    if (newest == null || r.mtimeMs > newest) newest = r.mtimeMs;
+  }
+  const { nag, reason } = shouldNagReconcile({ newestNonTerminalMtimeMs: newest, lastReconcileMs, backstopMin, now });
+  return { nag, reason, dirtySlugs };
+}
+
+/**
+ * COMPUTE BOARD DRIFT — the I/O wrapper over {@link assessDrift} the STOP hook uses (the per-turn
+ * reminder reuses its own richer scan). Scans `.fray/*.md`, builds records (status + mtime),
+ * flags un-drained queued follow-ups ({@link hasQueuedFollowup}), and returns the drift verdict
+ * plus the queued slugs — the "is there GENUINE work before idle?" signal for the self-satisfying
+ * stop. Fail-open: any error → clean ({nag:false, empty lists}).
+ * @param {string} projectDir @param {{backstopMin:number, now?:number}} opts
+ * @returns {{nag:boolean, reason:ReconcileNagReason, dirtySlugs:string[], queuedSlugs:string[], lastReconcileMs:number|null}}
+ */
+export function computeBoardDrift(projectDir, { backstopMin, now = Date.now() }) {
+  const lastReconcileMs = readLastReconcile(projectDir);
+  try {
+    const ownerReconciled = readOwnerReconciled(projectDir);
+    const frayDir = join(projectDir, '.fray');
+    let files;
+    try {
+      files = readdirSync(frayDir).filter((f) => f.endsWith('.md') && !f.startsWith('_') && !f.startsWith('.'));
+    } catch {
+      return { nag: false, reason: null, dirtySlugs: [], queuedSlugs: [], lastReconcileMs };
+    }
+    /** @type {{slug:string,status:string|undefined,mtimeMs:number}[]} */
+    const records = [];
+    /** @type {string[]} */
+    const queuedSlugs = [];
+    for (const f of files) {
+      const slug = f.replace(/\.md$/, '');
+      let src;
+      let mtimeMs = 0;
+      try {
+        const fp = join(frayDir, f);
+        src = readFileSync(fp, 'utf8');
+        mtimeMs = statSync(fp).mtimeMs;
+      } catch {
+        continue;
+      }
+      const status = normalizeStatus(src.match(/^status:\s*(\S+)/m)?.[1]) ?? undefined;
+      records.push({ slug, status, mtimeMs });
+      if (!TERMINAL.includes(status ?? '') && hasQueuedFollowup(src)) queuedSlugs.push(slug);
+    }
+    const { nag, reason, dirtySlugs } = assessDrift({ records, ownerReconciled, lastReconcileMs, backstopMin, now });
+    return { nag, reason, dirtySlugs, queuedSlugs, lastReconcileMs };
+  } catch {
+    return { nag: false, reason: null, dirtySlugs: [], queuedSlugs: [], lastReconcileMs };
+  }
+}
+
+// ── DEBOUNCE the 'dirty' reconcile nag (2026-07-06) ─────────────────────────────────
+// A burst of return-folding is several quick turns, each editing a non-terminal thread — every
+// one of which would otherwise trip the dirty-gate and nag a reconcile. Debounce it: a `dirty`
+// signal must PERSIST both > DEBOUNCE_MIN minutes AND > DEBOUNCE_TURNS turns before it nags.
+// `first`/`backstop` are inherently non-bursty (a baseline / a 2-hour fallback) and nag at once.
+
+/** Default debounce: a `dirty` reconcile nag holds until it has persisted this long (minutes)… */
+export const DEFAULT_RECONCILE_DEBOUNCE_MIN = 3;
+/** …AND this many turns. Both must be exceeded — the AND is what survives a fast fold-burst. */
+export const DEFAULT_RECONCILE_DEBOUNCE_TURNS = 2;
+
+/**
+ * DEBOUNCE gate — pure. `reason == null` (board clean) resets the window. `first`/`backstop` nag
+ * immediately (no window). A `dirty` reason starts a window on first sight (no nag yet) and nags
+ * only once the window has aged past BOTH thresholds. The caller owns reading/incrementing/
+ * persisting `turns` + the window state.
+ * @param {{reason:ReconcileNagReason, now:number, turns:number, state:{dirty_since_ms?:number,dirty_since_turn?:number}, debounceMin:number, debounceTurns:number}} a
+ * @returns {{nag:boolean, state:{dirty_since_ms?:number,dirty_since_turn?:number}}}
+ */
+export function debounceReconcileNag({ reason, now, turns, state, debounceMin, debounceTurns }) {
+  if (reason == null) return { nag: false, state: {} }; // clean → clear the window
+  if (reason !== 'dirty') return { nag: true, state: {} }; // first/backstop → immediate, no window
+  const since = state?.dirty_since_ms;
+  const sinceTurn = state?.dirty_since_turn;
+  if (typeof since !== 'number' || typeof sinceTurn !== 'number') {
+    return { nag: false, state: { dirty_since_ms: now, dirty_since_turn: turns } }; // start the window
+  }
+  const aged = now - since > debounceMin * 60_000 && turns - sinceTurn >= debounceTurns;
+  return { nag: aged, state: { dirty_since_ms: since, dirty_since_turn: sinceTurn } };
 }
 
 // ── REVALIDATE — time-based recheck for threads waiting on EXTERNAL state ──────────

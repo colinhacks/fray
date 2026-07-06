@@ -13,7 +13,7 @@
 // session, so re-paying it every prompt was pure waste.
 // Emits hookSpecificOutput.additionalContext (model-only). Robust: never throws (a broken
 // hook must not disrupt the prompt) — any failure → inject nothing.
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   frayActive,
@@ -25,8 +25,13 @@ import {
   isValidStatus,
   readLastReconcile,
   reconcileBackstopMin,
-  shouldNagReconcile,
   reconcileStampLastInstruction,
+  readOwnerReconciled,
+  assessDrift,
+  debounceReconcileNag,
+  hasQueuedFollowup,
+  DEFAULT_RECONCILE_DEBOUNCE_MIN,
+  DEFAULT_RECONCILE_DEBOUNCE_TURNS,
   revalidateState,
   classifyDep,
   parseDeps,
@@ -196,7 +201,7 @@ try {
       const age = ageLabel(t.mtimeMs);
       const isStale = t.status === 'active' && t.mtimeMs > 0 && now - t.mtimeMs > STALE_MIN * 60_000;
       pending.push(`${t.id}[${t.status ?? '?'}${age ? ', ' + age : ''}${isStale ? ' ⚠STALE' : ''}]`);
-      if (/\bQUEUED\b/.test(t.src)) queued.push(t.id);
+      if (hasQueuedFollowup(t.src)) queued.push(t.id); // STRUCTURED: only an UNCHECKED `- [ ]` follow-up, never a checked-off / prose "QUEUED"
       if (t.status === 'blocked') decisions.push({ slug: t.id, status_text: t.status_text }); // human-blocked (machine handled above)
     }
   }
@@ -222,18 +227,21 @@ try {
       ? "AUTONOMOUS MODE = ON (the human is away). What this MEANS: MAKE REASONABLE DECISIONS WITHOUT A HUMAN IN THE LOOP — do NOT ask questions, do NOT stall for confirmation; bias HARD to action and keep the background fleet busy. At a fork, pick the sensible option, DOCUMENT the call in the tracker, and PROCEED (choosing intelligently and letting the maintainer adjust on review beats stopping). Reconcile every completed sub-agent and immediately dispatch the next work. The ONLY things you may NOT autonomously land: a default / security-posture / product / brand / API-config-env decision the maintainer owns (recommend-only — design+prototype, surface to the tracker's decisions queue, don't flip the default), anything irreversible/destructive/published-external, and parked work not yet greenlit. Everything else: decide and do. Scan the board via `fray`. You ARE empowered — land greenlit work, merge landing agents' PRs, create repos, install tooling — yourself, no asking. Substantive work lands via a PR from an isolated git WORKTREE (agents open, you merge); the SHARED main tree is never branched/reset/stashed; exception-class edits (control surfaces, trivial docs) commit direct to main. Do NOT build an 'awaiting-maintainer' queue from REVERSIBLE decisions (the #1 repeated correction). The only true gates: a truly-irreversible-destructive act, a user-facing DEFAULT (ship behind a flag, don't freeze), and public-facing wording."
       : `autonomous_mode=${mode} → interactive: surface decisions + ask rather than auto-landing.`;
 
-  // Surface ONLY the high-confidence "ACTIVE THREAD, NO LIVE AGENT" lines per turn (never the
-  // soft idle notes — those would be noise). A genuinely stranded active thread SHOULD nag
-  // every turn until reconciled (the anti-drop signal that would have caught the GVS miss), and
-  // it is rare by construction (newest agent quiet >45m + rested + no PR/merge), so it can't cry
+  // Surface ONLY the high-confidence LOUD liveness lines per turn (never the soft idle notes —
+  // those would be noise): "ACTIVE THREAD, NO LIVE AGENT" (stranded) AND "VERIFY DIRECTLY" (a
+  // long-running agent that may be a hung watcher — the #327 drop-guard). Both SHOULD nag every
+  // turn until resolved (the anti-drop signal) and both are rare by construction, so neither cries
   // wolf. Dynamic import so a broken helper can never crash the prompt before this catch.
   let stranded = '';
   try {
-    const { strandedThreadLines } = await import('../scripts/fray/agent-liveness.mjs');
-    const sl = strandedThreadLines({ transcriptPath, projectDir: dir });
-    if (sl.length) stranded = '\n\n' + sl.join('\n');
+    const { strandedThreadLines, longRunningAgentLines } = await import('../scripts/fray/agent-liveness.mjs');
+    const loud = [
+      ...longRunningAgentLines({ transcriptPath, projectDir: dir }).map((v) => v.line),
+      ...strandedThreadLines({ transcriptPath, projectDir: dir }),
+    ];
+    if (loud.length) stranded = '\n\n' + loud.join('\n');
   } catch {
-    /* fail-open — no stranded surfacing rather than risk the prompt */
+    /* fail-open — no loud-liveness surfacing rather than risk the prompt */
   }
 
   // ANTI-DRIFT RECONCILE FORCING-FUNCTION (per-turn BACKSTOP render). The PRIMARY, causal home
@@ -244,30 +252,47 @@ try {
   // SUB-AGENT's turn, the wrong surface.) This per-turn render is the SECOND line of defense: it
   // catches drift the rest path can't — EXTERNAL drift (a PR merged / CI flipped with no thread
   // edit and thus no rest to key off) and the FIRST-reconcile baseline — plus any thread the
-  // orchestrator edited itself without a dispatched agent. TWO-TRIGGER gate (shouldNagReconcile):
-  // (1) DIRTY — a NON-TERMINAL thread's mtime is NEWER than the last reconcile; (2) BACKSTOP — a
-  // long wall-clock fallback for file-invisible external drift. Silent when clean — no cry-wolf.
-  // FAST by design: only mtime/timestamp math (no network/gh). The per-thread mtimes were already
-  // stat'd into `scanned`; take the newest among non-terminal.
+  // orchestrator edited itself without a dispatched agent.
+  //
+  // Three anti-treadmill refinements (2026-07-06):
+  //   #1 OWNER-FILTER — a thread whose latest edit was its OWNING AGENT's own reconciliation
+  //      (write-ownership) is NOT drift; assessDrift excludes it via the owner-reconcile marks, so
+  //      an agent editing its own thread no longer nags a full board re-ground (the main treadmill).
+  //   #3 SCOPED — name the specific drifted thread(s) ("re-ground <slug>"), not "everything".
+  //   #5 DEBOUNCE — a `dirty` signal must persist >T min AND >K turns before it nags, so a burst
+  //      of return-folding (each turn editing a non-terminal thread) doesn't nag every turn.
+  // FAST by design: only mtime/timestamp math (no network/gh). Reuses `scanned` (already stat'd).
   let reconcileBlock = '';
   try {
     const lastMs = readLastReconcile(dir);
     const backstopMin = reconcileBackstopMin(cfg);
-    const nonTerminalMtimes = scanned
-      .filter((t) => !TERMINAL.includes(t.status ?? '') && t.mtimeMs > 0)
-      .map((t) => t.mtimeMs);
-    const newestNonTerminalMtimeMs = nonTerminalMtimes.length ? Math.max(...nonTerminalMtimes) : null;
-    const { nag, reason } = shouldNagReconcile({ newestNonTerminalMtimeMs, lastReconcileMs: lastMs, backstopMin });
-    if (nag) {
-      const ago = lastMs == null ? 'never recorded' : `${Math.round((Date.now() - lastMs) / 60_000)}m ago`;
-      // Reason-aware framing so the orchestrator knows WHY it fired (and thus what to re-check).
+    const ownerReconciled = readOwnerReconciled(dir);
+    const records = scanned.map((t) => ({ slug: t.id, status: t.status, mtimeMs: t.mtimeMs }));
+    const { nag: driftNag, reason: driftReason, dirtySlugs } = assessDrift({ records, ownerReconciled, lastReconcileMs: lastMs, backstopMin, now });
+
+    // DEBOUNCE state (turn-aware): a tiny JSON under `.fray/` carrying the turn counter + the
+    // current dirty-window. Incremented every prompt; the window resets when drift clears.
+    const nagStatePath = join(dir, '.fray', '.reconcile-nag-state.json');
+    let nagState = {};
+    try { nagState = JSON.parse(readFileSync(nagStatePath, 'utf8')) || {}; } catch { nagState = {}; }
+    const turns = (typeof nagState.turns === 'number' ? nagState.turns : 0) + 1;
+    const deb = debounceReconcileNag({
+      reason: driftNag ? driftReason : null,
+      now, turns, state: nagState,
+      debounceMin: DEFAULT_RECONCILE_DEBOUNCE_MIN, debounceTurns: DEFAULT_RECONCILE_DEBOUNCE_TURNS,
+    });
+    try { writeFileSync(nagStatePath, JSON.stringify({ ...deb.state, turns }) + '\n'); } catch { /* best-effort */ }
+
+    if (deb.nag) {
+      const ago = lastMs == null ? 'never recorded' : `${Math.round((now - lastMs) / 60_000)}m ago`;
+      // Reason-aware + SCOPED framing so the orchestrator knows WHY it fired and exactly WHAT to re-check.
       const why =
-        reason === 'dirty'
-          ? `a NON-TERMINAL thread changed since the last reconcile (${ago}) — its status may no longer match reality; re-ground it`
-          : reason === 'backstop'
+        driftReason === 'dirty'
+          ? `${dirtySlugs.length} NON-TERMINAL thread(s) changed since the last reconcile (${ago}) via a non-owning-agent path — status may no longer match reality: ${dirtySlugs.join(', ')}`
+          : driftReason === 'backstop'
             ? `${ago} since the last reconcile — external state (PRs merging / CI flipping) may have drifted WITHOUT any thread edit; re-ground the board`
             : `no reconcile on record yet (${ago}) — establish the baseline`;
-      reconcileBlock = `⚠ BOARD RECONCILE STALE — ${why}. ${reconcileStampLastInstruction()} Do this before trusting the pending list below.\n\n`;
+      reconcileBlock = `⚠ BOARD RECONCILE STALE — ${why}. ${reconcileStampLastInstruction(driftReason === 'dirty' ? dirtySlugs : null)} Do this before trusting the pending list below.\n\n`;
     }
   } catch {
     /* fail-open — skip the reconcile nag rather than risk the prompt */
