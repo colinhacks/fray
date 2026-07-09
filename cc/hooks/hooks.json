@@ -8,6 +8,21 @@
         ]
       }
     ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/fray-subagent-rest.mjs\"" }
+        ]
+      },
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/fray-rest-guard.mjs\"" }
+        ]
+      }
+    ]
+  },
+  "_disabled_board_reconciliation": {
+    "_why": "v1.30.0: the cross-session board-reconciliation layer is DISABLED — every chat session manages only its own dispatched sub-agents, and no session is pulsed with the full set of in-flight fray threads. The shared .fray/ thread files remain the durable record; what's gone is the hook machinery that read them back into every session (per-turn pulses, stop-time nags, session seeding, cross-session notify surfacing, agent-thread bindings). The hook files are retained below for potential revival.",
     "PostToolUse": [
       {
         "matcher": "Agent",
@@ -38,18 +53,6 @@
       {
         "hooks": [
           { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/fray-notify-surface.mjs\"" }
-        ]
-      }
-    ],
-    "SubagentStop": [
-      {
-        "hooks": [
-          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/fray-subagent-rest.mjs\"" }
-        ]
-      },
-      {
-        "hooks": [
-          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/fray-rest-guard.mjs\"" }
         ]
       }
     ],

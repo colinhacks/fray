@@ -126,6 +126,8 @@ It enforces the invariant that a **human-`blocked` thread** (`status: blocked` w
 
 ### The hooks
 
+> **v1.30.0: the board-reconciliation layer is disabled.** Only `agent-dispatch` and the `SubagentStop` rest guards remain registered — each chat session manages its own dispatched sub-agents, and no session is pulsed with the full set of in-flight fray threads (the shared-board hooks were cross-notifying concurrent sessions). `.fray/` thread files stay the durable record; the `fray` CLI computes the board on demand. The disabled registrations (`fray-reminder`, `session-seed`, `fray-stop-reminder`, `fray-notify-surface`, `agent-bind`, `fray-thread-edit-steer`, `session-end`) are parked under `_disabled_board_reconciliation` in `hooks/hooks.json`; the table rows below describe that parked layer.
+
 The plugin wires six lifecycle hooks. All of them are gated on the activation check above — silent in any project without an opted-in `.fray/`.
 
 | Hook | Event | Job |

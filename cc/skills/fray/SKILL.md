@@ -1,12 +1,14 @@
 ---
 name: fray
 description: Load this skill IMMEDIATELY — as your FIRST action, before any other tool call or response — whenever the user mentions "fray" in ANY form ("fray", "fray mode", "enter/start fray", "load fray", "use fray", "in fray", "the fray skill"), OR asks to orchestrate / run / coordinate a multi-effort push, audit, or campaign through sub-agents. Also the default for any large, mixed set of efforts — investigations + decided fixes + verifications — toward a goal (a launch push, a pre-release audit, a refactor campaign) where the human wants to stay in the loop on what the investigations surface; the default for any multi-effort push that is part "find out what's true" and part "land the decided thing." Use it instead of hardcoding a multi-agent DAG up front — those bury the decision points and fan out expensively before the facts are in. Treat any "fray" mention as an explicit instruction to load this skill, never as ambient context.
-version: 1.29.1
+version: 1.30.0
 metadata:
   internal: true
 ---
 
 # fray
+
+> **v1.30.0 — the board-RECONCILIATION hook layer is DISABLED (maintainer decision, 2026-07-09).** The `fray-reminder` per-turn pulse, `fray-stop-reminder` reconcile nudge, `session-seed` seeding, `fray-notify-surface` idle surfacing, `agent-bind` bindings, `fray-thread-edit-steer`, and `session-end` liveness no longer fire — each chat session manages ONLY its own dispatched sub-agents and is never pulsed with the full set of in-flight fray threads (shared board state was cross-notifying concurrent sessions). Still active: `agent-dispatch` (background-dispatch enforcement + epilogue) and the SubagentStop rest guards. The `.fray/` thread files remain the durable record and the `fray` board CLI still computes the board ON DEMAND — read it when you want it; nothing pushes it at you. Passages below describing automatic hook pulses/nags/bindings predate this and describe the disabled layer (their registrations are parked under `_disabled_board_reconciliation` in `hooks/hooks.json` for revival).
 
 **fray** is the orchestrator-first methodology for driving a large, mixed set of efforts (investigations + decided fixes + verifications) through individually-dispatched background sub-agents. A *fray* is a tangle of concurrent **threads**; each thread is one ongoing effort (possibly a chain of sub-agents). The human stays in the loop on the decisions the investigations surface. fray is the default for any multi-effort push that is part *find-out-what's-true* and part *land-the-decided-thing* — use it **instead of** a hardcoded `Workflow` DAG, which fans out expensively and buries the decision points before the facts are in.
 
