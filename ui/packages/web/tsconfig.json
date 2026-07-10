@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "lib": ["es2023", "dom", "dom.iterable"],
+    "types": []
+  },
+  "include": ["src"],
+  // *.test.ts are node:test files run via `node --test`, not part of the browser bundle; the
+  // browser tsconfig has no node types, so keep them out of this typecheck.
+  "exclude": ["src/**/*.test.ts"]
+}

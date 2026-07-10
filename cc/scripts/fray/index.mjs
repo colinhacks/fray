@@ -51,6 +51,7 @@ import {
   parseDeps,
   blockMechanism,
   isHumanBlocked,
+  effectiveStatus,
   touchSessionHeartbeat,
   clearSessionHeartbeat,
   readSessionHeartbeat,
@@ -307,10 +308,6 @@ const threads = frayEntries
       if (fm.status && !isValidStatus(fm.status))
         errors.push(`invalid status "${fm.status}" (expected one of: ${ACCEPTED_STATUSES.join(', ')})`);
     }
-    // Bucket on the CANONICAL status: a legacy `todo`/`plan`/`needs-decision` thread groups
-    // (and is surfaced) as its canonical target. Unknown/garbage passes through unchanged so
-    // it still lands in the `(invalid status)` group below.
-    const status = normalizeStatus(fm?.status) ?? '?';
     // The dependency field is `blocking_threads` (the RENAME of `depends_on`, 2026-07-01);
     // `depends_on` stays accepted as a read-alias FIELD so old threads still resolve. Both mean
     // the same array — bare THREAD-slug deps (drive READY/auto-fire + dangling validation) plus
@@ -328,12 +325,37 @@ const threads = frayEntries
     // a typo'd timestamp surfaces as a non-fatal warning below rather than silently never firing.
     const revalidate = revalidateState(fm?.revalidate_at, fm?.last_checked);
     const revalidateMalformed = Boolean(fm?.revalidate_at) && !revalidate;
-    // The RESOLUTION MECHANISM of a `blocked` thread (meaningless for other statuses): human
-    // (⚖/yellow) vs threads/timer (gray). Both fields present → the validator warns; derivation
-    // picks timer > threads > human. `humanBlocked` is the ⚖ awaiting-you predicate.
-    const mechanism = blockMechanism({ hasBlockingThreads: dependsOn.length > 0, hasTimer: Boolean(revalidate) });
-    const humanBlocked = status === 'blocked' && isHumanBlocked({ hasBlockingThreads: dependsOn.length > 0, hasTimer: Boolean(revalidate) });
+    const hasBlockingThreads = dependsOn.length > 0;
+    const hasTimer = Boolean(revalidate);
+    // Bucket on the EFFECTIVE status: legacy string aliases normalized, PLUS the one contextual
+    // alias — a legacy `blocked` thread with no machine field reads as `needs-human` (see
+    // config.effectiveStatus). Unknown/garbage passes through so it still lands in `(invalid status)`.
+    const status = effectiveStatus(fm?.status, { hasBlockingThreads, hasTimer }) ?? '?';
+    // Status-specific validation (needs the effective status + the mechanism fields):
+    /** @type {string[]} */ const warnings = [];
+    if (fm) {
+      // `needs-human` (incl. a legacy blocked-with-no-machine-field thread that reads as
+      // needs-human) MUST carry a status_text — that line IS the ask surfaced in the ⚖ queue.
+      if (status === 'needs-human' && !(fm.status_text ?? '').trim())
+        errors.push('needs-human requires a status_text stating the ask');
+      // `blocked` now means a MACHINE wait; with no machine field it is mis-encoded (reads as
+      // needs-human). WARN, suggesting the canonical needs-human — never a hard error (legacy). Only
+      // when a status_text is present: otherwise the needs-human-requires-status_text ERROR above
+      // already covers this thread, so we don't double-report it.
+      if (normalizeStatus(fm.status) === 'blocked' && !hasBlockingThreads && !hasTimer && (fm.status_text ?? '').trim())
+        warnings.push('blocked with no machine field (blocking_threads/revalidate_at) reads as needs-human — write `status: needs-human`, or add a machine field');
+    }
+    // Mechanism (meaningful only for a machine-`blocked` thread: threads vs timer, both gray).
+    // `humanBlocked` — the ⚖ awaiting-you predicate — is now simply `status === 'needs-human'`
+    // (effectiveStatus already folded the legacy blocked-no-field human case into needs-human).
+    const mechanism = blockMechanism({ hasBlockingThreads, hasTimer });
+    const humanBlocked = status === 'needs-human';
     const next = nextStep(src);
+    // DERIVED plan marker (NOT a frontmatter flag — deliberately rejected): a thread whose body keeps
+    // a `## Plan` section carries a plan document, so the UI can render a quiet PLAN badge. Purely
+    // derived from doc content (like `next`), read-side only, additive — the validator never sees it.
+    // A `\b` after Plan so "## Planning notes"/"## Planned work" DON'T match; "## Plan"/"## Plan (v2)" do.
+    const hasPlan = /^##\s+Plan\b/im.test(src);
     const threadTerminal = TERMINAL.includes(status);
     const threadActive = status === 'active'; // only `active` threads flag dropped/idle agents; parked phases are expected to hold done agents
     const threadDownstream = downstream.has(id); // PR landing via the cascade → legitimately active, suppress
@@ -353,7 +375,13 @@ const threads = frayEntries
       title: fm?.title ?? '',
       status, // CANONICAL (legacy aliases normalized); unknown passes through as-is
       status_text: fm?.status_text ?? '',
+      // A form-constrained gerund ACTIVITY label (single line, ≤100 chars, e.g. "Awaiting CI on
+      // PR #391") that workers maintain — the at-a-glance "what it's doing right now" gloss the UI
+      // listing row shows. Distinct from status_text (the fuller board/queue gloss). Additive,
+      // read-side only; absent on old threads (undefined → omitted from JSON, renders nothing).
+      activity: fm?.activity ?? undefined,
       next,
+      hasPlan, // derived: body has a `## Plan` section (drives the UI's quiet PLAN badge)
       dependsOn,
       threadDeps,
       externalDeps,
@@ -366,7 +394,7 @@ const threads = frayEntries
       agents,
       text: src,
       errors,
-      /** @type {string[]} */ warnings: [],
+      warnings, // seeded with any status-specific validation warnings computed above; the pass below appends more
       dropRisk: false, // set true when the blocked-machine-but-all-deps-terminal heuristic fires
     };
   });
@@ -487,17 +515,12 @@ for (const t of threads) {
     t.warnings.push('drop risk: `blocked` on `blocking_threads` that are ALL terminal — it should have auto-fired; re-read the thread and dispatch/advance it now');
   }
 
-  // (1b) ONE MECHANISM PER BLOCKED THREAD — warn on ambiguity. A `blocked` thread should carry
-  //      exactly one resolution mechanism; both `blocking_threads` AND `revalidate_at` set is
-  //      ambiguous (which unblocks it?). And a HUMAN-blocked thread (neither field) MUST have a
-  //      status_text — it IS the ⚖ awaiting-you queue entry, so an empty one is an empty row.
-  if (t.status === 'blocked') {
-    if (t.hasBlockingThreads && t.revalidate) {
-      t.warnings.push('blocked with BOTH `blocking_threads` and `revalidate_at` — set exactly ONE resolution mechanism (the board treats it as the timer)');
-    }
-    if (t.humanBlocked && !t.status_text) {
-      t.warnings.push('HUMAN-blocked (no `blocking_threads`/`revalidate_at`) but no status_text — write the decision needed; it IS the ⚖ awaiting-you queue entry');
-    }
+  // (1b) ONE MECHANISM PER BLOCKED THREAD — warn on ambiguity. A machine-`blocked` thread should
+  //      carry exactly one resolution mechanism; both `blocking_threads` AND `revalidate_at` set is
+  //      ambiguous (which unblocks it?). (The needs-human-requires-status_text rule is a HARD ERROR
+  //      raised in the parse pass above, not a warning here.)
+  if (t.status === 'blocked' && t.hasBlockingThreads && t.revalidate) {
+    t.warnings.push('blocked with BOTH `blocking_threads` and `revalidate_at` — set exactly ONE resolution mechanism (the board treats it as the timer)');
   }
 
   // status_text is a 1-2 sentence English status note (frontmatter); flag overlong ones —
@@ -531,6 +554,18 @@ for (const t of threads) {
 
 const allErrors = threads.filter((t) => t.errors.length).map((t) => `  ${t.id}.md: ${t.errors.join('; ')}`);
 const allWarnings = threads.filter((t) => t.warnings.length).map((t) => `  ${t.id}.md: ${t.warnings.join('; ')}`);
+// STRUCTURED, per-file mirror of `allErrors` for the UI (--json only). The parser knows exactly WHY
+// it rejected a file, so it classifies here: a thread whose sole barrier is a missing frontmatter
+// block is one-click REPAIRABLE (`kind: 'no-frontmatter'`); anything else is `other` (dangling dep,
+// bad status, missing field) and carries no repair affordance. `file` is the .md basename. Additive
+// — `allErrors` (the legacy string array) is emitted unchanged alongside it.
+const errorItems = threads
+  .filter((t) => t.errors.length)
+  .map((t) => ({
+    file: `${t.id}.md`,
+    kind: t.errors.includes('no YAML frontmatter') ? 'no-frontmatter' : 'other',
+    message: t.errors.join('; '),
+  }));
 
 if (process.argv.includes('--validate') || process.argv.includes('--check')) {
   // Warnings print but DO NOT affect the exit code — they're conservative drop-risk
@@ -550,7 +585,12 @@ if (process.argv.includes('--json')) {
     // READY = thread deps present + all clear + no external gate outstanding.
     return { ...t, blockers: b, ready: t.threadDeps.length > 0 && b.length === 0 && t.externalDeps.length === 0 };
   });
-  console.log(JSON.stringify({ config: cfg, threads: dump, errors: allErrors, warnings: allWarnings }, null, 2));
+  // Await the write, THEN exit — stdout to a PIPE is async past 64KB, and console.log +
+  // process.exit truncated the payload mid-JSON (a ~1MB board reached consumers as exactly 64KB of
+  // unparseable prefix). The drain callback fires only once the pipe has the whole payload.
+  // Compact — this is a machine interface, and pretty-printing added ~90KB on a large board.
+  const payload = JSON.stringify({ config: cfg, threads: dump, errors: allErrors, warnings: allWarnings, errorItems }) + "\n";
+  await new Promise((res) => process.stdout.write(payload, res));
   process.exit(0);
 }
 
@@ -597,17 +637,17 @@ out.push(`fray board — autonomous_mode: ${cfg.autonomousMode ? 'on' : 'off'}${
 if (allErrors.length) out.push(`\n⚠ VALIDATION ERRORS:\n${allErrors.join('\n')}`);
 if (allWarnings.length) out.push(`\n⚠ DROP-RISK WARNINGS (advisory):\n${allWarnings.join('\n')}`);
 
-// ⚖ AWAITING YOU — the COMPUTED queue of every HUMAN-blocked thread (`blocked` with NO
-// `blocking_threads` and NO `revalidate_at` → only the maintainer can unblock it), surfaced by
-// its FULL status_text (the concise decision needed). HOISTED to the top of the board (not
-// buried mid-status-list) and rendered UNTRUNCATED. The machine/timer-blocked threads are NOT
-// here — they wait on non-human work and render (gray, last) in the `blocked` group below.
-// Nothing is stored: filtered live from the scanned threads. Shown in the live/default + `--all`
-// views and when `--status blocked` (or its `needs-decision`/`enqueued` aliases) is requested.
-if (!only || only === 'blocked') {
+// ⚖ AWAITING YOU — the COMPUTED queue of every `needs-human` thread (including a legacy `blocked`
+// thread with NO machine field, which reads as needs-human), surfaced by its FULL status_text (the
+// concise ask). HOISTED to the top of the board (not buried mid-status-list) and rendered
+// UNTRUNCATED. The machine/timer-`blocked` threads are NOT here — they wait on non-human work and
+// render (gray, last) in the `blocked` group below. Nothing is stored: filtered live from the
+// scanned threads. Shown in the live/default + `--all` views and when `--status needs-human` (or
+// its `needs-decision` alias) is requested.
+if (!only || normalizeStatus(only) === 'needs-human') {
   const pendingDecisions = threads.filter((t) => t.humanBlocked);
   if (pendingDecisions.length) {
-    out.push(`\n## ⚖ awaiting you (${pendingDecisions.length}) — human-blocked`);
+    out.push(`\n## ⚖ awaiting you (${pendingDecisions.length}) — needs-human`);
     for (const t of pendingDecisions) renderThread(t, out);
   }
 }

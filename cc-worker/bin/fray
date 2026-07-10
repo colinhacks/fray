@@ -1,0 +1,17 @@
+#!/usr/bin/env node
+// @ts-check
+/**
+ * fray — the board command, on the worker's Bash PATH while the fray-worker plugin is enabled.
+ * A worker owns ONE thread but can still run `fray` (validate/read the board for its repo). This
+ * shim execs cc's bundled board script directly (NOT a copy) — cc-worker never forks board logic.
+ *
+ * Resolving the board: this file is <plugin>/bin/fray, cc is a sibling of the plugin root, so the
+ * board is at ../../cc/scripts/fray/index.mjs relative to THIS file — cwd-independent. Imported
+ * via a file:// URL so argv/process.env (incl. CLAUDE_PROJECT_DIR) flow straight through.
+ */
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { dirname, join } from 'node:path';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const board = join(here, '..', '..', 'cc', 'scripts', 'fray', 'index.mjs');
+await import(pathToFileURL(board).href);

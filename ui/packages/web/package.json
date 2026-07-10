@@ -1,0 +1,41 @@
+{
+  "name": "@fray-ui/web",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@fray-ui/rpc": "workspace:*",
+    "@fray-ui/shared": "workspace:*",
+    "@radix-ui/react-dialog": "^1.1.18",
+    "@radix-ui/react-dropdown-menu": "^2.1.19",
+    "@radix-ui/react-select": "^2.3.2",
+    "@radix-ui/react-tabs": "^1.1.16",
+    "@radix-ui/react-tooltip": "^1.2.11",
+    "@tanstack/react-query": "^5",
+    "@xstate/react": "^6.1.0",
+    "@xterm/addon-fit": "^0.11",
+    "@xterm/addon-webgl": "^0.19",
+    "@xterm/xterm": "^5.5",
+    "cmdk": "^1",
+    "lucide-react": "^0.525",
+    "marked": "^15",
+    "react": "^19",
+    "react-dom": "^19",
+    "valtio": "^2",
+    "xstate": "^5.32.3",
+    "zod": "^3.24"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@vitejs/plugin-react": "^5",
+    "tailwindcss": "^4",
+    "typescript": "^5.7",
+    "vite": "^8"
+  }
+}

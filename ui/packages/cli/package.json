@@ -1,0 +1,14 @@
+{
+  "name": "fray-ui",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "bin": { "fray-ui": "./src/index.ts" },
+  "dependencies": {
+    "@fray-ui/server": "workspace:*",
+    "@fray-ui/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.7"
+  }
+}

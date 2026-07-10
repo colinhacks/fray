@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>fray</title>
+    <!-- Own Dock/tab identity. The SVG favicon is preferred by modern browsers; the PNGs are the
+         fallback + the source Chrome rasterizes into the macOS app icon when the app is installed
+         ("Install fray…" / Create Shortcut → Open as window), which is the only way a Chrome-hosted
+         window gets its own Dock name+icon (a plain --app window is owned by Chrome). -->
+    <!-- ?v= is a cache-buster: Chrome caches favicons per-URL for a long time, so an icon EDIT at the
+         same path keeps showing the stale cached copy (a hard-quit doesn't clear it). Bump this whenever
+         the icon art changes so the browser refetches. v2: reconnected 5th strand + spiral rope base. -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=3" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png?v=3" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png?v=3" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png?v=3" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="theme-color" content="#0d0e10" />
+    <!-- FOUC guard: the font choice lives in server settings, which arrive an RPC round-trip after
+         first paint — apply the last-known value synchronously from localStorage so the page never
+         flashes mono before swapping to sans (font.ts confirms/corrects once settings load). -->
+    <script>
+      try { document.documentElement.dataset.font = localStorage.getItem("fray-font") === "mono" ? "mono" : "sans" } catch {}
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

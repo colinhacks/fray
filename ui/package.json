@@ -1,0 +1,27 @@
+{
+  "name": "fray-ui-workspace",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=26"
+  },
+  "scripts": {
+    "dev": "node packages/server/src/dev.ts",
+    "typecheck": "tsc -b packages/shared packages/rpc packages/server packages/cli && pnpm --filter @fray-ui/web typecheck",
+    "test": "node --test 'packages/server/src/**/*.test.ts' 'packages/web/src/**/*.test.ts'"
+  },
+  "devDependencies": {
+    "@types/node": "^24",
+    "puppeteer": "^25.3.0",
+    "typescript": "^5.7"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "node-pty",
+      "@parcel/watcher",
+      "esbuild",
+      "@fray-ui/server"
+    ]
+  }
+}

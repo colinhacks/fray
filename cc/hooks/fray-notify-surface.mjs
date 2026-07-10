@@ -20,6 +20,11 @@
 //   - Coexists safely with any other Stop hook (and a project-local copy): they share the
 //     queue file's `surfaced` flag, so whichever fires first stamps it and the other no-ops.
 //   - Any error → allow the stop (never wedge the session on a notify bug).
+// GATE: a fray-ui WORKER session (FRAY_UI_THREAD set) is owned by the cc-worker plugin — the
+// orchestrator hooks must stay silent there, or their injected pulses pollute the worker's
+// transcript (and the fray-ui chat rendering of it). Exit 0 with no output = inert.
+if ((process.env.FRAY_UI_THREAD ?? '').trim()) process.exit(0);
+
 import { join } from 'node:path';
 import { readQueue, writeQueue, renderMarkdown } from '../scripts/fray/notify-shared.mjs';
 

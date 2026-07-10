@@ -17,6 +17,11 @@
 // Claude Code hooks docs, 2026-06-14), so the old PostCompact wiring was a silent no-op.
 // SessionStart additionalContext IS injected into the next turn. Robust: never throws (a
 // broken hook must not disrupt the session).
+// GATE: a fray-ui WORKER session (FRAY_UI_THREAD set) is owned by the cc-worker plugin — the
+// orchestrator hooks must stay silent there, or their injected pulses pollute the worker's
+// transcript (and the fray-ui chat rendering of it). Exit 0 with no output = inert.
+if ((process.env.FRAY_UI_THREAD ?? '').trim()) process.exit(0);
+
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { frayActive, currentSessionId, touchSessionHeartbeat } from '../scripts/fray/config.mjs';

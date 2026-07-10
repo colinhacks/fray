@@ -10,6 +10,11 @@
 // Run directly with node (no transpiler). Supersedes agent-must-be-background.sh.
 // FAIL OPEN: any parse error → allow unmodified. A broken dispatch hook must never halt
 // orchestration (the overnight heartbeat itself dispatches through here).
+// GATE: a fray-ui WORKER session (FRAY_UI_THREAD set) is owned by the cc-worker plugin — the
+// orchestrator hooks must stay silent there, or their injected pulses pollute the worker's
+// transcript (and the fray-ui chat rendering of it). Exit 0 with no output = inert.
+if ((process.env.FRAY_UI_THREAD ?? '').trim()) process.exit(0);
+
 import { readFileSync, appendFileSync, writeFileSync, existsSync } from 'node:fs';
 import { frayActive } from '../scripts/fray/config.mjs';
 

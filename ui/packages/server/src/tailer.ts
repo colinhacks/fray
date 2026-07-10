@@ -1,0 +1,1119 @@
+import { statSync, openSync, readSync, closeSync, readdirSync } from "node:fs"
+import { join } from "node:path"
+import { homedir } from "node:os"
+import type { Bus } from "./bus.ts"
+import type { Project } from "./project.ts"
+import type { Storage } from "./storage.ts"
+import * as tmux from "./tmux.ts"
+
+// The JSONL tailer: incrementally reads each registered session's Claude Code transcript
+// (~/.claude/projects/<cwdSlug>/<session_id>.jsonl) to derive liveness telemetry — last activity
+// time, a preview of the last assistant text, and whether the current TURN is in flight or idle.
+// Per the architecture invariant, this file is TELEMETRY ONLY: it never gates correctness, parses
+// defensively (bad line skipped, unknown type ignored, never throws), and degrades to "unknown"
+// on any schema surprise rather than crashing.
+//
+// ---- TURN-STATE HEURISTIC (chosen empirically) ----
+// Investigated the 15 real transcripts in ~/.claude/projects/-Users-colinmcd94-Documents-projects-fray/.
+// Record `type`s observed: assistant, user, attachment, queue-operation, last-prompt, ai-title,
+// permission-mode, mode, bridge-session, file-history-snapshot, system. Only `assistant`, `user`,
+// and `system` carry a `timestamp`; the rest are sidecar metadata (no timestamp).
+//
+// The DEFINITIVE turn-end signal is `assistant.message.stop_reason`. Across every transcript, an
+// assistant message is split into one JSONL record per content block, and ALL records of a given
+// message share the same stop_reason:
+//   - "tool_use"  → the model is calling tools; the turn CONTINUES (a tool_result user record and
+//                   further assistant records will follow).
+//   - "end_turn"  → the model has finished; control returns to the prompt (the agent is IDLE).
+// Empirically EVERY completed transcript's last substantive record is an assistant `end_turn`
+// (optionally trailed by sidecar `system`/`last-prompt`/`ai-title` records). Counts across the
+// corpus: 363 tool_use+tool_use, 209 tool_use+thinking, 117 tool_use+text, 41 end_turn.
+//
+// Derivation over the "last substantive record" (assistant or user; sidecar types ignored):
+//   - assistant, stop_reason "end_turn"  → idle (definitive)
+//   - assistant, stop_reason "tool_use"  → in-flight (tool exchange ongoing; DO NOT time out —
+//                                          Opus tool latency routinely exceeds 5s)
+//   - assistant, stop_reason missing/other → BACKSTOP: idle iff no append for >5s, else in-flight
+//   - user (a fresh prompt or a tool_result) → in-flight (the model is about to respond)
+//   - no substantive records yet             → in-flight (spawning; the pane is live)
+// The 5s backstop only fires for an UNKNOWN stop_reason, so it can never override a clear tool_use.
+
+const IDLE_BACKSTOP_MS = 5000
+const POLL_MS = 1000
+// A tracked background sub-agent whose transcript file has gone this long without an append is
+// treated as "stale" — a liveness fallback for a completion record we somehow missed (the child
+// died, or the worker session ended before the <task-notification> landed). ~5min: comfortably
+// longer than a child's between-tool quiet gaps, short enough that a dead child clears promptly.
+const SUBAGENT_STALE_MS = 5 * 60_000
+// How long the transcript must be silent while a turn still looks in-flight before we spend a
+// tmux capture-pane to sniff for an interactive permission prompt. Keeps us from shelling out
+// every tick for a healthily-streaming turn; a real prompt only appears after a tool_use record
+// (which stamps lastActivityAt), so by the time one shows the transcript has already gone quiet.
+const PERM_SNIFF_MS = 4000
+// Whole-directory FOREIGN-session discovery: a *.jsonl in the log dir with no registry row is a
+// maintainer terminal, surfaced as a read-only thread. Only files touched within this window are
+// "live" foreign threads (the dir accumulates every session ever); a file that ages past it drops
+// out of foreignIds() but keeps its cached tail. Exported so other verticals share the freshness rule.
+export const FOREIGN_FRESH_MS = 24 * 60 * 60_000
+// Cap on concurrently-surfaced foreign threads (most-recent by mtime) — defensive against a log dir
+// holding thousands of historical sessions.
+const FOREIGN_MAX = 20
+// Foreign discovery is a readdir + per-file stat; too costly per 1s tick, so scan at most every 5th
+// tick (~5s) plus the very first tick. Between scans the last fresh set is reused verbatim.
+const FOREIGN_SCAN_EVERY = 5
+
+export type TurnState = "in-flight" | "idle"
+
+// A live background sub-agent as surfaced to the board (mirrors @fray-ui/shared SubAgentView; kept
+// as a local shape so the tailer's telemetry stays decoupled from the wire schema).
+export interface SubAgentView {
+  label: string
+  startedAt: string // ISO8601 of the dispatch record
+  state: "running" | "stale"
+  subagentType?: string // the dispatch's input.subagent_type verbatim (e.g. "fray:fray-opus-high"); absent when unset
+  id: string // the dispatch tool_use id — the drill-in drawer's stable handle to this exact child
+}
+
+// A signal fence parsed from the FINAL assistant message (mirrors @fray-ui/shared ThreadFence; kept
+// as a local shape so the tailer's telemetry stays decoupled from the wire schema). The fence
+// language IS the state, the body is the message; `hints` are `<kind>: <value>` lines parsed from an
+// awaiting body. Only meaningful while it is the final message — any newer user record clears it.
+export interface FenceView {
+  kind: "done" | "awaiting"
+  body: string
+  hints: { kind: "pr" | "ci" | "timer" | "session"; value: string }[]
+}
+
+// Per-session derived telemetry surfaced to the board overlay.
+export interface SessionTelemetry {
+  turn: TurnState
+  permPrompt: boolean // paused on an interactive permission prompt (pane-sniffed; no jsonl signal)
+  lastActivityAt?: string // ISO8601 of the last timestamped record
+  lastAssistant?: string // trimmed preview (~200 chars) of the last assistant text block
+  aiTitle?: string // Claude's own auto-generated session title (latest ai-title sidecar record)
+  subAgents: SubAgentView[] // live background sub-agents this session dispatched (empty when none)
+  bgShells: BgShellView[] // live background shells this session launched (empty when none)
+  pendingAsk?: PendingAskData // a pending native AskUserQuestion the session is frozen on (else absent)
+  pendingQuestion: boolean // at rest with an unanswered ```question block as the last assistant message
+  lastUserAt?: string // ISO8601 of the newest USER-role record (answer/steer/dispatch) — the listing sort key
+  lastFence?: FenceView // done/awaiting excusal fence on the latest assistant message (else absent)
+}
+
+// ---- Interactive permission-prompt sniff (pane text; no jsonl signal) ----
+// Even under `--permission-mode auto`, claude still stops on an interactive permission prompt for
+// some tool calls, and the transcript gives NO signal — the last record stays assistant +
+// stop_reason:"tool_use" (in-flight) indefinitely. The only observable is the rendered TUI. These
+// markers were captured empirically (claude 2.1.198, --permission-mode default) for both a Bash
+// and an Edit approval:
+//
+//   Bash command
+//     touch approved-me.txt
+//     Create empty file approved-me.txt
+//   Do you want to proceed?
+//   ❯ 1. Yes
+//     2. Yes, and always allow access to permtest/ from this project
+//     3. No
+//   Esc to cancel · Tab to amend · ctrl+e to explain
+//
+//   Edit file / file.txt / <diff>
+//   Do you want to make this edit to file.txt?
+//   ❯ 1. Yes
+//     2. Yes, allow all edits during this session (shift+tab)
+//     3. No
+//   Esc to cancel · Tab to amend
+//
+// Stable across tools: a question line beginning "Do you want", a numbered "1. Yes" option, and the
+// modal footer "Esc to cancel" (a streaming turn shows "esc to interrupt" instead; an idle prompt
+// shows neither). We require the "1. Yes" option AND (the question OR the footer) — two independent
+// signals, so a model merely printing "Do you want…" or its own numbered list can't trip it.
+const PERM_YES_OPTION = /(^|\n)\s*(❯\s*)?1\.\s+Yes\b/
+const PERM_QUESTION = /\bDo you want\b/
+const PERM_FOOTER = /\bEsc to (cancel|reject)\b/
+
+export function matchesPermPrompt(pane: string): boolean {
+  if (!pane) return false
+  if (!PERM_YES_OPTION.test(pane)) return false
+  return PERM_QUESTION.test(pane) || PERM_FOOTER.test(pane)
+}
+
+// One tracked live background sub-agent, keyed in TailState by its dispatch tool_use id (the
+// correlation key present BOTH on the Agent tool_use block AND in the completion <task-notification>'s
+// <tool-use-id>). Registered on the background dispatch, enriched with `outputFile` from the launch
+// tool_result, and removed on a terminal completion notification.
+interface SubAgentEntry {
+  kind: "agent" | "shell" // an Agent sub-agent (drill-in) vs a background Bash shell (display-only)
+  toolUseId: string
+  label: string // the dispatch's input.description (shell: falls back to the command's first-line summary)
+  startedAt: string // ISO8601 — the dispatch record's timestamp
+  subagentType?: string // the dispatch's input.subagent_type verbatim (agents only; may be absent)
+  outputFile?: string // the child/shell's output path (from the launch tool_result); its mtime = liveness
+}
+
+// A live background shell as surfaced to the board (mirrors @fray-ui/shared BgShellView).
+export interface BgShellView {
+  label: string
+  startedAt: string
+  state: "running" | "stale"
+}
+
+// A pending native AskUserQuestion (structured, capped). Mirrors @fray-ui/shared PendingAsk; `id` is
+// the tool_use id used to clear it when its tool_result lands.
+interface AskOptionData {
+  label: string
+  description?: string
+}
+interface AskQuestionData {
+  question: string
+  header?: string
+  multiSelect?: boolean
+  options: AskOptionData[]
+}
+interface PendingAskData {
+  id: string
+  questions: AskQuestionData[]
+}
+
+// A COMPLETED sub-agent retained for post-hoc review (reviewing a finished child is the main reason to
+// open its drawer). On its terminal notification a live SubAgentEntry moves into a bounded ring here —
+// EXCLUDED from every live surface (banner / counts / spinner stay live-only), but still resolvable by
+// the drill-in drawer via its retained outputFile. The ring caps memory; its file may later be cleaned
+// from disk, in which case the drawer degrades to its "transcript unavailable" state.
+interface RetiredSubAgent {
+  toolUseId: string
+  label: string
+  subagentType?: string
+  outputFile?: string
+  finishedAt?: string // ISO8601 of the completion notification
+  status: "completed" | "failed" | "killed"
+}
+// How many terminal sub-agents to retain per thread for drawer review (newest-wins ring).
+const RETAINED_SUBAGENTS_MAX = 20
+
+// Mutable accumulator for one session's tail. `offset`/`partial` track the byte cursor; the rest
+// is the running derivation folded from every record seen so far.
+export interface TailState {
+  slug: string
+  sessionId: string
+  path: string
+  // A FOREIGN thread (a maintainer terminal discovered from the log dir, no registry row). Structural
+  // guarantee that this state can NEVER shell out to tmux — no pane-sniff, no pane-death, no notify /
+  // storage write — since no `fray-<slug>` tmux session exists for it. Keyed by session id, not slug.
+  foreign: boolean
+  offset: number
+  partial: string
+  sawRecords: boolean
+  lastActivityAt?: string
+  lastAssistant?: string
+  aiTitle?: string // latest ai-title sidecar record's title (Claude's auto-name for the session)
+  // turn-relevant tail: the kind of the last substantive record + (for assistant) its stop_reason
+  lastKind?: "assistant" | "user"
+  lastStopReason?: string
+  lastUserAt?: string // ISO8601 of the newest user-role record (drives the chronological listing order)
+  // Whether the latest assistant text block contained a ```question fence — set on that text block,
+  // CLEARED when a user message lands (the answer supersedes it). Combined with an idle turn, this is
+  // the derived `pendingQuestion` (see get()). A chat-only ask the worker never encoded in its file.
+  lastAssistantHasQuestion: boolean
+  // The done/awaiting signal fence carried by the latest assistant text — same lifecycle as
+  // lastAssistantHasQuestion (recomputed per assistant text record, cleared by any user record).
+  lastFence?: FenceView
+  // live background OPS (sub-agents AND background shells), keyed by dispatch/launch tool_use id
+  // (insertion order = launch order); the `kind` field distinguishes them at the view boundary.
+  subAgents: Map<string, SubAgentEntry>
+  // completed sub-agents retained for drawer review (bounded ring; NOT surfaced live) — see above
+  retiredSubAgents: Map<string, RetiredSubAgent>
+  // a pending native AskUserQuestion the session is frozen on (no tool_result yet), else undefined
+  pendingAsk?: PendingAskData
+  subAgentsSig?: string // last-emitted signature of the derived background-ops + ask view (dirty-change detection)
+  // transition tracking (dedupe)
+  primed: boolean // first tick restores state WITHOUT firing transition notifies (boot/restart)
+  turn: TurnState
+  permPrompt: boolean // last pane-sniff verdict (see matchesPermPrompt)
+  paneDead: boolean
+}
+
+// A single parsed JSONL record — only the fields the derivation needs are typed; the rest are
+// ignored. `unknown`-shaped so a schema surprise degrades rather than throws.
+interface Record {
+  type?: string
+  timestamp?: string
+  aiTitle?: string // present only on ai-title sidecar records
+  customTitle?: string // present only on custom-title records (written by /rename)
+  content?: unknown // top-level string on queue-operation records — carries the <task-notification> XML
+  promptSource?: string // on user records: typed/queued (human) · "system" (peer msg / task-notification)
+  message?: { stop_reason?: string; content?: unknown }
+}
+
+// A fresh, unread tail cursor for a session (exported for tick + tests).
+export function newTailState(slug: string, sessionId: string, path: string, foreign = false): TailState {
+  return {
+    slug,
+    sessionId,
+    path,
+    foreign,
+    offset: 0,
+    partial: "",
+    sawRecords: false,
+    lastAssistantHasQuestion: false,
+    subAgents: new Map(),
+    retiredSubAgents: new Map(),
+    primed: false,
+    turn: "in-flight",
+    permPrompt: false,
+    paneDead: false,
+  }
+}
+
+// Defensive JSON parse: a malformed line yields null (skipped), never an exception.
+export function parseLine(line: string): Record | null {
+  const s = line.trim()
+  if (!s) return null
+  try {
+    const v = JSON.parse(s)
+    return v && typeof v === "object" ? (v as Record) : null
+  } catch {
+    return null
+  }
+}
+
+// The RAW last text block of an assistant message (newlines intact). Handles the streaming split (one
+// block per record) and a defensive multi-block array alike. Kept raw because the question-fence
+// detection below needs the line structure the preview collapses away.
+function lastTextBlock(content: unknown): string | undefined {
+  if (!Array.isArray(content)) return undefined
+  let text: string | undefined
+  for (const block of content) {
+    if (block && typeof block === "object" && (block as { type?: string }).type === "text") {
+      const t = (block as { text?: unknown }).text
+      if (typeof t === "string") text = t
+    }
+  }
+  return text
+}
+
+// The board preview of an assistant text block: whitespace collapsed to single spaces, trimmed, capped
+// at ~200 chars. Empty/whitespace-only → undefined (leaves the prior preview in place).
+function previewText(raw: string): string | undefined {
+  const norm = raw.replace(/\s+/g, " ").trim()
+  if (!norm) return undefined
+  return norm.length > 200 ? `${norm.slice(0, 200)}…` : norm
+}
+
+// Minimal server-side MIRROR of the web's ```question fence convention (web/src/lib/questionBlocks.ts
+// QUESTION_BLOCK) — a presence check only, not a full parse: an opening ```question line (optional
+// kind info-string like `approval`), its body, then a closing ``` line. Kept in sync BY HAND (the
+// architecture forbids importing web code into the server). Drives the derived pending-question safety
+// net: a worker that asked the human IN CHAT but never flipped its thread file to blocked.
+// Info-string grammar mirrors the web exactly: one or more space-separated tokens (```question
+// approval danger) — the old single-token form silently missed multi-token gates the prompt teaches.
+const QUESTION_BLOCK_RE = /^```question(?:[ \t]+[A-Za-z][^\r\n]*?)?[ \t]*\r?\n[\s\S]*?\r?\n```[ \t]*$/m
+export function hasQuestionBlock(text: string | undefined): boolean {
+  return typeof text === "string" && QUESTION_BLOCK_RE.test(text)
+}
+
+// ---- signal-fence grammar (maintainer-settled) ----
+// Exactly two EXCUSAL fences: ```done and ```awaiting. The fence LANGUAGE is the state; the BODY is
+// the message. The opening line is the bare language word (trailing spaces/tabs tolerated, nothing
+// else after it); the body runs to a closing ``` line. If a text carries several signal fences the
+// LAST wins — and the last fence must be the FINAL NON-WHITESPACE CONTENT of the text (the prompt's
+// "at the very end" rule): a fence merely QUOTED mid-message (a worker explaining the protocol to the
+// human) must never excuse the thread from the queue. Malformed/unclosed fences never match.
+// CRLF-tolerant (normalized before matching).
+// ONE implementation so the grammar lives in a single place (mirrors QUESTION_BLOCK_RE's spirit). The
+// ```question fence keeps its own separate machinery (hasQuestionBlock) — it is NOT a signal fence.
+const SIGNAL_FENCE_RE = /^```(done|awaiting)[ \t]*\n([\s\S]*?)\n```[ \t]*$/gm
+// An awaiting-body hint line: `<kind>: <value>`. Kind is case-insensitive (lowercased on output); the
+// value must start with a non-space char (a bare `pr:` with nothing after is prose, not a hint).
+const AWAITING_HINT_RE = /^(pr|ci|timer|session):\s*(\S.*)$/i
+const FENCE_BODY_MAX = 500 // defensive: never let a worker's fence body fatten the snapshot
+const HINT_MAX = 8 // defensive cap on parsed hint lines
+const HINT_VALUE_MAX = 200 // defensive cap on a single hint value
+
+function capFenceBody(s: string): string {
+  return s.length > FENCE_BODY_MAX ? `${s.slice(0, FENCE_BODY_MAX)}…` : s
+}
+
+// Parse the done/awaiting signal fence out of an assistant text, or undefined if none. Pure and
+// defensive (never throws) so it is unit-testable and degrades on any surprise. For `awaiting`,
+// `<kind>: <value>` lines become `hints` in file order and the remaining lines are the prose `body`;
+// for `done`, the whole body is the message and hints are empty.
+export function parseSignalFence(text: string | undefined): FenceView | undefined {
+  if (typeof text !== "string") return undefined
+  const norm = text.replace(/\r\n/g, "\n")
+  SIGNAL_FENCE_RE.lastIndex = 0
+  let kind: "done" | "awaiting" | undefined
+  let raw = ""
+  let end = 0
+  let m: RegExpExecArray | null
+  while ((m = SIGNAL_FENCE_RE.exec(norm)) !== null) {
+    kind = m[1] as "done" | "awaiting" // last-fence-wins: keep overwriting
+    raw = m[2]
+    end = m.index + m[0].length
+  }
+  if (!kind) return undefined
+  // End-anchor: the fence only signals when it closes the message (trailing whitespace tolerated).
+  // Prose after the last fence means it was quoted/explanatory, not a signal — no excusal.
+  if (norm.slice(end).trim() !== "") return undefined
+  if (kind === "done") return { kind, body: capFenceBody(raw.trim()), hints: [] }
+  // awaiting: peel `<kind>: <value>` hint lines out; the remaining lines are the prose body.
+  const hints: FenceView["hints"] = []
+  const rest: string[] = []
+  for (const line of raw.split("\n")) {
+    const hm = line.match(AWAITING_HINT_RE)
+    if (hm) {
+      const value = hm[2].trim()
+      hints.push({ kind: hm[1].toLowerCase() as FenceView["hints"][number]["kind"], value: value.length > HINT_VALUE_MAX ? value.slice(0, HINT_VALUE_MAX) : value })
+    } else {
+      rest.push(line)
+    }
+  }
+  return { kind, body: capFenceBody(rest.join("\n").trim()), hints: hints.slice(0, HINT_MAX) }
+}
+
+// A user record is a REAL user interaction (a typed prompt / answer / steer / dispatch) rather than a
+// mere tool_result fed back to the model mid-turn. The distinction matters for the chronological
+// listing order: only the user's OWN messages should bump a row, never the agent's tool activity.
+// Shape: a real prompt's `content` is a STRING (or an array carrying at least one non-tool_result
+// block — text/image); a tool exchange's `content` is an array of ONLY tool_result blocks.
+export function isRealUserMessage(content: unknown): boolean {
+  if (typeof content === "string") return true
+  if (!Array.isArray(content)) return false
+  return content.some((b) => !(b && typeof b === "object" && (b as { type?: string }).type === "tool_result"))
+}
+
+// Flatten a tool_result's `content` (an array of {type:"text", text} blocks, or a bare string) into
+// one string so we can regex the launch metadata out of it. Defensive: anything unexpected → "".
+function toolResultText(content: unknown): string {
+  if (typeof content === "string") return content
+  if (!Array.isArray(content)) return ""
+  let out = ""
+  for (const block of content) {
+    if (block && typeof block === "object" && (block as { type?: string }).type === "text") {
+      const t = (block as { text?: unknown }).text
+      if (typeof t === "string") out += t
+    }
+  }
+  return out
+}
+
+// One-line summary of a shell command: first non-blank line, whitespace-collapsed, capped. The label
+// for a background shell when the model gave no `description`.
+function shellSummary(command: unknown): string {
+  if (typeof command !== "string") return "background shell"
+  const first = (command.split("\n").find((l) => l.trim()) ?? "").trim().replace(/\s+/g, " ")
+  if (!first) return "background shell"
+  return first.length > 120 ? `${first.slice(0, 119)}…` : first
+}
+
+// Register each BACKGROUND OP in an assistant message as a tracked live entry, keyed by tool_use id:
+//   • an `Agent` dispatch (unless run_in_background:false — a foreground/blocking child the spinner
+//     already covers; Agent defaults to background) → kind "agent" (drill-in + [type] tag).
+//   • a `Bash` with run_in_background:true (a persist-across-rest shell — a CI watcher, a long build)
+//     → kind "shell" (display-only). A FOREGROUND-blocking wait (e.g. a Monitor until-loop) keeps the
+//     turn in-flight, so the existing "Working…" spinner covers it — deliberately NOT tracked here.
+// Re-seeing the same id preserves any outputFile already resolved from its launch result.
+function trackDispatches(state: TailState, rec: Record): void {
+  const content = rec.message?.content
+  if (!Array.isArray(content)) return
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue
+    const b = block as { type?: string; name?: string; id?: unknown; input?: unknown }
+    if (b.type !== "tool_use") continue
+    const id = typeof b.id === "string" ? b.id : undefined
+    if (!id) continue
+    const input = (b.input ?? {}) as { description?: unknown; run_in_background?: unknown; subagent_type?: unknown; command?: unknown }
+    const startedAt = typeof rec.timestamp === "string" ? rec.timestamp : (state.lastActivityAt ?? "")
+    const outputFile = state.subAgents.get(id)?.outputFile
+    const desc = typeof input.description === "string" && input.description.trim() ? input.description.trim() : undefined
+    if (b.name === "Agent") {
+      if (input.run_in_background === false) continue // foreground (blocking) — visible via the spinner
+      // The worker-profile cell (model+effort), shown verbatim as a "[type]" tag — no stripping.
+      const subagentType = typeof input.subagent_type === "string" && input.subagent_type.trim() ? input.subagent_type.trim() : undefined
+      state.subAgents.set(id, { kind: "agent", toolUseId: id, label: desc ?? "sub-agent", startedAt, subagentType, outputFile })
+    } else if (b.name === "Bash" && input.run_in_background === true) {
+      state.subAgents.set(id, { kind: "shell", toolUseId: id, label: desc ?? shellSummary(input.command), startedAt, outputFile })
+    }
+  }
+}
+
+// Corpus-verified LAUNCH-ACK shapes (2026-07-09; surveyed across the real transcripts in
+// ~/.claude/projects — three Agent ack wordings + the Bash shell ack coexist in the wild):
+//   • "Async agent launched successfully…"  — older Agent ack; MAY carry "output_file: <path>"
+//   • "Spawned successfully…"               — newer mailbox/teammate ack; carries "agentId: <id>", NO path
+//   • "Command running in background…"      — Bash shell ack; carries "Output is being written to: <path>"
+// A tracked id's tool_result matching one of these means the child is now RUNNING DETACHED — keep
+// tracking. Anything else on a tracked AGENT id is the synchronous (foreground) call's final report —
+// its completion (an error/denial result also means the dispatch is over). The earlier discriminator
+// ("no output_file: token ⇒ foreground") retired live background children of the two path-less ack
+// shapes — including every mailbox-style Agent and every background shell — on their own launch ack.
+const LAUNCH_ACK_RE = /^\s*(Async agent launched successfully|Spawned successfully|Command running in background)/
+
+// Move a tracked AGENT entry into the bounded retained ring (drawer review), evicting the oldest.
+// Shared by the foreground-completion path and the <task-notification> path.
+function retireToRing(state: TailState, entry: SubAgentEntry, finishedAt: string | undefined, status: "completed" | "failed" | "killed"): void {
+  state.retiredSubAgents.delete(entry.toolUseId)
+  state.retiredSubAgents.set(entry.toolUseId, {
+    toolUseId: entry.toolUseId,
+    label: entry.label,
+    subagentType: entry.subagentType,
+    outputFile: entry.outputFile,
+    finishedAt,
+    status,
+  })
+  while (state.retiredSubAgents.size > RETAINED_SUBAGENTS_MAX) {
+    const oldest = state.retiredSubAgents.keys().next().value
+    if (oldest === undefined) break
+    state.retiredSubAgents.delete(oldest)
+  }
+}
+
+// Resolve a tracked child's transcript path from its launch ack, best shape first: an explicit
+// "output_file:" (older Agent ack), the shell ack's "Output is being written to:", else DERIVED from
+// the mailbox ack's agentId — subagent transcripts live at <session-dir>/subagents/agent-<id>.jsonl
+// beside the parent's own jsonl (verified on disk 2026-07-09). Undefined when nothing resolves (the
+// entry then simply never goes stale — its completion notification still clears it).
+function launchOutputFile(state: TailState, text: string): string | undefined {
+  const m = text.match(/output_file:\s*(\S+)/) ?? text.match(/Output is being written to:\s*(\S+)/)
+  // The shell ack embeds the path mid-sentence ("… written to: <path>. You will be notified …") —
+  // strip the sentence period or the staleness stat hits a nonexistent path and flags every shell stale.
+  if (m) return m[1].replace(/\.$/, "")
+  const aid = text.match(/agentId:\s*(\S+)/)?.[1]
+  if (aid) return `${state.path.replace(/\.jsonl$/, "")}/subagents/agent-${aid}.jsonl`
+  return undefined
+}
+
+// Process tool_results for tracked background ops: enrich a launch ack with the child's transcript
+// path (staleness clock) and keep tracking; retire a tracked AGENT whose tool_result is NOT a launch
+// ack (a synchronous call's final report / an error — no task-notification ever fires for those;
+// missing this leaked 26 phantom "running" sub-agents on a busy session, found 2026-07-09). A tracked
+// SHELL is NEVER retired here — run_in_background:true always acks, and its only terminal signal is a
+// <task-notification> (the earlier version deleted shells on their own ack).
+function trackLaunchResults(state: TailState, rec: Record): void {
+  if (state.subAgents.size === 0) return
+  const content = rec.message?.content
+  if (!Array.isArray(content)) return
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue
+    const b = block as { type?: string; tool_use_id?: unknown; content?: unknown }
+    if (b.type !== "tool_result") continue
+    const id = typeof b.tool_use_id === "string" ? b.tool_use_id : undefined
+    if (!id) continue
+    const entry = state.subAgents.get(id)
+    if (!entry) continue
+    const text = toolResultText(b.content)
+    if (!entry.outputFile) entry.outputFile = launchOutputFile(state, text)
+    if (entry.kind === "shell") continue // shells: ack-only here; retirement is the notification's job
+    if (LAUNCH_ACK_RE.test(text)) continue // background launch ack — the child is alive, keep tracking
+    // Foreground completion (or a failed dispatch): the tool_result IS the terminal signal.
+    state.subAgents.delete(id)
+    retireToRing(state, entry, typeof rec.timestamp === "string" ? rec.timestamp : undefined, "completed")
+  }
+}
+
+// RETIRE a tracked sub-agent when its <task-notification> reports a TERMINAL status: move it OUT of the
+// live map (so banner/counts/spinner stop showing it) and INTO the bounded retained ring (so the
+// drill-in drawer can still resolve its transcript for review). Notifications ride TWO record shapes
+// (both must be handled — missing the second leaked 20+ phantom "running" sub-agents on a busy
+// session, found 2026-07-09): (a) queue-operation records with a top-level `content` string, and
+// (b) USER records whose message.content (string, or text blocks) embeds the <task-notification>
+// XML — the shape newer harness versions emit. A record can carry multiple notification blocks;
+// each is retired independently. A task-id can notify more than once (a resumed background agent
+// re-notifies) and a non-terminal "running" ping exists too, so only completed/failed/killed retire
+// the entry. Idempotent: a repeat terminal notify finds nothing live to move (no-op).
+function notificationText(rec: Record): string | undefined {
+  if (typeof rec.content === "string") return rec.content
+  const c = rec.message?.content
+  if (typeof c === "string") return c
+  if (Array.isArray(c)) {
+    const text = c
+      .map((b) => (b && typeof b === "object" && (b as { type?: string }).type === "text" ? String((b as { text?: unknown }).text ?? "") : ""))
+      .join("\n")
+    return text || undefined
+  }
+  return undefined
+}
+
+function trackCompletions(state: TailState, rec: Record): void {
+  if (state.subAgents.size === 0) return
+  const raw = notificationText(rec)
+  if (!raw || !raw.includes("<task-notification>")) return
+  for (const block of raw.match(/<task-notification>[\s\S]*?<\/task-notification>/g) ?? []) {
+    const status = block.match(/<status>([^<]*)<\/status>/)?.[1]
+    if (status !== "completed" && status !== "failed" && status !== "killed") continue
+    // Prefer the tool-use-id correlation key; fall back to task-id (user-shaped notifications from
+    // some emitters omit tool-use-id — task-id matches nothing tracked, so it stays a safe no-op
+    // rather than mis-retiring).
+    const id = block.match(/<tool-use-id>([^<]*)<\/tool-use-id>/)?.[1]
+    if (!id) continue
+    const entry = state.subAgents.get(id)
+    if (!entry) continue // not live (unknown id, or already retired by an earlier notify) — no-op
+    state.subAgents.delete(id)
+    // Background SHELLS are display-only — nothing to review, so they just clear (no retention ring).
+    if (entry.kind === "shell") continue
+    // Sub-agents retain for drawer review: re-insert at the ring's tail (newest-wins); evict the oldest.
+    retireToRing(state, entry, typeof rec.timestamp === "string" ? rec.timestamp : undefined, status)
+  }
+}
+
+// Cap a foreign string defensively (AskUserQuestion is an UNTRUSTED tool payload — never let it
+// fatten the snapshot). Caps chosen so the read-only render stays a compact card.
+function capAsk(s: string, n: number): string {
+  return s.length > n ? `${s.slice(0, n - 1)}…` : s
+}
+// Parse an AskUserQuestion tool_use `input.questions` into the capped structured shape. Defensive at
+// every level: a missing/misshaped field is skipped, never thrown. Empty result → treat as "no ask".
+function parseAskInput(input: unknown): AskQuestionData[] {
+  const qs = (input as { questions?: unknown } | null)?.questions
+  if (!Array.isArray(qs)) return []
+  const out: AskQuestionData[] = []
+  for (const q of qs.slice(0, 8)) {
+    if (!q || typeof q !== "object") continue
+    const qq = q as { question?: unknown; header?: unknown; multiSelect?: unknown; options?: unknown }
+    const question = typeof qq.question === "string" && qq.question.trim() ? capAsk(qq.question.trim(), 400) : ""
+    if (!question) continue
+    const header = typeof qq.header === "string" && qq.header.trim() ? capAsk(qq.header.trim(), 60) : undefined
+    const multiSelect = qq.multiSelect === true ? true : undefined
+    const options: AskOptionData[] = []
+    if (Array.isArray(qq.options)) {
+      for (const o of qq.options.slice(0, 12)) {
+        if (!o || typeof o !== "object") continue
+        const oo = o as { label?: unknown; description?: unknown }
+        const label = typeof oo.label === "string" && oo.label.trim() ? capAsk(oo.label.trim(), 160) : undefined
+        if (!label) continue
+        const description = typeof oo.description === "string" && oo.description.trim() ? capAsk(oo.description.trim(), 300) : undefined
+        options.push({ label, description })
+      }
+    }
+    out.push({ question, header, multiSelect, options })
+  }
+  return out
+}
+// Capture a PENDING native AskUserQuestion: an AskUserQuestion tool_use whose tool_result hasn't landed
+// yet freezes the session at a TUI dialog. Same correlation pattern as sub-agent tracking (keyed by
+// tool_use id). Cleared by clearAskOnResult when the matching tool_result arrives.
+function trackAsk(state: TailState, rec: Record): void {
+  const content = rec.message?.content
+  if (!Array.isArray(content)) return
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue
+    const b = block as { type?: string; name?: string; id?: unknown; input?: unknown }
+    if (b.type !== "tool_use" || b.name !== "AskUserQuestion") continue
+    const id = typeof b.id === "string" ? b.id : undefined
+    if (!id) continue
+    const questions = parseAskInput(b.input)
+    if (questions.length) state.pendingAsk = { id, questions }
+  }
+}
+// Clear the pending ask once its tool_result lands (the human answered in the terminal).
+function clearAskOnResult(state: TailState, rec: Record): void {
+  const pending = state.pendingAsk
+  if (!pending) return
+  const content = rec.message?.content
+  if (!Array.isArray(content)) return
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue
+    const b = block as { type?: string; tool_use_id?: unknown }
+    if (b.type === "tool_result" && b.tool_use_id === pending.id) {
+      state.pendingAsk = undefined
+      return
+    }
+  }
+}
+
+// Fold one record into the running derivation. Only assistant/user records are "substantive" (they
+// move the turn state); assistant/user/system records with a timestamp advance lastActivityAt.
+export function applyRecord(state: TailState, rec: Record): void {
+  const type = rec.type
+  // A `type:"user"` record with promptSource:"system" is a peer (SendMessage) message or a sub-agent
+  // <task-notification> — NOT a human turn. It DOES re-invoke the agent (the model wakes to process
+  // it), so it moves the TURN to in-flight (shimmer during the resume) and advances lastActivityAt like
+  // any record. What it must NOT do is bump `lastUserAt` — the ROW-ORDER key — because that would jump
+  // the row to the top from motion the human didn't cause. (An earlier fix over-suppressed the turn
+  // flip too, which made a thread look IDLE/stalled while the agent was actually resuming after a
+  // sub-agent returned — no shimmer, then a message appeared out of nowhere. Found 2026-07-09.)
+  const systemUserRec = type === "user" && rec.promptSource === "system"
+  if (typeof rec.timestamp === "string" && (type === "assistant" || type === "user" || type === "system")) {
+    state.lastActivityAt = rec.timestamp
+  }
+  if (type === "assistant") {
+    state.sawRecords = true
+    state.lastKind = "assistant"
+    state.lastStopReason = typeof rec.message?.stop_reason === "string" ? rec.message.stop_reason : undefined
+    const raw = lastTextBlock(rec.message?.content)
+    if (raw !== undefined) {
+      const preview = previewText(raw)
+      if (preview !== undefined) state.lastAssistant = preview
+      // Track whether THIS (now the latest) assistant text carries an unanswered question fence.
+      state.lastAssistantHasQuestion = hasQuestionBlock(raw)
+      // Recompute the done/awaiting signal fence from THIS text — an assistant text with no fence
+      // clears it (the fence only signals while it is the final message). Same lifecycle as the
+      // question flag: set per assistant text, cleared by any user record below.
+      state.lastFence = parseSignalFence(raw)
+    }
+    trackDispatches(state, rec) // register any background Agent dispatches + background shells
+    trackAsk(state, rec) // capture a pending native AskUserQuestion (frozen at a TUI dialog)
+  } else if (type === "user") {
+    state.sawRecords = true
+    // A user record — human turn, tool_result, OR a re-invoking system record (peer/notification) —
+    // flips the turn to IN-FLIGHT: the model is about to respond, so the thread reads as WORKING
+    // (shimmer), not idle. This is what shows motion while an agent resumes after a sub-agent returns.
+    state.lastKind = "user"
+    state.lastStopReason = undefined
+    // A newer user record supersedes any pending chat question / excusal fence (they only signal as the
+    // FINAL message); the NEXT assistant record recomputes them.
+    state.lastAssistantHasQuestion = false
+    state.lastFence = undefined
+    // `lastUserAt` is the ROW-ORDER key — bump it ONLY for a genuine HUMAN interaction. A tool_result
+    // is agent activity (excluded by isRealUserMessage); a system record (peer/notification) is
+    // machine motion the human didn't cause — neither may jump the row to the top (the one part of the
+    // earlier over-fix that WAS a real bug).
+    if (!systemUserRec && typeof rec.timestamp === "string" && isRealUserMessage(rec.message?.content)) state.lastUserAt = rec.timestamp
+    trackLaunchResults(state, rec) // resolve a background dispatch's transcript path from its launch result
+    clearAskOnResult(state, rec) // the AskUserQuestion answer landed → clear the pending ask
+  } else if (type === "ai-title") {
+    // Sidecar record carrying Claude's own auto-generated session title. Emitted repeatedly (often
+    // identical) as the session evolves — take the latest non-empty. Never touches turn state.
+    if (typeof rec.aiTitle === "string" && rec.aiTitle.trim()) state.aiTitle = rec.aiTitle.trim()
+  } else if (type === "custom-title") {
+    // Written by /rename (bare /rename auto-generates; /rename <name> sets it). Same title slot —
+    // latest of either record kind wins, in file order.
+    if (typeof rec.customTitle === "string" && rec.customTitle.trim()) state.aiTitle = rec.customTitle.trim()
+  }
+  // all other types (attachment, queue-operation, last-prompt, permission-mode, mode,
+  // bridge-session, file-history-snapshot, system) are sidecar metadata — ignored for turn state.
+  // Sub-agent completion rides queue-operation records (a top-level <task-notification> string), so
+  // it's checked for EVERY record regardless of type (the helper self-guards on shape + tracked ids).
+  trackCompletions(state, rec)
+}
+
+// Derive the turn state from the folded tail (see the header heuristic). `nowMs` drives only the
+// unknown-stop-reason backstop; a clear end_turn/tool_use is time-independent.
+export function computeTurn(state: TailState, nowMs: number): TurnState {
+  if (state.lastKind === "assistant") {
+    if (state.lastStopReason === "end_turn") return "idle"
+    if (state.lastStopReason === "tool_use") return "in-flight"
+    // unknown/missing stop_reason: only the 5s-silence backstop can call it idle
+    const at = state.lastActivityAt ? Date.parse(state.lastActivityAt) : NaN
+    if (Number.isFinite(at) && nowMs - at > IDLE_BACKSTOP_MS) return "idle"
+    return "in-flight"
+  }
+  // last substantive record was a user prompt/tool_result, or nothing substantive yet → in-flight
+  return "in-flight"
+}
+
+// A compact change-key for a session's derived sub-agent view — lets the tick mark the board dirty
+// on any add / removal / running→stale transition (a completion clears an entry WITHOUT touching
+// lastActivityAt, so without this the suffix would linger until the next full reconcile).
+function subAgentSignature(views: SubAgentView[]): string {
+  return views.map((v) => `${v.label}\u0000${v.state}\u0000${v.startedAt}`).join("\u0001")
+}
+
+// Order-sensitive equality of two fresh-foreign sets (id order = mtime desc). A membership OR ordering
+// change means the board's foreign rows changed → the tick marks itself dirty.
+function sameForeign(a: { id: string }[], b: { id: string }[]): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) if (a[i].id !== b[i].id) return false
+  return true
+}
+
+export interface Tailer {
+  get(slug: string): SessionTelemetry | undefined
+  // FOREIGN session ids (JSONL files in the project dir with no registry row — maintainer terminals)
+  // whose transcript is FRESH (recent mtime): the board lists these as read-only session threads.
+  // Keyed by session id (the thread id for a foreign thread IS its session id).
+  foreignIds(): string[]
+  // Drill-in drawer lookup: a tracked or retained sub-agent's transcript path + state, or undefined if
+  // unknown (never dispatched, or aged out of the retained ring). The router maps undefined → "gone".
+  subAgent(slug: string, id: string): { outputFile?: string; state: "running" | "stale" | "done" } | undefined
+  start(): void
+  stop(): void
+  tick(): void // exposed for tests + boot; the interval calls it every POLL_MS
+}
+
+export interface TailerDeps {
+  project: Project
+  storage: Storage
+  bus: Bus
+  onChange: () => void // triggers a board rebuild when derived state changes (batched: ≤1/tick)
+  // Reports the sessions whose JSONL advanced this tick (bytes consumed) — the exact signal that a
+  // thread's rendered transcript may have changed. The /ws transcript producer uses it to push updates
+  // to subscribed clients (replacing the client's 1.5s poll). Optional: unset = no transcript push.
+  onTranscriptChange?: (slugs: string[]) => void
+  now?: () => number // injectable clock (tests)
+  paneDead?: (slug: string) => boolean // injectable liveness (tests)
+  capturePane?: (slug: string) => string // injectable pane text (tests); defaults to tmux
+  sessionLogDir?: string // injectable transcript dir (tests); defaults to the Claude Code path
+  mtimeMs?: (path: string) => number | undefined // injectable file mtime (tests); a sub-agent transcript's staleness clock
+}
+
+// A sub-agent transcript's mtime in epoch-ms, or undefined if it can't be stat'd (not yet created,
+// unreadable). Telemetry-grade: a stat failure degrades to "can't assess staleness", never throws.
+function defaultMtimeMs(path: string): number | undefined {
+  try {
+    return statSync(path).mtimeMs
+  } catch {
+    return undefined
+  }
+}
+
+// The Claude Code per-project transcript dir: ~/.claude/projects/<cwdSlug>/.
+function defaultLogDir(project: Project): string {
+  return join(homedir(), ".claude", "projects", project.cwdSlug)
+}
+
+export function createTailer(deps: TailerDeps): Tailer {
+  const now = deps.now ?? Date.now
+  // Cached (batched list-panes): the 1s tick asks per session row — uncached that was one
+  // subprocess per row per second, a standing event-loop tax that grew with thread count.
+  const paneDead = deps.paneDead ?? tmux.paneDeadCached
+  const capturePane = deps.capturePane ?? tmux.capturePane
+  const logDir = deps.sessionLogDir ?? defaultLogDir(deps.project)
+  const mtimeMs = deps.mtimeMs ?? defaultMtimeMs
+
+  // Derive the surfaced view of a session's live sub-agents (insertion = dispatch order). A tracked
+  // entry whose transcript file hasn't been touched in SUBAGENT_STALE_MS is reported "stale" — a
+  // liveness fallback for a completion record we missed; one still being appended to is "running".
+  // A tracked child is "stale" once we've resolved its transcript path and that file has gone
+  // SUBAGENT_STALE_MS without an append (or no longer stats) — a liveness fallback for a completion we
+  // missed. Before the path resolves (fresh dispatch) it stays "running" — it's just starting up.
+  function entryStale(e: SubAgentEntry, nowMs: number): boolean {
+    if (!e.outputFile) return false
+    const m = mtimeMs(e.outputFile)
+    return m === undefined || nowMs - m > SUBAGENT_STALE_MS
+  }
+
+  // Derive the surfaced view of a session's live SUB-AGENTS (kind "agent"; insertion = dispatch order).
+  function subAgentViews(state: TailState, nowMs: number): SubAgentView[] {
+    if (state.subAgents.size === 0) return []
+    const out: SubAgentView[] = []
+    for (const e of state.subAgents.values()) {
+      if (e.kind !== "agent") continue
+      out.push({ label: e.label, startedAt: e.startedAt, state: entryStale(e, nowMs) ? "stale" : "running", subagentType: e.subagentType, id: e.toolUseId })
+    }
+    return out
+  }
+
+  // Derive the surfaced view of a session's live background SHELLS (kind "shell"; display-only).
+  function bgShellViews(state: TailState, nowMs: number): BgShellView[] {
+    if (state.subAgents.size === 0) return []
+    const out: BgShellView[] = []
+    for (const e of state.subAgents.values()) {
+      if (e.kind !== "shell") continue
+      out.push({ label: e.label, startedAt: e.startedAt, state: entryStale(e, nowMs) ? "stale" : "running" })
+    }
+    return out
+  }
+
+  // A compact change-key over ALL derived background state — sub-agents + shells + the pending ask —
+  // so the tick marks the board dirty on any add/removal, running→stale flip (purely time-based, no new
+  // record), or an ask appearing/clearing. Without it those changes would linger to the next reconcile.
+  function derivedSignature(state: TailState, nowMs: number): string {
+    const agents = subAgentViews(state, nowMs).map((v) => `A:${v.label}|${v.state}|${v.startedAt}`).join("")
+    const shells = bgShellViews(state, nowMs).map((v) => `S:${v.label}|${v.state}|${v.startedAt}`).join("")
+    const ask = state.pendingAsk ? `Q:${state.pendingAsk.id}:${state.pendingAsk.questions.length}` : ""
+    return `${agents}\n${shells}\n${ask}`
+  }
+
+  // Resolve a tracked sub-agent (thread slug + dispatch tool_use id) to its transcript path + state —
+  // the drill-in drawer's server-side lookup. Checks the LIVE map first (running/stale), then the
+  // RETAINED ring (a completed child kept for review → "done"). Undefined only when the id is unknown
+  // to both (never dispatched, or aged out of the ring) → the router maps that to "gone".
+  function subAgentLookup(slug: string, id: string): { outputFile?: string; state: "running" | "stale" | "done" } | undefined {
+    const state = states.get(slug)
+    if (!state) return undefined
+    const live = state.subAgents.get(id)
+    if (live) return { outputFile: live.outputFile, state: entryStale(live, now()) ? "stale" : "running" }
+    const dead = state.retiredSubAgents.get(id)
+    if (dead) return { outputFile: dead.outputFile, state: "done" }
+    return undefined
+  }
+
+  // Perm-prompt verdict for a session: only worth a capture-pane once a still-in-flight turn has
+  // gone quiet for PERM_SNIFF_MS (see the constant). A perm prompt can't precede the tool_use
+  // record that stamps lastActivityAt, so a session with no activity yet never sniffs.
+  function sniffPerm(state: TailState, turn: TurnState, nowMs: number): boolean {
+    if (state.foreign) return false // structural: a foreign thread has no tmux pane to sniff
+    if (turn !== "in-flight" || !state.lastActivityAt) return false
+    const at = Date.parse(state.lastActivityAt)
+    if (!Number.isFinite(at) || nowMs - at < PERM_SNIFF_MS) return false
+    return matchesPermPrompt(capturePane(state.slug))
+  }
+  const states = new Map<string, TailState>()
+  // FOREIGN thread tails, keyed by session id (separate map so a session-id key can never collide
+  // with or shadow a registered slug's TailState in `states`). Entries persist once discovered — a
+  // file that ages out of the fresh set keeps its cached tail here but stops being reported.
+  const foreignStates = new Map<string, TailState>()
+  // The current fresh foreign set (mtime-desc, capped), refreshed on scan ticks and reused between.
+  let foreignFresh: { id: string; path: string }[] = []
+  let foreignScanTick = 0
+  let timer: NodeJS.Timeout | null = null
+
+  // Discover FOREIGN sessions: *.jsonl in the log dir whose stem is not any registered row's
+  // session_id, touched within FOREIGN_FRESH_MS, most-recent-first, capped at FOREIGN_MAX. Registered
+  // rows always win. Defensive: any fs error (dir/file) is skipped silently — discovery degrades to
+  // "no foreign threads", never throws.
+  function scanForeign(nowMs: number): { id: string; path: string }[] {
+    let names: string[]
+    try {
+      names = readdirSync(logDir)
+    } catch {
+      return []
+    }
+    const registered = new Set<string>()
+    for (const r of deps.storage.allSessions()) registered.add(r.session_id)
+    const found: { id: string; path: string; mtime: number }[] = []
+    for (const name of names) {
+      if (name.startsWith(".") || !name.endsWith(".jsonl")) continue
+      const id = name.slice(0, -".jsonl".length)
+      if (!id || registered.has(id)) continue // registered rows win — never also foreign
+      const path = join(logDir, name)
+      let mtime: number
+      try {
+        mtime = statSync(path).mtimeMs
+      } catch {
+        continue
+      }
+      if (nowMs - mtime > FOREIGN_FRESH_MS) continue // aged out of the freshness window
+      found.push({ id, path, mtime })
+    }
+    found.sort((a, b) => b.mtime - a.mtime)
+    return found.slice(0, FOREIGN_MAX).map(({ id, path }) => ({ id, path }))
+  }
+
+  // Tail one FOREIGN state: same fold/derivation as a registered session (consume → computeTurn →
+  // derivedSignature, priming the first sighting silently) but with NO pane sniff, NO pane-death
+  // check, and NO notify / storage write — a foreign thread has no tmux session and no registry row.
+  // Returns whether its derived telemetry changed (→ board dirty). Pushes to transcriptDirty on bytes.
+  function tailForeign(state: TailState, nowMs: number, transcriptDirty: string[]): boolean {
+    if (!state.primed) {
+      const primeOffset = state.offset
+      consume(state)
+      if (state.offset !== primeOffset) transcriptDirty.push(state.slug)
+      state.turn = computeTurn(state, nowMs)
+      state.subAgentsSig = derivedSignature(state, nowMs)
+      state.primed = true
+      return true // surface the newly-discovered thread
+    }
+    const prevActivity = state.lastActivityAt
+    const prevAssistant = state.lastAssistant
+    const prevOffset = state.offset
+    consume(state)
+    if (state.offset !== prevOffset) transcriptDirty.push(state.slug)
+    let dirty = false
+    const nextTurn = computeTurn(state, nowMs)
+    if (state.turn !== nextTurn) {
+      state.turn = nextTurn // foreign: a turn transition NEVER notifies or writes storage
+      dirty = true
+    }
+    const sig = derivedSignature(state, nowMs)
+    if (sig !== state.subAgentsSig) {
+      state.subAgentsSig = sig
+      dirty = true
+    }
+    if (state.lastActivityAt !== prevActivity || state.lastAssistant !== prevAssistant) dirty = true
+    return dirty
+  }
+
+  // Read whatever has been appended since our last offset, folding each complete line into the
+  // derivation. Handles: file-not-yet-created (ENOENT → skip), truncation/rotation (size < offset
+  // → re-read from 0), and a trailing partial line (buffered until its newline arrives).
+  function consume(state: TailState): void {
+    let size: number
+    try {
+      size = statSync(state.path).size
+    } catch {
+      return // file not written yet (agent still booting) or transiently unreadable
+    }
+    if (size < state.offset) {
+      // truncated/rotated — restart the derivation from the top of the new file
+      state.offset = 0
+      state.partial = ""
+    }
+    if (size <= state.offset) return
+    let chunk = ""
+    try {
+      const fd = openSync(state.path, "r")
+      try {
+        const buf = Buffer.allocUnsafe(size - state.offset)
+        const read = readSync(fd, buf, 0, buf.length, state.offset)
+        chunk = buf.toString("utf8", 0, read)
+        state.offset += read
+      } finally {
+        closeSync(fd)
+      }
+    } catch {
+      return // read raced with a write/unlink — try again next tick
+    }
+    const lines = (state.partial + chunk).split("\n")
+    state.partial = lines.pop() ?? "" // last element is the (possibly empty) trailing partial
+    for (const line of lines) {
+      const rec = parseLine(line)
+      if (rec) applyRecord(state, rec)
+    }
+  }
+
+  function tick(): void {
+    // Discover sessions from the registry so dispatch/resume/restart all "just work" — a new row
+    // starts being tailed on the next tick; a finished row keeps its final derived state.
+    let dirty = false
+    // Slugs whose JSONL advanced this tick (offset moved) → their transcript may have changed. Fed to the
+    // /ws transcript producer at the end so it pushes only for genuinely-changed threads.
+    const transcriptDirty: string[] = []
+    const nowMs = now()
+    for (const row of deps.storage.allSessions()) {
+      let state = states.get(row.slug)
+      if (!state) {
+        state = newTailState(row.slug, row.session_id, join(logDir, `${row.session_id}.jsonl`))
+        states.set(row.slug, state)
+      }
+
+      // First sighting of a session (fresh dispatch OR restored after a server restart): read the
+      // whole transcript to date and adopt its state as the baseline WITHOUT firing turn-done /
+      // exited notifies — those pre-restart events are history, not new activity.
+      if (!state.primed) {
+        const primeOffset = state.offset
+        consume(state)
+        if (state.offset !== primeOffset) transcriptDirty.push(row.slug)
+        state.turn = computeTurn(state, nowMs)
+        state.permPrompt = sniffPerm(state, state.turn, nowMs)
+        state.paneDead = paneDead(row.slug)
+        state.subAgentsSig = derivedSignature(state, nowMs)
+        state.primed = true
+        dirty = true // surface the restored overlay
+        continue
+      }
+
+      const prevActivity = state.lastActivityAt
+      const prevAssistant = state.lastAssistant
+      const prevOffset = state.offset
+      consume(state)
+      if (state.offset !== prevOffset) transcriptDirty.push(row.slug)
+
+      // turn transition (in-flight → idle): a completed turn. Mark unread + notify, gated on
+      // last_read_at so a turn the user has already scrolled past doesn't re-badge.
+      const nextTurn = computeTurn(state, nowMs)
+      if (state.turn !== nextTurn) {
+        if (state.turn === "in-flight" && nextTurn === "idle") {
+          onTurnDone(row.slug, state)
+          dirty = true
+        } else {
+          dirty = true // idle → in-flight (a new turn started): refresh the overlay badge
+        }
+        state.turn = nextTurn
+      }
+
+      // interactive permission prompt: no jsonl signal, so pane-sniff a quiet in-flight turn.
+      // Cleared automatically once jsonl activity resumes (turn no longer quiet) or the pane stops
+      // matching. Rides the board snapshot only — no notify, no unread (it's not a completed turn).
+      const perm = sniffPerm(state, nextTurn, nowMs)
+      if (perm !== state.permPrompt) dirty = true
+      state.permPrompt = perm
+
+      // pane death (tmux remain-on-exit pane went dead) — the agent process exited.
+      const dead = paneDead(row.slug)
+      if (dead && !state.paneDead) {
+        onPaneDeath(row.slug)
+        dirty = true
+      }
+      state.paneDead = dead
+
+      // live background ops + pending ask: a dispatch/completion/launch changes the set, a running→stale
+      // flip is purely time-based (no new record), and an ask appears/clears — recompute every tick.
+      const sig = derivedSignature(state, nowMs)
+      if (sig !== state.subAgentsSig) {
+        state.subAgentsSig = sig
+        dirty = true
+      }
+
+      if (state.lastActivityAt !== prevActivity || state.lastAssistant !== prevAssistant) dirty = true
+    }
+
+    // FOREIGN threads: refresh the fresh set on a scan tick (a change in membership/order is itself
+    // dirty), then tail every fresh one (reusing the cached set between scans).
+    if (foreignScanTick % FOREIGN_SCAN_EVERY === 0) {
+      const next = scanForeign(nowMs)
+      if (!sameForeign(next, foreignFresh)) dirty = true
+      foreignFresh = next
+    }
+    foreignScanTick++
+    for (const f of foreignFresh) {
+      let state = foreignStates.get(f.id)
+      if (!state) {
+        state = newTailState(f.id, f.id, f.path, true) // slug = session id = thread id for a foreign thread
+        foreignStates.set(f.id, state)
+      }
+      if (tailForeign(state, nowMs, transcriptDirty)) dirty = true
+    }
+
+    if (dirty) deps.onChange()
+    if (transcriptDirty.length) deps.onTranscriptChange?.(transcriptDirty)
+  }
+
+  // in-flight → idle: the turn finished. Badge unread if this completion post-dates the last read,
+  // and fire a one-shot turn-done notify (the transition itself is the dedupe).
+  function onTurnDone(slug: string, state: TailState): void {
+    const row = deps.storage.getSession(slug)
+    if (!row) return
+    const eventAt = state.lastActivityAt ?? new Date(now()).toISOString()
+    // The rest moment drives the nav's most-recently-rested-first order. A DISCRETE event (once
+    // per turn end), so rows move rarely and meaningfully — unlike continuous activity sorting.
+    deps.storage.setRestedAt(slug, eventAt)
+    if (landsAfterRead(eventAt, row.last_read_at)) deps.storage.setUnread(slug, true)
+    deps.bus.publish({
+      type: "notify",
+      slug,
+      kind: "turn-done",
+      title: slug,
+      body: state.lastAssistant,
+    })
+  }
+
+  // pane death: stamp exited (keeps the stored column honest for the overlay) + badge unread +
+  // one-shot exited notify.
+  function onPaneDeath(slug: string): void {
+    const row = deps.storage.getSession(slug)
+    if (!row) return
+    if (row.exited !== 1) deps.storage.setExited(slug, true)
+    const eventAt = new Date(now()).toISOString()
+    deps.storage.setRestedAt(slug, eventAt)
+    if (landsAfterRead(eventAt, row.last_read_at)) deps.storage.setUnread(slug, true)
+    deps.bus.publish({ type: "notify", slug, kind: "exited", title: slug, body: "Agent session ended" })
+  }
+
+  return {
+    get(slug) {
+      // Registered states win the key; a foreign thread resolves by its session id (its thread id).
+      const s = states.get(slug) ?? foreignStates.get(slug)
+      if (!s) return undefined
+      // pendingQuestion is DERIVED: the turn is at rest AND the latest assistant message still carries
+      // an unanswered ```question fence (a user reply clears the flag and flips the turn in-flight).
+      const pendingQuestion = s.turn === "idle" && s.lastAssistantHasQuestion
+      const nowMs = now()
+      return { turn: s.turn, permPrompt: s.permPrompt, lastActivityAt: s.lastActivityAt, lastAssistant: s.lastAssistant, aiTitle: s.aiTitle, subAgents: subAgentViews(s, nowMs), bgShells: bgShellViews(s, nowMs), pendingAsk: s.pendingAsk, pendingQuestion, lastUserAt: s.lastUserAt, lastFence: s.lastFence }
+    },
+    // The CURRENT fresh foreign session ids (mtime within FOREIGN_FRESH_MS, capped), mtime-desc. Kept
+    // as the last scan's result — recomputed at most every FOREIGN_SCAN_EVERY ticks.
+    foreignIds: () => foreignFresh.map((f) => f.id),
+    subAgent: subAgentLookup,
+    start() {
+      if (timer) return
+      tick() // derive current state immediately (also restores state after a server restart)
+      timer = setInterval(tick, POLL_MS)
+      timer.unref?.()
+    },
+    stop() {
+      if (timer) clearInterval(timer)
+      timer = null
+    },
+    tick,
+  }
+}
+
+// An event "lands after last_read_at" when there is no prior read, or the event's timestamp is
+// strictly newer than it. Bad/absent timestamps fail safe to marking unread.
+function landsAfterRead(eventAt: string, lastReadAt: string | null): boolean {
+  if (!lastReadAt) return true
+  const e = Date.parse(eventAt)
+  const r = Date.parse(lastReadAt)
+  if (!Number.isFinite(e) || !Number.isFinite(r)) return true
+  return e > r
+}

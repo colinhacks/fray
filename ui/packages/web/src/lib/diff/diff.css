@@ -1,0 +1,136 @@
+/* Styles for the rendered diff (packages/web/src/lib/diff). Self-contained: token colours are a
+   dark palette tuned to the fray theme (see styles.css --color-* vars). Import this where the diff
+   is rendered. Class names are namespaced `fray-diff-*` / `ftk-*` (fray token kind). */
+
+.fray-diff {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.55;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--color-bg);
+}
+
+/* Mirrors .fray-bash-header (space-between) so Edit / Bash / Read headers read as one system: a
+   petite-caps tool label on the left, detail beside it, the chevron pushed to the far right. */
+.fray-diff-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 10px;
+  background: var(--color-panel-2);
+  font-size: 11.5px;
+  color: var(--color-muted);
+}
+/* The header/body divider exists only when a body FOLLOWS — on a collapsed block the header is the
+   last child, and this rule would otherwise stack on the container's own border (a 2px bottom). */
+.fray-diff-header:not(:last-child) {
+  border-bottom: 1px solid var(--color-border);
+}
+/* Lighter than assistant prose — bright white is reserved for actual agent messages. */
+.fray-diff-header .fray-diff-file { color: var(--color-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fray-diff-header .fray-diff-add { color: #57ab5a; }
+.fray-diff-header .fray-diff-del { color: #e5534b; }
+
+.fray-diff-body { overflow-x: auto; }
+
+/* Divider between successive edit groups merged into one block (same-file consecutive edits). A
+   hairline is enough to read them as distinct edits without a heavy separator. */
+.fray-diff-editsep { border-top: 1px solid var(--color-border); }
+
+/* Line rows */
+.fray-diff-line {
+  display: flex;
+  align-items: baseline;
+  white-space: pre;
+}
+.fray-diff-line[data-type="add"] { background: rgba(87, 171, 90, 0.15); }
+.fray-diff-line[data-type="del"] { background: rgba(229, 83, 75, 0.15); }
+
+.fray-diff-gutter {
+  color: #4b4f57;
+  user-select: none;
+  text-align: right;
+  min-width: 3em;
+  padding: 0 8px 0 10px;
+  flex-shrink: 0;
+}
+.fray-diff-sign {
+  width: 1.4em;
+  text-align: center;
+  flex-shrink: 0;
+  user-select: none;
+  color: #4b4f57;
+}
+.fray-diff-line[data-type="add"] .fray-diff-sign { color: #57ab5a; }
+.fray-diff-line[data-type="del"] .fray-diff-sign { color: #e5534b; }
+
+.fray-diff-code { flex: 1; min-width: 0; padding-right: 12px; }
+
+/* Collapsed-context separator */
+.fray-diff-sep {
+  background: var(--color-panel);
+  color: var(--color-muted);
+  padding: 1px 12px;
+  font-size: 11px;
+  user-select: none;
+}
+
+/* Bordered card family shared by the Bash command block AND the Read excerpt block (ReadBlock reuses
+   these .fray-bash-* classes) — same visual language as the diff, for a collapsed expandable card. */
+.fray-bash {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.55;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--color-bg);
+}
+.fray-bash-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 10px;
+  background: var(--color-panel-2);
+}
+/* The "Bash" label sits in the same near-white the tool NAMES use (not the dimmer detail gray). */
+.fray-bash-label { color: rgb(from var(--color-fg) r g b / 0.85); font-size: 11.5px; }
+.fray-bash-expand {
+  color: var(--color-muted);
+  font-size: 11px;
+  cursor: pointer;
+  outline: none;
+  transition: color 0.12s;
+}
+.fray-bash-expand:hover { color: var(--color-fg); }
+/* pre-wrap: long lines wrap; a wide unbreakable token scrolls INSIDE the block (overflow-x auto),
+   never the page. margin:0 keeps the block on the message's explicit-spacer rhythm. */
+.fray-bash-body {
+  margin: 0;
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+  color: var(--color-fg);
+  border-top: 1px solid var(--color-border);
+}
+/* Past ~16 lines the body clamps; the header's expand affordance reveals the rest. */
+.fray-bash-clamp {
+  max-height: 320px;
+  overflow-y: hidden;
+}
+
+/* Token colours — coarse kinds emitted by highlight.ts */
+.ftk-kw    { color: #f47067; }
+.ftk-type  { color: #f69d50; }
+.ftk-str   { color: #96d0ff; }
+.ftk-com   { color: #6b7280; font-style: italic; }
+.ftk-num   { color: #6cb6ff; }
+.ftk-fn    { color: #dcbdfb; }
+.ftk-punct { color: #adbac7; }
+.ftk-op    { color: #f47067; }
+.ftk-plain { color: var(--color-fg); }

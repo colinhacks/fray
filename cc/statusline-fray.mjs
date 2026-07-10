@@ -6,10 +6,10 @@
 // MODEL-ONLY — never rendered in the TUI). This is the user-visible surface for the fray
 // board: a tasteful base line (dir · branch · model · context%) and, WHEN fray is active
 // for this session, the live board summary — the states that actually matter, in priority
-// order: AWAITING-YOU (human-blocked — YELLOW/prominent), ACTIVE (a live driver is on it now
+// order: AWAITING-YOU (`needs-human` — YELLOW/prominent), ACTIVE (a live driver is on it now
 // — cyan), and BLOCKED (machine/timer-blocked: waiting on another thread, a PR/CI, an external
-// gate, or a revalidate timer — GRAY/de-emphasized, deliberately quiet). A `blocked` thread's
-// RESOLUTION MECHANISM (which field is set) decides awaiting-you vs blocked, not a status word.
+// gate, or a revalidate timer — GRAY/de-emphasized, deliberately quiet). `needs-human` is the
+// declared awaiting-you state; a legacy `blocked` with no machine field reads the same way.
 // Everything else (planning/planned/terminal) is intentionally not counted here.
 //
 // CANONICAL SOURCE: this file lives in the fray repo at `cc/statusline-fray.mjs`. It is
@@ -58,12 +58,13 @@ function frayActive(projectDir, sessionId) {
 const TERMINAL = new Set(['done', 'dismissed']);
 
 /** Normalize a raw `status:` to canonical — inlined (this file is deployed standalone, no
- *  imports from the plugin). Legacy `enqueued`/`needs-decision` → `blocked`; `todo`/`plan` →
- *  `planned`. The human/machine split for `blocked` is derived from the mechanism FIELDS below,
- *  not the word, so a legacy `enqueued` (has deps → machine) or `needs-decision` (no field →
- *  human) classifies correctly. */
+ *  imports from the plugin). `needs-decision` → `needs-human` (the human-wait state, now
+ *  first-class); `enqueued` → `blocked` (a machine/dep wait); `todo`/`plan` → `planned`. A legacy
+ *  `blocked` thread with no machine field is the OLD human-wait encoding and is counted as
+ *  awaiting-you in scanBoard below (kept in lock-step with config.effectiveStatus). */
 function normStatus(s) {
-  if (s === 'enqueued' || s === 'needs-decision') return 'blocked';
+  if (s === 'needs-decision') return 'needs-human';
+  if (s === 'enqueued') return 'blocked';
   if (s === 'todo' || s === 'plan') return 'planned';
   return s;
 }
@@ -98,10 +99,17 @@ function scanBoard(projectDir) {
     const st = normStatus(raw);
     if (TERMINAL.has(st)) continue;
     if (st === 'active') { active++; continue; }
+    if (st === 'needs-human') { awaitingYou++; continue; } // first-class awaiting-a-human → YELLOW
     if (st === 'blocked') {
+      // NOTE: this matches only INLINE `blocking_threads: [..]` deps — a YAML BLOCK-form list
+      // (`blocking_threads:\n  - slug`) is not detected here (this file is deployed standalone and
+      // cannot import the shared block-form-aware parseDeps), so a block-form machine-blocked thread
+      // would be counted yellow/awaiting-you. Rare in practice; the board (index.mjs) is authoritative.
       const depsM = src.match(/^(?:blocking_threads|depends_on):\s*(.+)$/m);
       const hasDeps = depsM ? depsM[1].trim() !== '' && depsM[1].trim() !== '[]' : false;
       const hasTimer = /^revalidate_at:\s*\S/m.test(src);
+      // A `blocked` thread WITH a machine field is a machine/timer wait (gray); with NO field it is
+      // the legacy human-wait encoding → counts as awaiting-you (yellow), matching effectiveStatus.
       if (hasDeps || hasTimer) blocked++;
       else awaitingYou++;
     }

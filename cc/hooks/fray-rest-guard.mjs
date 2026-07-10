@@ -42,6 +42,11 @@
  *     act when fray is active AND has actually dispatched a background agent here, and
  *     never on a known harness builtin (Explore/Plan/…). Never block non-fray agents.
  */
+// GATE: a fray-ui WORKER session (FRAY_UI_THREAD set) is owned by the cc-worker plugin — the
+// orchestrator hooks must stay silent there, or their injected pulses pollute the worker's
+// transcript (and the fray-ui chat rendering of it). Exit 0 with no output = inert.
+if ((process.env.FRAY_UI_THREAD ?? '').trim()) process.exit(0);
+
 import { appendFileSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { frayActive } from '../scripts/fray/config.mjs';

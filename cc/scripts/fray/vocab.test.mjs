@@ -24,8 +24,10 @@ import { fileURLToPath } from 'node:url';
 import {
   STATUS,
   STATUS_ALIASES,
+  SURFACED,
   normalizeStatus,
   isValidStatus,
+  effectiveStatus,
   readLastReconcile,
   writeLastReconcile,
   shouldNagReconcile,
@@ -35,22 +37,23 @@ import {
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const INDEX = join(HERE, 'index.mjs');
+const DECISIONS = join(HERE, 'decisions.mjs');
 const REMINDER = join(HERE, '..', '..', 'hooks', 'fray-reminder.mjs');
 const STATUSLINE = join(HERE, '..', '..', 'statusline-fray.mjs');
 
 // ── status vocab — pure functions ────────────────────────────────────────────────
-test('STATUS is the unified canonical set — blocked absorbed enqueued + needs-decision', () => {
-  assert.deepEqual(STATUS, ['planning', 'planned', 'active', 'blocked', 'done', 'dismissed']);
+test('STATUS is the canonical set — needs-human is first-class; enqueued/needs-decision stay read-aliases', () => {
+  assert.deepEqual(STATUS, ['planning', 'planned', 'active', 'needs-human', 'blocked', 'done', 'dismissed']);
   for (const gone of ['enqueued', 'needs-decision', 'todo', 'plan']) {
     assert.ok(!STATUS.includes(gone), `${gone} is a read-alias, NOT canonical`);
   }
 });
 
-test('normalizeStatus collapses the legacy aliases into the unified vocab', () => {
+test('normalizeStatus maps the legacy aliases to their canonical target', () => {
   assert.equal(normalizeStatus('todo'), 'planned');
   assert.equal(normalizeStatus('plan'), 'planned');
-  assert.equal(normalizeStatus('enqueued'), 'blocked', 'enqueued collapsed into the unified blocked');
-  assert.equal(normalizeStatus('needs-decision'), 'blocked', 'needs-decision collapsed into the unified blocked');
+  assert.equal(normalizeStatus('enqueued'), 'blocked', 'enqueued → the machine-wait blocked');
+  assert.equal(normalizeStatus('needs-decision'), 'needs-human', 'needs-decision → the first-class needs-human');
   for (const s of STATUS) assert.equal(normalizeStatus(s), s, `${s} is canonical → unchanged`);
   assert.equal(normalizeStatus('bogus'), 'bogus', 'unknown passes through for the caller to reject');
   assert.equal(normalizeStatus(undefined), undefined);
@@ -59,9 +62,27 @@ test('normalizeStatus collapses the legacy aliases into the unified vocab', () =
 test('isValidStatus accepts canonical + aliases, rejects everything else', () => {
   for (const s of STATUS) assert.ok(isValidStatus(s));
   for (const a of Object.keys(STATUS_ALIASES)) assert.ok(isValidStatus(a), `${a} alias is accepted`);
+  assert.ok(isValidStatus('needs-human'), 'needs-human is canonical');
   assert.ok(!isValidStatus('ready'));
   assert.ok(!isValidStatus('complete'));
   assert.ok(!isValidStatus(undefined));
+});
+
+test('effectiveStatus: needs-human is first-class; blocked reclassifies by machine field', () => {
+  assert.equal(effectiveStatus('needs-human', {}), 'needs-human');
+  assert.equal(effectiveStatus('needs-decision', {}), 'needs-human', 'the string alias maps first');
+  assert.equal(effectiveStatus('active', {}), 'active');
+  // The ONE contextual alias: a legacy `blocked` thread with NO machine field reads as needs-human.
+  assert.equal(effectiveStatus('blocked', {}), 'needs-human', 'blocked + no machine field → needs-human');
+  assert.equal(effectiveStatus('blocked', { hasBlockingThreads: true }), 'blocked', 'blocked + deps stays blocked');
+  assert.equal(effectiveStatus('blocked', { hasTimer: true }), 'blocked', 'blocked + timer stays blocked');
+  assert.equal(effectiveStatus(undefined, {}), undefined);
+});
+
+test('SURFACED ranks needs-human first (the ⚖ awaiting-you queue), machine-blocked after active', () => {
+  assert.equal(SURFACED[0], 'needs-human', 'needs-human is top priority');
+  assert.ok(SURFACED.indexOf('needs-human') < SURFACED.indexOf('active'));
+  assert.ok(SURFACED.indexOf('active') < SURFACED.indexOf('blocked'), 'machine-blocked is de-emphasized, after active');
 });
 
 // ── reconcile forcing-function — two-trigger gate + round-trip ────────────────────
@@ -129,7 +150,7 @@ test('writeLastReconcile/readLastReconcile round-trip; absent reads null', () =>
 });
 
 // ── end-to-end: legacy `todo`/`needs-decision` normalize through the board read path ─────
-test('board --json: legacy `todo`→planned; `needs-decision`→blocked (human-blocked)', () => {
+test('board --json: legacy `todo`→planned; `needs-decision`→needs-human (human-blocked)', () => {
   const dir = mkdtempSync(join(tmpdir(), 'fray-board-'));
   try {
     mkdirSync(join(dir, '.fray'), { recursive: true });
@@ -142,9 +163,119 @@ test('board --json: legacy `todo`→planned; `needs-decision`→blocked (human-b
     const { threads, errors } = JSON.parse(out);
     const byId = Object.fromEntries(threads.map((t) => [t.id, t]));
     assert.equal(byId['legacy-todo'].status, 'planned', 'todo buckets as planned');
-    assert.equal(byId['legacy-nd'].status, 'blocked', 'needs-decision normalizes to the unified blocked');
-    assert.equal(byId['legacy-nd'].humanBlocked, true, 'a needs-decision thread (no machine field) is human-blocked');
+    assert.equal(byId['legacy-nd'].status, 'needs-human', 'needs-decision normalizes to the first-class needs-human');
+    assert.equal(byId['legacy-nd'].humanBlocked, true, 'a needs-human thread is human-blocked (awaiting you)');
     assert.equal(errors.length, 0, 'a legacy/canonical status is NOT a validation error');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── needs-human as a first-class status through the board read + validator ──
+test('board --json: a canonical needs-human thread emits status needs-human + humanBlocked; missing status_text errors', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fray-nh-'));
+  try {
+    mkdirSync(join(dir, '.fray'), { recursive: true });
+    writeFileSync(join(dir, '.fray', 'ask.md'), '---\ntitle: a\nstatus: needs-human\nstatus_text: "approve the API shape?"\n---\nbody\n');
+    writeFileSync(join(dir, '.fray', 'noask.md'), '---\ntitle: n\nstatus: needs-human\n---\nbody\n');
+    const out = execFileSync(process.execPath, [INDEX, '--json'], { env: { ...process.env, CLAUDE_PROJECT_DIR: dir }, encoding: 'utf8' });
+    const { threads, errors } = JSON.parse(out);
+    const byId = Object.fromEntries(threads.map((t) => [t.id, t]));
+    assert.equal(byId['ask'].status, 'needs-human', 'a canonical needs-human thread emits status needs-human');
+    assert.equal(byId['ask'].humanBlocked, true, 'needs-human IS the awaiting-you predicate');
+    assert.equal(byId['noask'].humanBlocked, true, 'still humanBlocked even without a status_text');
+    assert.ok(errors.some((e) => /noask\.md: .*needs-human requires a status_text/.test(e)), 'needs-human without status_text is a validation ERROR');
+    assert.equal(errors.filter((e) => /needs-human requires a status_text/.test(e)).length, 1, 'only the no-status_text thread errors (the one with a status_text is fine)');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── block-form deps: board + `fray decisions` agree (parseDeps, not a flat read) ──
+test('block-form blocking_threads → machine-blocked (NOT needs-human), excluded from `fray decisions`', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fray-bf-'));
+  try {
+    mkdirSync(join(dir, '.fray'), { recursive: true });
+    // A YAML BLOCK-form dep list (not inline `[..]`) + status blocked → a MACHINE wait.
+    writeFileSync(join(dir, '.fray', 'blockform.md'), '---\ntitle: b\nstatus: blocked\nstatus_text: "waiting on dep"\nblocking_threads:\n  - dep-thread\n---\n## Next step\nwait\n');
+    writeFileSync(join(dir, '.fray', 'dep-thread.md'), '---\ntitle: d\nstatus: active\nstatus_text: "on it"\n---\n## Next step\ngo\n');
+    writeFileSync(join(dir, '.fray', 'ask.md'), '---\ntitle: a\nstatus: needs-human\nstatus_text: "which default?"\n---\n## Next step\nask\n');
+    // Board (parseDeps, block-form aware): the block-form thread is machine-`blocked`, not needs-human.
+    const board = JSON.parse(execFileSync(process.execPath, [INDEX, '--json'], { env: { ...process.env, CLAUDE_PROJECT_DIR: dir }, encoding: 'utf8' }));
+    const byId = Object.fromEntries(board.threads.map((t) => [t.id, t]));
+    assert.equal(byId['blockform'].status, 'blocked', 'block-form deps → machine-blocked, not needs-human');
+    assert.equal(byId['blockform'].humanBlocked, false);
+    // `fray decisions` (decisions.mjs, now parseDeps-based) must AGREE: exclude the block-form thread,
+    // include the canonical needs-human one.
+    const dec = execFileSync(process.execPath, [DECISIONS], { env: { ...process.env, CLAUDE_PROJECT_DIR: dir }, encoding: 'utf8' });
+    assert.doesNotMatch(dec, /\[blockform\]/, 'a block-form machine-blocked thread is NOT a pending decision');
+    assert.match(dec, /\[ask\]/, 'the needs-human thread IS a pending decision');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── STRUCTURED errorItems: the --json branch classifies a missing-frontmatter file as REPAIRABLE ──
+test('board --json: errorItems classifies a no-frontmatter file as `no-frontmatter`, others as `other`', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fray-erritems-'));
+  try {
+    mkdirSync(join(dir, '.fray'), { recursive: true });
+    // The incident shape: metadata in bold prose, NO YAML frontmatter → repairable.
+    writeFileSync(join(dir, '.fray', 'no-fm.md'), '**Status: DONE**\n\nbody with no frontmatter\n');
+    // A well-formed thread but with an INVALID status → an error, but NOT frontmatter-repairable.
+    writeFileSync(join(dir, '.fray', 'bad-status.md'), '---\ntitle: b\nstatus: bogus\nstatus_text: "x"\n---\nbody\n');
+    // A clean thread → no error item at all.
+    writeFileSync(join(dir, '.fray', 'ok.md'), '---\ntitle: o\nstatus: active\nstatus_text: "fine"\n---\n## Next step\ngo\n');
+    const board = JSON.parse(execFileSync(process.execPath, [INDEX, '--json'], { env: { ...process.env, CLAUDE_PROJECT_DIR: dir }, encoding: 'utf8' }));
+    assert.ok(Array.isArray(board.errorItems), 'errorItems is emitted as an array');
+    const byFile = Object.fromEntries(board.errorItems.map((e) => [e.file, e]));
+    assert.equal(byFile['no-fm.md'].kind, 'no-frontmatter', 'a missing-frontmatter file is repairable');
+    assert.match(byFile['no-fm.md'].message, /no YAML frontmatter/);
+    assert.equal(byFile['bad-status.md'].kind, 'other', 'an invalid-status file is NOT frontmatter-repairable');
+    assert.equal(byFile['ok.md'], undefined, 'a clean thread produces no error item');
+    // The legacy string array is untouched (both errors still present, formatted as before).
+    assert.ok(board.errors.some((e) => e.includes('no-fm.md') && e.includes('no YAML frontmatter')), 'legacy errors string array preserved');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── `activity` (the UI listing-row gerund gloss) passes through --json, distinct from status_text ──
+test('board --json: `activity` frontmatter passes through; absent → undefined; distinct from status_text', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fray-activity-'));
+  try {
+    mkdirSync(join(dir, '.fray'), { recursive: true });
+    writeFileSync(join(dir, '.fray', 'has-activity.md'), '---\ntitle: h\nstatus: active\nstatus_text: "full board gloss"\nactivity: "Awaiting CI on PR #391"\n---\nbody\n');
+    writeFileSync(join(dir, '.fray', 'no-activity.md'), '---\ntitle: n\nstatus: active\nstatus_text: "just a gloss"\n---\nbody\n');
+    const out = execFileSync(process.execPath, [INDEX, '--json'], {
+      env: { ...process.env, CLAUDE_PROJECT_DIR: dir },
+      encoding: 'utf8',
+    });
+    const byId = Object.fromEntries(JSON.parse(out).threads.map((t) => [t.id, t]));
+    assert.equal(byId['has-activity'].activity, 'Awaiting CI on PR #391', 'activity flows through the --json emit');
+    assert.equal(byId['has-activity'].status_text, 'full board gloss', 'status_text is independent of activity');
+    assert.equal(byId['no-activity'].activity, undefined, 'a thread without an activity field carries no activity');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── derived `hasPlan` (a `## Plan` section) passes through --json — NO frontmatter flag ──
+test('board --json: `hasPlan` is derived from a `## Plan` body section; validator ignores it', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fray-hasplan-'));
+  try {
+    mkdirSync(join(dir, '.fray'), { recursive: true });
+    // A design thread with a `## Plan` section → hasPlan true. Heading match is word-bounded.
+    writeFileSync(join(dir, '.fray', 'with-plan.md'), '---\ntitle: w\nstatus: planning\nstatus_text: "designing"\n---\n## Goal\ng\n\n## Plan\n1. do a thing\n');
+    // No `## Plan` section → hasPlan false. A `## Planning` heading must NOT count (word boundary).
+    writeFileSync(join(dir, '.fray', 'no-plan.md'), '---\ntitle: n\nstatus: active\nstatus_text: "building"\n---\n## Planning notes\nnope\n');
+    const out = execFileSync(process.execPath, [INDEX, '--json'], { env: { ...process.env, CLAUDE_PROJECT_DIR: dir }, encoding: 'utf8' });
+    const byId = Object.fromEntries(JSON.parse(out).threads.map((t) => [t.id, t]));
+    assert.equal(byId['with-plan'].hasPlan, true, '`## Plan` section → hasPlan true');
+    assert.equal(byId['no-plan'].hasPlan, false, 'no `## Plan` section (a `## Planning` heading does NOT count) → hasPlan false');
+    // Derived, not frontmatter: neither thread carries a `plan` field and neither errors on one.
+    assert.equal(byId['with-plan'].plan, undefined, 'there is NO plan frontmatter flag — the marker is derived');
+    assert.equal(byId['with-plan'].errors.length, 0, 'a `## Plan` section is never a validation error');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -162,8 +293,8 @@ test('board: ⚖ hoists human-blocked (no machine field); machine-blocked render
     writeFileSync(join(dir, '.fray', 'dep.md'), '---\ntitle: dep\nstatus: active\nstatus_text: "running"\n---\n## Next step\ngo\n');
     writeFileSync(join(dir, '.fray', 'wait.md'), '---\ntitle: w\nstatus: blocked\nstatus_text: "waiting on dep"\nblocking_threads: [dep]\n---\n## Next step\nwait\n');
     const out = execFileSync(process.execPath, [INDEX], { env: { ...process.env, CLAUDE_PROJECT_DIR: dir }, encoding: 'utf8' });
-    // The ⚖ awaiting-you queue is HUMAN-blocked only — decide is in, wait is NOT.
-    assert.match(out, /⚖ awaiting you \(1\) — human-blocked/);
+    // The ⚖ awaiting-you queue is needs-human only — decide (legacy blocked-no-field) is in, wait is NOT.
+    assert.match(out, /⚖ awaiting you \(1\) — needs-human/);
     assert.match(out, /which default\?/, 'the human-blocked thread is surfaced by its status_text');
     assert.doesNotMatch(out, /⚖ awaiting you \(2\)/, 'machine-blocked wait is NOT in the ⚖ queue');
     // Order: ⚖ (human-blocked) before active before the blocked group (machine-blocked, last).

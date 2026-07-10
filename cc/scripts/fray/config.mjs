@@ -254,12 +254,13 @@ export function frayActive(projectDir, sessionId) {
  * written to disk going forward; legacy spellings (`todo`/`plan`/`enqueued`/`needs-decision`)
  * are accepted on read via {@link STATUS_ALIASES} + {@link normalizeStatus}, never written.
  *
- * THE UNIFIED WAITING MODEL (2026-07-01): the status word answers exactly ONE question — CAN
- * THIS RUN? — and nothing else. Every "waiting" flavor collapses into `blocked`; HOW a blocked
- * thread unblocks is an ORTHOGONAL RESOLUTION-MECHANISM field, and the board derives color,
- * urgency, ordering, and auto-fire from WHICH field is set — not from the status word (see
- * {@link blockMechanism}). This kills the old `enqueued`-vs-`blocked` ambiguity with zero loss
- * of expressiveness: the human(yellow)/machine(gray) split just moved from the WORD to the FIELD.
+ * THE WAITING MODEL (2026-07-08, refining the 2026-07-01 unified model): "awaiting a human" is
+ * now its OWN first-class status — `needs-human` — no longer an encoding of `blocked`. `blocked`
+ * narrows to MACHINE-waits ONLY and REQUIRES a resolution-mechanism field. So the human(yellow)/
+ * machine(gray) split is back in the WORD (`needs-human` vs `blocked`); the mechanism field now
+ * only distinguishes the two MACHINE flavors of `blocked` (threads vs timer). BACK-COMPAT: a
+ * legacy `blocked` thread with NO machine field reads as `needs-human` (see {@link
+ * effectiveStatus}); the legacy `needs-decision` spelling aliases to `needs-human`.
  *
  * - `planning` — ACTIVE design discussion happening RIGHT NOW: the deliverable is the DESIGN
  *   itself, not an implementation. Open questions in motion; worked WITH the human or a Plan/
@@ -270,35 +271,41 @@ export function frayActive(projectDir, sessionId) {
  *   `planned` — it is `blocked` + the right mechanism field. (RENAME of the old `todo`; also
  *   absorbs the old `plan`.)
  * - `active` — building NOW; a live agent is on it. SURFACED.
- * - `blocked` — CANNOT run right now. HOW it unblocks is the mechanism field ({@link
- *   blockMechanism}), EXACTLY ONE of:
- *     (1) HUMAN — no machine field set → only the maintainer can unblock it (a question/call).
- *         YELLOW, hoisted to the top of the `⚖ awaiting you` queue, surfaced in the nag by its
- *         `status_text` (untruncated), the ONLY thing the Stop hook pops. (Old `needs-decision`.)
- *     (2) `blocking_threads: [slug, …]` — blocked on other THREADS going terminal. GRAY,
+ * - `needs-human` — AWAITING A HUMAN: a question / decision / approval, OR a finished result that
+ *   needs human review, that ONLY the maintainer can resolve. REQUIRES a `status_text` stating
+ *   the ask. YELLOW, hoisted to the top of the `⚖ awaiting you` queue, surfaced in the nag by its
+ *   `status_text` (untruncated), the ONLY thing the Stop hook pops. (Absorbs the old
+ *   `needs-decision` spelling AND the old `blocked`-with-no-machine-field human encoding.)
+ * - `blocked` — CANNOT run, waiting on NON-human work. REQUIRES exactly ONE machine mechanism
+ *   ({@link blockMechanism}); a `blocked` thread with no machine field is mis-encoded and reads
+ *   as `needs-human` (the validator warns). The mechanism is one of:
+ *     (1) `blocking_threads: [slug, …]` — blocked on other THREADS going terminal. GRAY,
  *         de-emphasized, AUTO-FIRES: the instant every listed thread is done/dismissed the board
  *         flips it `▶ READY — dispatch now` (+ the DROP-RISK callout). (Old `enqueued`; the field
  *         is the RENAME of `depends_on`, which is still accepted as a read-alias field. Entries
  *         may also be typed EXTERNAL gates `pr:`/`ci:`/`external:` — those park, they don't fire.)
- *     (3) `revalidate_at: <ISO>` (+ `last_checked`) — blocked on an external event with a TIMER.
+ *     (2) `revalidate_at: <ISO>` (+ `last_checked`) — blocked on an external event with a TIMER.
  *         GRAY/dim, parked + quiet until due, then surfaces loudly for a recheck.
- *   The machine mechanisms (2, 3) do NOT clamor for attention — GRAY, rendered LAST among live
- *   groups, EXCLUDED from the `⚖ awaiting you` queue + the Stop-hook pop.
+ *   Machine-blocked threads do NOT clamor for attention — GRAY, rendered LAST among live groups,
+ *   EXCLUDED from the `⚖ awaiting you` queue + the Stop-hook pop.
  * - `done` / `dismissed` — TERMINAL (completed / decided-against): kept, never deleted,
  *   excluded from the active board's pending views.
  * @type {readonly string[]}
  */
-export const STATUS = ['planning', 'planned', 'active', 'blocked', 'done', 'dismissed'];
+export const STATUS = ['planning', 'planned', 'active', 'needs-human', 'blocked', 'done', 'dismissed'];
 
 /**
  * BACK-COMPAT READ ALIASES — legacy status spellings, accepted FOREVER on read (never a
  * validation error) and normalized to their canonical target. `todo`/`plan` → `planned`;
- * `enqueued`/`needs-decision` → `blocked` (both collapsed into the unified `blocked` + a
- * mechanism field on 2026-07-01). A thread still carrying any of these validates fine and
- * buckets as its canonical target; the CLI writes the canonical word.
+ * `enqueued` → `blocked` (dep-blocked, a machine wait); `needs-decision` → `needs-human` (the
+ * human-decision state, promoted to its own first-class status on 2026-07-08). A thread still
+ * carrying any of these validates fine and buckets as its canonical target; the CLI writes the
+ * canonical word. NOTE: a legacy `blocked` thread with no machine field is a SEPARATE contextual
+ * alias to `needs-human` — that one depends on the mechanism fields, so it lives in
+ * {@link effectiveStatus}, not this pure string map.
  * @type {Readonly<Record<string,string>>}
  */
-export const STATUS_ALIASES = { todo: 'planned', plan: 'planned', enqueued: 'blocked', 'needs-decision': 'blocked' };
+export const STATUS_ALIASES = { todo: 'planned', plan: 'planned', enqueued: 'blocked', 'needs-decision': 'needs-human' };
 
 /**
  * The full set ACCEPTED by the validator: canonical statuses plus the read-aliases. Used
@@ -353,15 +360,12 @@ export const PARKED = ['planned'];
 
 /**
  * The SURFACED (auto-nagged) subset of canonical {@link STATUS} — the actionable/in-flight
- * statuses, in PRIORITY order. Note `blocked` is ONE word covering both the yellow (human) and
- * gray (machine/timer) cases; the per-turn nag splits them by {@link blockMechanism}, surfacing
- * HUMAN-blocked prominently (the ⚖ queue) and keeping machine/timer-blocked quiet until ready or
- * due. Order here places `blocked` early because a HUMAN-blocked thread is top-priority; a
- * machine-blocked one is de-emphasized by the mechanism logic, not by the word. Equals
- * `STATUS − PARKED − TERMINAL`.
+ * statuses, in PRIORITY order. `needs-human` is FIRST (top-priority — the maintainer must act;
+ * the ⚖ awaiting-you queue). `blocked` is now MACHINE-only (gray, de-emphasized), rendered after
+ * `active`. Equals `STATUS − PARKED − TERMINAL`.
  * @type {readonly string[]}
  */
-export const SURFACED = ['blocked', 'active', 'planning'];
+export const SURFACED = ['needs-human', 'active', 'blocked', 'planning'];
 
 // ── the RESOLUTION MECHANISM of a `blocked` thread — the crux of the unified waiting model ──
 // A `blocked` thread carries EXACTLY ONE mechanism describing HOW it unblocks; the board derives
@@ -399,6 +403,25 @@ export function blockMechanism({ hasBlockingThreads, hasTimer }) {
  */
 export function isHumanBlocked(f) {
   return blockMechanism(f) === 'human';
+}
+
+/**
+ * The EFFECTIVE (bucketing) status of a thread, given its raw `status:` and its mechanism fields.
+ * Applies the pure string aliases ({@link normalizeStatus}) AND the ONE contextual alias that
+ * needs the fields: a legacy `blocked` thread with NO machine field (the old pre-`needs-human`
+ * human-wait encoding) reads as `needs-human`. A `blocked` thread WITH a machine field stays
+ * `blocked` (a machine wait). Everything else passes through its normalized form. This is the
+ * single predicate the board, `fray decisions`, the reminder/stop hooks, and the statusline share
+ * so "awaiting a human" can never drift between them — a thread is awaiting-you IFF
+ * `effectiveStatus(...) === 'needs-human'`.
+ * @param {string|undefined|null} rawStatus
+ * @param {{hasBlockingThreads?: boolean, hasTimer?: boolean}} [fields]
+ * @returns {string|undefined|null}
+ */
+export function effectiveStatus(rawStatus, { hasBlockingThreads, hasTimer } = {}) {
+  const s = normalizeStatus(rawStatus);
+  if (s === 'blocked' && !hasBlockingThreads && !hasTimer) return 'needs-human';
+  return s;
 }
 
 /**

@@ -31,6 +31,11 @@
 //
 // FAIL-OPEN ABSOLUTELY: any error / missing file / unparseable stdin → exit 0, no output. Never
 // throw, never block an edit.
+// GATE: a fray-ui WORKER session (FRAY_UI_THREAD set) is owned by the cc-worker plugin — the
+// orchestrator hooks must stay silent there, or their injected pulses pollute the worker's
+// transcript (and the fray-ui chat rendering of it). Exit 0 with no output = inert.
+if ((process.env.FRAY_UI_THREAD ?? '').trim()) process.exit(0);
+
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve, basename, dirname } from 'node:path';
 import { frayActive } from '../scripts/fray/config.mjs';

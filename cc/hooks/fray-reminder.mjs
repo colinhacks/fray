@@ -13,6 +13,11 @@
 // session, so re-paying it every prompt was pure waste.
 // Emits hookSpecificOutput.additionalContext (model-only). Robust: never throws (a broken
 // hook must not disrupt the prompt) — any failure → inject nothing.
+// GATE: a fray-ui WORKER session (FRAY_UI_THREAD set) is owned by the cc-worker plugin — the
+// orchestrator hooks must stay silent there, or their injected pulses pollute the worker's
+// transcript (and the fray-ui chat rendering of it). Exit 0 with no output = inert.
+if ((process.env.FRAY_UI_THREAD ?? '').trim()) process.exit(0);
+
 import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
@@ -197,12 +202,14 @@ try {
         }
         continue;
       }
-      // active, planning, or HUMAN-blocked → surfaced in the pending nag.
+      // active, planning, or needs-human (incl. a legacy `blocked` with no machine field) → surfaced.
       const age = ageLabel(t.mtimeMs);
       const isStale = t.status === 'active' && t.mtimeMs > 0 && now - t.mtimeMs > STALE_MIN * 60_000;
       pending.push(`${t.id}[${t.status ?? '?'}${age ? ', ' + age : ''}${isStale ? ' ⚠STALE' : ''}]`);
       if (hasQueuedFollowup(t.src)) queued.push(t.id); // STRUCTURED: only an UNCHECKED `- [ ]` follow-up, never a checked-off / prose "QUEUED"
-      if (t.status === 'blocked') decisions.push({ slug: t.id, status_text: t.status_text }); // human-blocked (machine handled above)
+      // needs-human is the ⚖ awaiting-you queue: canonical `needs-human`, OR a legacy `blocked`
+      // thread with no machine field (which reached here only because machineBlocked was false above).
+      if (t.status === 'needs-human' || t.status === 'blocked') decisions.push({ slug: t.id, status_text: t.status_text });
     }
   }
   // Order the pending list by SURFACE PRIORITY (human-blocked → active → planning), matching

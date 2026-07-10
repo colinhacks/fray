@@ -1,0 +1,28 @@
+/scratch/
+.fray/
+
+# per-user Claude Code overrides
+.claude/settings.local.json
+# Claude Code local state + transient agent worktrees (never commit these)
+.claude/worktrees/
+.claude/jobs/
+
+# dependencies + build artifacts
+node_modules/
+dist/
+build/
+out/
+*.tsbuildinfo
+.turbo/
+.cache/
+coverage/
+
+# os / editor cruft
+.DS_Store
+*.log
+
+# local runtime scratch / demo artifacts
+/demo-perm.txt
+*.db
+*.db-wal
+*.db-shm

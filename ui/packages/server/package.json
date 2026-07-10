@@ -1,0 +1,27 @@
+{
+  "name": "@fray-ui/server",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts", "./router": "./src/router.ts" },
+  "scripts": {
+    "postinstall": "node -e \"try{require('node:fs').chmodSync(require.resolve('node-pty/package.json').replace('package.json','prebuilds/'+process.platform+'-'+process.arch+'/spawn-helper'),0o755)}catch{}\""
+  },
+  "dependencies": {
+    "@fray-ui/rpc": "workspace:*",
+    "@fray-ui/shared": "workspace:*",
+    "@hono/node-server": "^1.13",
+    "@parcel/watcher": "^2.5",
+    "better-sqlite3": "^12",
+    "hono": "^4.7",
+    "node-pty": "^1.1",
+    "ws": "^8.18",
+    "zod": "^3.24"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6",
+    "@types/ws": "^8.5",
+    "typescript": "^5.7",
+    "vite": "^8"
+  }
+}

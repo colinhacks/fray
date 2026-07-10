@@ -30,6 +30,11 @@
  * the gate signal is unreadable we FAIL TOWARD RECORDING (a missed rest is the worse
  * failure — it silently hides exactly what the REST guard exists to catch).
  */
+// GATE: a fray-ui WORKER session (FRAY_UI_THREAD set) is owned by the cc-worker plugin — the
+// orchestrator hooks must stay silent there, or their injected pulses pollute the worker's
+// transcript (and the fray-ui chat rendering of it). Exit 0 with no output = inert.
+if ((process.env.FRAY_UI_THREAD ?? '').trim()) process.exit(0);
+
 import { appendFileSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { frayActive, stampOwnerReconciled } from '../scripts/fray/config.mjs';

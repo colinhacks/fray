@@ -20,7 +20,7 @@
 import { readFileSync, writeFileSync, existsSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { collectDecisions } from './decisions.mjs';
-import { STATUS, ACCEPTED_STATUSES, isValidStatus, normalizeStatus } from './config.mjs';
+import { STATUS, ACCEPTED_STATUSES, isValidStatus, normalizeStatus, parseDeps } from './config.mjs';
 
 // The status vocabulary is the SINGLE shared source from config.mjs (the same set the
 // board validates against) — importing it keeps the updater and the board from drifting.
@@ -156,35 +156,51 @@ function main() {
   const { fm, body } = splitFrontmatter(original);
   if (fm === null) die(`thread ${args.slug}.md has no YAML frontmatter block`);
 
-  // --- Validate status + the human-blocked/status_text invariant BEFORE writing ---
+  // --- Validate status + the needs-human/status_text invariant BEFORE writing ---
   // Accept canonical OR a legacy alias, then NORMALIZE to canonical so the on-disk value is
-  // always canonical going forward (e.g. `--status needs-decision`/`enqueued` writes `blocked`).
+  // always canonical going forward (e.g. `--status needs-decision` writes `needs-human`,
+  // `--status enqueued` writes `blocked`).
   if (args.status !== undefined && !isValidStatus(args.status)) {
     die(`invalid status "${args.status}"; must be one of: ${ACCEPTED_STATUSES.join(' · ')}`);
   }
   const canonicalStatus = args.status !== undefined ? normalizeStatus(args.status) : undefined;
-  // A HUMAN-blocked thread (status blocked with NO `blocking_threads`/`depends_on` and NO
-  // `revalidate_at`) IS the ⚖ awaiting-you queue entry, so it REQUIRES a status_text write-up.
-  // Machine/timer-blocked threads carry a mechanism field instead and need no write-up. We look
-  // at the fields being SET this call PLUS what's already on the thread.
-  if (canonicalStatus === 'blocked') {
+  // A `needs-human` thread — OR a `blocked` thread with NO machine field, which READS as
+  // needs-human (config.effectiveStatus) — IS the ⚖ awaiting-you queue entry, so it REQUIRES a
+  // status_text ask. A `blocked` thread WITH a `blocking_threads`/`revalidate_at` field is a
+  // machine/timer wait and needs no write-up. We look at the fields being SET this call PLUS
+  // what's already on the thread.
+  if (canonicalStatus === 'needs-human' || canonicalStatus === 'blocked') {
     // A key counts as a machine field only when its EFFECTIVE post-write value is non-empty —
     // the `--set` value if this call sets the key, else what's already on disk. Checking mere
     // key-PRESENCE would let `--set blocking_threads=[]` / `--set revalidate_at=` bypass the
-    // invariant and write a human-blocked thread with no status_text (the empty ⚖-queue row the
-    // invariant exists to forbid). Empty string, `[]`, and `[ ]` are all "no machine field."
-    const hasMachineField = ['blocking_threads', 'depends_on', 'revalidate_at'].some((k) => {
-      const setKv = args.sets.find((kv) => kv.slice(0, kv.indexOf('=')).trim() === k);
-      const raw = setKv !== undefined ? setKv.slice(setKv.indexOf('=') + 1) : fmGet(fm, k);
-      const v = (raw ?? '').trim().replace(/^["']|["']$/g, '').trim();
-      return v !== '' && v.replace(/\s+/g, '') !== '[]';
+    // invariant. Empty string, `[]`, and `[ ]` are all "no machine field."
+    // Deps: a `--set` on this call wins (inline value); otherwise read the ON-DISK deps via the
+    // shared block-form-aware parseDeps (a flat fmGet would miss a YAML block-form list and falsely
+    // refuse a legitimately machine-blocked thread — matches the board/decisions readers).
+    const setDep = args.sets.find((kv) => {
+      const k = kv.slice(0, kv.indexOf('=')).trim();
+      return k === 'blocking_threads' || k === 'depends_on';
     });
-    if (!hasMachineField) {
+    const hasDeps =
+      setDep !== undefined
+        ? (() => {
+            const v = setDep.slice(setDep.indexOf('=') + 1).trim().replace(/^["']|["']$/g, '').trim();
+            return v !== '' && v.replace(/\s+/g, '') !== '[]';
+          })()
+        : parseDeps(original).length > 0;
+    const setRv = args.sets.find((kv) => kv.slice(0, kv.indexOf('=')).trim() === 'revalidate_at');
+    const rvRaw = setRv !== undefined ? setRv.slice(setRv.indexOf('=') + 1) : fmGet(fm, 'revalidate_at');
+    const hasTimerField = (rvRaw ?? '').trim().replace(/^["']|["']$/g, '').trim() !== '';
+    const hasMachineField = hasDeps || hasTimerField;
+    // Effective needs-human = the word `needs-human`, OR `blocked` with no machine field.
+    if (canonicalStatus === 'needs-human' || !hasMachineField) {
       const willHaveStatusText = args.status_text !== undefined
         ? isStatusTextNonEmpty(`"${args.status_text}"`) || args.status_text.trim().length > 0
         : isStatusTextNonEmpty(getStatusText(fm));
       if (!willHaveStatusText) {
-        die('a HUMAN-blocked thread (blocked with no blocking_threads/revalidate_at) REQUIRES a write-up of the decision needed — pass --status-text "<text>", or add a `blocking_threads`/`revalidate_at` mechanism if the block is non-human');
+        die(canonicalStatus === 'needs-human'
+          ? 'a `needs-human` thread REQUIRES a status_text stating the ask — pass --status-text "<the decision/ask needed>"'
+          : 'a `blocked` thread with no `blocking_threads`/`revalidate_at` reads as needs-human and REQUIRES a status_text — pass --status-text "<the ask>", add a machine field to make it a real machine wait, or use --status needs-human');
       }
     }
   }

@@ -1,0 +1,18 @@
+#!/usr/bin/env node
+// @ts-check
+/**
+ * fray-update — the structured thread updater, on the worker's Bash PATH while the fray-worker
+ * plugin is enabled. This is the worker's PRIMARY tool for owning its one thread file: it writes
+ * `.fray/<slug>.md` through the same code path fray-ui uses (never hand-rolled markdown edits).
+ * Execs cc's bundled updater directly (NOT a copy) — cc-worker never forks updater logic.
+ *
+ * Resolving the script: this file is <plugin>/bin/fray-update, cc is a sibling of the plugin root,
+ * so the updater is at ../../cc/scripts/fray/thread-update.mjs relative to THIS file. Imported via
+ * a file:// URL so argv/process.env flow straight through.
+ */
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { dirname, join } from 'node:path';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const updater = join(here, '..', '..', 'cc', 'scripts', 'fray', 'thread-update.mjs');
+await import(pathToFileURL(updater).href);

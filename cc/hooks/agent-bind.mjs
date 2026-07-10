@@ -18,6 +18,11 @@
 //
 // FAIL-OPEN ABSOLUTELY: any error → exit 0 with no output. A PostToolUse hook must never
 // disturb the turn; a missed binding just means one agent isn't surfaced on the board.
+// GATE: a fray-ui WORKER session (FRAY_UI_THREAD set) is owned by the cc-worker plugin — the
+// orchestrator hooks must stay silent there, or their injected pulses pollute the worker's
+// transcript (and the fray-ui chat rendering of it). Exit 0 with no output = inert.
+if ((process.env.FRAY_UI_THREAD ?? '').trim()) process.exit(0);
+
 import { readFileSync } from 'node:fs';
 import { frayActive } from '../scripts/fray/config.mjs';
 import { recordBinding, threadFromPrompt } from '../scripts/fray/agent-bindings.mjs';

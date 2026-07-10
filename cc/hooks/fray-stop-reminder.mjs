@@ -61,6 +61,11 @@
  * (default on); `stop_reminder_cooldown_seconds` (default 1800) is the CLEANUP rest window.
  */
 
+// GATE: a fray-ui WORKER session (FRAY_UI_THREAD set) is owned by the cc-worker plugin — the
+// orchestrator hooks must stay silent there, or their injected pulses pollute the worker's
+// transcript (and the fray-ui chat rendering of it). Exit 0 with no output = inert.
+if ((process.env.FRAY_UI_THREAD ?? '').trim()) process.exit(0);
+
 import { readFileSync, writeFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { frayActive, reconcileStampLastInstruction, computeBoardDrift, reconcileBackstopMin, loadConfig } from '../scripts/fray/config.mjs';

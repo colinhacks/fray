@@ -17,6 +17,11 @@
 // hooks docs), so it is a best-effort ACCELERATOR, not the authoritative signal — the heartbeat
 // staleness window is the crash-safe fallback. Robust: never throws, never blocks (SessionEnd
 // cannot block anyway); any error → silent no-op.
+// GATE: a fray-ui WORKER session (FRAY_UI_THREAD set) is owned by the cc-worker plugin — the
+// orchestrator hooks must stay silent there, or their injected pulses pollute the worker's
+// transcript (and the fray-ui chat rendering of it). Exit 0 with no output = inert.
+if ((process.env.FRAY_UI_THREAD ?? '').trim()) process.exit(0);
+
 import { readFileSync } from 'node:fs';
 import { frayActive, currentSessionId, clearSessionHeartbeat } from '../scripts/fray/config.mjs';
 
