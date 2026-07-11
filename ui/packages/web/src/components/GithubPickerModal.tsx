@@ -6,7 +6,7 @@ import { rpc } from "../api/rpc.ts"
 import { showToast } from "../store.ts"
 import { Overlay } from "./NewThreadModal.tsx"
 import { Select } from "./ui/Select.tsx"
-import { PERMISSION_OPTIONS, MODEL_OPTIONS, EFFORT_OPTIONS, EFFORTS, PERMISSION_COLOR } from "../lib/options.ts"
+import { PERMISSION_OPTIONS, CLAUDE_MODELS, EFFORT_OPTIONS, EFFORTS, PERMISSION_COLOR, backendForModel, claudePermValue } from "../lib/options.ts"
 
 type Kind = "issues" | "prs"
 type Sort = "recent" | "reactions"
@@ -14,7 +14,10 @@ type Sort = "recent" | "reactions"
 // Readout option lists carry no empty "default" row — the footer readouts always show a concrete value
 // (the modal defaults model→opus, effort→high, mode→auto unless settings/user override), matching the
 // new-thread composer's footer.
-const MODEL_OPTIONS_CONCRETE = MODEL_OPTIONS.filter((o) => o.value !== "")
+// The GitHub batch-dispatch path is Claude-only for now (the batch RPC does not forward a backend —
+// see githubDispatchBatch); Codex in the picker is a Phase-3 follow-up. So this footer lists only the
+// Claude models (already concrete — no empty "default" row).
+const MODEL_OPTIONS_CONCRETE = CLAUDE_MODELS
 const EFFORT_OPTIONS_CONCRETE = EFFORT_OPTIONS.filter((o) => o.value !== "")
 
 // Mirrors GithubBatchInput.items `.max(20)` in shared/src/index.ts — the picker never lets the
@@ -42,8 +45,13 @@ export function GithubPickerModal({ onClose }: { onClose: () => void }) {
   const [permissionMode, setPermissionMode] = useState<PermissionMode | "">("")
   const [model, setModel] = useState("")
   const [effort, setEffort] = useState<(typeof EFFORTS)[number] | "">("")
-  const effectiveMode = permissionMode || (settings.data?.permissionMode ?? "auto")
-  const effectiveModel = model || settings.data?.model || "opus"
+  // The batch path is Claude-only (no backend forwarded — see MODEL_OPTIONS_CONCRETE note), but Phase 3
+  // now lets a user PERSIST a Codex model as the global default. CLAMP an inherited codex default back
+  // to a Claude model (and a codex-only `plan` sandbox back to `auto`), so the readout never blanks and
+  // the batch never dispatches `claude --model gpt-5.x` (a guaranteed spawn error).
+  const inheritedModel = model || settings.data?.model || "opus"
+  const effectiveModel = backendForModel(inheritedModel) === "codex" ? "opus" : inheritedModel
+  const effectiveMode = claudePermValue(permissionMode || (settings.data?.permissionMode ?? "auto"))
   const effectiveEffort = effort || settings.data?.effort || "high"
 
   // Server order is AUTHORITATIVE (the gh --search sort) — render items exactly as returned, never

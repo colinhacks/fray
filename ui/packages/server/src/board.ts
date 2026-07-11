@@ -266,6 +266,10 @@ function sessionThreadView(projectDir: string, row: SessionRow, tele: SessionTel
     state,
     needsYou,
     scratchpadPath: scratchpadPathIfExists(projectDir, row.session_id),
+    // The rail's backend badge (Codex-support epic, Phase 3). Only a codex row carries a badge; a
+    // claude row (backend NULL/'claude' — the column default) leaves it undefined so the default
+    // backend renders unmarked.
+    backend: row.backend === "codex" ? "codex" : undefined,
   }
 }
 

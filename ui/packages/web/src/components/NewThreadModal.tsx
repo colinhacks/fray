@@ -7,7 +7,17 @@ import { showToast, store } from "../store.ts"
 import { Composer } from "./Composer.tsx"
 import { GithubTrigger } from "./GithubTrigger.tsx"
 import { Select } from "./ui/Select.tsx"
-import { PERMISSION_OPTIONS, MODEL_OPTIONS, EFFORT_OPTIONS, EFFORTS, PERMISSION_COLOR } from "../lib/options.ts"
+import {
+  MODEL_GROUPS_CONCRETE,
+  EFFORT_OPTIONS,
+  CODEX_EFFORT_OPTIONS,
+  EFFORTS,
+  PERMISSION_COLOR,
+  backendForModel,
+  permOptionsFor,
+  permValueFor,
+  codexEffortValue,
+} from "../lib/options.ts"
 
 // THE dispatch prompt box — composer + quiet selects row — shared by every surface that can start a
 // thread: the queue's inline section and the anywhere-modal. There is no title field — the server
@@ -49,14 +59,20 @@ export function DispatchForm({
   const effectiveMode = permissionMode || (settings.data?.permissionMode ?? "auto")
   const effectiveModel = model || settings.data?.model || "opus"
   const effectiveEffort = effort || settings.data?.effort || "high"
+  // The model DRIVES the backend; the permission/effort readouts then present that backend's axis.
+  const backend = backendForModel(effectiveModel)
 
   function submit() {
     if (!prompt.trim()) return
     dispatch.mutate({
       prompt: prompt.trim(),
-      permissionMode: effectiveMode,
+      // For codex the stored permissionMode is mapped to the sandbox-facing value shown in the
+      // readout, so the dispatch carries exactly what the user sees (the server's codexSandbox then
+      // maps it to `-s`). Effort is clamped to the codex-accepted set (xhigh/max→high).
+      permissionMode: permValueFor(backend, effectiveMode),
       model: effectiveModel,
-      effort: effectiveEffort,
+      backend,
+      effort: (backend === "codex" ? codexEffortValue(effectiveEffort) : effectiveEffort) as (typeof EFFORTS)[number],
       ...(planPath ? { planPath } : {}),
     })
   }
@@ -76,31 +92,33 @@ export function DispatchForm({
       <>
         <Select
           variant="readout"
-          className={`petite-caps ${PERMISSION_COLOR[effectiveMode]}`}
-          value={effectiveMode}
-          onValueChange={(v) => setPermissionMode(v as PermissionMode)}
-          options={PERMISSION_OPTIONS}
-          ariaLabel="Permission mode"
-        />
-        <Select
-          variant="readout"
           className="petite-caps"
           value={effectiveModel}
           onValueChange={setModel}
-          options={MODEL_OPTIONS_CONCRETE}
+          groups={MODEL_GROUPS_CONCRETE}
           ariaLabel="Model"
         />
         <Select
           variant="readout"
+          className={`petite-caps ${PERMISSION_COLOR[permValueFor(backend, effectiveMode)]}`}
+          value={permValueFor(backend, effectiveMode)}
+          onValueChange={(v) => setPermissionMode(v as PermissionMode)}
+          options={permOptionsFor(backend)}
+          ariaLabel={backend === "codex" ? "Sandbox" : "Permission mode"}
+        />
+        <Select
+          variant="readout"
           className="petite-caps"
-          value={effectiveEffort}
+          value={backend === "codex" ? codexEffortValue(effectiveEffort) : effectiveEffort}
           onValueChange={(v) => setEffort(v as (typeof EFFORTS)[number])}
-          options={EFFORT_OPTIONS_CONCRETE}
+          options={backend === "codex" ? CODEX_EFFORT_OPTIONS : EFFORT_OPTIONS_CONCRETE}
           ariaLabel="Effort"
         />
       </>
     ),
-    [effectiveMode, effectiveModel, effectiveEffort],
+    // Model is now FIRST (it drives the backend); `backend` is derived from effectiveModel so it's
+    // already covered, but list it so the readout swaps the moment the family changes.
+    [effectiveMode, effectiveModel, effectiveEffort, backend],
   )
 
   return (
@@ -125,8 +143,8 @@ export function DispatchForm({
   )
 }
 
-// Readout option lists have NO empty "default" row — the readout always shows a concrete value.
-const MODEL_OPTIONS_CONCRETE = MODEL_OPTIONS.filter((o) => o.value !== "")
+// Readout option lists have NO empty "default" row — the readout always shows a concrete value. The
+// model readout uses the sectioned MODEL_GROUPS_CONCRETE (Claude Code / Codex) directly.
 const EFFORT_OPTIONS_CONCRETE = EFFORT_OPTIONS.filter((o) => o.value !== "")
 
 // The anywhere-modal behind the pill button: same form in a centered dialog. Esc closes (captured

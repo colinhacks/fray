@@ -25,6 +25,12 @@ export const RuntimeState = z.enum([
 ])
 export type RuntimeState = z.infer<typeof RuntimeState>
 
+// Which agent CLI a dispatch/thread runs on (Codex-support epic, Phase 3). Mirrors BackendKind in
+// server/backend/types.ts (the wire can't import it — it lives behind the server boundary). A model
+// selection drives this: a Claude model ⇒ "claude", an OpenAI/GPT model ⇒ "codex".
+export const Backend = z.enum(["claude", "codex"])
+export type Backend = z.infer<typeof Backend>
+
 export const ThreadAgent = z.object({
   id: z.string(),
   label: z.string().optional(),
@@ -200,6 +206,10 @@ export const ThreadView = z.object({
   scratchpadPath: z.string().optional(),
   // Project-relative plan artifact this thread was dispatched from (.fray/plans/*.md), if any.
   planPath: z.string().optional(),
+  // Which agent backend runs this thread (Codex-support epic, Phase 3) — drives the subtle per-row
+  // rail badge. Optional so a legacy/foreign/pre-restart row parses; absent OR "claude" ⇒ no badge
+  // (Claude is the unmarked default), "codex" ⇒ the small Codex badge.
+  backend: Backend.optional(),
 })
 export type ThreadView = z.infer<typeof ThreadView>
 
@@ -244,7 +254,12 @@ export const Settings = z.object({
   // Injected verbatim into every dispatch prompt. All orchestration wisdom lives here.
   dispatchPreamble: z.string(),
   permissionMode: PermissionMode,
-  model: z.string().optional(), // claude --model value; undefined = CLI default
+  model: z.string().optional(), // the agent's --model value; undefined = CLI default
+  // The agent backend the selected model runs on (Codex-support epic, Phase 3). Persisted ALONGSIDE
+  // `model` — a Claude model pins "claude", a GPT/Codex model pins "codex" — so the dependent controls
+  // (permission-mode vs sandbox, the effort set) know which axis to present. Optional so an old blob
+  // parses; absent ⇒ "claude" (derivable from `model` too, via backendForModel in web/lib/options).
+  backend: Backend.optional(),
   effort: z.enum(["low", "medium", "high", "xhigh", "max"]).optional(),
   notifications: z.boolean(),
   // UI type family. `mono` (default) is the mono-forward system; `sans` swaps prose/UI chrome to a
@@ -272,6 +287,10 @@ export const DispatchInput = z.object({
   slug: z.string().regex(/^[a-z0-9][a-z0-9-]*$/).optional(), // derived from title if omitted
   permissionMode: PermissionMode.optional(),
   model: z.string().optional(),
+  // The agent backend for THIS dispatch (Codex-support epic, Phase 3). Omitted ⇒ the dispatcher
+  // defaults to "claude", keeping the legacy RPC path byte-identical. The router forwards it into
+  // `dispatch(input, { backend })`; the model picker sets it from the chosen model's family.
+  backend: Backend.optional(),
   effort: Settings.shape.effort,
   // Project-relative plan artifact this dispatch works from (.fray/plans/*.md): stored as the
   // thread's plan_path association and named to the worker in its system-prompt orientation.

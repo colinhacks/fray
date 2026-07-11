@@ -102,7 +102,11 @@ export function createRouter(ctx: AppContext) {
     dispatch: mutation({
       input: DispatchInput,
       output: z.object({ slug: z.string(), sessionId: z.string() }),
-      handler: ({ input }) => ctx.dispatcher.dispatch(input),
+      // Forward the picker-selected backend into the dispatch opts seam (Codex-support epic, Phase 3).
+      // Omitted ⇒ the dispatcher defaults to "claude", so an old client (no backend field) is
+      // byte-identical. The resume path needs NO analog — resume reads the backend from the row's
+      // `backend` column (backendFor(row.backend)), which dispatch already stamped for a codex thread.
+      handler: ({ input }) => ctx.dispatcher.dispatch(input, { backend: input.backend }),
     }),
 
     // Cold-adopt a pre-existing thread (no session row): spawn a fresh worker on its file.

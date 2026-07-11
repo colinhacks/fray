@@ -186,6 +186,16 @@ const ThreadRow = memo(function ThreadRow({ t, legacy }: { t: ThreadView; legacy
                 terminal
               </span>
             )}
+            {/* Backend badge (Codex-support epic, Phase 3): only a codex-backed thread is marked;
+                Claude is the unmarked default. Subtle — same petite-caps pill idiom as `terminal`. */}
+            {!legacy && t.backend === "codex" && (
+              <span
+                className="petite-caps ml-1.5 inline-block rounded border border-emerald-500/30 px-1 align-[2px] text-[9.5px] leading-[14px] text-emerald-400/70"
+                title="Runs on the Codex (OpenAI) backend"
+              >
+                codex
+              </span>
+            )}
             {legacy && <StatusChip status={t.archived ? "archived" : t.status} />}
           </span>
           {hasSubtitle && (

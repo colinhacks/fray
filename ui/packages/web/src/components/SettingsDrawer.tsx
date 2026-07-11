@@ -11,7 +11,15 @@ import { queryClient } from "../main.tsx"
 import { Field } from "./NewThreadModal.tsx"
 import { Select } from "./ui/Select.tsx"
 import { Tooltip } from "./Tooltip.tsx"
-import { PERMISSION_OPTIONS, MODEL_OPTIONS, EFFORT_OPTIONS_SETTINGS } from "../lib/options.ts"
+import {
+  MODEL_GROUPS_SETTINGS,
+  EFFORT_OPTIONS_SETTINGS,
+  CODEX_EFFORT_OPTIONS_SETTINGS,
+  backendForModel,
+  permOptionsFor,
+  permValueFor,
+  codexEffortValue,
+} from "../lib/options.ts"
 
 type NotifPerm = "default" | "granted" | "denied" | "unsupported"
 function currentPerm(): NotifPerm {
@@ -81,6 +89,11 @@ export function SettingsDrawer() {
 
   const dirty = !!(draft && settings.data && JSON.stringify(draft) !== JSON.stringify(settings.data))
 
+  // The backend the current model selection implies — drives which permission/effort axis the
+  // dependent controls present. Derived from the model (the single source of truth) rather than the
+  // persisted `backend`, so the controls react the instant the model changes.
+  const backend = backendForModel(draft?.model)
+
   return (
     <div
       className={`fixed inset-0 z-50 flex justify-end bg-black/55 backdrop-blur-[1px] transition-opacity duration-200 ease-out motion-reduce:transition-none ${shown ? "opacity-100" : "opacity-0"}`}
@@ -103,32 +116,37 @@ export function SettingsDrawer() {
           <div className="p-4 text-[13px] text-muted">Loading…</div>
         ) : (
           <div className="flex-1 overflow-y-auto p-5 flex flex-col gap-6">
-            <Field label="Permission mode">
-              <Select
-                variant="bordered"
-                value={draft.permissionMode}
-                onValueChange={(v) => setDraft({ ...draft, permissionMode: v as Settings["permissionMode"] })}
-                options={PERMISSION_OPTIONS}
-                ariaLabel="Permission mode"
-              />
-            </Field>
-
+            {/* Model is the FIRST control: it drives the backend, and the permission/effort controls
+                below present the chosen backend's axis (Claude permission-mode vs Codex sandbox; the
+                codex effort set). Picking a model stamps the derived backend into the draft. */}
             <Field label="Model">
               <Select
                 variant="bordered"
                 value={draft.model ?? ""}
-                onValueChange={(v) => setDraft({ ...draft, model: v || undefined })}
-                options={MODEL_OPTIONS}
+                onValueChange={(v) => setDraft({ ...draft, model: v || undefined, backend: backendForModel(v || undefined) })}
+                groups={MODEL_GROUPS_SETTINGS}
                 ariaLabel="Model"
+              />
+            </Field>
+
+            {/* Permission mode (Claude) / Sandbox (Codex) — same stored `permissionMode` field; for
+                codex the options are a VIEW that the server's codexSandbox() maps to `-s`. */}
+            <Field label={backend === "codex" ? "Sandbox" : "Permission mode"}>
+              <Select
+                variant="bordered"
+                value={permValueFor(backend, draft.permissionMode)}
+                onValueChange={(v) => setDraft({ ...draft, permissionMode: v as Settings["permissionMode"] })}
+                options={permOptionsFor(backend)}
+                ariaLabel={backend === "codex" ? "Sandbox" : "Permission mode"}
               />
             </Field>
 
             <Field label="Effort">
               <Select
                 variant="bordered"
-                value={draft.effort ?? ""}
+                value={backend === "codex" ? codexEffortValue(draft.effort ?? "") : (draft.effort ?? "")}
                 onValueChange={(v) => setDraft({ ...draft, effort: (v || undefined) as Settings["effort"] })}
-                options={EFFORT_OPTIONS_SETTINGS}
+                options={backend === "codex" ? CODEX_EFFORT_OPTIONS_SETTINGS : EFFORT_OPTIONS_SETTINGS}
                 ariaLabel="Effort"
               />
             </Field>
