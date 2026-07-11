@@ -318,6 +318,7 @@ export function createDispatcher(deps: DispatchDeps): Dispatcher {
         meta: null,
         seen_at: null,
         plan_path: planPath,
+        transcript_id: null, // discovery caches this later only if the transcript drifts off <session_id>.jsonl
       })
 
       // Respond immediately — the client switches views on the slug; the rebuild (a shell-out to
@@ -384,6 +385,7 @@ export function createDispatcher(deps: DispatchDeps): Dispatcher {
         meta: null,
         seen_at: null,
         plan_path: null,
+        transcript_id: null,
       })
 
       void deps.board.rebuild()

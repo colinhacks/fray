@@ -1,9 +1,10 @@
-import { statSync, openSync, readSync, closeSync, readdirSync } from "node:fs"
+import { statSync, openSync, readSync, closeSync, readdirSync, mkdirSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
-import { homedir } from "node:os"
+import { homedir, tmpdir } from "node:os"
 import type { Bus } from "./bus.ts"
 import type { Project } from "./project.ts"
-import type { Storage } from "./storage.ts"
+import type { Storage, SessionRow } from "./storage.ts"
+import { discoverTranscriptId, DISCOVERY_GRACE_MS } from "./discover.ts"
 import * as tmux from "./tmux.ts"
 
 // The JSONL tailer: incrementally reads each registered session's Claude Code transcript
@@ -61,6 +62,12 @@ const FOREIGN_MAX = 20
 // Foreign discovery is a readdir + per-file stat; too costly per 1s tick, so scan at most every 5th
 // tick (~5s) plus the very first tick. Between scans the last fresh set is reused verbatim.
 const FOREIGN_SCAN_EVERY = 5
+// While a thread's transcript is still unresolved (missing past the grace window), re-run discovery at
+// most this often — the file may yet appear (a very late boot) or a drifted transcript may materialize.
+const DISCOVER_RETRY_MS = 15_000
+// Per-session sink for a captured boot-failure pane, so a stall's root cause (claude's own error text,
+// frozen in the remain-on-exit pane) survives past the pane being killed. Best-effort; inert litter.
+const STALL_LOG_DIR = join(tmpdir(), "fray-worker-logs")
 
 export type TurnState = "in-flight" | "idle"
 
@@ -97,6 +104,9 @@ export interface SessionTelemetry {
   pendingQuestion: boolean // at rest with an unanswered ```question block as the last assistant message
   lastUserAt?: string // ISO8601 of the newest USER-role record (answer/steer/dispatch) — the listing sort key
   lastFence?: FenceView // done/awaiting excusal fence on the latest assistant message (else absent)
+  // The pinned transcript never materialized and discovery found no drifted one either (worker likely
+  // failed to boot). Drives the board's degraded/stalled runtime instead of an eternal "Spinning up…".
+  noTranscript?: boolean
 }
 
 // ---- Interactive permission-prompt sniff (pane text; no jsonl signal) ----
@@ -229,6 +239,14 @@ export interface TailState {
   turn: TurnState
   permPrompt: boolean // last pane-sniff verdict (see matchesPermPrompt)
   paneDead: boolean
+  // ---- read-side transcript discovery (registered rows only; foreign states never touch these) ----
+  // The pinned `<session_id>.jsonl` never appeared and discovery found no drifted transcript: a boot
+  // failure. Surfaces a degraded runtime rather than an eternal spinner. Cleared if a transcript binds.
+  noTranscript: boolean
+  // Throttle: next epoch-ms at which discovery may re-run for an unresolved (missing-transcript) row.
+  nextDiscoverMs: number
+  // One-shot guard so a stall's pane is captured/logged once, not every tick.
+  stallLogged: boolean
 }
 
 // A single parsed JSONL record — only the fields the derivation needs are typed; the rest are
@@ -260,6 +278,9 @@ export function newTailState(slug: string, sessionId: string, path: string, fore
     turn: "in-flight",
     permPrompt: false,
     paneDead: false,
+    noTranscript: false,
+    nextDiscoverMs: 0,
+    stallLogged: false,
   }
 }
 
@@ -359,9 +380,12 @@ export function parseSignalFence(text: string | undefined): FenceView | undefine
   const rest: string[] = []
   for (const line of raw.split("\n")) {
     const hm = line.match(AWAITING_HINT_RE)
-    if (hm) {
+    const k = hm?.[1].toLowerCase()
+    // Only the four real hint kinds become hints; any other `word:` line is prose (a stray colon-line
+    // like "note: …" must not mint a phantom hint that then glosses as leaked internals). 2026-07-10.
+    if (hm && (k === "pr" || k === "ci" || k === "timer" || k === "session")) {
       const value = hm[2].trim()
-      hints.push({ kind: hm[1].toLowerCase() as FenceView["hints"][number]["kind"], value: value.length > HINT_VALUE_MAX ? value.slice(0, HINT_VALUE_MAX) : value })
+      hints.push({ kind: k, value: value.length > HINT_VALUE_MAX ? value.slice(0, HINT_VALUE_MAX) : value })
     } else {
       rest.push(line)
     }
@@ -724,6 +748,10 @@ export interface Tailer {
   // Drill-in drawer lookup: a tracked or retained sub-agent's transcript path + state, or undefined if
   // unknown (never dispatched, or aged out of the retained ring). The router maps undefined → "gone".
   subAgent(slug: string, id: string): { outputFile?: string; state: "running" | "stale" | "done" } | undefined
+  // Drop a session's in-memory tail state (registered + foreign) — called when its row is hard-deleted
+  // (forgetSession) so a stale TailState bound to the gone transcript can't mis-tail a later same-slug
+  // re-dispatch. A no-op for an unknown slug.
+  forget(slug: string): void
   start(): void
   stop(): void
   tick(): void // exposed for tests + boot; the interval calls it every POLL_MS
@@ -859,7 +887,15 @@ export function createTailer(deps: TailerDeps): Tailer {
       return []
     }
     const registered = new Set<string>()
-    for (const r of deps.storage.allSessions()) registered.add(r.session_id)
+    for (const r of deps.storage.allSessions()) {
+      registered.add(r.session_id)
+      // A DISCOVERED (drifted) transcript is owned by its row — exclude its id too, or the re-linked
+      // file would resurface as a duplicate read-only "foreign" thread (split-brain).
+      if (r.transcript_id) registered.add(r.transcript_id)
+    }
+    // Graveyard: a transcript whose row was hard-deleted via forgetSession must STAY gone — never let a
+    // dismissed phantom's *.jsonl re-surface as a read-only foreign thread on a later rescan.
+    for (const id of deps.storage.forgottenIds()) registered.add(id)
     const found: { id: string; path: string; mtime: number }[] = []
     for (const name of names) {
       if (name.startsWith(".") || !name.endsWith(".jsonl")) continue
@@ -951,6 +987,93 @@ export function createTailer(deps: TailerDeps): Tailer {
     }
   }
 
+  // Every OTHER row's pinned + discovered id — the exclude set so discovery never steals a transcript
+  // already claimed by a different thread. (Only called on a real discovery attempt, which is rare.)
+  function claimedIds(exceptSlug: string): Set<string> {
+    const ids = new Set<string>()
+    for (const r of deps.storage.allSessions()) {
+      if (r.slug === exceptSlug) continue
+      ids.add(r.session_id)
+      if (r.transcript_id) ids.add(r.transcript_id)
+    }
+    return ids
+  }
+
+  // Capture a stalled worker's (remain-on-exit) pane ONCE, so claude's own boot-failure output survives
+  // to the server console + a per-session sink before the pane is ever killed. Best-effort — the whole
+  // point is root-causing the missing transcript, but a capture failure must never break the tick.
+  function captureStall(state: TailState, row: SessionRow): void {
+    if (state.stallLogged) return
+    state.stallLogged = true
+    let pane = ""
+    try {
+      pane = capturePane(state.slug)
+    } catch {
+      pane = ""
+    }
+    const detail = pane.trim() || "(pane empty / unavailable)"
+    console.error(
+      `[fray-ui] thread ${row.slug} (session ${row.session_id}): no transcript ${DISCOVERY_GRACE_MS / 1000}s after dispatch — likely a boot failure. Pane:\n${detail.slice(0, 4000)}`,
+    )
+    try {
+      mkdirSync(STALL_LOG_DIR, { recursive: true })
+      writeFileSync(join(STALL_LOG_DIR, `${row.slug}.stall.log`), `session_id: ${row.session_id}\ncaptured_at: ${new Date(now()).toISOString()}\n\n${detail}\n`)
+    } catch {
+      // best-effort — a missing sink is inert
+    }
+  }
+
+  // READ-SIDE TRANSCRIPT DISCOVERY for a registered row whose bound file hasn't produced bytes yet.
+  // Byte-identical for the healthy path: once a file binds (offset > 0) this is a no-op, and a
+  // within-grace missing file is left to the ordinary spinning-up spinner. ONLY a past-grace missing
+  // file engages discovery (throttled); on a hit it re-links + caches the drifted transcript and replays
+  // it silently (primed=false → the next prime adopts it with no notify), on a miss it flags the row
+  // no-transcript (a boot failure) so the board shows a degraded state, not an eternal spinner.
+  function resolveTranscript(state: TailState, row: SessionRow, nowMs: number): void {
+    if (state.offset > 0) return // already bound to a real transcript — the normal path, untouched
+    // Presence alone isn't enough: a worker that creates `<id>.jsonl` then crashes before writing a
+    // single record leaves a permanent 0-byte file. Treat empty-or-missing alike so a touched-but-never-
+    // written transcript can't silently defeat the crash-net (found in review). A stat failure → size 0.
+    let size = 0
+    try {
+      size = statSync(state.path).size
+    } catch {
+      size = 0
+    }
+    if (size > 0) {
+      // Real content present (or just appeared) — clear any prior degraded state and let consume bind it.
+      state.noTranscript = false
+      state.stallLogged = false
+      return
+    }
+    // Empty/missing but still within the grace window → an ordinary just-spawned session (spinner). Wait.
+    const spawnedMs = Date.parse(row.spawned_at)
+    if (Number.isFinite(spawnedMs) && nowMs - spawnedMs < DISCOVERY_GRACE_MS) return
+    // Past grace, still missing: attempt discovery (throttled), else declare the transcript missing.
+    if (nowMs < state.nextDiscoverMs) return
+    state.nextDiscoverMs = nowMs + DISCOVER_RETRY_MS
+    const found = discoverTranscriptId(logDir, row.session_id, { nowMs, exclude: claimedIds(row.slug) })
+    if (found && found !== row.session_id) {
+      // Re-link to the drifted transcript: rebind the read path, cache it (survives restart + dedupes
+      // foreign discovery), and replay it as a fresh prime so no historical turn-done fires spuriously.
+      state.path = join(logDir, `${found}.jsonl`)
+      state.offset = 0
+      state.partial = ""
+      state.primed = false
+      state.noTranscript = false
+      state.stallLogged = false
+      try {
+        deps.storage.setTranscriptId(row.slug, found)
+      } catch {
+        // best-effort persistence — discovery still holds for this run without it
+      }
+      return
+    }
+    // Nothing to bind: the worker never wrote a transcript → degraded/stalled, captured once for triage.
+    state.noTranscript = true
+    captureStall(state, row)
+  }
+
   function tick(): void {
     // Discover sessions from the registry so dispatch/resume/restart all "just work" — a new row
     // starts being tailed on the next tick; a finished row keeps its final derived state.
@@ -962,9 +1085,16 @@ export function createTailer(deps: TailerDeps): Tailer {
     for (const row of deps.storage.allSessions()) {
       let state = states.get(row.slug)
       if (!state) {
-        state = newTailState(row.slug, row.session_id, join(logDir, `${row.session_id}.jsonl`))
+        // Bind the cached (discovered) transcript if one exists, else the pinned `<session_id>.jsonl`.
+        state = newTailState(row.slug, row.session_id, join(logDir, `${row.transcript_id ?? row.session_id}.jsonl`))
         states.set(row.slug, state)
       }
+
+      // Read-side discovery: rebind a drifted transcript / flag a boot-failure stall. A no-op for a
+      // healthy bound session (offset > 0). May rebind + reset primed → the prime branch below replays
+      // the discovered file silently. Track noTranscript flips so the degraded runtime surfaces promptly.
+      const prevNoTranscript = state.noTranscript
+      resolveTranscript(state, row, nowMs)
 
       // First sighting of a session (fresh dispatch OR restored after a server restart): read the
       // whole transcript to date and adopt its state as the baseline WITHOUT firing turn-done /
@@ -1025,6 +1155,10 @@ export function createTailer(deps: TailerDeps): Tailer {
       }
 
       if (state.lastActivityAt !== prevActivity || state.lastAssistant !== prevAssistant) dirty = true
+      // A no-transcript flip (grace expired with no file / a re-link cleared it) changes the derived
+      // runtime but touches no activity/turn — mark dirty so the board rebuilds without waiting for the
+      // periodic reconcile.
+      if (state.noTranscript !== prevNoTranscript) dirty = true
     }
 
     // FOREIGN threads: refresh the fresh set on a scan tick (a change in membership/order is itself
@@ -1088,12 +1222,16 @@ export function createTailer(deps: TailerDeps): Tailer {
       // an unanswered ```question fence (a user reply clears the flag and flips the turn in-flight).
       const pendingQuestion = s.turn === "idle" && s.lastAssistantHasQuestion
       const nowMs = now()
-      return { turn: s.turn, permPrompt: s.permPrompt, lastActivityAt: s.lastActivityAt, lastAssistant: s.lastAssistant, aiTitle: s.aiTitle, subAgents: subAgentViews(s, nowMs), bgShells: bgShellViews(s, nowMs), pendingAsk: s.pendingAsk, pendingQuestion, lastUserAt: s.lastUserAt, lastFence: s.lastFence }
+      return { turn: s.turn, permPrompt: s.permPrompt, lastActivityAt: s.lastActivityAt, lastAssistant: s.lastAssistant, aiTitle: s.aiTitle, subAgents: subAgentViews(s, nowMs), bgShells: bgShellViews(s, nowMs), pendingAsk: s.pendingAsk, pendingQuestion, lastUserAt: s.lastUserAt, lastFence: s.lastFence, noTranscript: s.noTranscript }
     },
     // The CURRENT fresh foreign session ids (mtime within FOREIGN_FRESH_MS, capped), mtime-desc. Kept
     // as the last scan's result — recomputed at most every FOREIGN_SCAN_EVERY ticks.
     foreignIds: () => foreignFresh.map((f) => f.id),
     subAgent: subAgentLookup,
+    forget(slug) {
+      states.delete(slug)
+      foreignStates.delete(slug)
+    },
     start() {
       if (timer) return
       tick() // derive current state immediately (also restores state after a server restart)

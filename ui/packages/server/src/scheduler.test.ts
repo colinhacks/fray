@@ -58,6 +58,7 @@ function row(slug: string, over: Partial<SessionRow> = {}): SessionRow {
     meta: null,
     seen_at: null,
     plan_path: null,
+    transcript_id: null,
     ...over,
   }
 }
@@ -74,6 +75,7 @@ function fakeTailer(map: Map<string, SessionTelemetry>): Tailer {
     get: (slug: string) => map.get(slug),
     foreignIds: () => [],
     subAgent: () => undefined,
+    forget: () => {},
     start: () => {},
     stop: () => {},
     tick: () => {},

@@ -20,6 +20,9 @@ export interface Api {
   threadSeen(input: { slug: string }): Promise<void>
   // The ONLY writer of a session thread's open|archived lifecycle (the done fence mutates nothing).
   setThreadState(input: { slug: string; state: "open" | "archived" }): Promise<void>
+  // Hard-delete a stalled/exited session (the Dismiss verb): removes the row + tombstones its transcript
+  // so it stays gone across a rescan. Server-gated to non-live rows; rejects a running/idle session.
+  forgetThread(input: { slug: string }): Promise<void>
   // A plan artifact's markdown (.fray/plans/*.md); `path` is a PlanView.path from the board snapshot.
   planBody(input: { path: string }): Promise<{ markdown: string }>
   // A session thread's scratchpad (.fray/scratch/<session-id>.md) — read-only doc tab.
@@ -59,6 +62,7 @@ const PROCEDURES: Record<keyof Api, ProcType> = {
   markRead: "mutation",
   threadSeen: "mutation",
   setThreadState: "mutation",
+  forgetThread: "mutation",
   planBody: "query",
   threadScratchpad: "query",
   openExternal: "mutation",

@@ -1,4 +1,13 @@
-import { FrayStatus } from "@fray-ui/shared"
+import { FrayStatus, type ThreadView } from "@fray-ui/shared"
+
+// The Dismiss (hard-delete/forget) verb is offered ONLY on an owned session that is NOT live — a
+// stalled/exited row. A "Stalled" phantom (a worker whose transcript never materialized) and a
+// normally-exited session both derive runtime "exited"; a running / turn-idle / perm-prompt session is
+// live and must be Archived, never forgotten out from under itself (the server re-checks this too).
+// Foreign sessions are read-only. Pure predicate so the gate is unit-tested without rendering React.
+export function canDismiss(thread: Pick<ThreadView, "kind" | "foreign" | "runtime">): boolean {
+  return thread.kind === "session" && thread.foreign !== true && thread.runtime === "exited"
+}
 
 // Lifecycle order for status pickers: planning → planned → active → blocked → done → dismissed.
 // This is the shared FrayStatus enum's own declaration order — single-sourced, never re-listed.

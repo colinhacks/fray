@@ -1,16 +1,28 @@
 import { useEffect, useRef, useState } from "react"
 import { Terminal } from "@xterm/xterm"
 import { FitAddon } from "@xterm/addon-fit"
-import { WebglAddon } from "@xterm/addon-webgl"
 import type { TermClientMsg } from "@fray-ui/shared"
 
 // One xterm + WebSocket per selected thread. Remounts on slug change (keyed by
 // the parent), so mount = attach and unmount = detach. The server kills only the
 // tmux attach client on ws close, so reattach cheaply replays the screen state.
+//
+// RENDERER: the built-in DOM renderer, NOT @xterm/addon-webgl. The WebGL addon desynced its
+// canvas backing store from xterm's dpr-scaled cell geometry whenever the effective
+// devicePixelRatio wasn't the integer it captured at load (a non-100% browser zoom, or the
+// window dragged between a Retina panel and an external 1× monitor): the backing store stayed at
+// 2× while the render service computed geometry at 1×, so — WebGL's origin being bottom-left —
+// every row got packed into the bottom-left quarter at half scale, leaving the top of the pane
+// blank. That was the "terminal never worked" bug: the WS attaches, the bytes stream, and the
+// xterm BUFFER is fully correct (proven), but the WebGL layer paints it into a quarter of the
+// canvas. The DOM renderer positions rows with plain CSS and renders correctly at every dpr. It
+// also drops the WebGL addon's teardown crash (its dispose reached back into an already-disposed
+// render service and took the whole React tree down on a Terminal→Chat tab switch). For an
+// agent's TUI the DOM renderer's throughput is more than enough; revisit WebGL only with an
+// explicit devicePixelRatio-resync if profiling ever demands it.
 export function TerminalPane({ slug }: { slug: string }) {
   const hostRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
-  const webglRef = useRef<WebglAddon | null>(null)
   const [exited, setExited] = useState(false)
 
   useEffect(() => {
@@ -31,13 +43,6 @@ export function TerminalPane({ slug }: { slug: string }) {
     const fit = new FitAddon()
     term.loadAddon(fit)
     term.open(host)
-    try {
-      const webgl = new WebglAddon()
-      term.loadAddon(webgl)
-      webglRef.current = webgl
-    } catch (e) {
-      console.warn("webgl unavailable", e)
-    }
     // NEVER fit against a degenerate host (a mid-layout zero-height mount produced NaN grid state
     // that corrupted xterm internals and crashed dispose, unmounting the whole workpane).
     const initialDims = fit.proposeDimensions()
@@ -88,18 +93,6 @@ export function TerminalPane({ slug }: { slug: string }) {
       ro.disconnect()
       dataSub.dispose()
       ws.close()
-      // Dispose the WebGL addon BEFORE the terminal. term.dispose() DOES dispose loaded addons,
-      // but @xterm/addon-webgl's teardown reaches back into the terminal's render service — once the
-      // terminal is torn down first that read lands on `undefined`, throwing "Cannot read properties
-      // of undefined (reading '_isDisposed')" and taking the whole React tree down on a Terminal→Chat
-      // tab switch. Disposing the addon first (while the terminal is still intact), guarded, and
-      // clearing the ref so term.dispose() below can't double-dispose it, closes that path.
-      try {
-        webglRef.current?.dispose()
-      } catch (e) {
-        console.warn("webgl addon dispose failed", e)
-      }
-      webglRef.current = null
       // dispose() can throw if xterm internals were corrupted (e.g. a zero-dim fit) — a cleanup
       // throw would take the whole React tree down with it, which is far worse than a leak.
       try {

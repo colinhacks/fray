@@ -38,6 +38,7 @@ const noopTailer: Tailer = {
   get: () => undefined,
   foreignIds: () => [],
   subAgent: () => undefined,
+  forget: () => {},
   start: () => {},
   stop: () => {},
   tick: () => {},
@@ -69,6 +70,7 @@ function sessionRow(slug: string, over: Partial<SessionRow> = {}): SessionRow {
     meta: null,
     seen_at: null,
     plan_path: null,
+    transcript_id: null,
     ...over,
   }
 }

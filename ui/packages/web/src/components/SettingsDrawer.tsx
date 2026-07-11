@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { useMutation, useQuery } from "@tanstack/react-query"
 import { useSnapshot } from "valtio"
 import { Check, Copy, HelpCircle, X } from "lucide-react"
@@ -102,23 +102,7 @@ export function SettingsDrawer() {
         {!draft ? (
           <div className="p-4 text-[13px] text-muted">Loading…</div>
         ) : (
-          <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-5">
-            {/* Custom instructions — helper prose lives in the label's tooltip so the row stays clean. */}
-            <div className="flex flex-col gap-1.5">
-              <LabelWithHelp
-                label="Dispatch preamble"
-                help="Your custom per-project instructions, appended to every dispatched agent's prompt after the built-in worker contract."
-              />
-              <textarea
-                value={draft.dispatchPreamble}
-                onChange={(e) => setDraft({ ...draft, dispatchPreamble: e.target.value })}
-                rows={12}
-                className="input resize-none text-[12px] leading-relaxed"
-                placeholder="e.g. Prefer pnpm. Never touch the generated/ dir. Ask before adding dependencies."
-                spellCheck={false}
-              />
-            </div>
-
+          <div className="flex-1 overflow-y-auto p-5 flex flex-col gap-6">
             <Field label="Permission mode">
               <Select
                 variant="bordered"
@@ -166,7 +150,7 @@ export function SettingsDrawer() {
               {draft.notifications && <PermHint perm={perm} />}
             </Field>
 
-            <GithubPromptsSection draft={draft} setDraft={setDraft} />
+            <PromptsSection draft={draft} setDraft={setDraft} />
           </div>
         )}
 
@@ -202,43 +186,147 @@ function LabelWithHelp({ label, help }: { label: string; help: string }) {
   )
 }
 
-// The 6 substitution tokens the server fills in a GitHub batch-dispatch template. Kept in lockstep
-// with PROMPT_TOKENS in server/github.ts (there is no shared const; this is a display hint only).
-const GH_PROMPT_TOKENS = ["repo", "n", "title", "url", "labels", "body"] as const
+// The 6 substitution tokens the server fills in a GitHub batch-dispatch template, each with a one-word
+// gloss of what it expands to. Kept in lockstep with PROMPT_TOKENS in server/github.ts (there is no
+// shared const; this is a display hint only). Surfaced once, via the "?" popover on the token fields.
+const GH_PROMPT_TOKENS: { token: string; gloss: string }[] = [
+  { token: "repo", gloss: "repository" },
+  { token: "n", gloss: "number" },
+  { token: "title", gloss: "title" },
+  { token: "url", gloss: "link" },
+  { token: "labels", gloss: "labels" },
+  { token: "body", gloss: "description" },
+]
 
-// "GitHub prompts" — the two editable batch-dispatch templates (Issue, PR) used by the GitHub picker.
-// Each editor PREFILLS with the shipped default (fetched from the server, the single source of truth)
+// "Prompts" — every user-editable prompt in one place: the Subagent instructions preamble (appended to
+// EVERY dispatched agent) plus the two GitHub-picker investigation templates (Issue, PR). The two
+// picker editors PREFILL with the shipped default (fetched from the server, the single source of truth)
 // so the user edits from the real prompt; a stored override supersedes it. Empty override = default.
-function GithubPromptsSection({ draft, setDraft }: { draft: Settings; setDraft: (s: Settings) => void }) {
+function PromptsSection({ draft, setDraft }: { draft: Settings; setDraft: (s: Settings) => void }) {
   const defaults = useQuery({ queryKey: ["githubPromptDefaults"], queryFn: () => rpc.githubPromptDefaults() })
   return (
-    <div className="flex flex-col gap-3 border-t border-border pt-5">
-      <div className="flex flex-col gap-1">
-        <span className="text-[11px] uppercase tracking-wide text-muted">GitHub prompts</span>
-        <span className="text-[11px] leading-relaxed text-muted/70">
-          The worker prompt used for each item you dispatch from the GitHub picker. Leave an editor empty to use the
-          built-in default.
-        </span>
+    <div className="flex flex-col gap-6 border-t border-border pt-6">
+      <DividerLabel label="Prompts" />
+
+      {/* Subagent instructions — the old "Dispatch preamble", now grouped with the picker prompts since
+          it is a prompt too. Does NOT use tokens, so no "?" affordance here. */}
+      <div className="flex flex-col gap-2">
+        <LabelWithHelp
+          label="Subagent instructions"
+          help="Your custom per-project instructions, appended to every dispatched agent's prompt after the built-in worker contract."
+        />
+        <textarea
+          value={draft.dispatchPreamble}
+          onChange={(e) => setDraft({ ...draft, dispatchPreamble: e.target.value })}
+          rows={10}
+          className="input resize-none text-[12px] leading-relaxed"
+          placeholder="e.g. Prefer pnpm. Never touch the generated/ dir. Ask before adding dependencies."
+          spellCheck={false}
+        />
       </div>
+
+      {/* The two GitHub-picker investigation templates. Tokens apply to BOTH, so the "?" popover lives
+          once in this group's intro row rather than being repeated per field. */}
       {!defaults.data ? (
         <div className="text-[12px] text-muted">Loading defaults…</div>
       ) : (
-        <>
+        <div className="flex flex-col gap-5">
+          <div className="flex items-start justify-between gap-3">
+            <span className="text-[11px] leading-relaxed text-muted/70">
+              The worker prompt used for each item you dispatch from the GitHub picker. Leave an editor empty to use the
+              built-in default.
+            </span>
+            <TokenHelpPopover />
+          </div>
           <GithubPromptField
-            label="Issue prompt"
+            label="Issue investigation prompt"
             help="The prompt for each ISSUE dispatched from the picker. The default has the worker classify the issue as a bug or feature and branch: reproduce + fix-plan for a bug, or a plan + impact analysis for a feature."
             value={draft.githubIssuePrompt}
             fallback={defaults.data.issue}
             onChange={(v) => setDraft({ ...draft, githubIssuePrompt: v })}
           />
           <GithubPromptField
-            label="PR prompt"
+            label="PR investigation prompt"
             help="The prompt for each PR dispatched from the picker. The default runs an adversarial review/audit — read the diff, verify correctness/edges/tests/CI, then recommend approve / request-changes."
             value={draft.githubPrPrompt}
             fallback={defaults.data.pr}
             onChange={(v) => setDraft({ ...draft, githubPrPrompt: v })}
           />
-        </>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// A section header in the transcript's centered-divider idiom (see ChatView's EventLine): a small
+// muted label flanked by faint hairlines, so a settings group reads as a titled band rather than a
+// left-aligned caption.
+function DividerLabel({ label }: { label: string }) {
+  return (
+    <div className="flex items-center gap-2.5 text-[11px] uppercase tracking-wide text-muted/70">
+      <span aria-hidden className="h-px flex-1 bg-border/60" />
+      <span className="shrink-0">{label}</span>
+      <span aria-hidden className="h-px flex-1 bg-border/60" />
+    </div>
+  )
+}
+
+// A real click-popover (NOT a hover tooltip) listing the substitution tokens. Opens on click, stays
+// open, and dismisses on outside-click or Esc. There is no @radix-ui/react-popover dep, so this is a
+// hand-rolled panel: an open flag + an absolutely-positioned panel + document listeners. The Esc
+// handler stopPropagation()s so it closes the popover WITHOUT bubbling up to App's window-level Esc
+// (which would otherwise close the whole Settings drawer).
+function TokenHelpPopover() {
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!open) return
+    function onDown(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        e.stopPropagation()
+        setOpen(false)
+      }
+    }
+    document.addEventListener("mousedown", onDown)
+    document.addEventListener("keydown", onKey)
+    return () => {
+      document.removeEventListener("mousedown", onDown)
+      document.removeEventListener("keydown", onKey)
+    }
+  }, [open])
+  return (
+    <div ref={ref} className="relative shrink-0">
+      <button
+        type="button"
+        aria-label="Available tokens"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+        className={`transition-colors ${open ? "text-accent" : "text-muted/60 hover:text-fg"}`}
+      >
+        <HelpCircle size={14} />
+      </button>
+      {open && (
+        <div
+          role="dialog"
+          // Opens UPWARD (bottom-full): the "?" lives low in the scroll body, so a downward panel would
+          // clip against the drawer footer / viewport edge. Upward has the roomy Subagent editor above it.
+          className="absolute right-0 bottom-full mb-2 z-10 w-56 rounded-md border border-border bg-elevated p-3 shadow-lg shadow-black/40"
+        >
+          <div className="mb-2 text-[11px] font-medium text-fg">Substitution tokens</div>
+          <ul className="flex flex-col gap-1.5">
+            {GH_PROMPT_TOKENS.map(({ token, gloss }) => (
+              <li key={token} className="flex items-center justify-between gap-3 text-[11px]">
+                <code className="font-mono-keep rounded border border-border bg-bg px-1 py-0.5 text-[10px] text-fg/80">
+                  {`{${token}}`}
+                </code>
+                <span className="text-muted/80">{gloss}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
     </div>
   )
@@ -262,7 +350,7 @@ function GithubPromptField({
 }) {
   const customized = value != null
   return (
-    <div className="flex flex-col gap-1.5">
+    <div className="flex flex-col gap-2">
       <div className="flex items-center justify-between gap-2">
         <LabelWithHelp label={label} help={help} />
         {customized && (
@@ -274,14 +362,6 @@ function GithubPromptField({
             Reset to default
           </button>
         )}
-      </div>
-      <div className="flex flex-wrap items-center gap-1 text-[10.5px] text-muted/70">
-        <span>Tokens:</span>
-        {GH_PROMPT_TOKENS.map((t) => (
-          <code key={t} className="font-mono-keep rounded border border-border bg-bg px-1 py-0.5 text-[10px] text-fg/80">
-            {`{${t}}`}
-          </code>
-        ))}
       </div>
       <textarea
         value={value ?? fallback}

@@ -109,6 +109,18 @@ export function commentCount(v: unknown): number | undefined {
   return undefined
 }
 
+// gh `labels` = `[{ name, color, … }]` — keep the name + 6-hex color for the row chips. Defensive:
+// a foreign shape yields []; nameless entries are dropped.
+export function parseLabels(v: unknown): { name: string; color: string }[] {
+  if (!Array.isArray(v)) return []
+  const out: { name: string; color: string }[] = []
+  for (const l of v) {
+    const o = l as { name?: unknown; color?: unknown }
+    if (typeof o?.name === "string" && o.name) out.push({ name: o.name, color: typeof o?.color === "string" ? o.color : "" })
+  }
+  return out
+}
+
 // Parse the raw `gh {issue,pr} list --json …` output into GithubItems. PURE + defensive (this is the
 // unit-tested seam — tests inject gh JSON here instead of shelling out): bad rows are skipped, missing
 // fields default, and `kind` stamps the item discriminant. Reactions summed; comments length-counted.
@@ -133,9 +145,15 @@ export function parseListJson(raw: string, kind: GhKind): GithubItem[] {
       url: typeof r?.url === "string" ? r.url : "",
       reactions: sumReactions(r?.reactionGroups),
       updatedAt: typeof r?.updatedAt === "string" ? r.updatedAt : "",
+      labels: parseLabels(r?.labels),
     }
     const c = commentCount(r?.comments)
     if (c !== undefined) item.comments = c
+    if (typeof r?.createdAt === "string") item.createdAt = r.createdAt
+    const login = (r?.author as { login?: unknown } | null)?.login
+    if (typeof login === "string") item.author = login
+    if (typeof r?.state === "string") item.state = r.state
+    if (typeof r?.isDraft === "boolean") item.isDraft = r.isDraft
     out.push(item)
   }
   return out
@@ -154,8 +172,8 @@ export async function listItems(repo: string, kind: GhKind, sort: GhSort, limit:
   const sub = kind === "issues" ? "issue" : "pr"
   const fields =
     kind === "issues"
-      ? "number,title,url,reactionGroups,updatedAt,comments"
-      : "number,title,url,reactionGroups,updatedAt"
+      ? "number,title,url,reactionGroups,updatedAt,comments,createdAt,author,labels,state"
+      : "number,title,url,reactionGroups,updatedAt,comments,createdAt,author,labels,state,isDraft"
   const raw = await gh([sub, "list", "-R", repo, "--search", SEARCH_SORT[sort], "--json", fields, "--limit", String(clampLimit(limit))])
   return parseListJson(raw, kind)
 }
@@ -242,6 +260,9 @@ function labelsLine(labels: string[]): string {
 
 // The ISSUE default. Branches on report type: the worker first classifies bug-vs-feature, then a
 // BUG gets reproduce → trace → recommend, and a FEATURE gets clarify → impact → plan. Research only.
+// The body is deliberately NOT inlined ({body} is unused here) — the worker fetches it via
+// `gh issue view`, keeping the dispatched first-message bubble small (a giant body dump used to fill
+// the whole thread UI). A user's custom Settings template MAY still use {body} if they prefer inlining.
 export const DEFAULT_ISSUE_PROMPT = `You are triaging a GitHub issue in {repo}. This is a RESEARCH thread: the deliverable is FINDINGS and
 a recommendation — not a landed fix.
 
@@ -249,12 +270,9 @@ Issue #{n}: {title}
 URL: {url}
 Labels: {labels}
 
---- issue body ---
-{body}
-------------------
-
-FIRST classify this issue as a BUG report or a FEATURE request — read the body, the labels, and (via
-\`gh issue view {n} -R {repo} --comments\`) the thread. State which it is and why, then branch:
+Read the full issue FIRST — \`gh issue view {n} -R {repo} --comments\` (title, body, and the discussion).
+Then classify it as a BUG report or a FEATURE request from the body + labels + thread, state which it is
+and why, then branch:
 
 IF BUG:
 1. REPRODUCE. Establish whether the reported behavior actually happens on the current tree. If it
@@ -287,11 +305,7 @@ PR #{n}: {title}
 URL: {url}
 Labels: {labels}
 
---- PR description ---
-{body}
-----------------------
-
-Do this:
+Read the PR FIRST — \`gh pr view {n} -R {repo} --comments\` (description + discussion), then:
 1. READ THE DIFF. \`gh pr diff {n} -R {repo}\` (pipe large output through toon). Read the changed files
    in context, not just the hunks.
 2. VERIFY. For each substantive change, ask: is it correct? does it handle edges? does it break

@@ -1,6 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, writeFileSync, appendFileSync, utimesSync } from "node:fs"
+import { mkdtempSync, writeFileSync, appendFileSync, utimesSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createStorage, type Storage, type SessionRow } from "./storage.ts"
@@ -590,7 +590,7 @@ function makeTailer(h: Harness) {
 }
 
 function row(over: Partial<SessionRow> = {}): SessionRow {
-  return { slug: "t", session_id: "sid", tmux_name: "fray-t", spawned_at: "2026-07-01T00:00:00.000Z", last_read_at: null, unread: 0, exited: 0, archived: 0, rested_at: null, title_auto: 0, title: null, state: null, meta: null, seen_at: null, plan_path: null, ...over }
+  return { slug: "t", session_id: "sid", tmux_name: "fray-t", spawned_at: "2026-07-01T00:00:00.000Z", last_read_at: null, unread: 0, exited: 0, archived: 0, rested_at: null, title_auto: 0, title: null, state: null, meta: null, seen_at: null, plan_path: null, transcript_id: null, ...over }
 }
 
 test("tailer: primes an already-finished transcript WITHOUT a turn-done notify", () => {
@@ -874,6 +874,25 @@ test("tailer: a REGISTERED session_id's file is never foreign (registered rows w
   assert.deepEqual(t.foreignIds(), ["foreign-2"], "the registered session_id is excluded; only the unregistered file is foreign")
 })
 
+test("tailer: a FORGOTTEN phantom's transcript is never re-added by foreign discovery (tombstone)", () => {
+  const h = harness()
+  h.clock.ms = FCLOCK
+  // A phantom whose (drifted) transcript file lives on disk. While registered it's owned by its row; the
+  // maintainer then Dismisses it — forgetSession deletes the row and tombstones its ids.
+  h.storage.upsertSession(row({ slug: "phantom", session_id: "phantom-sid", transcript_id: "phantom-drift" }))
+  foreignFile(h.logDir, "phantom-drift", [IN_FLIGHT, TOOL, DONE], FRESH_MTIME) // fresh, would-be foreign after delete
+  foreignFile(h.logDir, "genuine-foreign", [IN_FLIGHT], FRESH_MTIME)
+  h.storage.forgetSession("phantom")
+
+  const { t } = foreignTailer(h)
+  t.tick()
+  assert.deepEqual(
+    t.foreignIds(),
+    ["genuine-foreign"],
+    "the forgotten phantom's fresh transcript stays excluded; only the genuine unregistered file is foreign",
+  )
+})
+
 test("tailer: a STALE (>24h mtime) foreign file ages out of foreignIds()", () => {
   const h = harness()
   h.clock.ms = FCLOCK
@@ -925,4 +944,128 @@ test("tailer: a foreign turn derives in-flight vs idle and transitions WITHOUT n
   assert.equal(t.get("f-turn")?.turn, "idle", "the foreign turn transitions like a registered one")
   assert.equal(h.events.length, 0, "a foreign turn-done NEVER notifies")
   assert.equal(h.storage.getSession("f-turn"), undefined, "no storage row is created for a foreign thread")
+})
+
+// ---- read-side transcript DISCOVERY + missing-transcript hardening (session-transcript-drift) ----
+
+const SPAWN = "2026-07-01T00:00:00.000Z"
+const PAST_GRACE = Date.parse("2026-07-01T00:01:01.000Z") // 61s after SPAWN (> DISCOVERY_GRACE_MS)
+
+// A drifted transcript: lives at `fileId`.jsonl but carries `ownerId`'s scratchpad sentinel in content.
+function driftedFixture(dir: string, fileId: string, ownerId: string, tail: string[] = [DONE]) {
+  const sentinel = JSON.stringify({ type: "user", timestamp: SPAWN, message: { role: "user", content: `Your scratchpad is \`.fray/scratch/${ownerId}.md\` — keep state here.` } })
+  fixture(dir, fileId, [sentinel, ...tail])
+}
+
+test("tailer: a PRESENT transcript binds directly — no discovery, transcript_id stays null (normal path unchanged)", () => {
+  const h = harness()
+  h.storage.upsertSession(row())
+  fixture(h.logDir, "sid", [IN_FLIGHT, TOOL, DONE])
+  const t = makeTailer(h)
+  h.clock.ms = Date.parse("2026-07-01T00:05:00.000Z") // WELL past grace, but the pinned file is present
+  t.tick()
+  assert.equal(t.get("t")?.turn, "idle")
+  assert.equal(t.get("t")?.lastAssistant, "all done")
+  assert.equal(t.get("t")?.noTranscript ?? false, false, "a present transcript is never degraded")
+  assert.equal(h.storage.getSession("t")?.transcript_id ?? null, null, "no drift → transcript_id never written")
+})
+
+test("tailer: a transcript missing past the grace window → noTranscript degraded state (not an eternal spinner)", () => {
+  const slug = "stall-thread"
+  const stallLog = join(tmpdir(), "fray-worker-logs", `${slug}.stall.log`)
+  try { rmSync(stallLog) } catch { /* not there */ }
+  const h = harness()
+  h.storage.upsertSession(row({ slug, tmux_name: `fray-${slug}` }))
+  h.pane.text = "Error: Session ID sid is already in use." // claude's own boot-failure text in the pane
+  const t = makeTailer(h)
+
+  h.clock.ms = Date.parse(SPAWN)
+  t.tick() // prime WITHIN grace: pinned file absent → still spinning, not yet degraded
+  assert.equal(t.get(slug)?.noTranscript ?? false, false)
+
+  h.clock.ms = PAST_GRACE
+  const before = h.changes.n
+  t.tick()
+  assert.equal(t.get(slug)?.noTranscript, true, "past grace + no transcript + no discovery hit → degraded")
+  assert.ok(h.changes.n > before, "the degraded flip marks the board dirty (no waiting for the reconcile)")
+  // claude's pane output was captured to disk for root-causing (point 5).
+  const log = readFileSync(stallLog, "utf8")
+  assert.match(log, /already in use/, "the boot-failure pane is persisted for triage")
+  try { rmSync(stallLog) } catch { /* cleanup */ }
+})
+
+test("tailer: a present-but-EMPTY (0-byte) transcript past grace is treated as MISSING → degraded (0-byte crash-net hole closed)", () => {
+  const slug = "empty-thread"
+  const stallLog = join(tmpdir(), "fray-worker-logs", `${slug}.stall.log`)
+  try { rmSync(stallLog) } catch { /* not there */ }
+  const h = harness()
+  h.storage.upsertSession(row({ slug, tmux_name: `fray-${slug}` }))
+  fixture(h.logDir, "sid", []) // <sid>.jsonl EXISTS but is 0 bytes (worker created it then crashed)
+  const t = makeTailer(h)
+
+  h.clock.ms = Date.parse(SPAWN)
+  t.tick() // within grace: an empty file is still "just spinning up", not yet degraded
+  assert.equal(t.get(slug)?.noTranscript ?? false, false)
+
+  h.clock.ms = PAST_GRACE
+  t.tick()
+  assert.equal(t.get(slug)?.noTranscript, true, "a 0-byte file past grace is missing content, not bound — must degrade")
+  try { rmSync(stallLog) } catch { /* cleanup */ }
+})
+
+test("tailer: an empty transcript that LATER gets its first record binds normally (self-heals)", () => {
+  const h = harness()
+  h.storage.upsertSession(row())
+  fixture(h.logDir, "sid", []) // starts empty
+  const t = makeTailer(h)
+  h.clock.ms = PAST_GRACE
+  t.tick() // empty past grace → degraded
+  assert.equal(t.get("t")?.noTranscript, true)
+  appendFileSync(join(h.logDir, "sid.jsonl"), DONE + "\n") // the worker finally writes a record
+  t.tick()
+  assert.equal(t.get("t")?.noTranscript ?? false, false, "content arrived → clears degraded and binds")
+  assert.equal(t.get("t")?.turn, "idle")
+})
+
+test("tailer: discovers a drifted transcript by sentinel, re-links + caches transcript_id, replays it SILENTLY", () => {
+  const h = harness()
+  h.storage.upsertSession(row()) // session_id "sid"
+  driftedFixture(h.logDir, "forked-id", "sid", [DONE]) // real transcript at forked-id.jsonl, ends idle
+  const t = makeTailer(h)
+
+  h.clock.ms = Date.parse(SPAWN)
+  t.tick() // prime within grace: <sid>.jsonl absent → no discovery yet
+  assert.equal(h.storage.getSession("t")?.transcript_id ?? null, null)
+  const before = h.events.length
+
+  h.clock.ms = PAST_GRACE
+  t.tick() // discovery re-links forked-id and replays it as a silent prime
+  assert.equal(h.storage.getSession("t")?.transcript_id, "forked-id", "the discovered id is cached")
+  assert.equal(t.get("t")?.noTranscript ?? false, false, "re-linked → not degraded")
+  assert.equal(t.get("t")?.turn, "idle", "the discovered transcript's derivation now drives telemetry")
+  assert.equal(t.get("t")?.lastAssistant, "all done")
+  assert.equal(h.events.length, before, "a discovered transcript replays as a SILENT prime — no spurious turn-done notify")
+})
+
+test("tailer: a row with a cached transcript_id binds THAT file, not <session_id>.jsonl", () => {
+  const h = harness()
+  h.storage.upsertSession(row({ transcript_id: "forked-id" })) // <sid>.jsonl does NOT exist
+  fixture(h.logDir, "forked-id", [IN_FLIGHT, TOOL, DONE])
+  const t = makeTailer(h)
+  t.tick()
+  assert.equal(t.get("t")?.turn, "idle")
+  assert.equal(t.get("t")?.lastAssistant, "all done")
+  assert.equal(t.get("t")?.noTranscript ?? false, false)
+})
+
+test("tailer: a cached transcript_id is excluded from FOREIGN discovery (the re-linked file is not a duplicate thread)", () => {
+  const h = harness()
+  h.clock.ms = FCLOCK
+  h.storage.upsertSession(row({ transcript_id: "forked-id" }))
+  const { t } = foreignTailer(h)
+  foreignFile(h.logDir, "forked-id", [IN_FLIGHT, DONE], FRESH_MTIME) // the re-linked transcript
+  foreignFile(h.logDir, "stranger", [IN_FLIGHT], FRESH_MTIME) // a genuinely-unregistered terminal
+  t.tick()
+  assert.equal(t.foreignIds().includes("forked-id"), false, "the row's discovered transcript is NOT surfaced as foreign")
+  assert.equal(t.foreignIds().includes("stranger"), true, "an unrelated fresh file still surfaces as foreign (control)")
 })

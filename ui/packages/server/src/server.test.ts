@@ -86,6 +86,7 @@ test("storage: session roundtrip + markRead + exited", () => {
     meta: null,
     seen_at: null,
     plan_path: null,
+    transcript_id: null,
   })
   let row = s.getSession("t")
   assert.equal(row?.session_id, "sid-1")
@@ -105,6 +106,35 @@ test("storage: session roundtrip + markRead + exited", () => {
   assert.equal(s.allSessions().length, 1)
   assert.equal(s.getSession("t")?.session_id, "sid-2")
   s.close()
+})
+
+test("storage: transcript_id cache round-trips, survives restart, resets on re-dispatch, preserves on resume", () => {
+  const dir = tmp("fray-store-tid-")
+  const dbPath = join(dir, "ui.db")
+  const s = createStorage(dbPath)
+  s.upsertSession({
+    slug: "t", session_id: "sid-1", tmux_name: "fray-t", spawned_at: "2026-07-01T00:00:00.000Z",
+    last_read_at: null, unread: 0, exited: 0, archived: 0, rested_at: null, title_auto: 0, title: null,
+    state: "open", meta: null, seen_at: null, plan_path: null, transcript_id: null,
+  })
+  // The tailer's discovery caches the drifted transcript's id.
+  s.setTranscriptId("t", "forked-id")
+  assert.equal(s.getSession("t")?.transcript_id, "forked-id")
+  s.close()
+
+  // Survives a server restart (persisted to disk, read back on reopen).
+  const s2 = createStorage(dbPath)
+  assert.equal(s2.getSession("t")?.transcript_id, "forked-id", "the cached id persists across restart")
+
+  // A RESUME spreads the existing row (same session_id) → the cached discovery is preserved.
+  const row = s2.getSession("t")!
+  s2.upsertSession({ ...row, spawned_at: "2026-07-01T01:00:00.000Z", exited: 0 })
+  assert.equal(s2.getSession("t")?.transcript_id, "forked-id", "resume preserves the cache")
+
+  // A RE-DISPATCH/ADOPT carries a FRESH session_id + transcript_id:null → the stale cache is cleared.
+  s2.upsertSession({ ...row, session_id: "sid-2", transcript_id: null })
+  assert.equal(s2.getSession("t")?.transcript_id ?? null, null, "a fresh session_id resets the cache")
+  s2.close()
 })
 
 test("settings: defaults, roundtrip, merge-over-defaults", () => {

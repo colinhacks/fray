@@ -1,7 +1,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import type { ThreadView } from "@fray-ui/shared"
-import { needsAction, queued, sectionOf, sectionThreads, isMachineWaiting, titleIsProvisional, displayTitle, SPINNING_UP_TITLE } from "./groups.ts"
+import { needsAction, queued, sectionOf, sectionThreads, isAwaitingExternal, titleIsProvisional, displayTitle, SPINNING_UP_TITLE } from "./groups.ts"
 
 // Minimal ThreadView fixture — the same shape board-delta.test.ts uses, defaulting to a live/active
 // thread; each case overrides only the fields under test.
@@ -138,6 +138,17 @@ test("sectionOf v2: ONE Active section — running, needs-you, awaiting all toge
   assert.equal(sectionOf(thread({ kind: "session", foreign: true, runtime: "running" })), "active")
 })
 
+test("sectionOf: an ARCHIVED thread that's ACTIVELY RUNNING goes to Active (never a spinner under Inactive)", () => {
+  // Idle-archived stays Inactive — the user hid it and it's at rest.
+  assert.equal(sectionOf(thread({ kind: "session", state: "archived", runtime: "turn-idle" })), "inactive")
+  assert.equal(sectionOf(thread({ kind: "session", state: "archived", runtime: "exited" })), "inactive")
+  // Running / spawning archived → Active (a live, in-flight session must NEVER sit in Inactive; maintainer hit 3×).
+  assert.equal(sectionOf(thread({ kind: "session", state: "archived", runtime: "running" })), "active")
+  assert.equal(sectionOf(thread({ kind: "session", state: "archived", runtime: "spawning" })), "active")
+  // turn-idle but a dispatched sub-agent is still going (the sidebar shows a spinner) → Active too.
+  assert.equal(sectionOf(thread({ kind: "session", state: "archived", runtime: "turn-idle", subAgents: [{ label: "x", startedAt: "2026-07-10T00:00:00.000Z", state: "running", id: "a1" }] })), "active")
+})
+
 test("sectionThreads v2: partitions Active/Archive; foreign + legacy excluded; interactionAt orders", () => {
   const s = sectionThreads([
     thread({ id: "older", kind: "session", state: "open", runtime: "running", lastUserAt: "2026-07-08T01:00:00.000Z" }),
@@ -152,43 +163,85 @@ test("sectionThreads v2: partitions Active/Archive; foreign + legacy excluded; i
   assert.equal("legacy" in s, false)
 })
 
-// ---- isMachineWaiting: the ```awaiting-at-rest signal that drives clock + dim + bottom-of-active ----
+// ---- isAwaitingExternal: the pr/ci/timer-at-rest signal that drives the dimmed Awaiting-external band ----
 
-test("isMachineWaiting: true only for an awaiting fence AT REST", () => {
-  const awaiting = { kind: "awaiting" as const, body: "", hints: [] }
-  assert.equal(isMachineWaiting(thread({ runtime: "turn-idle", lastFence: awaiting })), true)
-  assert.equal(isMachineWaiting(thread({ runtime: "exited", lastFence: awaiting })), true)
-  // Mid-turn (still working) never machine-waits, even with a stale awaiting fence.
-  assert.equal(isMachineWaiting(thread({ runtime: "running", lastFence: awaiting })), false)
-  // A done fence or a bare rest is NOT machine-waiting (those read as done/idle → a ✓, not the clock).
-  assert.equal(isMachineWaiting(thread({ runtime: "turn-idle", lastFence: { kind: "done", body: "x", hints: [] } })), false)
-  assert.equal(isMachineWaiting(thread({ runtime: "turn-idle" })), false)
+const awaitingPr = { kind: "awaiting" as const, body: "", hints: [{ kind: "pr" as const, value: "owner/repo#12" }] }
+const liveSub = [{ label: "x", startedAt: "2026-07-10T00:00:00.000Z", state: "running" as const, id: "a1" }]
+
+test("isAwaitingExternal: true for a pr/ci/timer awaiting fence AT REST with no live sub-agents", () => {
+  const ci = { kind: "awaiting" as const, body: "", hints: [{ kind: "ci" as const, value: "build #4821" }] }
+  const timer = { kind: "awaiting" as const, body: "", hints: [{ kind: "timer" as const, value: "5m" }] }
+  assert.equal(isAwaitingExternal(thread({ runtime: "turn-idle", lastFence: awaitingPr })), true)
+  assert.equal(isAwaitingExternal(thread({ runtime: "exited", lastFence: awaitingPr })), true)
+  assert.equal(isAwaitingExternal(thread({ runtime: "turn-idle", lastFence: ci })), true)
+  assert.equal(isAwaitingExternal(thread({ runtime: "turn-idle", lastFence: timer })), true)
 })
 
-test("sectionThreads: machine-waiting rows sink to the BOTTOM of Active, recency within each group", () => {
-  const awaiting = { kind: "awaiting" as const, body: "", hints: [] }
+test("isAwaitingExternal: INTERNAL waits are NOT external — live sub-agents, session hint, bare rest, mid-turn", () => {
+  // Awaiting its OWN sub-agents (a live child) is internal work → Active, never the dimmed band.
+  assert.equal(isAwaitingExternal(thread({ runtime: "turn-idle", lastFence: awaitingPr, subAgents: liveSub })), false)
+  // A `session` hint (waiting on another fray session) reads as internal/ambiguous → Active.
+  assert.equal(isAwaitingExternal(thread({ runtime: "turn-idle", lastFence: { kind: "awaiting", body: "", hints: [{ kind: "session", value: "s1" }] } })), false)
+  // A hintless awaiting fence → not scheduler-actionable → Active.
+  assert.equal(isAwaitingExternal(thread({ runtime: "turn-idle", lastFence: { kind: "awaiting", body: "", hints: [] } })), false)
+  // Mid-turn (still working) never awaits externally, even with a stale pr fence.
+  assert.equal(isAwaitingExternal(thread({ runtime: "running", lastFence: awaitingPr })), false)
+  // A done fence or a bare rest is NOT awaiting-external (those read as done/idle).
+  assert.equal(isAwaitingExternal(thread({ runtime: "turn-idle", lastFence: { kind: "done", body: "x", hints: [] } })), false)
+  assert.equal(isAwaitingExternal(thread({ runtime: "turn-idle" })), false)
+})
+
+test("sectionOf: a pr/ci/timer awaiting thread bands as awaitingExternal; live-sub / session / bare stay Active", () => {
+  // External waiter → the dimmed band.
+  assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingPr })), "awaitingExternal")
+  // Same fence but a LIVE sub-agent → still Active (internal work, maintainer's differentiator).
+  assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingPr, subAgents: liveSub })), "active")
+  // Session-hint / hintless / bare rest → Active.
+  assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle", lastFence: { kind: "awaiting", body: "", hints: [{ kind: "session", value: "s1" }] } })), "active")
+  assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle" })), "active")
+  // Archive wins over an external wait.
+  assert.equal(sectionOf(thread({ kind: "session", state: "archived", runtime: "turn-idle", lastFence: awaitingPr })), "inactive")
+})
+
+test("sectionThreads: external waiters split into the awaitingExternal band; live-subs stay Active", () => {
   const s = sectionThreads([
-    thread({ id: "wait-new", kind: "session", state: "open", runtime: "turn-idle", lastFence: awaiting, lastUserAt: "2026-07-09T05:00:00.000Z" }),
+    thread({ id: "pr-new", kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingPr, lastUserAt: "2026-07-09T05:00:00.000Z" }),
     thread({ id: "live-old", kind: "session", state: "open", runtime: "running", lastUserAt: "2026-07-08T01:00:00.000Z" }),
-    thread({ id: "wait-old", kind: "session", state: "open", runtime: "turn-idle", lastFence: awaiting, lastUserAt: "2026-07-08T05:00:00.000Z" }),
-    thread({ id: "live-new", kind: "session", state: "open", runtime: "running", lastUserAt: "2026-07-09T01:00:00.000Z" }),
+    thread({ id: "pr-old", kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingPr, lastUserAt: "2026-07-08T05:00:00.000Z" }),
+    thread({ id: "sub-wait", kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingPr, subAgents: liveSub, lastUserAt: "2026-07-09T01:00:00.000Z" }),
   ])
-  // In-play rows (recency) first, then the two awaiting rows (recency) at the bottom — even though
-  // wait-new has the newest interaction of all, it stays below every non-waiting row.
-  assert.deepEqual(s.active.map((t) => t.id), ["live-new", "live-old", "wait-new", "wait-old"])
+  // Active holds the live-running row AND the sub-agent-waiting row (internal); recency orders them.
+  assert.deepEqual(s.active.map((t) => t.id), ["sub-wait", "live-old"])
+  // The two pr-awaiting rows land in the dimmed band, recency within it.
+  assert.deepEqual(s.awaitingExternal.map((t) => t.id), ["pr-new", "pr-old"])
+})
+
+test("orderActive: a session/hintless declared-wait that stayed in Active sinks below in-play rows", () => {
+  const sessWait = { kind: "awaiting" as const, body: "", hints: [{ kind: "session" as const, value: "s1" }] }
+  const s = sectionThreads([
+    thread({ id: "wait-new", kind: "session", state: "open", runtime: "turn-idle", lastFence: sessWait, lastUserAt: "2026-07-09T05:00:00.000Z" }),
+    thread({ id: "live-old", kind: "session", state: "open", runtime: "running", lastUserAt: "2026-07-08T01:00:00.000Z" }),
+  ])
+  // wait-new has the newer interaction but sinks below the in-play live row (it declared a machine wait).
+  assert.deepEqual(s.active.map((t) => t.id), ["live-old", "wait-new"])
 })
 
 // ---- title placeholder: never show the machine-guessed dispatch title ----
 
-test("titleIsProvisional / displayTitle: guessed title shows the 'Spinning up' placeholder until aiTitle lands", () => {
-  // titleAuto with no aiTitle = provisional → placeholder, not the guess.
-  assert.equal(titleIsProvisional(thread({ titleAuto: true, title: "fix the parser bug" })), true)
-  assert.equal(displayTitle(thread({ titleAuto: true, title: "fix the parser bug" })), SPINNING_UP_TITLE)
-  // Once Claude's ai-title lands, it wins and the row is no longer provisional.
-  assert.equal(titleIsProvisional(thread({ titleAuto: true, aiTitle: "Parser fix" })), false)
-  assert.equal(displayTitle(thread({ titleAuto: true, aiTitle: "Parser fix" })), "Parser fix")
+test("titleIsProvisional / displayTitle: 'Spinning up' shows briefly, then falls back to the dispatch title", () => {
+  const fresh = new Date().toISOString()
+  // Fresh dispatch, guessed title, no aiTitle yet → the placeholder.
+  assert.equal(titleIsProvisional(thread({ titleAuto: true, title: "fix the parser bug", spawnedAt: fresh })), true)
+  assert.equal(displayTitle(thread({ titleAuto: true, title: "fix the parser bug", spawnedAt: fresh })), SPINNING_UP_TITLE)
+  // aiTitle landed → not provisional; the real name wins.
+  assert.equal(titleIsProvisional(thread({ titleAuto: true, aiTitle: "Parser fix", spawnedAt: fresh })), false)
+  assert.equal(displayTitle(thread({ titleAuto: true, aiTitle: "Parser fix", spawnedAt: fresh })), "Parser fix")
+  // STALE spawn, still no aiTitle (e.g. a compacted session whose transcript fray lost track of) → NOT
+  // provisional: fall back to the dispatch title, never stick on "Spinning up…" forever.
+  assert.equal(titleIsProvisional(thread({ titleAuto: true, title: "fix the parser bug", spawnedAt: "2026-07-08T00:00:00.000Z" })), false)
+  assert.equal(displayTitle(thread({ titleAuto: true, title: "fix the parser bug", spawnedAt: "2026-07-08T00:00:00.000Z" })), "fix the parser bug")
   // A user-supplied title (titleAuto false) is real — shown as-is, never provisional.
-  assert.equal(titleIsProvisional(thread({ titleAuto: false, title: "My thread" })), false)
+  assert.equal(titleIsProvisional(thread({ titleAuto: false, title: "My thread", spawnedAt: fresh })), false)
   assert.equal(displayTitle(thread({ titleAuto: false, title: "My thread" })), "My thread")
   // Absent titleAuto (legacy/slim/foreign row) ⇒ never provisional.
   assert.equal(titleIsProvisional(thread({ title: "legacy" })), false)

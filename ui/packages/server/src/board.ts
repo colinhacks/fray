@@ -42,6 +42,17 @@ function deriveRuntime(
   return turn === "idle" ? "turn-idle" : "running"
 }
 
+// A worker whose transcript never materialized (a boot failure the tailer flagged noTranscript) would
+// otherwise read "running" forever — deriveRuntime sees a live tmux pane with no telemetry and defaults
+// to running, so the row spins with nothing to tail. Downgrade ONLY that spinner to the degraded "exited"
+// affordance ("Stalled", a "!" glyph); with the "in-flight" turn a transcript-less session keeps, this
+// also trips deriveNeedsYou's crash-net so it cards for the human. Every other runtime is left as-is (a
+// dead pane is already "exited"; a healthily-bound session is never noTranscript). Reused "exited" rather
+// than minting a new RuntimeState — see session-transcript-drift (a distinct error enum is a follow-up).
+export function degradeIfNoTranscript(runtime: RuntimeState, noTranscript: boolean | undefined): RuntimeState {
+  return noTranscript && runtime === "running" ? "exited" : runtime
+}
+
 // Display fields are ONE-LINERS in every surface that renders them — cap them at the server so a
 // thread whose agent wrote an essay into status_text can't fatten every snapshot push (on a large
 // board these two fields alone were half a megabyte).
@@ -215,7 +226,7 @@ function scratchpadPathIfExists(projectDir: string, sessionId: string): string |
 // A REGISTERED session thread's view (id = row.slug). Runtime via the shared deriveRuntime (tmux-aware);
 // telemetry fields mirror the legacy path exactly. Display prefers aiTitle client-side over row.title.
 function sessionThreadView(projectDir: string, row: SessionRow, tele: SessionTelemetry | undefined, legacyTerminal: boolean): ThreadView {
-  const runtime = deriveRuntime(row.slug, true, tele?.turn, tele?.permPrompt ?? false)
+  const runtime = degradeIfNoTranscript(deriveRuntime(row.slug, true, tele?.turn, tele?.permPrompt ?? false), tele?.noTranscript)
   const state = effectiveSessionState(row, legacyTerminal)
   const archived = state === "archived"
   const needsYou = archived ? false : deriveNeedsYou(row, tele, runtime)

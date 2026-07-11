@@ -4,6 +4,7 @@ import { homedir } from "node:os"
 import type { TranscriptMessage, TranscriptToolCall } from "@fray-ui/shared"
 import type { Project } from "./project.ts"
 import type { Storage } from "./storage.ts"
+import { discoverTranscriptId, DISCOVERY_GRACE_MS } from "./discover.ts"
 
 // Parse a session JSONL into a renderable conversation — mechanically, no AI. Same defensive
 // posture as the tailer: bad line → skip, unknown type → ignore, never throw. Assistant messages
@@ -509,12 +510,37 @@ export function readTranscript(project: Project, sessionId: string): TranscriptM
 // forecloses path separators so the session-id join in readTranscript can't traverse out of the log dir.
 export const FOREIGN_SESSION_ID_RE = /^[0-9a-fA-F][0-9a-fA-F-]{7,63}$/
 
-// Resolve a thread slug to its rendered transcript: a registry row's session_id, else — for a foreign
-// thread — the slug itself as a session id, else empty. The single resolution both the threadTranscript
-// RPC and the /ws transcript producer share, so foreign threads render identically on both paths.
+// The Claude Code per-project transcript dir: ~/.claude/projects/<cwdSlug>/. (Mirrors the tailer's.)
+function logDirOf(project: Project): string {
+  return join(homedir(), ".claude", "projects", project.cwdSlug)
+}
+
+// Resolve a thread slug to its rendered transcript: a registry row's DISCOVERED transcript (transcript_id)
+// if one was cached, else its pinned session_id; for a foreign thread the slug itself as a session id;
+// else empty. When the pinned transcript renders empty and nothing's been cached yet, a best-effort
+// content discovery (scratchpad sentinel, same as the tailer) re-links a drifted transcript so the drawer
+// isn't blank while the tailer catches up. The single resolution the threadTranscript RPC and the /ws
+// transcript producer share, so foreign threads render identically on both paths. Degrades to [].
 export function readThreadTranscript(project: Project, storage: Storage, slug: string): TranscriptMessage[] {
   const row = storage.getSession(slug)
-  if (row) return readTranscript(project, row.session_id)
+  if (row) {
+    const msgs = readTranscript(project, row.transcript_id ?? row.session_id)
+    if (msgs.length || row.transcript_id) return msgs
+    // The pinned transcript rendered empty and nothing's cached. GATE the fallback on the spin-up grace:
+    // a fresh dispatch renders empty simply because its file isn't written yet, and this path runs on
+    // every drawer view / WS subscribe — an ungated per-view directory scan would be wasted work on the
+    // common case. Only a genuinely-overdue thread engages discovery (bounded; see discover.ts).
+    if (Date.now() - Date.parse(row.spawned_at) < DISCOVERY_GRACE_MS) return msgs
+    // Exclude ids owned by OTHER rows (their pinned + discovered transcripts) — never steal a claimed one.
+    const exclude = new Set<string>()
+    for (const r of storage.allSessions()) {
+      if (r.slug === row.slug) continue
+      exclude.add(r.session_id)
+      if (r.transcript_id) exclude.add(r.transcript_id)
+    }
+    const found = discoverTranscriptId(logDirOf(project), row.session_id, { exclude })
+    return found ? readTranscript(project, found) : msgs
+  }
   if (FOREIGN_SESSION_ID_RE.test(slug)) return readTranscript(project, slug)
   return []
 }

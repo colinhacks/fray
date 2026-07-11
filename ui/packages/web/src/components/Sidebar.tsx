@@ -1,13 +1,12 @@
 import { memo } from "react"
 import { useSnapshot } from "valtio"
-import { Check, ChevronRight, CircleDashed, Clock, FileText, Hourglass } from "lucide-react"
+import { Check, ChevronRight, CircleDashed, Clock, Ellipsis, FileText, Github, Hourglass, Timer } from "lucide-react"
 import type { AwaitingHint, PlanView, ThreadView } from "@fray-ui/shared"
 import { store, openThread, scrollToQueueCard, pushSubAgentDrawer, pushPlanDrawer, type ConnectionState } from "../store.ts"
 import { useBoard, asThreads } from "../hooks.ts"
-import { sectionThreads, needsAction, displayTitle, titleIsProvisional, isMachineWaiting } from "../groups.ts"
+import { sectionThreads, needsAction, displayTitle, titleIsProvisional, isAwaitingExternal } from "../groups.ts"
 import { MarkAsButton } from "./MarkAsButton.tsx"
 import { DispatchForm } from "./NewThreadModal.tsx"
-import { GithubTrigger } from "./GithubTrigger.tsx"
 import { Tooltip } from "./Tooltip.tsx"
 import { STATUS_CHIP } from "../lib/status.ts"
 import type { ReactElement, ReactNode } from "react"
@@ -23,11 +22,13 @@ import type { ReactElement, ReactNode } from "react"
 // drawer (chat / doc via store.openThread); a plan row opens the plan drawer; a legacy row opens its
 // fray doc.
 //
-// Sections (v2, maintainer 2026-07-09): ONE Active section — running, awaiting-you, and
-// machine-awaiting all together (the earlier Needs-you/Working split made seen-clearance visibly
-// shuffle rows on click). Needs-you renders as the row INDICATOR + the queue; awaiting as the hint
-// gloss. Plans from board.plans; Archive = explicitly archived. Legacy .fray rows and foreign
-// terminal sessions do not render at all.
+// Sections (v3, maintainer 2026-07-10): THREE bands top→bottom — Active, then a DIMMED
+// Awaiting-external band (genuinely blocked on an external pr/ci/timer gate), then the collapsible
+// Inactive — each split by a bare <hr>. A thread merely awaiting its OWN sub-agents is INTERNAL work
+// and stays in Active undimmed; only external waiters drop into the dimmed band (see groups.ts
+// isAwaitingExternal). Needs-you renders as the row INDICATOR + the queue; awaiting as the hint gloss.
+// Plans from board.plans; Inactive = explicitly archived. Legacy .fray rows and foreign terminal
+// sessions do not render at all.
 
 
 export function Sidebar() {
@@ -38,6 +39,7 @@ export function Sidebar() {
   const plans = (board?.plans ?? []) as PlanView[]
   const collapsed = snap.sidebarCollapsed
   const activeThreads = sections.active
+  const awaitingExternalThreads = sections.awaitingExternal
   const inactiveThreads = sections.inactive
 
   return (
@@ -52,10 +54,9 @@ export function Sidebar() {
             this same box CENTERED as the whole screen (App hides the sidebar); the first dispatch
             shunts it here to the left. */}
         <div className="mb-5 shrink-0 px-0.5">
+          {/* The GitHub picker's door now lives INSIDE the dispatch composer (a small icon left of the
+              send button — see DispatchForm/Composer leftAction); no separate pill here. */}
           <DispatchForm />
-          {/* The GitHub picker's door, right under the dispatch box — self-hides unless gh is authed
-              in a GitHub repo (GithubTrigger gates itself). */}
-          <GithubTrigger className="mt-2.5" />
         </div>
         <div className="min-h-0 min-w-0 overflow-y-auto overflow-x-hidden">
           {/* ACTIVE — always shown, NEVER collapsible (you can't hide your live work), no label. */}
@@ -68,6 +69,20 @@ export function Sidebar() {
             ))
           ) : (
             <div className="px-1.5 py-1 text-[11.5px] text-muted/50">No active threads</div>
+          )}
+          {/* AWAITING-EXTERNAL — the DIMMED band for threads genuinely blocked on an external pr/ci/timer
+              gate (isAwaitingExternal). A bare <hr> above (no header — the rule matches the other
+              dividers); rows self-dim via dimLabel. OMITTED (with its rule) when empty. */}
+          {awaitingExternalThreads.length > 0 && (
+            <div>
+              <hr className="my-3 border-border/50" />
+              {awaitingExternalThreads.map((t) => (
+                <div key={t.id}>
+                  <ThreadRow t={t} />
+                  <SubAgentRows t={t} />
+                </div>
+              ))}
+            </div>
           )}
           {/* INACTIVE — collapsible, OMITTED entirely (with its rule) when empty. */}
           {inactiveThreads.length > 0 && (
@@ -138,9 +153,10 @@ const ThreadRow = memo(function ThreadRow({ t, legacy }: { t: ThreadView; legacy
   const subTooltip = subs.map((s) => (s.subagentType ? `[${s.subagentType}] ${s.label}` : s.label)).join("\n")
   const foreign = !legacy && t.foreign === true
   // Dim the label for a de-emphasized row: a PROVISIONAL title ("Spinning up a thread…", no real name
-  // yet) or a MACHINE-WAITING thread (parked behind an ```awaiting fence — clock indicator, sunk to the
-  // bottom of Active). Both read as "not demanding your eyes right now" (maintainer 2026-07-10).
-  const dimLabel = !legacy && (titleIsProvisional(t) || isMachineWaiting(t))
+  // yet) or an AWAITING-EXTERNAL thread (the dimmed band — genuinely blocked on an external pr/ci/timer
+  // gate). Both read as "not demanding your eyes right now" (maintainer 2026-07-10). A thread awaiting
+  // its OWN sub-agents is internal work — NOT dimmed (it stays in Active).
+  const dimLabel = !legacy && (titleIsProvisional(t) || isAwaitingExternal(t))
   // An awaiting session row glosses its first machine-wait hint (e.g. "PR owner/repo#12").
   const gloss = !legacy && t.lastFence?.kind === "awaiting" ? hintGloss(t.lastFence.hints) : null
   const hasSubtitle = Boolean(t.activity) || subLabel !== null || gloss !== null
@@ -264,10 +280,13 @@ function StatusChip({ status }: { status: string }) {
   )
 }
 
-// Format a machine-wait hint as a compact gloss: "PR owner/repo#12", "CI build #4821", "timer 5m",
-// "session sub-123". Null when there are no hints.
+// Format a machine-wait hint as a compact row subtitle: "PR owner/repo#12", "CI build #4821",
+// "timer 5m". A `session` hint is NOT glossed — its value is an internal session id that reads as
+// leaked internals in the row subtitle (maintainer 2026-07-10: "what the fuck is that?! looks bad");
+// the CircleDashed indicator + its "Waiting on another session" tooltip already carry that state.
+// Null when there's no glossable (pr/ci/timer) hint.
 function hintGloss(hints: readonly AwaitingHint[]): string | null {
-  const h = hints[0]
+  const h = hints.find((x) => x.kind === "pr" || x.kind === "ci" || x.kind === "timer")
   if (!h) return null
   const label = h.kind === "pr" ? "PR" : h.kind === "ci" ? "CI" : h.kind
   return `${label} ${h.value}`
@@ -287,7 +306,7 @@ export function ThreadIndicator({ t, legacy }: { t: ThreadView; legacy?: boolean
   const { node, tip } = legacy ? legacyIndicatorFor(t) : sessionIndicatorFor(t)
   if (!tip) return node
   return (
-    <Tooltip label={tip} side="right">
+    <Tooltip label={tip} side="left">
       <span className="flex items-center justify-center">{node}</span>
     </Tooltip>
   )
@@ -315,13 +334,26 @@ function sessionIndicatorFor(t: ThreadView): { node: ReactElement; tip: string |
   if (t.needsYou || t.pendingAsk || t.runtime === "perm-prompt") {
     // A crash (needsYou on an EXITED pane) reads as "!" — the agent died, not a live question.
     if (t.runtime === "exited") return { node: <StatusBox accent><Glyph ch="!" /></StatusBox>, tip: "Stalled — the agent exited" }
-    return { node: <StatusBox accent><Glyph ch="?" /></StatusBox>, tip: "Needs your input" }
+    // Muted "?", same gray as every other glyph — a needs-you thread already carries maximum emphasis
+    // by sitting in the ⚖ queue, so the rail indicator adds NO extra color (maintainer 2026-07-10).
+    return { node: <StatusBox><Glyph ch="?" muted /></StatusBox>, tip: "Needs your input" }
   }
   if (t.runtime === "running" || t.runtime === "spawning") return { node: <BoxSpinner />, tip: "Working" }
   const liveSub = (t.subAgents ?? []).some((s) => s.state === "running")
   if (t.runtime === "turn-idle" && liveSub) return { node: <BoxSpinner />, tip: "Working" }
   const atRest = t.runtime === "turn-idle" || t.runtime === "exited"
-  if (t.lastFence?.kind === "awaiting" && atRest) return { node: <StatusBox><Clock size={9} className="text-muted/70" /></StatusBox>, tip: "Waiting on a machine" }
+  if (t.lastFence?.kind === "awaiting" && atRest) {
+    // Icon by the PRIMARY machine-wait hint (maintainer 2026-07-10): a PR block wears the GitHub mark,
+    // CI an hourglass, a timer the stopwatch, another-session a dashed circle, everything else the
+    // clock. The pr/ci/timer ones split into the dimmed Awaiting-external band (isAwaitingExternal); a
+    // `session`/hintless await keeps its glyph here but stays in Active, undimmed.
+    const hk = t.lastFence.hints[0]?.kind
+    if (hk === "pr") return { node: <StatusBox><Github size={9} className="text-muted/70" /></StatusBox>, tip: "Waiting on a PR" }
+    if (hk === "ci") return { node: <StatusBox><Hourglass size={9} className="text-muted/70" /></StatusBox>, tip: "Waiting on CI" }
+    if (hk === "timer") return { node: <StatusBox><Timer size={10} className="text-muted/70" /></StatusBox>, tip: "Waiting on a timer" }
+    if (hk === "session") return { node: <StatusBox><CircleDashed size={10} className="text-muted/70" /></StatusBox>, tip: "Waiting on another session" }
+    return { node: <StatusBox><Clock size={9} className="text-muted/70" /></StatusBox>, tip: "Waiting on a machine" }
+  }
   // A CHECK MARK means DONE — and ONLY that (maintainer 2026-07-10: a check on a still-active,
   // fenceless thread "doesn't make sense"). The two things that earn it: the thread is ARCHIVED
   // (terminal), or the worker declared ` ```done ` and is at rest (that card carries the Archive button).
@@ -333,7 +365,7 @@ function sessionIndicatorFor(t: ThreadView): { node: ReactElement; tip: string |
   // know the reason — the worker didn't fence — so: the clock, with NO hint gloss (vs an ```awaiting
   // fence, which carries pr/ci hints AND dims + sinks the row). The honest fix is the worker emitting
   // ` ```awaiting ` when it's blocked on a machine; until then this is our best-guess "paused/waiting".
-  return { node: <StatusBox><Clock size={9} className="text-muted/70" /></StatusBox>, tip: "Waiting — at rest, no signal from the worker" }
+  return { node: <StatusBox><Ellipsis size={11} className="text-muted/70" /></StatusBox>, tip: "At rest — awaiting you" }
 }
 
 // THE shared rounded-rect checkbox — the ONE outer shape every status glyph sits in.
@@ -348,10 +380,11 @@ function StatusBox({ accent, children }: { accent?: boolean; children?: ReactNod
     </span>
   )
 }
-// A bold single-char glyph (?, !) centered in the box, in the accent.
-function Glyph({ ch }: { ch: string }) {
+// A bold single-char glyph (?, !) centered in the box. Accent by default; `muted` renders it the same
+// gray as every other rail glyph (the "?" needs-you mark — the ⚖ queue already carries the emphasis).
+function Glyph({ ch, muted }: { ch: string; muted?: boolean }) {
   return (
-    <span aria-hidden className="font-bold leading-none text-accent" style={{ fontSize: 10 }}>
+    <span aria-hidden className={`font-bold leading-none ${muted ? "text-muted/70" : "text-accent"}`} style={{ fontSize: 10 }}>
       {ch}
     </span>
   )
@@ -384,7 +417,7 @@ function legacyIndicatorFor(t: ThreadView): { node: ReactElement; tip: string | 
   if (t.runtime === "turn-idle" && liveSub && !t.humanBlocked) return { node: <Spinner />, tip: "Working" }
   if (needsAction(t)) return { node: <BlueDot />, tip: "Needs your input" }
   if (t.status === "needs-human") return { node: <YellowDot />, tip: "Awaiting you — open to read & reply" }
-  if (t.status === "blocked" && t.mechanism === "timer") return { node: <Clock size={INDICATOR + 1} className="text-muted/70" />, tip: "Waiting on a timer" }
+  if (t.status === "blocked" && t.mechanism === "timer") return { node: <Timer size={INDICATOR + 1} className="text-muted/70" />, tip: "Waiting on a timer" }
   if (t.status === "blocked" && t.mechanism === "threads") return { node: <CircleDashed size={INDICATOR + 1} className="text-muted/70" />, tip: "Waiting on other work" }
   return { node: <FaintDot />, tip: null }
 }

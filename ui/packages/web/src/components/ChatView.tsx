@@ -1,4 +1,4 @@
-import { createContext, memo, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react"
+import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import { useMutation, useQuery } from "@tanstack/react-query"
 import { AlertTriangle, Archive, ArrowUpRight, Check, ChevronRight, Clock, HelpCircle, KeyRound, ListChecks, ShieldCheck, X } from "lucide-react"
 import type { AwaitingHint, PendingAsk, TranscriptEdit, TranscriptMessage } from "@fray-ui/shared"
@@ -6,7 +6,7 @@ import { store, threadBySlug, pushDrawer, pushSubAgentDrawer, showToast } from "
 import { useBoard, useTranscript, useSocketTranscripts, type ChatMessage } from "../hooks.ts"
 import { rpc } from "../api/rpc.ts"
 import { displayTitle } from "../groups.ts"
-import { mdToHtml } from "../lib/markdown.ts"
+import { mdToHtml, stripFrontmatter } from "../lib/markdown.ts"
 import { splitProseImages } from "../lib/imagePaths.ts"
 import { DiffBlock, PathLink } from "./DiffBlock.tsx"
 import { splitQuestionBlocks, parseQuestionBlock, type QuestionKind, type BlockAnswer, type MessageAnswering } from "../lib/questionBlocks.ts"
@@ -282,6 +282,13 @@ export function ThreadHeader({ slug, tab, onTab, onStatusApplied, onClose }: { s
   const board = useBoard()
   const thread = threadBySlug(board, slug)
   const markComplete = useMutation({ mutationFn: () => rpc.markComplete({ slug }) })
+  // The "Fray document" header affordance opens .fray/<slug>.md (threadBody). Many session threads have
+  // no such file — their working doc is the scratchpad (the Doc tab) — so the button would dead-end on
+  // "No thread file found". Gate it on the doc actually having body content (same stripFrontmatter the
+  // drawer renders through), so it shows iff there's a real doc to open. Shares the drawer's cached query
+  // (identical key), so opening the drawer adds no extra round-trip.
+  const docQ = useQuery({ queryKey: ["threadBody", slug], queryFn: () => rpc.threadBody({ slug }) })
+  const hasDoc = stripFrontmatter(docQ.data?.markdown ?? "").trim().length > 0
   if (!thread) return null
   const showTerminal = thread.foreign !== true // no tmux session we own to attach for a foreign thread
   const showScratch = !!thread.scratchpadPath
@@ -299,7 +306,7 @@ export function ThreadHeader({ slug, tab, onTab, onStatusApplied, onClose }: { s
       </div>
       <HeaderActions
         thread={thread}
-        onDoc={() => pushDrawer("doc", thread.id)}
+        onDoc={hasDoc ? () => pushDrawer("doc", thread.id) : undefined}
         onDone={() => markComplete.mutate(undefined, { onSuccess: onStatusApplied })}
         doneBusy={markComplete.isPending}
         onStatusApplied={onStatusApplied}
@@ -930,6 +937,7 @@ export const Message = memo(function Message({ m, answering, dense, paired, onAr
             fenceKind={fseg.fenceKind}
             body={fseg.body}
             hints={fseg.hints}
+            wrap={dense}
             onArchive={fseg.fenceKind === "done" ? onArchive : undefined}
           />,
         )
@@ -938,7 +946,7 @@ export const Message = memo(function Message({ m, answering, dense, paired, onAr
       for (const [si, seg] of splitQuestionBlocks(fseg.text).entries()) {
         if (seg.kind === "prose") {
           for (const [j, p] of splitProseImages(seg.text).entries()) {
-            blocks.push(p.kind === "image" ? <BlockImage key={`${keyBase}-${fi}-p${si}-${j}`} path={p.path} /> : <ProseHtml key={`${keyBase}-${fi}-p${si}-${j}`} md={p.text} />)
+            blocks.push(p.kind === "image" ? <BlockImage key={`${keyBase}-${fi}-p${si}-${j}`} path={p.path} /> : <ProseHtml key={`${keyBase}-${fi}-p${si}-${j}`} md={p.text} wrap={dense} />)
           }
           continue
         }
@@ -952,7 +960,7 @@ export const Message = memo(function Message({ m, answering, dense, paired, onAr
               onSubmit: answering.onSubmit,
             }
           : undefined
-        blocks.push(<QuestionBlockCard key={`${keyBase}-${fi}-q${si}`} raw={seg.text} questionKind={seg.questionKind} danger={seg.danger} interactive={interactive} />)
+        blocks.push(<QuestionBlockCard key={`${keyBase}-${fi}-q${si}`} raw={seg.text} questionKind={seg.questionKind} danger={seg.danger} interactive={interactive} wrap={dense} />)
       }
     }
   }
@@ -1029,10 +1037,18 @@ function AnswersCard({ answers, queued }: { answers: PairedAnswer[]; queued?: bo
   )
 }
 
-function ProseHtml({ md }: { md: string }) {
+// Queue cards live in the narrow needs-you rail, so a worker message carrying a long UNBREAKABLE token
+// — a Windows path, a box-drawing error dump — must wrap at the character level rather than bleed past
+// the card edge (maintainer 2026-07-10: it "looks so bad"). Applied ONLY in the dense (queue) surface:
+// `overflow-wrap:anywhere` breaks unbreakable PROSE runs to fit, and code fences additionally get
+// `whitespace-pre-wrap` + `break-all` so their long lines wrap INSIDE the <pre> instead of forcing the
+// horizontal scroll/overflow. The roomier thread view keeps its scroll-on-overflow default (wrap=false).
+const QUEUE_WRAP = "[overflow-wrap:anywhere] [&_pre]:whitespace-pre-wrap [&_pre]:break-all"
+
+function ProseHtml({ md, wrap }: { md: string; wrap?: boolean }) {
   const html = useMemo(() => mdToHtml(md), [md])
   if (!html) return null
-  return <div className="md-body" dangerouslySetInnerHTML={{ __html: html }} />
+  return <div className={`md-body${wrap ? ` ${QUEUE_WRAP}` : ""}`} dangerouslySetInnerHTML={{ __html: html }} />
 }
 
 // A local absolute image path rendered inline via the gated /local-image route: rounded, bordered,
@@ -1076,11 +1092,13 @@ function QuestionBlockCard({
   questionKind,
   danger,
   interactive,
+  wrap,
 }: {
   raw: string
   questionKind: QuestionKind
   danger?: boolean
   interactive?: BlockInteractive
+  wrap?: boolean
 }) {
   const parsed = useMemo(() => parseQuestionBlock(raw, questionKind, danger), [raw, questionKind, danger])
   const html = useMemo(() => mdToHtml(parsed.contextMd), [parsed.contextMd])
@@ -1091,6 +1109,19 @@ function QuestionBlockCard({
   const chosen = interactive?.answer.chosen ?? null
   const chosenSet = interactive?.answer.chosenSet ?? []
   const freetext = interactive?.answer.text ?? ""
+  // The free-text answer is an AUTO-EXPANDING textarea (not a fixed one-line input): reset to `auto`
+  // so it can SHRINK when text is deleted, then lock to the content height so the box grows line-by-line
+  // as the answer is typed. Runs on every freetext change (incl. an external clear via a chip-click).
+  const taRef = useRef<HTMLTextAreaElement>(null)
+  useLayoutEffect(() => {
+    const ta = taRef.current
+    if (!ta) return
+    ta.style.height = "auto"
+    // box-sizing is border-box (Tailwind preflight), so the style height must INCLUDE the borders —
+    // else clientHeight lands a couple px short of scrollHeight and the last line clips (overflow is
+    // hidden). `offsetHeight - clientHeight` is the vertical border delta measured at height:auto.
+    ta.style.height = `${ta.scrollHeight + ta.offsetHeight - ta.clientHeight}px`
+  }, [freetext])
   const KindIcon = isDanger ? AlertTriangle : isMulti ? ListChecks : isApproval ? ShieldCheck : HelpCircle
   const kindLabel = isMulti ? "select multiple" : isApproval ? "approval" : "question"
   return (
@@ -1099,9 +1130,12 @@ function QuestionBlockCard({
         <KindIcon size={11} className="shrink-0" />
         {kindLabel}
       </div>
-      {html && <div className="md-body" dangerouslySetInnerHTML={{ __html: html }} />}
+      {html && <div className={`md-body${wrap ? ` ${QUEUE_WRAP}` : ""}`} dangerouslySetInnerHTML={{ __html: html }} />}
       {(parsed.options.length > 0 || interactive) && (
-        <div className="mt-2 flex flex-col gap-1.5">
+        // Options stack in a SINGLE full-width column (maintainer 2026-07-10: a 2-col grid read as
+        // ragged, uneven columns with dead whitespace once option text got long). One chip per row;
+        // the free-text row keeps col-span-full so the "something else…" answer gets the whole line.
+        <div className="mt-2 grid grid-cols-1 gap-1.5">
           {parsed.options.map((opt, i) => (
             <Chip
               key={i}
@@ -1123,14 +1157,18 @@ function QuestionBlockCard({
                 // live at once (chips + a color note coexist), so leave the input focused there.
                 if (isMulti) return
                 const ae = document.activeElement as HTMLElement | null
-                if (ae?.tagName === "INPUT" && ae.dataset.surface === "queueComposer") ae.blur()
+                if (ae?.tagName === "TEXTAREA" && ae.dataset.surface === "queueComposer") ae.blur()
               }}
             />
           ))}
-          {/* The free-text answer IS the final option in the choice list — same row shape as a chip. */}
+          {/* The free-text answer IS the final option — but it SPANS THE FULL WIDTH (col-span-full)
+              below the multi-column options, and is an auto-growing textarea (see taRef effect above)
+              rather than a one-line input, so a long "something else…" answer stays fully visible. */}
           {interactive && (
-            <input
-              // Tagged so the chip-click blur above can identify this input. Escape BLURS (climb out,
+            <textarea
+              ref={taRef}
+              rows={1}
+              // Tagged so the chip-click blur above can identify this box. Escape BLURS (climb out,
               // same semantics as the shared Composer) and must NOT bubble — the window handler would
               // pop the enclosing drawer mid-answer. Every key stops here.
               data-surface="queueComposer"
@@ -1157,9 +1195,11 @@ function QuestionBlockCard({
               placeholder={
                 isMulti ? "Add a note…" : parsed.options.length ? `${nextOptionId(parsed.options)} Something else…` : "Type your answer…"
               }
-              // Styled as the FINAL option row (same shape/type as a chip). Focus or content = the
-              // accent border (the selection lives HERE now); the tinted bg marks an actual answer.
-              className={`w-full rounded-md border px-2.5 py-1.5 text-[12px] leading-snug text-fg/90 outline-none placeholder:text-muted/80 transition-colors ${
+              // Styled as the FINAL option row (same shape as a chip) that SPANS both grid columns.
+              // resize-none + overflow-hidden hand height control to the auto-grow effect (no manual
+              // drag handle, no inner scrollbar). Focus or content = the accent border (the selection
+              // lives HERE now); the tinted bg marks an actual answer.
+              className={`col-span-full w-full resize-none overflow-hidden rounded-md border px-2.5 py-1.5 text-[12px] leading-snug text-fg/90 outline-none placeholder:text-muted/80 transition-colors ${
                 freetext.trim() ? "border-accent bg-accent/10" : "border-border bg-transparent hover:bg-panel-2 focus:border-accent"
               }`}
             />
@@ -1180,7 +1220,7 @@ function QuestionBlockCard({
 // archiver — the fence itself mutates nothing. `awaiting` → a quiet machine-wait card: the body prose
 // plus hint chips (pr/ci/timer/session) parsed from the fence body. Historical fences render the same
 // cards without the Archive button (onArchive undefined).
-function FenceCard({ fenceKind, body, hints, onArchive }: { fenceKind: FenceKind; body: string; hints: AwaitingHint[]; onArchive?: () => void }) {
+function FenceCard({ fenceKind, body, hints, wrap, onArchive }: { fenceKind: FenceKind; body: string; hints: AwaitingHint[]; wrap?: boolean; onArchive?: () => void }) {
   const html = useMemo(() => (body ? mdToHtml(body) : ""), [body])
   if (fenceKind === "done") {
     return (
@@ -1191,7 +1231,7 @@ function FenceCard({ fenceKind, body, hints, onArchive }: { fenceKind: FenceKind
         <div className="mb-1.5 flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-muted/70">
           <Check size={12} className="shrink-0" /> Done
         </div>
-        {html && <div className="md-body" dangerouslySetInnerHTML={{ __html: html }} />}
+        {html && <div className={`md-body${wrap ? ` ${QUEUE_WRAP}` : ""}`} dangerouslySetInnerHTML={{ __html: html }} />}
         {onArchive && (
           <div className="mt-3 flex justify-end">
             <button
@@ -1211,7 +1251,7 @@ function FenceCard({ fenceKind, body, hints, onArchive }: { fenceKind: FenceKind
       <div className="mb-1.5 flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-muted/70">
         <Clock size={12} className="shrink-0" /> Awaiting
       </div>
-      {html && <div className="md-body" dangerouslySetInnerHTML={{ __html: html }} />}
+      {html && <div className={`md-body${wrap ? ` ${QUEUE_WRAP}` : ""}`} dangerouslySetInnerHTML={{ __html: html }} />}
       {hints.length > 0 && (
         <div className="mt-2 flex flex-wrap gap-1.5">
           {hints.map((h, i) => (

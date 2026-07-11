@@ -1,6 +1,6 @@
 import { useState, type ComponentType } from "react"
 import { useMutation, useQuery } from "@tanstack/react-query"
-import { Check, Github, Inbox, Loader2, MessageSquare, Triangle } from "lucide-react"
+import { Check, CircleCheck, CircleDot, GitMerge, GitPullRequest, GitPullRequestClosed, GitPullRequestDraft, Github, Inbox, Loader2, MessageSquare } from "lucide-react"
 import { PermissionMode, type GithubItem } from "@fray-ui/shared"
 import { rpc } from "../api/rpc.ts"
 import { showToast } from "../store.ts"
@@ -192,7 +192,7 @@ export function GithubPickerModal({ onClose }: { onClose: () => void }) {
               className="flex items-center gap-2 rounded-md bg-fg px-3.5 py-1.5 text-[12.5px] font-medium text-bg outline-none transition-all hover:opacity-90 active:scale-95 disabled:opacity-30 disabled:hover:opacity-30"
             >
               {dispatch.isPending && <Loader2 size={13} className="animate-spin" />}
-              {n === 0 ? "Dispatch threads" : `Dispatch ${n} thread${n === 1 ? "" : "s"}`}
+              {n === 1 ? "Start investigation" : "Start investigations"}
             </button>
           </div>
         </div>
@@ -230,29 +230,111 @@ function Segmented<T extends string>({
   )
 }
 
-// One issue/PR row: the rounded-rect checkbox (Sidebar's StatusBox idiom), the #number, the title, and
-// the comments/reactions badges (shown only when non-zero). Clicking anywhere on the row toggles it.
-function Row({ item, checked, onToggle }: { item: GithubItem; checked: boolean; onToggle: () => void }) {
+// GitHub's own issue/PR state glyph — green open-dot for an open issue, purple merge for a merged PR,
+// etc. Mirrors github.com so the row reads the same at a glance. Defaults to the open glyph if state
+// is absent (the picker lists OPEN items, so that's the common case).
+function StateIcon({ item }: { item: GithubItem }) {
+  const st = (item.state ?? "OPEN").toUpperCase()
+  if (item.kind === "pr") {
+    if (st === "MERGED") return <GitMerge size={15} className="shrink-0 text-purple-400" />
+    if (st === "CLOSED") return <GitPullRequestClosed size={15} className="shrink-0 text-red-400" />
+    if (item.isDraft) return <GitPullRequestDraft size={15} className="shrink-0 text-muted/70" />
+    return <GitPullRequest size={15} className="shrink-0 text-emerald-500" />
+  }
+  if (st === "CLOSED") return <CircleCheck size={15} className="shrink-0 text-purple-400" />
+  return <CircleDot size={15} className="shrink-0 text-emerald-500" />
+}
+
+// Compact "opened <ago>" relative time (github-ish: 8h ago, 3d ago). Empty when the timestamp is absent.
+function relTime(iso?: string): string {
+  if (!iso) return ""
+  const t = Date.parse(iso)
+  if (!Number.isFinite(t)) return ""
+  const s = Math.max(0, (Date.now() - t) / 1000)
+  const mn = s / 60
+  const h = mn / 60
+  const d = h / 24
+  if (s < 45) return "just now"
+  if (mn < 60) return `${Math.round(mn)}m ago`
+  if (h < 24) return `${Math.round(h)}h ago`
+  if (d < 30) return `${Math.round(d)}d ago`
+  if (d < 365) return `${Math.round(d / 30)}mo ago`
+  return `${Math.round(d / 365)}y ago`
+}
+
+// A github-style label chip: the label's own color as outline + text on a faint tint. Truncates long names.
+function LabelChip({ name, color }: { name: string; color: string }) {
+  const hex = /^[0-9a-fA-F]{6}$/.test(color) ? `#${color}` : undefined
   return (
-    <button
-      onClick={onToggle}
-      onMouseDown={(e) => e.preventDefault()}
-      className="group flex w-full items-start gap-3 border-b border-border/40 px-3 py-2.5 text-left outline-none transition-colors last:border-b-0 hover:bg-white/[0.03]"
+    <span
+      className="max-w-[130px] shrink-0 truncate rounded-full border px-1.5 py-px text-[9.5px] leading-[13px]"
+      style={hex ? { borderColor: `${hex}59`, color: hex, backgroundColor: `${hex}14` } : undefined}
+      title={name}
     >
-      <span className="mt-[1.5px] shrink-0">
+      {name}
+    </span>
+  )
+}
+
+// One issue/PR row, mirroring github.com: the select checkbox, the state glyph, the title (a LINK OUT)
+// with its label chips, a metadata line "#N · author opened <ago>", and the comment/reaction badges on
+// the right. Clicking the row toggles selection; clicking the title or the #number opens GitHub.
+function Row({ item, checked, onToggle }: { item: GithubItem; checked: boolean; onToggle: () => void }) {
+  const opened = relTime(item.createdAt)
+  const meta = [item.author, opened ? `opened ${opened}` : ""].filter(Boolean).join(" ")
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={onToggle}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault()
+          onToggle()
+        }
+      }}
+      className="group flex w-full cursor-pointer items-start gap-2.5 border-b border-border/40 px-3 py-2.5 text-left outline-none transition-colors last:border-b-0 hover:bg-white/[0.03]"
+    >
+      <span className="mt-px shrink-0">
         <Checkbox checked={checked} />
       </span>
-      <span className="flex min-w-0 flex-1 items-baseline gap-2">
-        <span className="shrink-0 tabular-nums text-[12px] text-muted/70">#{item.number}</span>
-        <span className="min-w-0 flex-1 truncate text-[13px] text-fg/90" title={item.title}>
-          {item.title}
+      <span className="mt-px">
+        <StateIcon item={item} />
+      </span>
+      <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+        <span className="flex min-w-0 items-center gap-1.5">
+          <a
+            href={item.url}
+            target="_blank"
+            rel="noreferrer noopener"
+            onClick={(e) => e.stopPropagation()}
+            title={item.title}
+            className="min-w-0 truncate text-[13px] font-medium text-fg/90 hover:underline"
+          >
+            {item.title}
+          </a>
+          {item.labels.slice(0, 4).map((l) => (
+            <LabelChip key={l.name} name={l.name} color={l.color} />
+          ))}
+        </span>
+        <span className="flex items-center gap-1 text-[11px] text-muted/55">
+          <a
+            href={item.url}
+            target="_blank"
+            rel="noreferrer noopener"
+            onClick={(e) => e.stopPropagation()}
+            className="shrink-0 tabular-nums hover:text-muted hover:underline"
+          >
+            #{item.number}
+          </a>
+          {meta ? <span className="truncate">· {meta}</span> : null}
         </span>
       </span>
-      <span className="mt-[1px] flex shrink-0 items-center gap-2.5 text-[11.5px] text-muted/70">
+      <span className="mt-px flex shrink-0 items-center gap-2.5 text-[11.5px] text-muted/70">
         {item.comments ? <Badge icon={MessageSquare} n={item.comments} label="comments" /> : null}
-        {item.reactions ? <Badge icon={Triangle} n={item.reactions} label="reactions" filled /> : null}
+        {item.reactions ? <Badge emoji="👍" n={item.reactions} label="reactions" /> : null}
       </span>
-    </button>
+    </div>
   )
 }
 
@@ -272,22 +354,22 @@ function Checkbox({ checked }: { checked: boolean }) {
   )
 }
 
-// A count badge (comments / reactions). The reaction badge uses a filled triangle (▲) as the "score"
-// mark; comments a message glyph. `title` names it on hover so the icons never read as cryptic.
+// A count badge (comments / reactions). Comments use a monochrome message glyph (mirrors github.com);
+// reactions use the literal 👍 emoji (maintainer 2026-07-10 — not the old triangle). `title` names it.
 function Badge({
   icon: Icon,
+  emoji,
   n,
   label,
-  filled,
 }: {
-  icon: ComponentType<{ size?: number; className?: string; strokeWidth?: number }>
+  icon?: ComponentType<{ size?: number; className?: string; strokeWidth?: number }>
+  emoji?: string
   n: number
   label: string
-  filled?: boolean
 }) {
   return (
     <span className="inline-flex items-center gap-1 tabular-nums" title={`${n} ${label}`}>
-      <Icon size={12} strokeWidth={filled ? 0 : 2} className={filled ? "fill-current" : ""} />
+      {emoji ? <span aria-hidden className="text-[11px] leading-none">{emoji}</span> : Icon ? <Icon size={12} strokeWidth={2} /> : null}
       {n}
     </span>
   )

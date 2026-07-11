@@ -1,11 +1,11 @@
 import { useState, type ComponentType } from "react"
-import { useMutation } from "@tanstack/react-query"
-import { Archive, ArrowUpRight, Ban, ChevronsDownUp, ChevronsUpDown, FileText, Loader2, RefreshCw, RotateCcw } from "lucide-react"
+import { Archive, ArrowUpRight, ChevronsDownUp, ChevronsUpDown, FileText, Loader2, RefreshCw, RotateCcw, Trash2 } from "lucide-react"
 import type { ThreadView } from "@fray-ui/shared"
 import { rpc } from "../api/rpc.ts"
 import { showToast } from "../store.ts"
 import { Tooltip } from "./Tooltip.tsx"
 import { MarkAsButton } from "./MarkAsButton.tsx"
+import { canDismiss } from "../lib/status.ts"
 
 // THE shared whole-thread action icons, rendered IDENTICALLY by the queue card header and the thread
 // header so the two can never drift. Order left→right runs least→most important, so the primary verb
@@ -43,14 +43,13 @@ export function HeaderActions({
   const isSession = thread.kind === "session"
   const isForeign = thread.foreign === true
   const archived = thread.state === "archived"
-  const live = thread.runtime === "running" || thread.runtime === "spawning" || thread.runtime === "turn-idle" || thread.runtime === "perm-prompt"
-  const renameLive = thread.runtime !== "none" && thread.runtime !== "exited"
-
-  const kill = useMutation({
-    mutationFn: () => rpc.killAgent({ slug: thread.id }),
-    onSuccess: () => showToast("Killing session…"),
-    onError: (e) => showToast(`Kill failed: ${(e as Error).message.slice(0, 60)}`),
-  })
+  // /rename injects a slash-command into the live session — only safe when the agent is AT THE PROMPT
+  // (turn-idle). Firing it mid-turn (running/spawning) or on a permission prompt would queue behind the
+  // turn or be swallowed as the prompt's answer, never round-tripping into a fresh title. Gating on idle
+  // also degrades honestly for a busy/drifted thread (e.g. a compacted session whose transcript never
+  // landed on disk) — the button disables instead of firing a "Renaming…" toast that never completes.
+  // The doc-side round-trip still depends on the tailer reading that transcript; see session-transcript-drift.
+  const renameReady = thread.runtime === "turn-idle"
 
   return (
     <div className="flex shrink-0 items-center gap-0.5">
@@ -65,28 +64,28 @@ export function HeaderActions({
       {/* Rename: registered threads only (a foreign session has no session we own to rename). */}
       {!isForeign && (
         <IconBtn
-          label="Regenerate name"
+          label={renameReady ? "Regenerate name" : "Regenerate name (agent must be idle)"}
           icon={RefreshCw}
           size={13}
-          disabled={!renameLive}
-          onClick={() => rpc.renameThread({ slug: thread.id }).then(() => showToast("Renaming…")).catch(() => {})}
+          disabled={!renameReady}
+          onClick={() =>
+            rpc
+              .renameThread({ slug: thread.id })
+              .then(() => showToast("Renaming…"))
+              .catch((e) => showToast(`Rename failed: ${(e as Error).message.slice(0, 60)}`))
+          }
         />
       )}
       {onDoc && <IconBtn label="Fray document" icon={FileText} size={14} onClick={onDoc} />}
       {onOpen && <IconBtn label="Open thread" icon={ArrowUpRight} size={14} onClick={onOpen} />}
       {isSession ? (
-        // Session verbs. A foreign session is read-only → no Kill/Archive.
+        // Session verbs — a foreign session is read-only → no Archive. NO Kill button (the maintainer
+        // never approved one; Archive/Reopen is the lifecycle verb). Dismiss (hard-delete) sits left of
+        // Archive and shows ONLY for a stalled/exited row — the escape hatch for a phantom that Archive
+        // would only shelve into Inactive, never remove.
         !isForeign && (
           <>
-            {live && (
-              <IconBtn
-                label="Kill session"
-                icon={Ban}
-                size={14}
-                busy={kill.isPending}
-                onClick={() => kill.mutate()}
-              />
-            )}
+            {canDismiss(thread) && <DismissButton slug={thread.id} onDismissed={onStatusApplied} />}
             <StateButton slug={thread.id} archived={archived} onArchived={onStatusApplied} />
           </>
         )
@@ -133,6 +132,39 @@ function StateButton({ slug, archived, onArchived }: { slug: string; archived: b
       {busy ? <Loader2 size={12} className="animate-spin" /> : <Icon size={12} />}
       {archived ? "Reopen" : "Archive"}
     </button>
+  )
+}
+
+// The Dismiss verb: hard-delete a stalled/exited session (rpc.forgetThread) — the row is removed and its
+// transcript tombstoned so it stays gone across a rescan. On success it fires `onDismissed` (the same
+// resolve callback Archive uses) so the surface closes: a queue card collapses, a thread drawer slides
+// out. Rendered iff canDismiss(thread); the server re-checks liveness and rejects a live row.
+function DismissButton({ slug, onDismissed }: { slug: string; onDismissed?: () => void }) {
+  const [busy, setBusy] = useState(false)
+  const apply = () => {
+    setBusy(true)
+    rpc
+      .forgetThread({ slug })
+      .then(() => {
+        showToast("Dismissed")
+        onDismissed?.()
+      })
+      .catch((e) => showToast(`Failed: ${(e as Error).message.slice(0, 60)}`))
+      .finally(() => setBusy(false))
+  }
+  return (
+    <Tooltip label="Dismiss — permanently remove this stalled session">
+      <button
+        onClick={apply}
+        disabled={busy}
+        aria-label="Dismiss session"
+        onMouseDown={(e) => e.preventDefault()}
+        className="ml-1 flex items-center gap-1.5 rounded-md border border-border-strong bg-panel-2 px-2.5 py-1 text-[12px] font-medium text-muted outline-none transition-colors hover:bg-elevated hover:text-red-400 disabled:opacity-50"
+      >
+        {busy ? <Loader2 size={12} className="animate-spin" /> : <Trash2 size={12} />}
+        Dismiss
+      </button>
+    </Tooltip>
   )
 }
 

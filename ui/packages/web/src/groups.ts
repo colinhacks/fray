@@ -7,10 +7,11 @@ import type { ThreadView } from "@fray-ui/shared"
 // exists, else the dispatch title. One place so every render site (sidebar, palette, header) agrees.
 // Typed to just the two fields it reads so it accepts a valtio readonly snapshot as readily as a
 // plain ThreadView.
-export function displayTitle(t: Pick<ThreadView, "title" | "aiTitle" | "id" | "titleAuto">): string {
-  // A machine-guessed dispatch title (titleAuto) with no aiTitle yet is NOT a real name — never show
-  // the guess (maintainer 2026-07-10: "do not try to guess at the thread title"). Show a placeholder
-  // until Claude's own ai-title lands; the sidebar dims it via titleIsProvisional.
+export function displayTitle(t: Pick<ThreadView, "title" | "aiTitle" | "id" | "titleAuto" | "spawnedAt">): string {
+  // A machine-guessed dispatch title (titleAuto) with no aiTitle yet is NOT a real name — show the
+  // "Spinning up…" placeholder while the session is genuinely just spinning up (maintainer 2026-07-10:
+  // "do not try to guess at the thread title"). But that's BOUNDED (see titleIsProvisional): a session
+  // that never yields an aiTitle must fall back to the dispatch title, not stick on "Spinning up…".
   if (titleIsProvisional(t)) return SPINNING_UP_TITLE
   // aiTitle first, then the dispatch title; a session row can carry title "" with no aiTitle yet, so
   // fall back to the slug/id (a bare thread never renders as an empty row).
@@ -20,10 +21,19 @@ export function displayTitle(t: Pick<ThreadView, "title" | "aiTitle" | "id" | "t
 // The placeholder shown (dimmed) while a freshly-dispatched thread has only a machine-guessed title.
 export const SPINNING_UP_TITLE = "Spinning up a thread…"
 
-// A title is PROVISIONAL when it's the auto-guessed dispatch slug and Claude hasn't renamed the
-// session yet (titleAuto && no aiTitle). Absent titleAuto (legacy/slim/foreign row) ⇒ never provisional.
-export function titleIsProvisional(t: Pick<ThreadView, "aiTitle" | "titleAuto">): boolean {
-  return !!t.titleAuto && !t.aiTitle
+// "Spinning up…" is a BRIEF placeholder for the window between dispatch and Claude naming the session.
+const SPIN_UP_MS = 60_000
+
+// A title is PROVISIONAL when it's the auto-guessed dispatch slug, Claude hasn't named the session yet
+// (titleAuto && no aiTitle), AND the dispatch is still WITHIN the spin-up window. The time bound is
+// load-bearing: a long session that compacts gets a NEW transcript id, so fray (still tracking the
+// pinned id) loses the transcript and never sees an aiTitle — without the bound the row would stick on
+// "Spinning up…" forever (maintainer 2026-07-10). After the window it falls back to the dispatch title.
+// Root cause of the lost transcript is tracked separately ([[session-transcript-drift]]).
+export function titleIsProvisional(t: Pick<ThreadView, "aiTitle" | "titleAuto" | "spawnedAt">): boolean {
+  if (!t.titleAuto || t.aiTitle) return false
+  const spawned = Date.parse(t.spawnedAt ?? "")
+  return Number.isFinite(spawned) && Date.now() - spawned < SPIN_UP_MS
 }
 
 // A thread "needs action" when it is genuinely waiting on the human — and ONLY once the agent has
@@ -149,18 +159,19 @@ export function foreignThreads(threads: readonly ThreadView[]): ThreadView[] {
 // ── SIDEBAR SECTIONS (session-first) ───────────────────────────────────────────────────────────────
 // The rail's THREAD-derived sections, keyed on the session-first model (NOT fray status). Every thread
 // row lands in exactly one of these; the Plans section is separate (from board.plans, not threads).
-//   • needsYou — the queue: server-derived t.needsYou (the primary attention band).
-//   • working  — open session work in motion OR at rest without an excusal (a done-fenced-at-rest row
-//                lives here too, with a quiet done adornment — the done fence mutates nothing).
-//   • awaiting — open, unexcused-by-you, machine-waiting: at rest with an ```awaiting fence.
-//   • inactive — state === "archived" (the only archiver is an explicit Archive / done-card button).
-//   • legacy   — kind !== "session": vestigial .fray-file rows, a collapsed read-only shelf.
-// A FOREIGN session row (a maintainer terminal — no registry row, so no state/needsYou) sorts into
-// working/awaiting like any open session, just read-only. Order within a section is interaction recency.
-export type SectionKey = "active" | "inactive"
+//   • active           — open session work: running, needs-you, bare rest, done-fenced, OR awaiting its
+//                        OWN sub-agents (internal work) / another session. Never dimmed as a band.
+//   • awaitingExternal — open, AT REST behind an ```awaiting fence whose primary hint is pr/ci/timer AND
+//                        no live sub-agents: genuinely blocked on an EXTERNAL event. Its own DIMMED band
+//                        between Active and Inactive (maintainer 2026-07-10).
+//   • inactive         — state === "archived" (the only archiver is an explicit Archive / done-card button).
+//   • legacy           — kind !== "session": vestigial .fray-file rows, hidden entirely (null).
+// A FOREIGN session row (a maintainer terminal — no registry row, so no state/needsYou) is dropped
+// entirely (never rows). Order within a section is interaction recency.
+export type SectionKey = "active" | "awaitingExternal" | "inactive"
 // Thread-derived buckets, in render order. The Plans section (board.plans) is interleaved by the
-// Sidebar between `awaiting` and `archive`; it has no thread bucket here.
-export const SECTION_ORDER: readonly SectionKey[] = ["active", "inactive"]
+// Sidebar after the thread buckets; it has no thread bucket here.
+export const SECTION_ORDER: readonly SectionKey[] = ["active", "awaitingExternal", "inactive"]
 
 // A session process is "at rest" (off-turn) when the pane is idle or the session has exited — the gate
 // an awaiting excusal needs (a mid-turn worker is still working, never awaiting).
@@ -168,13 +179,41 @@ function atRest(t: ThreadView): boolean {
   return t.runtime === "turn-idle" || t.runtime === "exited"
 }
 
-// MACHINE-WAITING (a.k.a. "blocked"): at rest behind an ```awaiting fence — the thread declared it is
-// parked on a machine (CI, a PR review/merge, a timer, another session), not on you and not still
-// working. These get the de-emphasized treatment the maintainer asked for (2026-07-10): the clock-hands
-// indicator, a dimmed label, and a sink to the BOTTOM of the Active list. NB: this requires the worker
-// to actually emit the fence — a thread that rests bare (prose only) reads as idle/done, not waiting.
-export function isMachineWaiting(t: ThreadView): boolean {
+// DECLARED MACHINE-WAIT: at rest behind an ```awaiting fence — the thread ITSELF declared it is parked
+// on a machine (CI, a PR review/merge, a timer, another session), not on you and not still working. The
+// RAW signal; the banding below refines it into external-vs-internal. NB: this requires the worker to
+// actually emit the fence — a thread that rests bare (prose only) reads as idle/waiting, not declared.
+function isDeclaredAwaiting(t: ThreadView): boolean {
   return atRest(t) && t.lastFence?.kind === "awaiting"
+}
+
+// INTERNAL WORK: a thread with a LIVE sub-agent is awaiting its OWN dispatched child — not an external
+// event — so it is a fully ACTIVE thread and must never be dimmed (maintainer 2026-07-10: "when an
+// agent is merely awaiting its own sub-agents, we should NOT dim it — that's the differentiator").
+function hasLiveSubAgents(t: ThreadView): boolean {
+  return (t.subAgents ?? []).some((s) => s.state === "running")
+}
+
+// AWAITING-EXTERNAL: the thread is genuinely blocked on an EXTERNAL, scheduler-actionable gate — a
+// declared ```awaiting fence at rest whose PRIMARY hint is pr / ci / timer — AND it has no live
+// sub-agents. This is the ONLY set that earns the dedicated DIMMED band between Active and Inactive
+// (maintainer 2026-07-10: give the truly-external waiters their own band). Excluded on purpose, all
+// staying in Active undimmed: a bare rest (no fence), a `session` hint (waiting on another fray session
+// reads as internal/ambiguous → treat as Active), and anything with a live sub-agent (internal work —
+// hasLiveSubAgents keeps it Active even with a stale awaiting fence).
+export function isAwaitingExternal(t: ThreadView): boolean {
+  if (!isDeclaredAwaiting(t) || hasLiveSubAgents(t)) return false
+  const hk = t.lastFence?.hints[0]?.kind
+  return hk === "pr" || hk === "ci" || hk === "timer"
+}
+
+// ACTIVELY RUNNING: a live session with work in flight — exactly the states the sidebar renders with a
+// spinner (running/spawning, or turn-idle while a dispatched sub-agent is still going). A running thread
+// must NEVER be filed under Inactive, even when its row is archived (maintainer 2026-07-10, hit 3×: a
+// bumped-then-resumed archived thread showed a spinner under Inactive).
+export function isActivelyRunning(t: ThreadView): boolean {
+  if (t.runtime === "running" || t.runtime === "spawning") return true
+  return t.runtime === "turn-idle" && hasLiveSubAgents(t)
 }
 
 export function sectionOf(t: ThreadView): SectionKey | null {
@@ -184,34 +223,46 @@ export function sectionOf(t: ThreadView): SectionKey | null {
   // distinction still renders — as the row INDICATOR and the queue cards — just not as sections.
   // Legacy (.fray-file) rows are HIDDEN entirely (null; not even a shelf). Foreign never rows.
   if (t.kind !== "session") return null
-  if (t.state === "archived") return "inactive"
+  // Archived → Inactive, UNLESS it's actively running: a live, in-flight session must never sit in
+  // Inactive (maintainer, hit 3×). It shows in Active with its spinner while it works, and drops back
+  // to Inactive only once it comes to rest still-archived. (A user BUMP un-archives it for good via
+  // resume; this is the display safety net for a running-yet-archived session.)
+  if (t.state === "archived" && !isActivelyRunning(t)) return "inactive"
+  // The EXTERNAL waiters (pr/ci/timer awaiting, no live subs) split out into their own dimmed band.
+  // Everything else open — running, needs-you, bare rest, done-fenced, awaiting-its-own-subs, or an
+  // awaiting `session`/hintless wait — is Active.
+  if (isAwaitingExternal(t)) return "awaitingExternal"
   return "active"
 }
 
-// The ACTIVE section's order: interaction-recency, EXCEPT machine-waiting (```awaiting) threads sink to
-// the bottom as a group (maintainer 2026-07-10: "waiting/blocked should always show up at the bottom of
-// the active list"). Within each group, interaction recency holds. New array; input untouched.
+// The ACTIVE section's order: interaction-recency, EXCEPT a DECLARED machine-wait that stayed in Active
+// (a `session`/hintless ```awaiting fence — the external pr/ci/timer waits live in their own band now)
+// sinks to the bottom as a group (maintainer 2026-07-10: "waiting/blocked should always show up at the
+// bottom of the active list"). Live work and live-sub-agent threads float on top; interaction recency
+// holds within each group. New array; input untouched.
 export function orderActive(threads: readonly ThreadView[]): ThreadView[] {
   return [...threads].sort((a, b) => {
-    const aw = isMachineWaiting(a) ? 1 : 0
-    const bw = isMachineWaiting(b) ? 1 : 0
-    if (aw !== bw) return aw - bw // waiting sinks below everything still in play
+    const aw = isDeclaredAwaiting(a) && !hasLiveSubAgents(a) ? 1 : 0
+    const bw = isDeclaredAwaiting(b) && !hasLiveSubAgents(b) ? 1 : 0
+    if (aw !== bw) return aw - bw // declared-waiting sinks below everything still in play
     const d = interactionAt(b) - interactionAt(a)
     return d !== 0 ? d : a.id.localeCompare(b.id)
   })
 }
 
-// Partition threads into the thread-derived sidebar sections. Active sinks machine-waiting rows to the
-// bottom (orderActive); inactive/archived is plain interaction recency.
+// Partition threads into the thread-derived sidebar sections. Active sinks its leftover declared-waiting
+// rows to the bottom (orderActive); awaitingExternal (the dimmed band) and inactive/archived are plain
+// interaction recency.
 export type SectionedThreads = Record<SectionKey, ThreadView[]>
 export function sectionThreads(threads: readonly ThreadView[]): SectionedThreads {
-  const out: SectionedThreads = { active: [], inactive: [] }
+  const out: SectionedThreads = { active: [], awaitingExternal: [], inactive: [] }
   for (const t of threads) {
     if (t.kind === "session" && t.foreign === true) continue // foreign sessions never row (nor strip — dropped)
     const k = sectionOf(t)
     if (k) out[k].push(t)
   }
   out.active = orderActive(out.active)
+  out.awaitingExternal = orderByInteraction(out.awaitingExternal)
   out.inactive = orderByInteraction(out.inactive)
   return out
 }

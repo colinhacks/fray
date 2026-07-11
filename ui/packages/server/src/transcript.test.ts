@@ -1,6 +1,11 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { parseTranscript } from "./transcript.ts"
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs"
+import { tmpdir, homedir } from "node:os"
+import { join } from "node:path"
+import { parseTranscript, readThreadTranscript } from "./transcript.ts"
+import { createStorage, type SessionRow } from "./storage.ts"
+import type { Project } from "./project.ts"
 
 // Build a minimal assistant JSONL record carrying one tool_use block.
 function toolLine(name: string, input: unknown): string {
@@ -327,4 +332,64 @@ test("a queued follow-up between assistant turns leaves the assistant cards inta
   )
   assert.equal(msgs.filter((m) => m.role === "user").length, 1) // one delivered human message…
   assert.equal(msgs.filter((m) => m.role === "assistant" && m.kind === undefined).length, 2) // …between two intact assistant turns
+})
+
+// ---- readThreadTranscript: transcript_id honoring + GATED discovery fallback (session-transcript-drift) ----
+// These exercise the real path resolution, which reads ~/.claude/projects/<cwdSlug>/<id>.jsonl. We use a
+// unique throwaway cwdSlug under the real log root and clean it up, so the test is hermetic in practice.
+
+const DGRACE_MS = 60_000
+function txHarness() {
+  const slug = `-tmp-fray-tx-test-${process.pid}-${Math.random().toString(36).slice(2, 8)}`
+  const logDir = join(homedir(), ".claude", "projects", slug)
+  mkdirSync(logDir, { recursive: true })
+  const store = createStorage(join(mkdtempSync(join(tmpdir(), "fray-tx-")), "ui.db"))
+  const project = { cwdSlug: slug } as unknown as Project
+  const writeJsonl = (id: string, lines: string[]) => writeFileSync(join(logDir, `${id}.jsonl`), lines.map((l) => l + "\n").join(""))
+  const cleanup = () => { try { rmSync(logDir, { recursive: true, force: true }) } catch { /* best-effort */ } }
+  return { slug, logDir, store, project, writeJsonl, cleanup }
+}
+function txRow(over: Partial<SessionRow>): SessionRow {
+  return { slug: "t", session_id: "sid", tmux_name: "fray-t", spawned_at: new Date().toISOString(), last_read_at: null, unread: 0, exited: 0, archived: 0, rested_at: null, title_auto: 0, title: null, state: "open", meta: null, seen_at: null, plan_path: null, transcript_id: null, ...over }
+}
+const USER_LINE = (text: string) => JSON.stringify({ type: "user", timestamp: "2026-07-10T18:00:00.000Z", message: { role: "user", content: text } })
+
+test("readThreadTranscript: honors a cached transcript_id over the pinned session_id", () => {
+  const h = txHarness()
+  try {
+    h.store.upsertSession(txRow({ transcript_id: "forked-x" }))
+    h.writeJsonl("forked-x", [USER_LINE("render me from the drifted file")])
+    // NO sid.jsonl written — resolution must pick the transcript_id file.
+    const msgs = readThreadTranscript(h.project, h.store, "t")
+    assert.equal(msgs.length, 1)
+    assert.equal(msgs[0].text, "render me from the drifted file")
+  } finally {
+    h.cleanup()
+  }
+})
+
+test("readThreadTranscript: within the spin-up grace, an empty pinned render does NOT trigger a discovery scan", () => {
+  const h = txHarness()
+  try {
+    // Fresh dispatch (spawned NOW) with no transcript yet, but a drifted file WITH the sentinel exists.
+    h.store.upsertSession(txRow({ spawned_at: new Date().toISOString() }))
+    h.writeJsonl("forked-y", [USER_LINE("Your scratchpad is `.fray/scratch/sid.md`. TASK:\nhi")])
+    const msgs = readThreadTranscript(h.project, h.store, "t")
+    assert.deepEqual(msgs, [], "within grace the fallback is gated off — returns the empty pinned render")
+  } finally {
+    h.cleanup()
+  }
+})
+
+test("readThreadTranscript: past grace, an empty pinned render discovers the drifted transcript by sentinel", () => {
+  const h = txHarness()
+  try {
+    h.store.upsertSession(txRow({ spawned_at: new Date(Date.now() - (DGRACE_MS + 5000)).toISOString() }))
+    h.writeJsonl("forked-z", [USER_LINE("scratchpad `.fray/scratch/sid.md` — work it")])
+    const msgs = readThreadTranscript(h.project, h.store, "t")
+    assert.equal(msgs.length, 1)
+    assert.ok(msgs[0].text.includes("work it"), "past grace the sentinel discovery re-links the drifted render")
+  } finally {
+    h.cleanup()
+  }
 })

@@ -13,7 +13,6 @@ import { Composer } from "./Composer.tsx"
 import { BackgroundOpsStrip } from "./ChatView.tsx"
 import { HeaderActions } from "./HeaderActions.tsx"
 import { DispatchForm } from "./NewThreadModal.tsx"
-import { GithubTrigger } from "./GithubTrigger.tsx"
 
 // The Queue: everything currently waiting on the human, rendered as a SCROLLING LIST of cards — every
 // pending item visible at once, one per card, in one vertical column that scrolls when it overflows.
@@ -116,10 +115,9 @@ export function TodosView() {
         // appears and this same box shunts to its top; this column then holds only the queue.
         <div className="w-full flex flex-col gap-3">
           <h2 className="text-[15px] font-medium text-center">What should the agent do?</h2>
+          {/* The GitHub picker's door rides inside DispatchForm's composer now (a small icon left of
+              the send button), so no separate trigger here. */}
           <DispatchForm autoFocus />
-          {/* On a fresh GitHub repo this is the prime moment to batch-dispatch from issues/PRs; the
-              trigger self-hides unless gh is authed in a GitHub repo. */}
-          <GithubTrigger className="mx-auto max-w-[280px]" />
         </div>
       ) : items.length === 0 && activeCount > 0 ? (
         // Active work exists but nothing's queued: the calm empty-inbox (NO dispatch box — the prompt

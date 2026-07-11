@@ -5,6 +5,7 @@ import { PermissionMode, type DispatchInput } from "@fray-ui/shared"
 import { rpc } from "../api/rpc.ts"
 import { showToast, store } from "../store.ts"
 import { Composer } from "./Composer.tsx"
+import { GithubTrigger } from "./GithubTrigger.tsx"
 import { Select } from "./ui/Select.tsx"
 import { PERMISSION_OPTIONS, MODEL_OPTIONS, EFFORT_OPTIONS, EFFORTS, PERMISSION_COLOR } from "../lib/options.ts"
 
@@ -115,6 +116,7 @@ export function DispatchForm({
         maxHeight={340}
         busy={dispatch.isPending}
         footer={footer}
+        leftAction={<GithubTrigger />}
       />
       {dispatch.isError && (
         <span className="px-0.5 text-[11px] text-red-400 truncate">{(dispatch.error as Error).message}</span>

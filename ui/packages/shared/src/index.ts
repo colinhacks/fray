@@ -308,6 +308,12 @@ export const GithubItem = z.object({
   reactions: z.number().int().nonnegative(),
   updatedAt: z.string(),
   comments: z.number().int().nonnegative().optional(),
+  // GitHub-mirror row fields — all optional/defaulted so a pre-restart snapshot still parses.
+  createdAt: z.string().optional(), // for "opened <when>"
+  author: z.string().optional(), // login
+  labels: z.array(z.object({ name: z.string(), color: z.string() })).default([]),
+  state: z.string().optional(), // OPEN | CLOSED | MERGED
+  isDraft: z.boolean().optional(), // PRs only
 })
 export type GithubItem = z.infer<typeof GithubItem>
 

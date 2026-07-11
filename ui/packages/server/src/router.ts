@@ -169,6 +169,28 @@ export function createRouter(ctx: AppContext) {
       },
     }),
 
+    // Dismiss/forget: the HARD-DELETE verb for a stalled/exited phantom the user wants GONE, not merely
+    // shelved (Archive = state='archived', still listed in Inactive). Removes the registry row AND
+    // tombstones its transcript id so a log-dir rescan / foreign-discovery can never resurrect it, then
+    // drops the tailer's in-memory state. GATED on a NOT-live row: only a thread whose derived runtime is
+    // "exited" (a dead pane, or a boot-failure "Stalled" session degradeIfNoTranscript flags) can be
+    // forgotten — a genuinely-live session (running / turn-idle / perm-prompt) is refused so it can't be
+    // yanked out from under itself. Idempotent: an already-forgotten slug no-ops.
+    forgetThread: mutation({
+      input: SlugInput,
+      handler: async ({ input }) => {
+        if (!ctx.storage.getSession(input.slug)) return // already gone — idempotent
+        const t = (await ctx.board.snapshot()).threads.find((x) => x.id === input.slug)
+        if (t && t.runtime !== "exited") {
+          throw new Error("only a stalled or exited session can be dismissed — archive a live one instead")
+        }
+        tmux.killSession(input.slug) // tear down any lingering (remain-on-exit) pane before we forget it
+        ctx.storage.forgetSession(input.slug)
+        ctx.tailer.forget(input.slug)
+        ctx.board.refresh() // storage-only change — the removed row fans out as a delete delta on SSE
+      },
+    }),
+
     // A plan artifact's markdown (.fray/plans/*.md — no schema, no validation). The path is the
     // PlanView.path shipped on the board snapshot; a strict shape check (single filename segment,
     // .md) forecloses traversal.

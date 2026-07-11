@@ -1,6 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { deriveNeedsYou } from "./board.ts"
+import { deriveNeedsYou, degradeIfNoTranscript } from "./board.ts"
 import type { SessionRow } from "./storage.ts"
 import type { SessionTelemetry } from "./tailer.ts"
 
@@ -17,7 +17,7 @@ function row(over: Partial<SessionRow> = {}): SessionRow {
   return {
     slug: "t", session_id: "s", tmux_name: "fray-t", spawned_at: T0, last_read_at: null,
     unread: 0, exited: 0, archived: 0, rested_at: null, title_auto: 0, title: null,
-    state: "open", meta: null, seen_at: null, plan_path: null, ...over,
+    state: "open", meta: null, seen_at: null, plan_path: null, transcript_id: null, ...over,
   }
 }
 function tele(over: Partial<SessionTelemetry> = {}): SessionTelemetry {
@@ -76,4 +76,27 @@ test("deriveNeedsYou: crash net — pane EXITED while the turn was in-flight que
   assert.equal(deriveNeedsYou(row({ seen_at: LATER }), tele({ turn: "in-flight", lastActivityAt: T0 }), "exited"), true)
   // A cleanly-ended (turn idle) exited thread is bare-rest — clears on view as normal.
   assert.equal(deriveNeedsYou(row({ seen_at: LATER }), tele({ turn: "idle", lastActivityAt: T0 }), "exited"), false)
+})
+
+// ---- missing-transcript degraded runtime (session-transcript-drift) ----
+
+test("degradeIfNoTranscript: only a live-pane spinner (running) downgrades to the stalled 'exited' affordance", () => {
+  // The eternal-spinner case: a boot-failed worker whose pane still reads live → deriveRuntime = running.
+  assert.equal(degradeIfNoTranscript("running", true), "exited")
+  // A present transcript (noTranscript false/undefined) is NEVER downgraded — the normal path is untouched.
+  assert.equal(degradeIfNoTranscript("running", false), "running")
+  assert.equal(degradeIfNoTranscript("running", undefined), "running")
+  // Every other runtime is left exactly as-is (a dead pane is already exited; idle/perm/none are real).
+  for (const r of ["none", "turn-idle", "perm-prompt", "exited", "spawning"] as const) {
+    assert.equal(degradeIfNoTranscript(r, true), r)
+  }
+})
+
+test("deriveNeedsYou: a missing-transcript row cards — degraded to exited, its turn stays in-flight (crash-net)", () => {
+  // The tailer keeps a transcript-less session's turn "in-flight" (no records → in-flight); the board
+  // degrades its runtime to "exited" (degradeIfNoTranscript). That pair trips the crash-net → it queues,
+  // so a boot-failed worker surfaces to the human instead of spinning silently forever.
+  const runtime = degradeIfNoTranscript("running", true)
+  assert.equal(runtime, "exited")
+  assert.equal(deriveNeedsYou(row({ seen_at: LATER }), tele({ turn: "in-flight", noTranscript: true, lastActivityAt: T0 }), runtime), true)
 })

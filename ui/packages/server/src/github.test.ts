@@ -64,6 +64,10 @@ test("parseListJson: issues — maps fields, sums reactions, counts comment arra
       ],
       updatedAt: "2026-07-01T00:00:00Z",
       comments: [{ body: "x" }, { body: "y" }],
+      createdAt: "2026-06-01T00:00:00Z",
+      author: { login: "octocat", name: "The Octocat" },
+      labels: [{ name: "enhancement", color: "a2eeef", description: "…" }],
+      state: "OPEN",
     },
   ])
   const items = parseListJson(raw, "issues")
@@ -75,7 +79,11 @@ test("parseListJson: issues — maps fields, sums reactions, counts comment arra
     url: "https://github.com/cli/cli/issues/326",
     reactions: 418,
     updatedAt: "2026-07-01T00:00:00Z",
+    labels: [{ name: "enhancement", color: "a2eeef" }],
     comments: 2,
+    createdAt: "2026-06-01T00:00:00Z",
+    author: "octocat",
+    state: "OPEN",
   })
 })
 
@@ -199,6 +207,12 @@ test("DEFAULT_ISSUE_PROMPT: branches on bug vs feature; DEFAULT_PR_PROMPT is the
   assert.ok(DEFAULT_PR_PROMPT.includes("AUDIT thread"))
   assert.ok(DEFAULT_PR_PROMPT.includes("gh pr diff {n} -R {repo}"))
   assert.ok(!DEFAULT_PR_PROMPT.includes("THREAD:"))
+  // The body is NOT inlined in the shipped defaults — the worker fetches it via the gh CLI, so the
+  // dispatched first-message bubble stays small (a giant issue/PR body used to flood the whole thread UI).
+  assert.ok(!DEFAULT_ISSUE_PROMPT.includes("{body}"), "issue default must not inline the body")
+  assert.ok(!DEFAULT_PR_PROMPT.includes("{body}"), "PR default must not inline the body")
+  assert.ok(DEFAULT_ISSUE_PROMPT.includes("gh issue view {n} -R {repo}"))
+  assert.ok(DEFAULT_PR_PROMPT.includes("gh pr view {n} -R {repo}"))
 })
 
 test("DEFAULT_ISSUE_PROMPT renders into a real issue prompt (round-trip through renderGithubPrompt)", () => {

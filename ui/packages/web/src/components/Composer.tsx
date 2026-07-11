@@ -37,6 +37,7 @@ export function Composer({
   autoFocus,
   busy,
   footer,
+  leftAction,
 }: {
   value: string
   onChange: (v: string) => void
@@ -55,6 +56,9 @@ export function Composer({
   // Rendered INSIDE the box along its bottom edge (the dispatch form's inline mode/model/effort
   // readouts). The textarea auto-grows above it; the footer strip is always reserved.
   footer?: React.ReactNode
+  // A small action rendered just LEFT of the send button (the dispatch composer's GitHub-picker icon).
+  // Only surfaces that pass it get it; reply/queue composers omit it.
+  leftAction?: React.ReactNode
 }) {
   const taRef = useRef<HTMLTextAreaElement>(null)
   const [dragging, setDragging] = useState(false)
@@ -168,6 +172,7 @@ export function Composer({
           inset (6), i.e. both arcs share a center. At the old px-2 (8px) the chip's corner sat 2px
           inside the box arc and read misaligned. */}
       {footer && <div className="flex items-center gap-1 px-1.5 pb-1.5">{footer}</div>}
+      {leftAction && <div className="absolute bottom-2 right-11 flex items-center">{leftAction}</div>}
       <button
         type="button"
         onClick={onSubmit}
