@@ -6,10 +6,13 @@ import { resolveProject, type Project } from "./project.ts"
 import { createStorage, type Storage } from "./storage.ts"
 import { getSettings, setSettings, resetSettings } from "./settings.ts"
 import { createBoard, type BoardManager } from "./board.ts"
-import { createTailer, type Tailer } from "./tailer.ts"
+import { createTailer, defaultLogDir, type Tailer } from "./tailer.ts"
 import { createDispatcher, type Dispatcher } from "./dispatch.ts"
 import { createScheduler, type Scheduler } from "./scheduler.ts"
 import { resumeThread } from "./resume.ts"
+import { createClaudeBackend } from "./backend/claude.ts"
+import { createCodexBackend } from "./backend/codex.ts"
+import type { AgentBackend } from "./backend/types.ts"
 import { detectGithub, type GithubDetection } from "./github.ts"
 import * as tmux from "./tmux.ts"
 
@@ -29,6 +32,11 @@ export interface AppContext {
   board: BoardManager
   tailer: Tailer
   dispatcher: Dispatcher
+  // Per-session agent-backend resolver behind the spawn/resume/transcript seam (Codex-support epic).
+  // Maps a row's `backend` column (claude|codex) to its AgentBackend; DEFAULTS to claude for any unset/
+  // unknown kind, so every existing session and all current behavior are unchanged until a dispatch
+  // explicitly selects codex. Shared by the dispatcher, the tailer, and every resumeThread call.
+  backendFor: (kind?: string) => AgentBackend
   // The WAKERS scheduler: resumes a rested `awaiting`-fenced session when its declared timer/pr/ci
   // condition fires. Started in index.ts alongside the tailer; boot-safe (never fires on first sight).
   scheduler: Scheduler
@@ -83,6 +91,15 @@ export function createContext(opts: ContextOptions = {}): AppContext {
 
   reconcileSessions(storage)
 
+  // The agent backends behind the spawn/resume/transcript seam (Codex-support epic). The ClaudeBackend's
+  // transcript dir matches the tailer's (defaultLogDir) so foreign-scan + per-session path stay
+  // consistent; the CodexBackend uses $CODEX_HOME (default ~/.codex). `backendFor` maps a row's `backend`
+  // column to the right one, DEFAULTING to claude for any unset/unknown kind — so a session is codex ONLY
+  // when it was dispatched codex, and every claude path is byte-identical to before.
+  const claudeBackend = createClaudeBackend({ logDir: defaultLogDir(project), claudeBin: opts.claudeBin })
+  const codexBackend = createCodexBackend({})
+  const backendFor = (kind?: string): AgentBackend => (kind === "codex" ? codexBackend : claudeBackend)
+
   // The tailer derives turn/liveness telemetry and, on a state change, asks the board for an
   // OVERLAY-ONLY refresh (tailer changes never alter .fray content — the full shell-out rebuild
   // here was the source of multi-second RPC stalls). Late-bound `board` breaks the cycle.
@@ -93,6 +110,7 @@ export function createContext(opts: ContextOptions = {}): AppContext {
     project,
     storage,
     bus,
+    backendFor,
     onChange: () => board.refresh(),
     onTranscriptChange: (slugs) => transcriptChange.emit(slugs),
   })
@@ -103,6 +121,7 @@ export function createContext(opts: ContextOptions = {}): AppContext {
     board,
     getSettings: () => getSettings(storage),
     claudeBin: opts.claudeBin,
+    backendFor,
   })
 
   // Wakers: on each tick, resume any at-rest `awaiting` session whose timer/pr/ci condition just
@@ -111,7 +130,7 @@ export function createContext(opts: ContextOptions = {}): AppContext {
   const scheduler = createScheduler({
     storage,
     tailer,
-    resume: (slug, message) => resumeThread({ project, storage, board, getSettings: () => getSettings(storage) }, slug, message),
+    resume: (slug, message) => resumeThread({ project, storage, board, getSettings: () => getSettings(storage), backendFor }, slug, message),
   })
 
   return {
@@ -124,6 +143,7 @@ export function createContext(opts: ContextOptions = {}): AppContext {
     tailer,
     dispatcher,
     scheduler,
+    backendFor,
     getSettings: () => getSettings(storage),
     setSettings: (s) => setSettings(storage, s),
     resetSettings: () => resetSettings(storage),

@@ -4,6 +4,7 @@ import { homedir } from "node:os"
 import type { Bus } from "./bus.ts"
 import type { Project } from "./project.ts"
 import type { Storage } from "./storage.ts"
+import type { AgentBackend, FoldState, NormalizedEvent, NormalizedTail } from "./backend/types.ts"
 import * as tmux from "./tmux.ts"
 
 // The JSONL tailer: incrementally reads each registered session's Claude Code transcript
@@ -84,8 +85,10 @@ export interface FenceView {
   hints: { kind: "pr" | "ci" | "timer" | "session"; value: string }[]
 }
 
-// Per-session derived telemetry surfaced to the board overlay.
-export interface SessionTelemetry {
+// Per-session derived telemetry surfaced to the board overlay. Structurally a NormalizedTail (the
+// backend-neutral fold-output contract) PLUS `permPrompt` — which is pane-sniffed live, not folded
+// from the transcript. `extends` makes tsc enforce that this stays a superset of the shared contract.
+export interface SessionTelemetry extends NormalizedTail {
   turn: TurnState
   permPrompt: boolean // paused on an interactive permission prompt (pane-sniffed; no jsonl signal)
   lastActivityAt?: string // ISO8601 of the last timestamped record
@@ -168,7 +171,7 @@ interface AskQuestionData {
   multiSelect?: boolean
   options: AskOptionData[]
 }
-interface PendingAskData {
+export interface PendingAskData {
   id: string
   questions: AskQuestionData[]
 }
@@ -189,9 +192,11 @@ interface RetiredSubAgent {
 // How many terminal sub-agents to retain per thread for drawer review (newest-wins ring).
 const RETAINED_SUBAGENTS_MAX = 20
 
-// Mutable accumulator for one session's tail. `offset`/`partial` track the byte cursor; the rest
-// is the running derivation folded from every record seen so far.
-export interface TailState {
+// Mutable accumulator for one session's tail. Extends the backend-neutral FoldState (the running
+// derivation `applyRecord`/`applyEvent` fold into — turn, lastActivityAt, lastAssistant, aiTitle,
+// lastUserAt, lastFence, lastAssistantHasQuestion, sawRecords); adds the tailer's own byte cursor
+// (`offset`/`partial`) plus Claude-only tracking the neutral shape doesn't carry.
+export interface TailState extends FoldState {
   slug: string
   sessionId: string
   path: string
@@ -201,21 +206,11 @@ export interface TailState {
   foreign: boolean
   offset: number
   partial: string
-  sawRecords: boolean
-  lastActivityAt?: string
-  lastAssistant?: string
-  aiTitle?: string // latest ai-title sidecar record's title (Claude's auto-name for the session)
-  // turn-relevant tail: the kind of the last substantive record + (for assistant) its stop_reason
+  // Claude's turn model: the kind of the last substantive record + (for assistant) its stop_reason.
+  // NOT in the neutral FoldState — codex brackets turns explicitly (applyEvent sets `turn` directly);
+  // only Claude's computeTurn reads these two (+ the 5s unknown-stop-reason backstop).
   lastKind?: "assistant" | "user"
   lastStopReason?: string
-  lastUserAt?: string // ISO8601 of the newest user-role record (drives the chronological listing order)
-  // Whether the latest assistant text block contained a ```question fence — set on that text block,
-  // CLEARED when a user message lands (the answer supersedes it). Combined with an idle turn, this is
-  // the derived `pendingQuestion` (see get()). A chat-only ask the worker never encoded in its file.
-  lastAssistantHasQuestion: boolean
-  // The done/awaiting signal fence carried by the latest assistant text — same lifecycle as
-  // lastAssistantHasQuestion (recomputed per assistant text record, cleared by any user record).
-  lastFence?: FenceView
   // live background OPS (sub-agents AND background shells), keyed by dispatch/launch tool_use id
   // (insertion order = launch order); the `kind` field distinguishes them at the view boundary.
   subAgents: Map<string, SubAgentEntry>
@@ -226,7 +221,6 @@ export interface TailState {
   subAgentsSig?: string // last-emitted signature of the derived background-ops + ask view (dirty-change detection)
   // transition tracking (dedupe)
   primed: boolean // first tick restores state WITHOUT firing transition notifies (boot/restart)
-  turn: TurnState
   permPrompt: boolean // last pane-sniff verdict (see matchesPermPrompt)
   paneDead: boolean
 }
@@ -685,6 +679,81 @@ export function applyRecord(state: TailState, rec: Record): void {
   trackCompletions(state, rec)
 }
 
+// Derive the final-message-dependent fields (preview + question flag + done/awaiting fence) from the
+// text of a FINAL assistant message. Shared by assistant-text{final:true} and turn-end.finalText so
+// the same derivation lands whichever event a backend carries the final answer on. Mirrors the
+// assistant-text arm of applyRecord — minus Claude's every-block fence recompute (a normalized
+// backend fences only on the final message; a codex `commentary` block must never excuse the thread).
+function applyFinalText(state: FoldState, text: string): void {
+  const preview = previewText(text)
+  if (preview !== undefined) state.lastAssistant = preview
+  state.lastAssistantHasQuestion = hasQuestionBlock(text)
+  state.lastFence = parseSignalFence(text)
+}
+
+// Fold one NORMALIZED event into the backend-neutral accumulator — the codex-facing counterpart to
+// applyRecord (which folds raw Claude records). A backend whose turn model maps cleanly onto
+// NormalizedEvent (codex's explicit task_started/task_complete brackets) drives its fold as
+// `for (const ev of parseLine(line)) applyEvent(state, ev)`; it produces the SAME FoldState fields
+// applyRecord does, so the tailer/board consume either identically. Claude does NOT use this path —
+// its 3-way stop_reason + 5s backstop turn signal can't round-trip through the union without loss
+// (see the NOTE on NormalizedEvent in backend/types.ts).
+export function applyEvent(state: FoldState, ev: NormalizedEvent): void {
+  // Every timestamped event advances the activity clock (events map 1:1 to substantive lines; only the
+  // untimestamped `title` lacks an `at`). Folded in file order, so the latest `at` wins.
+  if ("at" in ev && typeof ev.at === "string") state.lastActivityAt = ev.at
+  switch (ev.kind) {
+    case "turn-start":
+      // A turn opened → the agent is working.
+      state.sawRecords = true
+      state.turn = "in-flight"
+      break
+    case "turn-end":
+      // A turn bracketed closed → idle. finalText (when the backend carries the final message on the
+      // bracket) is authoritative: (re)derive preview + question/excusal fence from it.
+      state.sawRecords = true
+      state.turn = "idle"
+      if (ev.finalText !== undefined) applyFinalText(state, ev.finalText)
+      break
+    case "assistant-text":
+      // Streamed assistant text. The FINAL answer sets preview + question/excusal fence; a non-final
+      // (commentary) block only refreshes the row preview and must NOT carry a fence. Turn state is
+      // untouched — the turn brackets on turn-start/turn-end, not on a text block.
+      state.sawRecords = true
+      if (ev.final) applyFinalText(state, ev.text)
+      else {
+        const preview = previewText(ev.text)
+        if (preview !== undefined) state.lastAssistant = preview
+      }
+      break
+    case "user-message":
+      // A human/peer/notification turn re-opens the turn (the model is about to respond → in-flight)
+      // and supersedes any pending question / excusal fence (they only signal as the FINAL message).
+      // Only a GENUINE human turn bumps lastUserAt — a synthetic one (peer msg / notification /
+      // tool-result echo) is machine motion the human didn't cause, so it never jumps the row.
+      state.sawRecords = true
+      state.turn = "in-flight"
+      state.lastAssistantHasQuestion = false
+      state.lastFence = undefined
+      if (!ev.synthetic && typeof ev.at === "string") state.lastUserAt = ev.at
+      break
+    case "tool-call":
+    case "tool-result":
+      // Agent activity mid-turn: it advanced the activity clock (above) but doesn't move the turn
+      // (still bracketed in-flight) or the preview. Codex has no sub-agent/bg-shell tracking to fold;
+      // Claude's rich tool tracking rides applyRecord, never this path. NOTE (deliberate divergence
+      // from applyRecord's user arm): a tool-result does NOT clear lastFence/lastAssistantHasQuestion —
+      // tool activity is mid-turn (a user-message re-open already cleared any prior-turn fence, and the
+      // final message recomputes it), so a normalized backend must not let tool motion excuse a fence.
+      state.sawRecords = true
+      break
+    case "title":
+      // The backend's own session auto-title (codex thread title / Claude ai-title). Never touches turn.
+      state.aiTitle = ev.title
+      break
+  }
+}
+
 // Derive the turn state from the folded tail (see the header heuristic). `nowMs` drives only the
 // unknown-stop-reason backstop; a clear end_turn/tool_use is time-independent.
 export function computeTurn(state: TailState, nowMs: number): TurnState {
@@ -696,7 +765,15 @@ export function computeTurn(state: TailState, nowMs: number): TurnState {
     if (Number.isFinite(at) && nowMs - at > IDLE_BACKSTOP_MS) return "idle"
     return "in-flight"
   }
-  // last substantive record was a user prompt/tool_result, or nothing substantive yet → in-flight
+  // A backend that brackets turns EXPLICITLY never sets lastKind (codex: applyEvent writes `state.turn`
+  // directly on task_started/task_complete and touches neither lastKind nor lastStopReason) — trust its
+  // folded turn verbatim instead of clobbering it back to in-flight. This is BEHAVIOR-NEUTRAL for Claude:
+  // applyRecord assigns lastKind on EVERY substantive record (tailer.ts:633/653) and never clears it, so
+  // for Claude `lastKind === undefined` holds ONLY before any substantive record — and there `state.turn`
+  // is still the newTailState "in-flight" the old fallthrough returned. For codex it makes the explicit
+  // task_started/task_complete brackets authoritative (the fix: a folded `idle` survives the tick).
+  if (state.lastKind === undefined) return state.turn
+  // last substantive record was a user prompt/tool_result → in-flight (the model is about to respond)
   return "in-flight"
 }
 
@@ -743,6 +820,16 @@ export interface TailerDeps {
   capturePane?: (slug: string) => string // injectable pane text (tests); defaults to tmux
   sessionLogDir?: string // injectable transcript dir (tests); defaults to the Claude Code path
   mtimeMs?: (path: string) => number | undefined // injectable file mtime (tests); a sub-agent transcript's staleness clock
+  // The agent backend that locates + folds a session's transcript (Codex-support epic). Injected by
+  // the composition layer as a ClaudeBackend; when absent (tests) the tailer folds with its own
+  // corpus-verified applyRecord + deterministic Claude path — a byte-identical default.
+  backend?: AgentBackend
+  // Per-session backend resolver (Codex-support epic, Phase 2): the tailer picks a backend per ROW by
+  // its `backend` column so a codex row folds through the codex rollout parser while every claude row
+  // (and all foreign maintainer terminals) stays on the corpus-verified Claude fold. Injected by the
+  // composition layer; when absent (tests) the single `backend`/default Claude fold covers every row —
+  // byte-identical to before. Takes precedence over `backend` when both are set.
+  backendFor?: (kind?: string) => AgentBackend
 }
 
 // A sub-agent transcript's mtime in epoch-ms, or undefined if it can't be stat'd (not yet created,
@@ -755,10 +842,15 @@ function defaultMtimeMs(path: string): number | undefined {
   }
 }
 
-// The Claude Code per-project transcript dir: ~/.claude/projects/<cwdSlug>/.
-function defaultLogDir(project: Project): string {
+// The Claude Code per-project transcript dir: ~/.claude/projects/<cwdSlug>/. Exported so the
+// composition layer can construct the matching ClaudeBackend (its transcriptPath appends the id).
+export function defaultLogDir(project: Project): string {
   return join(homedir(), ".claude", "projects", project.cwdSlug)
 }
+
+// The slice of AgentBackend the tailer drives: locate a session's transcript, fold a raw line into
+// the accumulator, and (registered sessions only) sniff the pane for a permission prompt.
+type TailBackend = Pick<AgentBackend, "transcriptPath" | "foldLine" | "matchesPermPrompt">
 
 export function createTailer(deps: TailerDeps): Tailer {
   const now = deps.now ?? Date.now
@@ -768,6 +860,26 @@ export function createTailer(deps: TailerDeps): Tailer {
   const capturePane = deps.capturePane ?? tmux.capturePane
   const logDir = deps.sessionLogDir ?? defaultLogDir(deps.project)
   const mtimeMs = deps.mtimeMs ?? defaultMtimeMs
+  // Default backend = this file's own corpus-verified Claude fold (identical to the injected
+  // ClaudeBackend, which reuses the same applyRecord/parseLine/matchesPermPrompt). Tests never inject
+  // a backend, so this default is the regression-proof path.
+  const defaultBackend: TailBackend = {
+    transcriptPath: (sessionId) => join(logDir, `${sessionId}.jsonl`),
+    foldLine: (state, line) => {
+      const rec = parseLine(line)
+      // The tailer only ever hands foldLine the concrete TailState it constructs; applyRecord needs
+      // Claude's full accumulator (sub-agent/ask tracking, lastKind/lastStopReason) the neutral
+      // FoldState doesn't carry, so narrow back to it. Byte-identical to the pre-refactor fold.
+      if (rec) applyRecord(state as TailState, rec)
+    },
+    matchesPermPrompt,
+  }
+  // Resolve the backend for a row by its `backend` column. Prod injects `backendFor` (claude|codex);
+  // a single injected `backend` or the local default covers every row otherwise. For claude (and every
+  // foreign maintainer terminal) this is the corpus-verified Claude fold — byte-identical to before.
+  function resolveBackend(kind?: string): TailBackend {
+    return deps.backendFor?.(kind) ?? deps.backend ?? defaultBackend
+  }
 
   // Derive the surfaced view of a session's live sub-agents (insertion = dispatch order). A tracked
   // entry whose transcript file hasn't been touched in SUBAGENT_STALE_MS is reported "stale" — a
@@ -830,12 +942,13 @@ export function createTailer(deps: TailerDeps): Tailer {
   // Perm-prompt verdict for a session: only worth a capture-pane once a still-in-flight turn has
   // gone quiet for PERM_SNIFF_MS (see the constant). A perm prompt can't precede the tool_use
   // record that stamps lastActivityAt, so a session with no activity yet never sniffs.
-  function sniffPerm(state: TailState, turn: TurnState, nowMs: number): boolean {
+  function sniffPerm(state: TailState, turn: TurnState, nowMs: number, backend: TailBackend): boolean {
     if (state.foreign) return false // structural: a foreign thread has no tmux pane to sniff
     if (turn !== "in-flight" || !state.lastActivityAt) return false
     const at = Date.parse(state.lastActivityAt)
     if (!Number.isFinite(at) || nowMs - at < PERM_SNIFF_MS) return false
-    return matchesPermPrompt(capturePane(state.slug))
+    // codex omits matchesPermPrompt (`-a never` → no in-turn approval modal), so `?.` yields false.
+    return backend.matchesPermPrompt?.(capturePane(state.slug)) ?? false
   }
   const states = new Map<string, TailState>()
   // FOREIGN thread tails, keyed by session id (separate map so a session-id key can never collide
@@ -883,10 +996,10 @@ export function createTailer(deps: TailerDeps): Tailer {
   // derivedSignature, priming the first sighting silently) but with NO pane sniff, NO pane-death
   // check, and NO notify / storage write — a foreign thread has no tmux session and no registry row.
   // Returns whether its derived telemetry changed (→ board dirty). Pushes to transcriptDirty on bytes.
-  function tailForeign(state: TailState, nowMs: number, transcriptDirty: string[]): boolean {
+  function tailForeign(state: TailState, nowMs: number, transcriptDirty: string[], backend: TailBackend): boolean {
     if (!state.primed) {
       const primeOffset = state.offset
-      consume(state)
+      consume(state, backend)
       if (state.offset !== primeOffset) transcriptDirty.push(state.slug)
       state.turn = computeTurn(state, nowMs)
       state.subAgentsSig = derivedSignature(state, nowMs)
@@ -896,7 +1009,7 @@ export function createTailer(deps: TailerDeps): Tailer {
     const prevActivity = state.lastActivityAt
     const prevAssistant = state.lastAssistant
     const prevOffset = state.offset
-    consume(state)
+    consume(state, backend)
     if (state.offset !== prevOffset) transcriptDirty.push(state.slug)
     let dirty = false
     const nextTurn = computeTurn(state, nowMs)
@@ -916,7 +1029,7 @@ export function createTailer(deps: TailerDeps): Tailer {
   // Read whatever has been appended since our last offset, folding each complete line into the
   // derivation. Handles: file-not-yet-created (ENOENT → skip), truncation/rotation (size < offset
   // → re-read from 0), and a trailing partial line (buffered until its newline arrives).
-  function consume(state: TailState): void {
+  function consume(state: TailState, backend: TailBackend): void {
     let size: number
     try {
       size = statSync(state.path).size
@@ -945,10 +1058,7 @@ export function createTailer(deps: TailerDeps): Tailer {
     }
     const lines = (state.partial + chunk).split("\n")
     state.partial = lines.pop() ?? "" // last element is the (possibly empty) trailing partial
-    for (const line of lines) {
-      const rec = parseLine(line)
-      if (rec) applyRecord(state, rec)
-    }
+    for (const line of lines) backend.foldLine(state, line)
   }
 
   function tick(): void {
@@ -960,9 +1070,15 @@ export function createTailer(deps: TailerDeps): Tailer {
     const transcriptDirty: string[] = []
     const nowMs = now()
     for (const row of deps.storage.allSessions()) {
+      // Per-row backend: a codex row folds through the codex rollout parser + locates its DISCOVERED
+      // rollout by the pinned agent_session_id; a claude row (agent_session_id NULL) is byte-identical
+      // to before (session_id, corpus-verified fold). `?? session_id` keeps claude's deterministic path.
+      const backend = resolveBackend(row.backend)
+      const nativeId = row.agent_session_id ?? row.session_id
       let state = states.get(row.slug)
       if (!state) {
-        state = newTailState(row.slug, row.session_id, join(logDir, `${row.session_id}.jsonl`))
+        const path = backend.transcriptPath(nativeId) ?? join(logDir, `${row.session_id}.jsonl`)
+        state = newTailState(row.slug, row.session_id, path)
         states.set(row.slug, state)
       }
 
@@ -971,10 +1087,10 @@ export function createTailer(deps: TailerDeps): Tailer {
       // exited notifies — those pre-restart events are history, not new activity.
       if (!state.primed) {
         const primeOffset = state.offset
-        consume(state)
+        consume(state, backend)
         if (state.offset !== primeOffset) transcriptDirty.push(row.slug)
         state.turn = computeTurn(state, nowMs)
-        state.permPrompt = sniffPerm(state, state.turn, nowMs)
+        state.permPrompt = sniffPerm(state, state.turn, nowMs, backend)
         state.paneDead = paneDead(row.slug)
         state.subAgentsSig = derivedSignature(state, nowMs)
         state.primed = true
@@ -985,14 +1101,20 @@ export function createTailer(deps: TailerDeps): Tailer {
       const prevActivity = state.lastActivityAt
       const prevAssistant = state.lastAssistant
       const prevOffset = state.offset
-      consume(state)
+      // Snapshot the turn BEFORE the fold. A codex fold (applyEvent) writes state.turn INLINE on
+      // task_started/task_complete, so by the time we diff below state.turn already holds the new value
+      // — comparing against it would miss the transition (no turn-done notify). Claude's applyRecord
+      // never touches state.turn (computeTurn derives it), so prevTurn === state.turn for claude here:
+      // byte-identical. This makes the transition edge backend-agnostic.
+      const prevTurn = state.turn
+      consume(state, backend)
       if (state.offset !== prevOffset) transcriptDirty.push(row.slug)
 
       // turn transition (in-flight → idle): a completed turn. Mark unread + notify, gated on
       // last_read_at so a turn the user has already scrolled past doesn't re-badge.
       const nextTurn = computeTurn(state, nowMs)
-      if (state.turn !== nextTurn) {
-        if (state.turn === "in-flight" && nextTurn === "idle") {
+      if (prevTurn !== nextTurn) {
+        if (prevTurn === "in-flight" && nextTurn === "idle") {
           onTurnDone(row.slug, state)
           dirty = true
         } else {
@@ -1004,7 +1126,7 @@ export function createTailer(deps: TailerDeps): Tailer {
       // interactive permission prompt: no jsonl signal, so pane-sniff a quiet in-flight turn.
       // Cleared automatically once jsonl activity resumes (turn no longer quiet) or the pane stops
       // matching. Rides the board snapshot only — no notify, no unread (it's not a completed turn).
-      const perm = sniffPerm(state, nextTurn, nowMs)
+      const perm = sniffPerm(state, nextTurn, nowMs, backend)
       if (perm !== state.permPrompt) dirty = true
       state.permPrompt = perm
 
@@ -1035,13 +1157,16 @@ export function createTailer(deps: TailerDeps): Tailer {
       foreignFresh = next
     }
     foreignScanTick++
+    // Foreign threads are Claude maintainer terminals discovered in the Claude log dir — always the
+    // Claude fold (resolveBackend("claude") returns the injected ClaudeBackend, or the default).
+    const foreignBackend = resolveBackend("claude")
     for (const f of foreignFresh) {
       let state = foreignStates.get(f.id)
       if (!state) {
         state = newTailState(f.id, f.id, f.path, true) // slug = session id = thread id for a foreign thread
         foreignStates.set(f.id, state)
       }
-      if (tailForeign(state, nowMs, transcriptDirty)) dirty = true
+      if (tailForeign(state, nowMs, transcriptDirty, foreignBackend)) dirty = true
     }
 
     if (dirty) deps.onChange()

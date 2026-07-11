@@ -116,7 +116,7 @@ export function createRouter(ctx: AppContext) {
       input: FollowUpInput,
       handler: async ({ input }) => {
         // Live → inject; dead → resume the pinned conversation. Shared with the wakers scheduler.
-        resumeThread({ project: ctx.project, storage: ctx.storage, board: ctx.board, getSettings: ctx.getSettings }, input.slug, input.message)
+        resumeThread({ project: ctx.project, storage: ctx.storage, board: ctx.board, getSettings: ctx.getSettings, backendFor: ctx.backendFor }, input.slug, input.message)
       },
     }),
 

@@ -1,12 +1,15 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync } from "node:fs"
+import { mkdtempSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createStorage, type Storage, type SessionRow } from "./storage.ts"
 import { createBoard, type BoardManager } from "./board.ts"
 import { Bus } from "./bus.ts"
 import { resumeThread, type ResumeTmux } from "./resume.ts"
+import { createCodexBackend } from "./backend/codex.ts"
+import { createClaudeBackend } from "./backend/claude.ts"
+import type { AgentBackend } from "./backend/types.ts"
 import type { Project } from "./project.ts"
 import type { Tailer } from "./tailer.ts"
 import type { Settings, ThreadView, BoardSnapshot } from "@fray-ui/shared"
@@ -137,6 +140,42 @@ test("resumeThread un-archives a bumped DEAD archived thread on the respawn path
   assert.equal(row?.archived, 0)
   assert.equal(row?.exited, 0) // respawn cleared the exited flag
   assert.equal(sectionOf(threadIn(board.refresh(), slug)), "active")
+})
+
+test("resumeThread (codex, dead): pre-arms cwd trust + re-attaches the pinned rollout via `codex resume <id>`", () => {
+  const { storage, board, dir } = harness()
+  const codexHome = tmpDir("fray-codexhome-")
+  const slug = "codex-dead"
+  const CODEX_ID = "019f4e0a-cafe-7891-9cbf-00000000feed"
+  storage.upsertSession(sessionRow(slug, { exited: 1 }))
+  storage.setBackend(slug, "codex") // the shared upsert never writes backend/agent_session_id
+  storage.setAgentSession(slug, CODEX_ID)
+
+  const spawnedCmds: string[][] = []
+  const tmux: ResumeTmux = {
+    isLive: () => false, // dead → dead-resume (respawn) path
+    sendKeys: () => {},
+    pasteText: () => {},
+    killSession: () => {},
+    ensureServer: () => {},
+    spawn: (_slug, cmd) => void spawnedCmds.push(cmd),
+  }
+  const codexBackend = createCodexBackend({ codexHome })
+  const claudeBackend = createClaudeBackend({ logDir: join(dir, "logs") })
+  const backendFor = (kind?: string): AgentBackend => (kind === "codex" ? codexBackend : claudeBackend)
+  resumeThread({ project: fakeProject(dir), storage, board, getSettings: () => settings, tmux, backendFor, codexHome }, slug, "keep going")
+
+  // A codex respawn hits the trust modal for an untrusted cwd — resume must pre-arm it too.
+  const cfg = readFileSync(join(codexHome, "config.toml"), "utf8")
+  assert.ok(cfg.includes('trust_level = "trusted"'), "resume pre-arms the codex cwd trust gate")
+
+  // argv: `codex resume … <CODEX_ID> <message>` — the DISCOVERED rollout id, not the fray session_id.
+  const cmd = spawnedCmds[0]
+  assert.equal(cmd[0], "codex")
+  assert.equal(cmd[1], "resume")
+  assert.ok(cmd.includes(CODEX_ID), "resume re-attaches the pinned codex rollout id")
+  assert.ok(!cmd.includes(`sid-${slug}`), "the fray session_id is NOT used as the codex resume id")
+  assert.equal(storage.getSession(slug)?.exited, 0, "respawn cleared the exited flag")
 })
 
 test("resumeThread leaves a non-archived thread's state untouched (no needless flip)", () => {
