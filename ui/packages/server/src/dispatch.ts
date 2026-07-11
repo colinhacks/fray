@@ -7,6 +7,8 @@ import { tmuxSessionName, type DispatchInput, type Settings, type PermissionMode
 import type { Project } from "./project.ts"
 import type { Storage } from "./storage.ts"
 import type { BoardManager } from "./board.ts"
+import type { AgentBackend, BackendKind, BuiltCommand } from "./backend/types.ts"
+import { ensureCwdTrusted, discoverCodexRollout, codexSessionSentinel } from "./backend/codex.ts"
 import * as tmux from "./tmux.ts"
 
 // Dispatch = provision the thread's scratchpad + compose the full prompt + spawn a detached `claude`
@@ -235,8 +237,47 @@ export function buildClaudeResumeCommand(opts: {
   return argv
 }
 
+// Codex rollout-discovery poll budget: codex writes session_meta within ~hundreds of ms of spawn, so a
+// short poll pins the id before the tailer needs it. ~3s cap total — a safety net, not the common wait.
+const CODEX_DISCOVERY_ATTEMPTS = 30
+const CODEX_DISCOVERY_INTERVAL_MS = 100
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+
+// ---- codex prompt transport (tmux command-length dodge) ----
+// The codex worker-contract rides the PROMPT (the resolved prompt-prepend decision), so codex's prompt
+// argv is the full contract (~18KB) — passing it inline on the `tmux new-session` command line exceeds
+// tmux's command-length limit and fails EVERY codex spawn (the SAME limit Claude dodges by writing its
+// system prompt to a file and passing a short `--append-system-prompt-file <path>`). Codex has no
+// prompt-file flag, so we spill the prompt to a temp file and rebuild argv as a tiny `sh -c` wrapper
+// that reads it at exec time — the tmux command stays short, and codex still receives the identical
+// prompt as its trailing positional arg (nothing pollutes the repo/global config — the temp file is a
+// transient transport artifact, NOT an on-disk AGENTS.md). This lives in the DISPATCH layer (like
+// Claude's systemPromptFlags), leaving the CodexBackend's argv contract untouched.
+const CODEX_PROMPT_DIR = join(tmpdir(), "fray-codex-prompts")
+// POSIX single-quote a shell token (wrap in '' and escape embedded quotes) so the wrapper script can't
+// word-split or interpret the codex flags (cwd/model/effort values).
+function shQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`
+}
+// Rewrite a codex BuiltCommand so its (large) trailing prompt argv travels via a temp file instead of
+// the tmux command line. The prompt is ALWAYS the last argv element (codex takes it as the trailing
+// positional). Adds the temp file to prewrite (dispatch writes it before spawn).
+function transportCodexPrompt(built: BuiltCommand, sessionId: string): BuiltCommand {
+  const prompt = built.argv[built.argv.length - 1]
+  const head = built.argv.slice(0, -1)
+  mkdirSync(CODEX_PROMPT_DIR, { recursive: true })
+  const promptFile = join(CODEX_PROMPT_DIR, `${sessionId}.txt`)
+  // sh -c '<script>' <$0> <$1=promptFile>: `"$(cat "$1")"` re-hydrates the prompt as ONE arg at exec.
+  const script = `exec ${head.map(shQuote).join(" ")} "$(cat "$1")"`
+  return { ...built, argv: ["sh", "-c", script, "fray-codex", promptFile], prewrite: [...built.prewrite, { path: promptFile, contents: prompt }] }
+}
+
 export interface Dispatcher {
-  dispatch(input: DispatchInput): Promise<{ slug: string; sessionId: string }>
+  // `opts.backend` selects the agent backend for THIS dispatch (Codex-support epic, Phase 2); omitted /
+  // "claude" is the default, so the RPC path (which passes no opts until the Phase-3 UI picker wires
+  // DispatchInput.backend through) is byte-identical to before. A codex dispatch pre-arms the cwd trust
+  // gate, spawns the codex TUI, then sentinel-discovers + pins the rollout id on the row.
+  dispatch(input: DispatchInput, opts?: { backend?: BackendKind }): Promise<{ slug: string; sessionId: string }>
   // Cold-adopt an EXISTING thread fray-ui didn't originate (e.g. a repo with a pre-existing .fray
   // board): spawn a fresh worker pointed at the thread file. Fray's contract makes this sound —
   // the doc, not the conversation, is the durable context; the worker reads it and continues.
@@ -250,15 +291,81 @@ export interface DispatchDeps {
   getSettings: () => Settings
   claudeBin?: string // injectable (tests / a stand-in command)
   spawn?: typeof tmux.spawn // injectable so tests don't touch tmux
+  // Per-session agent-backend resolver that builds the spawn argv + injection (Codex-support epic).
+  // Injected by the composition layer (context.ts); when absent (tests) dispatch falls back to the
+  // local Claude argv builder, producing a byte-identical command. Selected by `opts.backend`.
+  backendFor?: (kind?: string) => AgentBackend
+  // $CODEX_HOME override for the codex trust pre-arm + rollout discovery (tests inject a tmp dir);
+  // unset → the codex default (~/.codex), matching the CodexBackend the composition layer built.
+  codexHome?: string
 }
 
 export function createDispatcher(deps: DispatchDeps): Dispatcher {
   const spawn = deps.spawn ?? tmux.spawn
   const frayDir = join(deps.project.dir, ".fray")
 
+  // Build the detached-spawn command through the backend seam for the chosen `kind` (falling back to
+  // the local Claude builder when no resolver is injected — identical argv). Returns argv + prewrites.
+  function buildSpawnCommand(o: {
+    sessionId: string
+    permissionMode: PermissionMode
+    model?: string
+    effort?: string
+    prompt: string
+    extraSystemPrompt?: string
+    kind?: BackendKind
+  }): BuiltCommand {
+    const backend = deps.backendFor?.(o.kind)
+    if (backend) {
+      const built = backend.buildSpawn({
+        sessionId: o.sessionId,
+        cwd: deps.project.dir,
+        prompt: o.prompt,
+        workerContract: loadWorkerPrompt(),
+        extraSystemPrompt: o.extraSystemPrompt,
+        permissionMode: o.permissionMode,
+        model: o.model,
+        effort: o.effort,
+      })
+      // Codex inlines the ~18KB worker contract into its prompt argv — too long for the tmux command
+      // line. Spill it to a temp file (see transportCodexPrompt). Claude already writes its system
+      // prompt to a file, so its argv is short — left untouched.
+      return o.kind === "codex" ? transportCodexPrompt(built, o.sessionId) : built
+    }
+    const argv = buildClaudeCommand({
+      sessionId: o.sessionId,
+      permissionMode: o.permissionMode,
+      model: o.model,
+      effort: o.effort,
+      prompt: o.prompt,
+      claudeBin: deps.claudeBin,
+      pluginDir: workerPluginDir(),
+      extraSystemPrompt: o.extraSystemPrompt,
+    })
+    return { argv, env: {}, prewrite: [] }
+  }
+
+  // Codex has NO --session-id pin: the rollout id is minted by codex and only knowable once it writes
+  // session_meta (a beat after spawn). Poll the sentinel-based discovery briefly until the rollout
+  // appears, so the pinned id is on the row before the tailer first sights it. Bounded so a codex that
+  // never wrote a rollout (spawn misfire) can't hang dispatch; a miss just leaves agent_session_id NULL.
+  // The row still exists (killable), but until the id is pinned the tailer can't locate the rollout and
+  // resume would target the wrong id — there is NO re-discovery yet, so a miss strands the row's telemetry.
+  // Rare (codex writes session_meta well within the poll budget); re-discovery-on-tick is a Phase-3 follow-up.
+  async function discoverCodexRolloutWithRetry(o: { sessionId: string; spawnedAtMs: number }): Promise<string | undefined> {
+    const sentinel = codexSessionSentinel(o.sessionId)
+    for (let attempt = 0; attempt < CODEX_DISCOVERY_ATTEMPTS; attempt++) {
+      const found = discoverCodexRollout({ cwd: deps.project.dir, spawnedAtMs: o.spawnedAtMs, sentinel, codexHome: deps.codexHome })
+      if (found) return found.sessionId
+      await sleep(CODEX_DISCOVERY_INTERVAL_MS)
+    }
+    return discoverCodexRollout({ cwd: deps.project.dir, spawnedAtMs: o.spawnedAtMs, sentinel, codexHome: deps.codexHome })?.sessionId
+  }
+
   return {
-    async dispatch(input) {
+    async dispatch(input, opts) {
       const settings = deps.getSettings()
+      const kind: BackendKind = opts?.backend ?? "claude"
       // Title: explicit human title, else the heuristic chop. (A headless `claude -p` titling pass
       // was tried and REMOVED — print mode is going away for Max subscription auth, which is the
       // whole reason the workers run as interactive tmux sessions. Claude's own evolving ai-title
@@ -271,26 +378,35 @@ export function createDispatcher(deps: DispatchDeps): Dispatcher {
       const planPath = validPlanPath(deps.project.dir, input.planPath)
 
       // Session-first: provision the scratchpad (the durable working memory) — NO .fray/<slug>.md file.
+      // The scratchpad keys on the fray-minted sessionId, which stays the row's session_id for BOTH
+      // backends (codex's discovered rollout id is pinned separately on agent_session_id).
       const scratchRel = writeScratchpad(deps.project.dir, sessionId, title)
 
       const prompt = composePrompt(sessionId, input.prompt, settings.dispatchPreamble)
-      const cmd = buildClaudeCommand({
+      const built = buildSpawnCommand({
         sessionId,
         permissionMode,
         model: input.model ?? settings.model,
         effort: input.effort ?? settings.effort,
         prompt,
-        claudeBin: deps.claudeBin,
-        pluginDir: workerPluginDir(),
         extraSystemPrompt: scratchpadOrientation(sessionId, planPath),
+        kind,
       })
+
+      // Codex TUI blocks on a "Do you trust this directory?" modal for an untrusted cwd — an unattended
+      // worker would hang forever. Pre-arm the persisted-trust entry BEFORE spawn (idempotent global
+      // ~/.codex/config.toml write; respects an existing block — see ensureCwdTrusted). Claude never
+      // touches it. [maintainer-approved global write — Codex-support epic ⚖.]
+      if (kind === "codex") ensureCwdTrusted(deps.project.dir, deps.codexHome)
+      const spawnedAtMs = Date.now()
 
       // Spawn BEFORE writing the registry row so a spawn failure never strands a contentless row on
       // the board (C1). If the spawn throws, roll back the scratchpad we just provisioned too — a
       // failed dispatch must leave NO trace (no orphan row, no litter) — then surface the concise error.
       tmux.ensureServer()
       try {
-        spawn(slug, cmd, deps.project.dir, { FRAY_UI_THREAD: slug })
+        for (const f of built.prewrite) writeFileSync(f.path, f.contents)
+        spawn(slug, built.argv, deps.project.dir, { ...built.env, FRAY_UI_THREAD: slug })
       } catch (err) {
         try {
           rmSync(join(deps.project.dir, scratchRel))
@@ -299,6 +415,11 @@ export function createDispatcher(deps: DispatchDeps): Dispatcher {
         }
         throw err
       }
+
+      // Codex mints its own rollout id — discover it (sentinel-matched, race-proof across concurrent
+      // same-cwd dispatches) so it's pinned on the row BEFORE the tailer first sights it (else the
+      // tailer can't locate the rollout). Best-effort: a discovery miss leaves agent_session_id NULL.
+      const agentSessionId = kind === "codex" ? await discoverCodexRolloutWithRetry({ sessionId, spawnedAtMs }) : undefined
 
       deps.storage.upsertSession({
         slug,
@@ -320,6 +441,13 @@ export function createDispatcher(deps: DispatchDeps): Dispatcher {
         plan_path: planPath,
         transcript_id: null, // discovery caches this later only if the transcript drifts off <session_id>.jsonl
       })
+      // Codex pins live OFF the shared upsert (whose named-param statement every claude caller feeds):
+      // stamp the backend + the discovered rollout id AFTER the row exists. Claude skips both, so its
+      // `backend` stays the column DEFAULT 'claude' and `agent_session_id` stays NULL — untouched.
+      if (kind === "codex") {
+        deps.storage.setBackend(slug, kind)
+        if (agentSessionId) deps.storage.setAgentSession(slug, agentSessionId)
+      }
 
       // Respond immediately — the client switches views on the slug; the rebuild (a shell-out to
       // the fray board scripts) fans out over SSE moments later.
@@ -343,14 +471,12 @@ export function createDispatcher(deps: DispatchDeps): Dispatcher {
       // Provision a scratchpad too (the adopted worker's durable memory); the legacy file stays read-only.
       const scratchRel = writeScratchpad(deps.project.dir, sessionId, slug)
       const prompt = composePrompt(sessionId, task, settings.dispatchPreamble)
-      const cmd = buildClaudeCommand({
+      const built = buildSpawnCommand({
         sessionId,
         permissionMode: settings.permissionMode,
         model: settings.model,
         effort: settings.effort,
         prompt,
-        claudeBin: deps.claudeBin,
-        pluginDir: workerPluginDir(),
         extraSystemPrompt: [scratchpadOrientation(sessionId), adoption].join("\n\n"),
       })
 
@@ -359,7 +485,8 @@ export function createDispatcher(deps: DispatchDeps): Dispatcher {
       // Row is written only AFTER a successful spawn (C1); a spawn failure rolls the scratchpad back
       // and rethrows so the board never shows a stuck row for an adopt that never spawned.
       try {
-        spawn(slug, cmd, deps.project.dir, { FRAY_UI_THREAD: slug })
+        for (const f of built.prewrite) writeFileSync(f.path, f.contents)
+        spawn(slug, built.argv, deps.project.dir, { ...built.env, FRAY_UI_THREAD: slug })
       } catch (err) {
         try {
           rmSync(join(deps.project.dir, scratchRel))

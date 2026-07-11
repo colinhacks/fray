@@ -32,6 +32,17 @@ export interface SessionRow {
   meta: string | null // JSON blob for future annotations (unparsed here)
   seen_at: string | null // ISO8601 — interaction clearance: recorded when the human opens the thread
   plan_path: string | null // project-relative .fray/plans/*.md this thread was dispatched from
+  // Which agent backend serves this session (Codex-support epic). Optional in the TS shape (older rows
+  // + the many test-fixture literals predate it); the SQLite column carries a "claude" DEFAULT so every
+  // existing row and all current behavior are unchanged. Phase 1 only ever writes "claude".
+  backend?: string
+  // The backend's OWN native session id when it differs from the fray-minted session_id (Codex-support
+  // epic, Phase 2). Claude pins session_id via --session-id, so its native id IS session_id and this
+  // stays NULL. Codex mints its OWN rollout id (discovered post-spawn), so session_id remains the fray
+  // UUID (the sentinel + scratchpad key) and the discovered codex id is pinned HERE — the id the tailer
+  // locates the rollout with and resume re-attaches. Readers use `agent_session_id ?? session_id`, so a
+  // claude row (NULL) is byte-identical to before.
+  agent_session_id?: string | null
 }
 
 export interface Storage {
@@ -64,6 +75,12 @@ export interface Storage {
   // Every tombstoned transcript id (session_id + any discovered transcript_id of a forgotten row). The
   // tailer's foreign-discovery consults this so a forgotten phantom's transcript stays excluded forever.
   forgottenIds(): Set<string>
+  // Codex-support epic (Phase 2): pin the agent backend + its native session id on a row AFTER
+  // dispatch. Kept OFF the shared upsert (whose named-param statement every claude caller + test
+  // fixture feeds) so the codex path is purely additive — a claude dispatch never calls these, so its
+  // `backend` stays the column DEFAULT 'claude' and `agent_session_id` stays NULL.
+  setBackend(slug: string, backend: string): void
+  setAgentSession(slug: string, agentSessionId: string): void
   getSetting(key: string): unknown
   setSetting(key: string, value: unknown): void
   deleteSetting(key: string): void
@@ -110,6 +127,8 @@ export function createStorage(dbPath: string): Storage {
     "seen_at TEXT",
     "plan_path TEXT",
     "transcript_id TEXT",
+    "backend TEXT NOT NULL DEFAULT 'claude'",
+    "agent_session_id TEXT",
   ]) {
     try {
       db.exec(`ALTER TABLE session ADD COLUMN ${col}`)
@@ -168,9 +187,12 @@ export function createStorage(dbPath: string): Storage {
     const at = new Date().toISOString()
     putTomb.run(existing.session_id, slug, at)
     if (existing.transcript_id) putTomb.run(existing.transcript_id, slug, at)
+    if (existing.agent_session_id) putTomb.run(existing.agent_session_id, slug, at)
     delSession.run(slug)
     return existing
   })
+  const backendStmt = db.prepare("UPDATE session SET backend = ? WHERE slug = ?")
+  const agentSessionStmt = db.prepare("UPDATE session SET agent_session_id = ? WHERE slug = ?")
   const getSet = db.prepare<[string], { value: string }>("SELECT value FROM settings WHERE key = ?")
   const putSet = db.prepare(
     "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -193,6 +215,8 @@ export function createStorage(dbPath: string): Storage {
     setTitle: (slug, title) => void titleStmt.run(title, slug),
     forgetSession: (slug) => forget(slug),
     forgottenIds: () => new Set(allTombs.all().map((r) => r.transcript_id)),
+    setBackend: (slug, backend) => void backendStmt.run(backend, slug),
+    setAgentSession: (slug, agentSessionId) => void agentSessionStmt.run(agentSessionId, slug),
     getSetting: (key) => {
       const row = getSet.get(key)
       if (!row) return undefined

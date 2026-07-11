@@ -1,8 +1,11 @@
+import { writeFileSync } from "node:fs"
 import { tmuxSessionName, type Settings } from "@fray-ui/shared"
 import type { Project } from "./project.ts"
 import type { Storage } from "./storage.ts"
 import type { BoardManager } from "./board.ts"
-import { buildClaudeResumeCommand, workerPluginDir, scratchpadOrientation } from "./dispatch.ts"
+import type { AgentBackend } from "./backend/types.ts"
+import { ensureCwdTrusted } from "./backend/codex.ts"
+import { buildClaudeResumeCommand, workerPluginDir, scratchpadOrientation, loadWorkerPrompt } from "./dispatch.ts"
 import * as tmux from "./tmux.ts"
 
 // The ONE resume/steer path, shared by the followUp RPC (a human steer) and the wakers scheduler (a
@@ -30,6 +33,13 @@ export interface ResumeDeps {
   board: BoardManager
   getSettings: () => Settings
   tmux?: ResumeTmux // injectable for tests; defaults to the real tmux module
+  // Per-session agent-backend resolver that builds the dead-session resume argv (Codex-support epic).
+  // Injected by the composition layer; when absent (tests) resume falls back to the local Claude resume
+  // builder. Resolved by the row's `backend` column so a codex row resumes via `codex resume`.
+  backendFor?: (kind?: string) => AgentBackend
+  // $CODEX_HOME override for the codex trust pre-arm (tests inject a tmp dir); unset → the codex default
+  // (~/.codex), matching the CodexBackend the composition layer built.
+  codexHome?: string
 }
 
 export function resumeThread(deps: ResumeDeps, slug: string, message: string): void {
@@ -58,14 +68,21 @@ export function resumeThread(deps: ResumeDeps, slug: string, message: string): v
   if (!row) throw new Error(`no session registered for ${slug}`)
   tx.killSession(slug) // clear the dead (remain-on-exit) pane so new-session can reuse the name
   tx.ensureServer()
-  const cmd = buildClaudeResumeCommand({
-    sessionId: row.session_id,
-    permissionMode: deps.getSettings().permissionMode,
-    message,
-    pluginDir: workerPluginDir(),
-    extraSystemPrompt: scratchpadOrientation(row.session_id, row.plan_path),
-  })
-  tx.spawn(slug, cmd, deps.project.dir, { FRAY_UI_THREAD: slug })
+  const permissionMode = deps.getSettings().permissionMode
+  // The scratchpad orientation keys on the fray-minted session_id (unchanged by codex discovery); the
+  // backend-NATIVE id (codex rollout id, pinned on agent_session_id) is what resume re-attaches +
+  // `codex resume` continues. For claude, agent_session_id is NULL → session_id — byte-identical.
+  const extraSystemPrompt = scratchpadOrientation(row.session_id, row.plan_path)
+  const backend = deps.backendFor?.(row.backend)
+  // A dead codex resume re-spawns a fresh TUI, which blocks on the trust modal for an untrusted cwd
+  // exactly like a dispatch spawn — pre-arm it (idempotent; respects an existing trust choice).
+  if (row.backend === "codex") ensureCwdTrusted(deps.project.dir, deps.codexHome)
+  const nativeSessionId = row.agent_session_id ?? row.session_id
+  const built = backend
+    ? backend.buildResume({ sessionId: nativeSessionId, cwd: deps.project.dir, message, workerContract: loadWorkerPrompt(), extraSystemPrompt, permissionMode })
+    : { argv: buildClaudeResumeCommand({ sessionId: nativeSessionId, permissionMode, message, pluginDir: workerPluginDir(), extraSystemPrompt }), env: {} as Record<string, string>, prewrite: [] }
+  for (const f of built.prewrite) writeFileSync(f.path, f.contents)
+  tx.spawn(slug, built.argv, deps.project.dir, { ...built.env, FRAY_UI_THREAD: slug })
   deps.storage.upsertSession({ ...row, tmux_name: tmuxSessionName(slug), spawned_at: new Date().toISOString(), exited: 0 })
   deps.board.refresh() // storage-only change — overlay is enough
 }

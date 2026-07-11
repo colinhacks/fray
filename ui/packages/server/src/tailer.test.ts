@@ -7,7 +7,11 @@ import { createStorage, type Storage, type SessionRow } from "./storage.ts"
 import { Bus } from "./bus.ts"
 import type { ServerEvent } from "@fray-ui/shared"
 import type { Project } from "./project.ts"
-import { parseLine, applyRecord, computeTurn, newTailState, createTailer, matchesPermPrompt, hasQuestionBlock, isRealUserMessage, parseSignalFence, FOREIGN_FRESH_MS } from "./tailer.ts"
+import { parseLine, applyRecord, applyEvent, computeTurn, newTailState, createTailer, matchesPermPrompt, hasQuestionBlock, isRealUserMessage, parseSignalFence, FOREIGN_FRESH_MS } from "./tailer.ts"
+import type { AgentBackend, NormalizedEvent } from "./backend/types.ts"
+import { createClaudeBackend } from "./backend/claude.ts"
+import { createCodexBackend } from "./backend/codex.ts"
+import { mkdirSync } from "node:fs"
 
 function tmp(prefix: string) {
   return mkdtempSync(join(tmpdir(), prefix))
@@ -96,6 +100,100 @@ test("computeTurn: unknown stop_reason uses the 5s silence backstop", () => {
   applyRecord(s, { type: "assistant", timestamp: "2026-07-01T00:00:00.000Z", message: { content: [] } })
   assert.equal(computeTurn(s, Date.parse("2026-07-01T00:00:03.000Z")), "in-flight") // 3s: still in flight
   assert.equal(computeTurn(s, Date.parse("2026-07-01T00:00:06.000Z")), "idle") // 6s: backstop fires
+})
+
+// ---- applyEvent: the backend-NEUTRAL fold over NormalizedEvents (the codex-facing seam) ----
+// applyEvent is what a codex backend drives its foldLine off (`for (ev of parseLine(line)) applyEvent`),
+// so these tests pin the same FoldState fields the tailer/board consume — with turn driven by explicit
+// turn-start/turn-end brackets, NOT Claude's stop_reason vocab. `pendingQuestion` is derived exactly as
+// get() derives it: an idle turn whose final message still carries an unanswered ```question fence.
+const pendingQuestion = (s: { turn: string; lastAssistantHasQuestion: boolean }) => s.turn === "idle" && s.lastAssistantHasQuestion
+
+test("applyEvent: a full codex-style turn folds to idle with the final preview + parsed done fence", () => {
+  const s = newTailState("t", "s", "/x")
+  const seq: NormalizedEvent[] = [
+    { kind: "turn-start", at: "2026-07-01T00:00:00.000Z" },
+    { kind: "assistant-text", at: "2026-07-01T00:00:01.000Z", text: "I'll read hello.txt to check.", final: false }, // commentary
+    { kind: "tool-call", at: "2026-07-01T00:00:02.000Z", id: "call_1", name: "exec_command", input: { cmd: "cat hello.txt" } },
+    { kind: "tool-result", at: "2026-07-01T00:00:03.000Z", id: "call_1", text: "hello world" },
+    { kind: "assistant-text", at: "2026-07-01T00:00:04.000Z", text: "All set — shipped it.\n\n```done\nread the file\n```", final: true },
+    { kind: "turn-end", at: "2026-07-01T00:00:05.000Z" },
+  ]
+  for (const ev of seq) applyEvent(s, ev)
+  assert.equal(s.turn, "idle") // bracketed closed by turn-end, no stop_reason heuristic
+  assert.equal(s.lastActivityAt, "2026-07-01T00:00:05.000Z") // latest event's timestamp
+  assert.equal(s.lastAssistant, "All set — shipped it. ```done read the file ```") // final preview (whitespace-collapsed)
+  assert.deepEqual(s.lastFence, { kind: "done", body: "read the file", hints: [] }) // parsed off the FINAL message
+  assert.equal(s.lastAssistantHasQuestion, false)
+  assert.equal(pendingQuestion(s), false)
+  assert.equal(s.lastUserAt, undefined) // no human turn in this sequence
+})
+
+test("applyEvent: commentary refreshes the preview but NEVER carries a fence; only the final answer does", () => {
+  const s = newTailState("t", "s", "/x")
+  // A commentary block that literally contains a done-shaped fence must NOT excuse the thread.
+  applyEvent(s, { kind: "turn-start", at: "2026-07-01T00:00:00.000Z" })
+  applyEvent(s, { kind: "assistant-text", at: "2026-07-01T00:00:01.000Z", text: "working on it\n\n```done\nnot really\n```", final: false })
+  assert.equal(s.lastAssistant, "working on it ```done not really ```") // preview updated
+  assert.equal(s.lastFence, undefined) // commentary carries NO fence
+  assert.equal(s.lastAssistantHasQuestion, false)
+})
+
+test("applyEvent: turn-end.finalText derives the fence when the backend brackets the final message on task_complete", () => {
+  const s = newTailState("t", "s", "/x")
+  applyEvent(s, { kind: "turn-start", at: "2026-07-01T00:00:00.000Z" })
+  // No assistant-text{final} — the final message rides task_complete.last_agent_message instead.
+  applyEvent(s, { kind: "turn-end", at: "2026-07-01T00:00:02.000Z", finalText: "Need your call.\n\n```awaiting\npr: owner/repo#7\nshould I merge?\n```" })
+  assert.equal(s.turn, "idle")
+  assert.deepEqual(s.lastFence, { kind: "awaiting", body: "should I merge?", hints: [{ kind: "pr", value: "owner/repo#7" }] })
+  assert.equal(s.lastAssistant, "Need your call. ```awaiting pr: owner/repo#7 should I merge? ```")
+})
+
+test("applyEvent: an idle turn ending on a ```question fence surfaces pendingQuestion", () => {
+  const s = newTailState("t", "s", "/x")
+  applyEvent(s, { kind: "turn-start", at: "2026-07-01T00:00:00.000Z" })
+  applyEvent(s, { kind: "assistant-text", at: "2026-07-01T00:00:01.000Z", text: "```question\nWhich option do you want?\n```", final: true })
+  assert.equal(pendingQuestion(s), false) // still in-flight — not yet at rest
+  applyEvent(s, { kind: "turn-end", at: "2026-07-01T00:00:02.000Z" })
+  assert.equal(s.turn, "idle")
+  assert.equal(s.lastAssistantHasQuestion, true)
+  assert.equal(pendingQuestion(s), true) // idle + unanswered question → pending
+})
+
+test("applyEvent: only a GENUINE user-message bumps lastUserAt; a synthetic one never does", () => {
+  const s = newTailState("t", "s", "/x")
+  applyEvent(s, { kind: "user-message", at: "2026-07-01T00:00:00.000Z", text: "go do the thing", synthetic: false })
+  assert.equal(s.turn, "in-flight") // a user turn re-opens → the model is about to respond
+  assert.equal(s.lastUserAt, "2026-07-01T00:00:00.000Z")
+  // A synthetic user-message (peer msg / notification) re-invokes the model (in-flight) but is machine
+  // motion the human didn't cause — it must NOT jump the row, so lastUserAt is left untouched.
+  applyEvent(s, { kind: "user-message", at: "2026-07-01T00:00:05.000Z", synthetic: true })
+  assert.equal(s.turn, "in-flight")
+  assert.equal(s.lastUserAt, "2026-07-01T00:00:00.000Z") // NOT bumped to 00:05
+  assert.equal(s.lastActivityAt, "2026-07-01T00:00:05.000Z") // but activity clock did advance
+})
+
+test("applyEvent: a later user-message clears a prior excusal fence + pending question", () => {
+  const s = newTailState("t", "s", "/x")
+  applyEvent(s, { kind: "turn-start", at: "2026-07-01T00:00:00.000Z" })
+  applyEvent(s, { kind: "assistant-text", at: "2026-07-01T00:00:01.000Z", text: "Done.\n\n```done\nshipped\n```", final: true })
+  applyEvent(s, { kind: "turn-end", at: "2026-07-01T00:00:02.000Z" })
+  assert.deepEqual(s.lastFence, { kind: "done", body: "shipped", hints: [] })
+  // A fresh human turn supersedes the fence (it only signals while it is the final message).
+  applyEvent(s, { kind: "user-message", at: "2026-07-01T00:00:03.000Z", text: "one more thing", synthetic: false })
+  assert.equal(s.lastFence, undefined)
+  assert.equal(s.lastAssistantHasQuestion, false)
+  assert.equal(s.turn, "in-flight")
+  assert.equal(s.lastUserAt, "2026-07-01T00:00:03.000Z")
+})
+
+test("applyEvent: a title event sets aiTitle and never disturbs turn state", () => {
+  const s = newTailState("t", "s", "/x")
+  applyEvent(s, { kind: "turn-start", at: "2026-07-01T00:00:00.000Z" })
+  applyEvent(s, { kind: "title", title: "Codex thread title" })
+  assert.equal(s.aiTitle, "Codex thread title")
+  assert.equal(s.turn, "in-flight") // title is a sidecar — turn untouched
+  assert.equal(s.lastActivityAt, "2026-07-01T00:00:00.000Z") // a title has no `at`, so the clock is unmoved
 })
 
 // ai-title is a sidecar record carrying Claude's own session name; the LATEST non-empty wins and it
@@ -1068,4 +1166,97 @@ test("tailer: a cached transcript_id is excluded from FOREIGN discovery (the re-
   t.tick()
   assert.equal(t.foreignIds().includes("forked-id"), false, "the row's discovered transcript is NOT surfaced as foreign")
   assert.equal(t.foreignIds().includes("stranger"), true, "an unrelated fresh file still surfaces as foreign (control)")
+})
+
+// ---- codex: a rollout folds THROUGH THE TICK to idle (the computeTurn regression) ----
+// Codex brackets turns EXPLICITLY (task_started .. task_complete → applyEvent writes state.turn) and
+// never sets lastKind. BEFORE the computeTurn patch, the tick's computeTurn — which reads only Claude's
+// lastKind/lastStopReason (undefined for codex) — fell through to "in-flight", CLOBBERING the `idle`
+// applyEvent set, so a wired codex row was stuck in-flight forever. These drive a REAL CodexBackend
+// through the tick (not applyEvent directly — codex.test.ts covers that) so computeTurn actually runs.
+
+// Codex rollout record builders (real 0.144.1 schema — see backend/codex.fixtures/*.jsonl).
+const cxMeta = (codexId: string, cwd: string) => JSON.stringify({ timestamp: "2026-07-10T21:58:43.000Z", type: "session_meta", payload: { session_id: codexId, cwd } })
+const cxTaskStarted = JSON.stringify({ timestamp: "2026-07-10T21:58:43.255Z", type: "event_msg", payload: { type: "task_started", turn_id: "turn-1" } })
+const cxAgentFinal = (text: string) => JSON.stringify({ timestamp: "2026-07-10T21:58:50.000Z", type: "event_msg", payload: { type: "agent_message", message: text, phase: "final_answer" } })
+const cxTaskComplete = (last: string) => JSON.stringify({ timestamp: "2026-07-10T21:59:00.000Z", type: "event_msg", payload: { type: "task_complete", turn_id: "turn-1", last_agent_message: last } })
+const CX_DONE = "All wired.\n\n```done\nwired\n```"
+
+// Write a rollout into a $CODEX_HOME date-sharded sessions dir (filename suffix = the codex id, which
+// findRolloutById locates by). Returns the path so the test can append to it mid-tick.
+function writeCodexRollout(codexHome: string, codexId: string, lines: string[]): string {
+  const dir = join(codexHome, "sessions", "2026", "07", "10")
+  mkdirSync(dir, { recursive: true })
+  const path = join(dir, `rollout-2026-07-10T21-58-43-${codexId}.jsonl`)
+  writeFileSync(path, lines.map((l) => l + "\n").join(""))
+  return path
+}
+
+// A tailer whose backendFor routes codex rows to a real CodexBackend (tmp $CODEX_HOME) and everything
+// else to a real ClaudeBackend — mirroring context.ts's resolver.
+function codexTailer(h: Harness, codexHome: string) {
+  const codexBackend = createCodexBackend({ codexHome })
+  const claudeBackend = createClaudeBackend({ logDir: h.logDir })
+  const backendFor = (kind?: string): AgentBackend => (kind === "codex" ? codexBackend : claudeBackend)
+  return createTailer({
+    project: { cwdSlug: "x" } as Project,
+    storage: h.storage,
+    bus: h.bus,
+    onChange: () => h.changes.n++,
+    now: () => h.clock.ms,
+    paneDead: () => h.dead.v,
+    capturePane: () => h.pane.text,
+    sessionLogDir: h.logDir,
+    backendFor,
+  })
+}
+
+// Pin a codex row the way dispatch does: backend + the discovered rollout id land via the dedicated
+// setters (the shared upsert never writes them), leaving session_id as the fray-minted key.
+function pinCodexRow(h: Harness, codexId: string) {
+  h.storage.upsertSession(row({ session_id: "fray-uuid" }))
+  h.storage.setBackend("t", "codex")
+  h.storage.setAgentSession("t", codexId)
+}
+
+test("tailer: a codex rollout primes to in-flight, then transitions to idle+fence THROUGH the tick", () => {
+  const h = harness()
+  const codexHome = tmp("fray-codexhome-")
+  const codexId = "019f4e0a-42cb-7891-9cbf-325e93ae587c"
+  const path = writeCodexRollout(codexHome, codexId, [cxMeta(codexId, "/x"), cxTaskStarted]) // turn open
+  pinCodexRow(h, codexId)
+  const t = codexTailer(h, codexHome)
+
+  h.clock.ms = Date.parse("2026-07-10T21:58:45.000Z")
+  t.tick() // prime while the turn is open
+  assert.equal(t.get("t")?.turn, "in-flight", "an open codex turn (task_started, no task_complete) is in-flight")
+  assert.equal(h.events.length, 0, "priming an in-flight codex turn never notifies")
+
+  // The turn brackets closed with a done fence on the final message.
+  appendFileSync(path, cxAgentFinal(CX_DONE) + "\n" + cxTaskComplete(CX_DONE) + "\n")
+  h.clock.ms = Date.parse("2026-07-10T21:59:05.000Z")
+  t.tick()
+  const tele = t.get("t")
+  // THE REGRESSION: without the patch computeTurn clobbers this back to "in-flight".
+  assert.equal(tele?.turn, "idle", "task_complete's explicit bracket survives the tick's computeTurn")
+  assert.deepEqual(tele?.lastFence, { kind: "done", body: "wired", hints: [] }, "the done fence is derived from the final message")
+  assert.equal(tele?.lastAssistant, "All wired. ```done wired ```", "the final answer is the preview")
+  const notifies = h.events.filter((e) => e.type === "notify")
+  assert.equal(notifies.length, 1, "the in-flight→idle transition fires exactly one turn-done notify")
+  assert.equal(notifies[0].type === "notify" && notifies[0].kind, "turn-done")
+  assert.equal(h.storage.getSession("t")?.unread, 1, "a completed codex turn badges unread")
+})
+
+test("tailer: a codex rollout already at task_complete PRIMES straight to idle (not clobbered to in-flight)", () => {
+  const h = harness()
+  const codexHome = tmp("fray-codexhome-")
+  const codexId = "019f4e0b-1111-2222-3333-444455556666"
+  writeCodexRollout(codexHome, codexId, [cxMeta(codexId, "/x"), cxTaskStarted, cxAgentFinal(CX_DONE), cxTaskComplete(CX_DONE)])
+  pinCodexRow(h, codexId)
+  const t = codexTailer(h, codexHome)
+
+  h.clock.ms = Date.parse("2026-07-10T22:05:00.000Z")
+  t.tick() // prime a fully-bracketed rollout
+  assert.equal(t.get("t")?.turn, "idle", "a primed, fully-bracketed codex rollout is idle — computeTurn respects it")
+  assert.equal(h.events.length, 0, "priming never notifies (the completion pre-dates first sight)")
 })

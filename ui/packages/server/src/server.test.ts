@@ -1,6 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs"
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, realpathSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createStorage } from "./storage.ts"
@@ -18,6 +18,9 @@ import {
   validPlanPath,
   createDispatcher,
 } from "./dispatch.ts"
+import { createClaudeBackend } from "./backend/claude.ts"
+import { createCodexBackend } from "./backend/codex.ts"
+import type { AgentBackend } from "./backend/types.ts"
 
 function tmp(prefix: string) {
   return mkdtempSync(join(tmpdir(), prefix))
@@ -393,4 +396,91 @@ test("adopt: requires the legacy file, provisions a scratchpad, orientation is c
 test("cwdSlug: replaces / and . with - (Claude Code project-log convention)", () => {
   assert.equal(cwdSlug("/Users/x/Documents/projects/fray"), "-Users-x-Documents-projects-fray")
   assert.equal(cwdSlug("/Users/x/.workshell/wt"), "-Users-x--workshell-wt")
+})
+
+// ---- Codex dispatch wiring (Codex-support epic, Phase 2): the COMPOSED spawn orchestration ----
+// createCodexBackend + createClaudeBackend behind a backendFor resolver (mirrors context.ts). A codex
+// dispatch must: pre-arm the cwd trust gate, spawn the codex argv (worker contract in the prompt), then
+// sentinel-discover the rollout id and PIN it on the row (session_id stays the fray key). A claude
+// dispatch through the SAME dispatcher is byte-identical — no trust write, backend stays 'claude'.
+function codexDispatcherHarness() {
+  const dir = tmp("fray-dispatch-codex-")
+  const codexHome = tmp("fray-codexhome-")
+  const storage = createStorage(join(dir, "ui.db"))
+  const project: Project = { dir, id: "id", name: "test", label: "o/test", stateDir: dir, cwdSlug: cwdSlug(dir) }
+  const spawned: { slug: string; cmd: string[]; cwd: string; env?: Record<string, string> }[] = []
+  const CODEX_ID = "019f4e0a-cafe-7891-9cbf-00000000abcd"
+  // A spawn that SIMULATES codex: extract the per-dispatch sentinel from the prompt (codex spawns via an
+  // `sh -c` wrapper that reads the prompt from a temp FILE — the last argv element — so read it) and write
+  // a fresh rollout carrying it (+ a session_meta id/cwd) so the dispatcher's sentinel discovery resolves
+  // it. A claude spawn (no `fray-session:` sentinel) writes nothing — the resolver stayed off codex.
+  const spawn = (slug: string, cmd: string[], cwd: string, env?: Record<string, string>) => {
+    spawned.push({ slug, cmd, cwd, env })
+    const last = cmd[cmd.length - 1] ?? ""
+    const promptText = cmd[0] === "sh" ? readFileSync(last, "utf8") : last
+    const sentinel = promptText.match(/fray-session:[0-9a-f-]+/)?.[0]
+    if (!sentinel) return
+    const sdir = join(codexHome, "sessions", "2026", "07", "10")
+    mkdirSync(sdir, { recursive: true })
+    const meta = JSON.stringify({ timestamp: "2026-07-10T22:00:00.000Z", type: "session_meta", payload: { session_id: CODEX_ID, cwd } })
+    const um = JSON.stringify({ timestamp: "2026-07-10T22:00:01.000Z", type: "event_msg", payload: { type: "user_message", message: `do the task <!-- ${sentinel} -->` } })
+    writeFileSync(join(sdir, `rollout-2026-07-10T22-00-00-${CODEX_ID}.jsonl`), meta + "\n" + um + "\n")
+  }
+  const codexBackend = createCodexBackend({ codexHome })
+  const claudeBackend = createClaudeBackend({ logDir: join(dir, "logs") })
+  const backendFor = (kind?: string): AgentBackend => (kind === "codex" ? codexBackend : claudeBackend)
+  const board: BoardManager = {
+    snapshot: async () => ({}) as never,
+    currentSeq: () => 0,
+    rebuild: async () => ({}) as never,
+    refresh: () => ({}) as never,
+    start: async () => {},
+    stop: async () => {},
+  }
+  const dispatcher = createDispatcher({ project, storage, board, getSettings: () => defaultSettings(), spawn, backendFor, codexHome })
+  return { dir, codexHome, storage, project, spawned, dispatcher, CODEX_ID }
+}
+
+test("dispatch(codex): pre-arms cwd trust, spawns the codex argv, and pins the discovered rollout id", async () => {
+  const h = codexDispatcherHarness()
+  const { slug, sessionId } = await h.dispatcher.dispatch({ prompt: "Wire codex." }, { backend: "codex" })
+
+  // 1. trust pre-arm: the global codex config gained a trusted entry for the (realpath'd) cwd.
+  const cfg = readFileSync(join(h.codexHome, "config.toml"), "utf8")
+  assert.ok(cfg.includes('trust_level = "trusted"'), "ensureCwdTrusted wrote a trusted entry")
+  assert.ok(cfg.includes(`[projects."${realpathSync(h.project.dir)}"]`), "trusted entry keys on the realpath'd cwd")
+
+  // 2. codex argv: the ~18KB worker contract would blow tmux's command-length limit inline, so the
+  //    prompt is spilled to a temp FILE and codex spawns via a short `sh -c` wrapper that reads it. The
+  //    tmux command line stays tiny; the full contract + sentinel ride the file (codex's prompt arg).
+  const cmd = h.spawned[0].cmd
+  assert.equal(cmd[0], "sh")
+  assert.equal(cmd[1], "-c")
+  const script = cmd[2]
+  assert.ok(script.includes(`exec 'codex' '--cd' '${h.project.dir}'`), "the wrapper execs the real codex argv")
+  assert.ok(script.includes("'-a' 'never'"), "approvals never (unattended)")
+  const promptFile = cmd[cmd.length - 1]
+  const promptText = readFileSync(promptFile, "utf8")
+  assert.ok(promptText.includes(`fray-session:${sessionId}`), "the discovery sentinel rides the prompt file")
+  assert.ok(promptText.length > 10_000, "the ~18KB worker contract rides the prompt file")
+  assert.ok(cmd.join(" ").length < 2_000, "the tmux command line stays well under the length limit")
+
+  // 3. the row: backend pinned codex, agent_session_id = the discovered rollout id, session_id = the
+  //    fray key (unchanged — the scratchpad lives under it).
+  const rowdb = h.storage.getSession(slug)!
+  assert.equal(rowdb.backend, "codex")
+  assert.equal(rowdb.agent_session_id, h.CODEX_ID, "the discovered codex rollout id is pinned")
+  assert.equal(rowdb.session_id, sessionId, "session_id stays the fray-minted key")
+  assert.ok(existsSync(join(h.dir, ".fray", "scratch", `${sessionId}.md`)), "scratchpad keyed on the fray session_id")
+})
+
+test("dispatch(claude) through the same resolver is UNCHANGED — no trust write, backend stays claude", async () => {
+  const h = codexDispatcherHarness()
+  const { slug } = await h.dispatcher.dispatch({ prompt: "Business as usual." }) // no opts → claude
+
+  assert.ok(!existsSync(join(h.codexHome, "config.toml")), "a claude dispatch never touches the codex trust config")
+  const rowdb = h.storage.getSession(slug)!
+  assert.equal(rowdb.backend, "claude", "backend stays the column default")
+  assert.equal(rowdb.agent_session_id ?? null, null, "no codex rollout id pinned")
+  assert.equal(h.spawned[0].cmd[0], "claude", "the claude argv builder ran")
 })
