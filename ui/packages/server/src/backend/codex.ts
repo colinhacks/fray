@@ -52,13 +52,15 @@ function composeSpawnPrompt(o: SpawnOpts): string {
 }
 
 // ---- spawn / resume argv ----
-// Codex reasoning-effort values are {minimal,low,medium,high}; fray's effort enum adds xhigh/max which
-// codex doesn't accept — clamp them to "high" (codex's ceiling). Unknown → undefined (codex default).
-const CODEX_EFFORTS = new Set(["minimal", "low", "medium", "high"])
+// Codex reasoning-effort values are {low,medium,high,xhigh} (per ~/.codex/models_cache.json — every
+// listed model exposes these four; corrected 2026-07-12, was wrongly {minimal,…,high} clamping xhigh→high).
+// fray's enum also has "max", which codex lacks → clamp max→xhigh (codex's ceiling). Unknown → undefined
+// (codex then uses the model's default_reasoning_level).
+const CODEX_EFFORTS = new Set(["low", "medium", "high", "xhigh"])
 export function codexEffort(effort?: string): string | undefined {
   if (!effort) return undefined
   if (CODEX_EFFORTS.has(effort)) return effort
-  if (effort === "xhigh" || effort === "max") return "high"
+  if (effort === "max") return "xhigh"
   return undefined
 }
 

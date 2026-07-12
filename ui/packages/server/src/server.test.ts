@@ -465,6 +465,15 @@ test("dispatch(codex): pre-arms cwd trust, spawns the codex argv, and pins the d
   assert.ok(promptText.length > 10_000, "the ~18KB worker contract rides the prompt file")
   assert.ok(cmd.join(" ").length < 2_000, "the tmux command line stays well under the length limit")
 
+  // 2b. the contract a codex worker receives is the CODEX variant — codex's own session/wake +
+  //     model/effort/sandbox framing, and NONE of the Claude-Code-only guidance it can't act on
+  //     (the Agent tool + fray:<model>-<effort> profiles, "claude session"/`claude -r`).
+  assert.ok(promptText.includes("a top-level `codex` session"), "codex worker gets the codex session framing")
+  assert.ok(promptText.includes("## Working solo"), "codex worker gets the solo section")
+  assert.ok(!promptText.includes("## Sub-agents"), "codex worker never gets the Claude Sub-agents section")
+  assert.ok(!promptText.includes("fray:<model>-<effort>"), "codex worker never gets the fray profile ladder")
+  assert.ok(!promptText.includes("claude -r"), "codex worker never gets the `claude -r` wake")
+
   // 3. the row: backend pinned codex, agent_session_id = the discovered rollout id, session_id = the
   //    fray key (unchanged — the scratchpad lives under it).
   const rowdb = h.storage.getSession(slug)!

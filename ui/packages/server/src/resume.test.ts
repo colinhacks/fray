@@ -178,6 +178,14 @@ test("resumeThread (codex, dead): pre-arms cwd trust + re-attaches the pinned ro
   assert.ok(cmd.includes(CODEX_ID), "resume re-attaches the pinned codex rollout id")
   assert.ok(!cmd.includes(`sid-${slug}`), "the fray session_id is NOT used as the codex resume id")
   assert.equal(storage.getSession(slug)?.exited, 0, "respawn cleared the exited flag")
+
+  // The resume MESSAGE (last argv element) re-carries the backend-aware scratchpad orientation — for a
+  // codex row that means the CODEX variant (compaction memory), NOT Claude's sub-agent/blackboard
+  // framing. This pins `scratchpadOrientation(..., backend?.kind)` on the resume seam (resume.ts).
+  const message = cmd[cmd.length - 1]
+  assert.match(message, /compaction-proof working memory/, "codex resume carries the codex scratchpad orientation")
+  assert.doesNotMatch(message, /blackboard/, "codex resume never carries the sub-agent blackboard framing")
+  assert.doesNotMatch(message, /sub-agent/, "codex resume never carries sub-agent framing")
 })
 
 test("resumeThread leaves a non-archived thread's state untouched (no needless flip)", () => {

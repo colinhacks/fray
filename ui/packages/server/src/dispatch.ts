@@ -70,9 +70,24 @@ export function resolveSlug(frayDir: string, base: string, taken?: (slug: string
   }
 }
 
-// The scratchpad skeleton (a CONVENTION, never validated): an H1, a one-line orientation, and the three
-// working sections. The worker owns it from here — this is only the starting shape.
-export function scratchpadContent(title: string): string {
+// The scratchpad skeleton (a CONVENTION, never validated): an H1, a one-line orientation, and the
+// working sections. The worker owns it from here — this is only the starting shape. Backend-aware:
+// a claude worker's pad is ALSO the fleet blackboard its sub-agents read (hence "## Shared context"),
+// but a codex worker runs solo (fray dispatches no codex sub-agents), so its pad is purely
+// compaction memory — the blackboard framing + shared section are dropped.
+export function scratchpadContent(title: string, kind: BackendKind = "claude"): string {
+  if (kind === "codex") {
+    return `# Scratchpad — ${title}
+
+Your compaction-proof working memory — keep your task list and any state that must survive a compaction here.
+
+## Task list
+
+- [ ]
+
+## Notes
+`
+  }
   return `# Scratchpad — ${title}
 
 Your compaction-proof working memory and the fleet blackboard — keep your task list and any state that must survive a compaction or be shared with your sub-agents here.
@@ -89,24 +104,45 @@ Your compaction-proof working memory and the fleet blackboard — keep your task
 
 // Provision the thread's scratchpad (.fray/scratch/<sessionId>.md), atomic tmp+rename. Returns the
 // project-relative path. sessionId is a fresh UUID at both dispatch and adopt, so this never clobbers.
-export function writeScratchpad(projectDir: string, sessionId: string, title: string): string {
+export function writeScratchpad(projectDir: string, sessionId: string, title: string, kind: BackendKind = "claude"): string {
   const dir = join(projectDir, ".fray", "scratch")
   mkdirSync(dir, { recursive: true })
   const rel = `.fray/scratch/${sessionId}.md`
   const path = join(projectDir, rel)
   const tmp = `${path}.tmp.${process.pid}`
-  writeFileSync(tmp, scratchpadContent(title))
+  writeFileSync(tmp, scratchpadContent(title, kind))
   renameSync(tmp, path)
   return rel
 }
 
-// The FIXED worker system prompt: ui/WORKER_PROMPT.md below its provenance header. Not
-// user-modifiable — the settings dispatchPreamble (custom instructions) is appended separately.
-export function loadWorkerPrompt(): string {
+// Parse a per-backend fragment file (WORKER_PROMPT.<kind>.md) into a name→text map keyed by its
+// `<!-- FRAY:NAME -->` section headers (anything before the first header is documentation, ignored).
+// Each fragment is trimmed so the marker substitutes cleanly regardless of the blank lines the core
+// keeps around it — that trim is what makes the claude fill reproduce the pre-split contract exactly.
+function loadWorkerFragments(uiDir: string, kind: BackendKind): Record<string, string> {
+  const frag = readFileSync(join(uiDir, `WORKER_PROMPT.${kind}.md`), "utf8")
+  const parts = frag.split(/^<!-- FRAY:(\w+) -->$/m)
+  const out: Record<string, string> = {}
+  for (let i = 1; i < parts.length; i += 2) out[parts[i]] = parts[i + 1].trim()
+  return out
+}
+
+// The FIXED worker system prompt for `kind`: ui/WORKER_PROMPT.md (the shared, backend-agnostic CORE
+// below its provenance header) with its `{{FRAY_*}}` markers filled from WORKER_PROMPT.<kind>.md. The
+// CLAUDE fills reproduce the pre-split contract BYTE-FOR-BYTE (the regression bar); the CODEX fills
+// swap the Claude-Code-only guidance (the `Agent` tool + `fray:<model>-<effort>` profiles, "claude
+// session", `claude -r`, the sub-agent blackboard framing) for codex's own (solo worker, `codex
+// resume` wake, reasoning-effort + sandbox framing). Not user-modifiable — the settings
+// dispatchPreamble (custom instructions) is appended separately. Any read failure → "" (as before).
+export function loadWorkerPrompt(kind: BackendKind = "claude"): string {
   try {
-    const md = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "../../../WORKER_PROMPT.md"), "utf8")
+    const uiDir = resolve(dirname(fileURLToPath(import.meta.url)), "../../..")
+    const md = readFileSync(join(uiDir, "WORKER_PROMPT.md"), "utf8")
     const cut = md.indexOf("\n---\n")
-    return cut === -1 ? md.trim() : md.slice(cut + 5).trim()
+    const core = cut === -1 ? md.trim() : md.slice(cut + 5).trim()
+    const parts = loadWorkerFragments(uiDir, kind)
+    // An unresolved marker keeps its literal text (a missing fragment is surfaced, not silently blanked).
+    return core.replace(/\{\{FRAY_(\w+)\}\}/g, (m, n) => parts[n] ?? m)
   } catch {
     return ""
   }
@@ -117,8 +153,11 @@ export function loadWorkerPrompt(): string {
 // orientation (a new dispatch owns no .fray file). The fixed worker prompt (WORKER_PROMPT.md) and the
 // same scratchpad line at SYSTEM level travel via --append-system-prompt (see buildClaudeCommand) so
 // they survive compaction and re-apply on resume; this composes the visible-message half.
-export function composePrompt(sessionId: string, prompt: string, customInstructions: string): string {
-  const scratch = `Your scratchpad is \`.fray/scratch/${sessionId}.md\` — your compaction-proof working memory and the shared blackboard for your sub-agents. Keep your task list and any state that must survive a compaction or be shared with sub-agents IN it, and pass its path to every sub-agent you dispatch.`
+export function composePrompt(sessionId: string, prompt: string, customInstructions: string, kind: BackendKind = "claude"): string {
+  const scratch =
+    kind === "codex"
+      ? `Your scratchpad is \`.fray/scratch/${sessionId}.md\` — your compaction-proof working memory. Keep your task list and any state that must survive a compaction IN it, and re-read it after a compaction to recover where you are.`
+      : `Your scratchpad is \`.fray/scratch/${sessionId}.md\` — your compaction-proof working memory and the shared blackboard for your sub-agents. Keep your task list and any state that must survive a compaction or be shared with sub-agents IN it, and pass its path to every sub-agent you dispatch.`
   const custom = customInstructions.trim()
     ? `\n\nPROJECT INSTRUCTIONS (from the human operator):\n${customInstructions.trim()}`
     : ""
@@ -128,10 +167,12 @@ export function composePrompt(sessionId: string, prompt: string, customInstructi
 // The SYSTEM-level scratchpad orientation (survives compaction, rebuilds on every resume): a scratchpad
 // line, plus a PLAN line when the thread is associated with a plan artifact. Passed as extraSystemPrompt
 // on dispatch, adopt, AND the followUp resume path.
-export function scratchpadOrientation(sessionId: string, planPath?: string | null): string {
-  const lines = [
-    `SCRATCHPAD: .fray/scratch/${sessionId}.md — your compaction-proof working memory and the shared blackboard for your sub-agents (write shared state + your task list there; pass this path in every sub-agent prompt).`,
-  ]
+export function scratchpadOrientation(sessionId: string, planPath?: string | null, kind: BackendKind = "claude"): string {
+  const scratch =
+    kind === "codex"
+      ? `SCRATCHPAD: .fray/scratch/${sessionId}.md — your compaction-proof working memory (write your task list + any state that must survive a compaction there; re-read it after a compaction to recover where you are).`
+      : `SCRATCHPAD: .fray/scratch/${sessionId}.md — your compaction-proof working memory and the shared blackboard for your sub-agents (write shared state + your task list there; pass this path in every sub-agent prompt).`
+  const lines = [scratch]
   if (planPath) lines.push(`PLAN: ${planPath} — the durable plan artifact this thread works from; read it FIRST.`)
   return lines.join("\n")
 }
@@ -321,7 +362,7 @@ export function createDispatcher(deps: DispatchDeps): Dispatcher {
         sessionId: o.sessionId,
         cwd: deps.project.dir,
         prompt: o.prompt,
-        workerContract: loadWorkerPrompt(),
+        workerContract: loadWorkerPrompt(o.kind),
         extraSystemPrompt: o.extraSystemPrompt,
         permissionMode: o.permissionMode,
         model: o.model,
@@ -380,16 +421,16 @@ export function createDispatcher(deps: DispatchDeps): Dispatcher {
       // Session-first: provision the scratchpad (the durable working memory) — NO .fray/<slug>.md file.
       // The scratchpad keys on the fray-minted sessionId, which stays the row's session_id for BOTH
       // backends (codex's discovered rollout id is pinned separately on agent_session_id).
-      const scratchRel = writeScratchpad(deps.project.dir, sessionId, title)
+      const scratchRel = writeScratchpad(deps.project.dir, sessionId, title, kind)
 
-      const prompt = composePrompt(sessionId, input.prompt, settings.dispatchPreamble)
+      const prompt = composePrompt(sessionId, input.prompt, settings.dispatchPreamble, kind)
       const built = buildSpawnCommand({
         sessionId,
         permissionMode,
         model: input.model ?? settings.model,
         effort: input.effort ?? settings.effort,
         prompt,
-        extraSystemPrompt: scratchpadOrientation(sessionId, planPath),
+        extraSystemPrompt: scratchpadOrientation(sessionId, planPath, kind),
         kind,
       })
 

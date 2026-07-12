@@ -321,12 +321,12 @@ test("createCodexBackend: buildResume → `codex resume <id> <message>` with ori
 
 // ==== effort / sandbox mappings ====
 
-test("codexEffort: passes through codex values, clamps xhigh/max → high, unknown → undefined", () => {
+test("codexEffort: passes through low/medium/high/xhigh, clamps max → xhigh, unknown → undefined", () => {
   assert.equal(codexEffort("low"), "low")
   assert.equal(codexEffort("medium"), "medium")
   assert.equal(codexEffort("high"), "high")
-  assert.equal(codexEffort("xhigh"), "high")
-  assert.equal(codexEffort("max"), "high")
+  assert.equal(codexEffort("xhigh"), "xhigh")
+  assert.equal(codexEffort("max"), "xhigh")
   assert.equal(codexEffort(undefined), undefined)
   assert.equal(codexEffort("bogus"), undefined)
 })

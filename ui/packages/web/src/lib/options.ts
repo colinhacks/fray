@@ -56,11 +56,12 @@ export const CLAUDE_MODELS: SelectOption[] = [
   { value: "haiku", label: "Haiku" },
 ]
 
-// Codex (OpenAI) models — the `codex -m <id>` values. CURATED from the local codex install's
-// authoritative catalogue: ~/.codex/models_cache.json (codex-cli 0.144.1), the visibility="list"
-// entries. gpt-5.3-codex-spark is `supported_in_api=false` but selectable in the interactive TUI
-// (which is how fray spawns codex), so it's offered. ⚖ MAINTAINER: confirm/extend this list — it is
-// pinned to ONE machine's cache and codex ships new ids over time (see the thread doc's model note).
+// Codex (OpenAI) models — the `codex -m <id>` values, ONLY from the authoritative local catalogue
+// ~/.codex/models_cache.json (visibility="list" entries). gpt-5.5 is the newest codex supports.
+// NEVER add an unverified id: codex 400s on an unknown model ("model 'X' is not supported when using
+// Codex with a ChatGPT account"), which KILLS the spawn — a dead, silent thread. (gpt-5.6 was added
+// 2026-07-12 on a bad guess and REVERTED after codex rejected it live.) gpt-5.3-codex-spark is
+// `supported_in_api=false` but selectable in the interactive TUI (how fray spawns codex).
 export const CODEX_MODELS: SelectOption[] = [
   { value: "gpt-5.5", label: "GPT-5.5", title: "GPT-5.5 — frontier coding/research model (codex default)" },
   { value: "gpt-5.4", label: "GPT-5.4" },
@@ -117,8 +118,9 @@ export function claudePermValue(mode: PermissionMode): PermissionMode {
 }
 
 export const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const
-// Codex accepts only low/medium/high (the wrapper clamps xhigh/max→high; see server backend/codex.ts).
-export const CODEX_EFFORTS = ["low", "medium", "high"] as const
+// Codex accepts low/medium/high/xhigh (per ~/.codex/models_cache.json — every listed model exposes
+// these four; corrected 2026-07-12). fray's enum also has "max", which codex lacks → clamped to xhigh.
+export const CODEX_EFFORTS = ["low", "medium", "high", "xhigh"] as const
 
 export const EFFORT_LABEL: Record<string, string> = { low: "Low", medium: "Medium", high: "High", xhigh: "X-high", max: "Max" }
 
@@ -133,14 +135,14 @@ export const EFFORT_OPTIONS_SETTINGS: SelectOption[] = [
   ...EFFORTS.map((e) => ({ value: e, label: EFFORT_LABEL[e] })),
 ]
 
-// Codex effort option sets (low/medium/high only) — composer (concrete) and settings (leading Default).
+// Codex effort option sets (low/medium/high/xhigh) — composer (concrete) and settings (leading Default).
 export const CODEX_EFFORT_OPTIONS: SelectOption[] = CODEX_EFFORTS.map((e) => ({ value: e, label: EFFORT_LABEL[e] }))
 export const CODEX_EFFORT_OPTIONS_SETTINGS: SelectOption[] = [{ value: "", label: "Default" }, ...CODEX_EFFORT_OPTIONS]
 
-// Clamp a stored effort into the codex-displayable set (xhigh/max → high) so the Codex effort dropdown
-// reflects what will actually be sent (the server clamps too) rather than showing an empty selection.
+// Clamp a stored effort into the codex-displayable set: only "max" (which codex lacks) → xhigh; xhigh is
+// valid. Keeps the Codex effort dropdown showing what will actually be sent (the server clamps identically).
 export function codexEffortValue(effort: string): string {
-  return effort === "xhigh" || effort === "max" ? "high" : effort
+  return effort === "max" ? "xhigh" : effort
 }
 
 // The permission/effort option sets + display-mapper for a backend — one place the two surfaces share

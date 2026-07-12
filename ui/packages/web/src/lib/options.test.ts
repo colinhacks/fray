@@ -46,10 +46,10 @@ test("permValueFor: dispatches to the codex vs claude mapper by backend", () => 
   assert.equal(permValueFor("claude", "acceptEdits"), "acceptEdits")
 })
 
-// Codex accepts only low/medium/high (the wrapper clamps xhigh/max→high); the dropdown reflects that.
-test("codexEffortValue: xhigh/max clamp to high, low/medium/high pass through", () => {
-  assert.equal(codexEffortValue("xhigh"), "high")
-  assert.equal(codexEffortValue("max"), "high")
+// Codex accepts low/medium/high/xhigh; only "max" (which codex lacks) clamps → xhigh. The dropdown reflects that.
+test("codexEffortValue: max clamps to xhigh, low/medium/high/xhigh pass through", () => {
+  assert.equal(codexEffortValue("xhigh"), "xhigh")
+  assert.equal(codexEffortValue("max"), "xhigh")
   assert.equal(codexEffortValue("low"), "low")
   assert.equal(codexEffortValue("medium"), "medium")
   assert.equal(codexEffortValue("high"), "high")

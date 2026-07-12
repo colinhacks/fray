@@ -72,14 +72,17 @@ export function resumeThread(deps: ResumeDeps, slug: string, message: string): v
   // The scratchpad orientation keys on the fray-minted session_id (unchanged by codex discovery); the
   // backend-NATIVE id (codex rollout id, pinned on agent_session_id) is what resume re-attaches +
   // `codex resume` continues. For claude, agent_session_id is NULL → session_id — byte-identical.
-  const extraSystemPrompt = scratchpadOrientation(row.session_id, row.plan_path)
   const backend = deps.backendFor?.(row.backend)
+  // The scratchpad orientation + worker contract are backend-aware (a codex resume must re-carry the
+  // CODEX variant, not Claude's sub-agent/`claude -r` guidance). backend?.kind resolves the row's
+  // backend; when no resolver is injected (tests) it falls back to the claude default — byte-identical.
+  const extraSystemPrompt = scratchpadOrientation(row.session_id, row.plan_path, backend?.kind)
   // A dead codex resume re-spawns a fresh TUI, which blocks on the trust modal for an untrusted cwd
   // exactly like a dispatch spawn — pre-arm it (idempotent; respects an existing trust choice).
   if (row.backend === "codex") ensureCwdTrusted(deps.project.dir, deps.codexHome)
   const nativeSessionId = row.agent_session_id ?? row.session_id
   const built = backend
-    ? backend.buildResume({ sessionId: nativeSessionId, cwd: deps.project.dir, message, workerContract: loadWorkerPrompt(), extraSystemPrompt, permissionMode })
+    ? backend.buildResume({ sessionId: nativeSessionId, cwd: deps.project.dir, message, workerContract: loadWorkerPrompt(backend.kind), extraSystemPrompt, permissionMode })
     : { argv: buildClaudeResumeCommand({ sessionId: nativeSessionId, permissionMode, message, pluginDir: workerPluginDir(), extraSystemPrompt }), env: {} as Record<string, string>, prewrite: [] }
   for (const f of built.prewrite) writeFileSync(f.path, f.contents)
   tx.spawn(slug, built.argv, deps.project.dir, { ...built.env, FRAY_UI_THREAD: slug })
