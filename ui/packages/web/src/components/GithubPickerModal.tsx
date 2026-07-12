@@ -35,6 +35,9 @@ const MAX_BATCH = 20
 export function GithubPickerModal({ onClose }: { onClose: () => void }) {
   const status = useQuery({ queryKey: ["githubStatus"], queryFn: () => rpc.githubStatus() })
   const settings = useQuery({ queryKey: ["settingsGet"], queryFn: () => rpc.settingsGet() })
+  // Codex catalogue (authoritative ~/.codex cache) — used only to correctly recognize an inherited codex
+  // default so the Claude-only batch path clamps it back to a Claude model even for a brand-new slug.
+  const codexModels = useQuery({ queryKey: ["codexModels"], queryFn: () => rpc.codexModels() })
 
   const [kind, setKind] = useState<Kind>("issues")
   const [sort, setSort] = useState<Sort>("recent")
@@ -50,7 +53,7 @@ export function GithubPickerModal({ onClose }: { onClose: () => void }) {
   // to a Claude model (and a codex-only `plan` sandbox back to `auto`), so the readout never blanks and
   // the batch never dispatches `claude --model gpt-5.x` (a guaranteed spawn error).
   const inheritedModel = model || settings.data?.model || "opus"
-  const effectiveModel = backendForModel(inheritedModel) === "codex" ? "opus" : inheritedModel
+  const effectiveModel = backendForModel(inheritedModel, codexModels.data ?? []) === "codex" ? "opus" : inheritedModel
   const effectiveMode = claudePermValue(permissionMode || (settings.data?.permissionMode ?? "auto"))
   const effectiveEffort = effort || settings.data?.effort || "high"
 
@@ -180,6 +183,7 @@ export function GithubPickerModal({ onClose }: { onClose: () => void }) {
               value={effectiveModel}
               onValueChange={setModel}
               options={MODEL_OPTIONS_CONCRETE}
+              indicatorPosition="right"
               ariaLabel="Model"
             />
             <Select
@@ -188,6 +192,7 @@ export function GithubPickerModal({ onClose }: { onClose: () => void }) {
               value={effectiveEffort}
               onValueChange={(v) => setEffort(v as (typeof EFFORTS)[number])}
               options={EFFORT_OPTIONS_CONCRETE}
+              indicatorPosition="right"
               ariaLabel="Effort"
             />
           </div>

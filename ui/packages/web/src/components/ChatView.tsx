@@ -1127,6 +1127,7 @@ function QuestionBlockCard({
 }) {
   const parsed = useMemo(() => parseQuestionBlock(raw, questionKind, danger), [raw, questionKind, danger])
   const html = useMemo(() => mdToHtml(parsed.contextMd), [parsed.contextMd])
+  const trailingHtml = useMemo(() => (parsed.trailingMd ? mdToHtml(parsed.trailingMd) : ""), [parsed.trailingMd])
   const recIdx = useMemo(() => recommendedIndex(parsed.recommendation, parsed.options), [parsed])
   const isApproval = parsed.kind === "approval"
   const isMulti = parsed.kind === "multi"
@@ -1230,6 +1231,11 @@ function QuestionBlockCard({
             />
           )}
         </div>
+      )}
+      {/* A "Note: …" footnote the worker wrote AFTER the options — rendered below the chips (muted) so
+          the choices stay answerable instead of swallowing them (the old parser dropped the chips). */}
+      {parsed.trailingMd && (
+        <div className={`mt-2 md-body text-[12px] text-muted/70${wrap ? ` ${QUEUE_WRAP}` : ""}`} dangerouslySetInnerHTML={{ __html: trailingHtml }} />
       )}
       {/* The caption fallback survives ONLY when the recommendation didn't match an option. */}
       {parsed.recommendation && recIdx === null && (

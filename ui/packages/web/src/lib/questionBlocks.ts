@@ -74,6 +74,9 @@ export interface ParsedQuestion {
   contextMd: string
   options: string[]
   recommendation?: string
+  // Prose that follows the option run (a worker often adds a "Note: …" footnote AFTER the choices).
+  // Rendered BELOW the chips so the options stay answerable instead of the trailing prose swallowing them.
+  trailingMd?: string
 }
 
 // An option line: an optional markdown list marker (workers write options as `- A. …`), then a single
@@ -86,39 +89,49 @@ function optionText(line: string): string {
   return line.trim().replace(/^[-*+]\s+/, "")
 }
 
-// Detect a TRAILING run of option lines (the convention: the block ends with its lettered/numbered
-// choices), optionally followed by one "Recommendation: …" line. Those lines become chips/a note and
-// are removed from the rendered prose. No trailing option run → a freetext-only question (options: []).
+// Detect the option RUN — a maximal block of lettered/numbered choice lines (`- A. …`), wherever it
+// sits in the block: NOT required to be trailing. Workers often follow the choices with a "Note: …"
+// footnote (or lead with context), and the old "options must be the last thing" rule then found no run
+// and dropped every chip. Now: context = prose BEFORE the run; the run = the chips; prose AFTER the run
+// = `trailingMd` (rendered below the chips); a "Recommendation: …" line anywhere after the run is the
+// muted rec note. Blank lines WITHIN the run are tolerated. No option run → a freetext-only question.
 export function parseQuestionBlock(body: string, kind: QuestionKind, danger = false): ParsedQuestion {
   const lines = body.split("\n").map((l) => l.replace(/\r$/, ""))
-  let end = lines.length - 1
-  while (end >= 0 && lines[end].trim() === "") end--
-  if (end < 0) return { kind, danger, contextMd: body, options: [] }
 
-  let cursor = end
-  let recIdx = -1
-  if (REC_RE.test(lines[cursor])) {
-    recIdx = cursor
-    cursor--
-    while (cursor >= 0 && lines[cursor].trim() === "") cursor--
+  // First maximal run of option lines (consecutive OPTION_RE lines; interspersed blanks don't break it).
+  let runStart = -1
+  let runEnd = -1
+  for (let i = 0; i < lines.length; i++) {
+    if (OPTION_RE.test(lines[i])) {
+      if (runStart === -1) runStart = i
+      runEnd = i
+    } else if (runStart !== -1 && lines[i].trim() !== "") {
+      break // a non-blank, non-option line ends the run
+    }
+  }
+  if (runStart === -1) return { kind, danger, contextMd: body, options: [] }
+
+  const options: string[] = []
+  for (let i = runStart; i <= runEnd; i++) if (OPTION_RE.test(lines[i])) options.push(optionText(lines[i]))
+
+  const trim = (arr: string[]) => {
+    let a = 0
+    let b = arr.length - 1
+    while (a <= b && arr[a].trim() === "") a++
+    while (b >= a && arr[b].trim() === "") b--
+    return arr.slice(a, b + 1)
   }
 
-  const optIdxs: number[] = []
-  while (cursor >= 0 && OPTION_RE.test(lines[cursor])) {
-    optIdxs.push(cursor)
-    cursor--
+  const contextMd = trim(lines.slice(0, runStart)).join("\n")
+  // After the run: peel a single "Recommendation: …" line out as the rec note; the rest is trailing prose.
+  let recommendation: string | undefined
+  const trailing: string[] = []
+  for (const l of lines.slice(runEnd + 1)) {
+    if (recommendation === undefined && REC_RE.test(l)) recommendation = l.trim()
+    else trailing.push(l)
   }
-  // No trailing options → the whole body is context (a lone "Recommendation:" isn't special here).
-  if (optIdxs.length === 0) return { kind, danger, contextMd: body, options: [] }
-
-  optIdxs.reverse()
-  const options = optIdxs.map((i) => optionText(lines[i]))
-  const recommendation = recIdx !== -1 ? lines[recIdx].trim() : undefined
-
-  let ctxEnd = optIdxs[0] - 1
-  while (ctxEnd >= 0 && lines[ctxEnd].trim() === "") ctxEnd--
-  const contextMd = lines.slice(0, ctxEnd + 1).join("\n")
-  return { kind, danger, contextMd, options, recommendation }
+  const trailingMd = trim(trailing).join("\n") || undefined
+  return { kind, danger, contextMd, options, recommendation, trailingMd }
 }
 
 // An option's leading identifier ("A. SQLite …" → "A", "3) Ten" → "3"), used to compose a multi-select

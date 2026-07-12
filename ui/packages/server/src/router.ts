@@ -13,6 +13,7 @@ import {
   GithubBatchResult,
   Settings,
   TranscriptMessage,
+  CodexModel,
 } from "@fray-ui/shared"
 import type { AppContext } from "./context.ts"
 import { runThreadUpdate } from "./fray.ts"
@@ -22,6 +23,7 @@ import { readThreadTranscript, readTranscriptFile } from "./transcript.ts"
 import { openExternalUrl } from "./open-external.ts"
 import { ghInstalled, ghAuthed, ghRepo, listItems, hydrateIssue, hydratePr, renderGithubPrompt, effectiveTemplate, DEFAULT_ISSUE_PROMPT, DEFAULT_PR_PROMPT } from "./github.ts"
 import { slugify, resolveSlug } from "./dispatch.ts"
+import { readCodexModels } from "./backend/codex-models.ts"
 import * as tmux from "./tmux.ts"
 
 const SlugInput = z.object({ slug: z.string() })
@@ -305,6 +307,14 @@ export function createRouter(ctx: AppContext) {
         ctx.storage.setExited(input.slug, true)
         ctx.board.refresh() // storage-only change — overlay is enough
       },
+    }),
+
+    // The selectable Codex models + PER-MODEL effort options, read fresh (short TTL) from the
+    // authoritative ~/.codex/models_cache.json so the picker tracks codex's own catalogue instead of a
+    // hand-maintained list. Degrades to a minimal fallback (never throws) when the cache is absent.
+    codexModels: query({
+      output: z.array(CodexModel),
+      handler: async () => readCodexModels(),
     }),
 
     settingsGet: query({

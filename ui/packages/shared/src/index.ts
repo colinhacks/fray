@@ -31,6 +31,20 @@ export type RuntimeState = z.infer<typeof RuntimeState>
 export const Backend = z.enum(["claude", "codex"])
 export type Backend = z.infer<typeof Backend>
 
+// One selectable Codex model, derived server-side from the AUTHORITATIVE ~/.codex/models_cache.json
+// (the codexModels RPC) rather than a hand-maintained list — the source of two live breakages (a bare
+// `gpt-5.6` that codex 400s, and a single hardcoded effort set that's wrong per-model). `slug` is the
+// `codex -m` id; `efforts` is exactly that model's supported reasoning levels (5.6 → …/max/ultra, 5.5 →
+// …/xhigh), so the effort dropdown offers only what the chosen model actually accepts. Ordered by the
+// cache's `priority` (index 0 = the codex default). See .fray/codex-model-cache.md.
+export const CodexModel = z.object({
+  slug: z.string(),
+  displayName: z.string(),
+  defaultEffort: z.string(),
+  efforts: z.array(z.string()),
+})
+export type CodexModel = z.infer<typeof CodexModel>
+
 export const ThreadAgent = z.object({
   id: z.string(),
   label: z.string().optional(),
@@ -260,7 +274,11 @@ export const Settings = z.object({
   // (permission-mode vs sandbox, the effort set) know which axis to present. Optional so an old blob
   // parses; absent ⇒ "claude" (derivable from `model` too, via backendForModel in web/lib/options).
   backend: Backend.optional(),
-  effort: z.enum(["low", "medium", "high", "xhigh", "max"]).optional(),
+  // Reasoning effort. The ladder spans BOTH backends' universes: Claude's (low..max) and codex's
+  // (adds "ultra" — a 5.6-sol/terra level above max). Which subset is OFFERED is backend/model-gated
+  // in the UI (Claude models stop at max; a codex model exposes exactly its cache `efforts`), and the
+  // server passes the chosen value through per backend — so the wire enum is simply the union.
+  effort: z.enum(["low", "medium", "high", "xhigh", "max", "ultra"]).optional(),
   notifications: z.boolean(),
   // UI type family. `mono` (default) is the mono-forward system; `sans` swaps prose/UI chrome to a
   // sans stack while code / tool lines / the terminal stay mono. Optional so an old settings blob

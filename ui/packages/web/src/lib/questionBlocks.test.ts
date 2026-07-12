@@ -100,6 +100,21 @@ test("lettered options (markdown list form) → chips, stripped from context", (
   assert.equal(p.recommendation, "Recommendation: A, for consistency.")
 })
 
+test("options FOLLOWED by a trailing Note paragraph → chips STILL detected, note → trailingMd (the nub#440 bug)", () => {
+  // The worker put a footnote after the choices; the old "options must be trailing" rule then found no
+  // run and dropped every chip. Inline markdown (backticks, **bold**, em-dash) must not confuse it either.
+  const body =
+    "How do you want to proceed?\n\n" +
+    "- A. Merge as-is (`--admin`) — my recommendation\n" +
+    "- B. Switch to **pnpm-owned** first\n" +
+    "- C. Hold — review it yourself\n\n" +
+    "Note: the invalid-URL warn-drop is in the PR body as recommend-only."
+  const p = parseQuestionBlock(body, "question")
+  assert.deepEqual(p.options, ["A. Merge as-is (`--admin`) — my recommendation", "B. Switch to **pnpm-owned** first", "C. Hold — review it yourself"])
+  assert.equal(p.contextMd, "How do you want to proceed?")
+  assert.equal(p.trailingMd, "Note: the invalid-URL warn-drop is in the PR body as recommend-only.")
+})
+
 test("lettered options (bare form, no list marker)", () => {
   const body = "Pick one:\nA. Tabs\nB. Spaces"
   const p = parseQuestionBlock(body, "question")

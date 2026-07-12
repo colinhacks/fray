@@ -321,12 +321,15 @@ test("createCodexBackend: buildResume → `codex resume <id> <message>` with ori
 
 // ==== effort / sandbox mappings ====
 
-test("codexEffort: passes through low/medium/high/xhigh, clamps max → xhigh, unknown → undefined", () => {
+test("codexEffort: passes through codex's full universe (incl. max/ultra), unknown → undefined", () => {
   assert.equal(codexEffort("low"), "low")
   assert.equal(codexEffort("medium"), "medium")
   assert.equal(codexEffort("high"), "high")
   assert.equal(codexEffort("xhigh"), "xhigh")
-  assert.equal(codexEffort("max"), "xhigh")
+  // max/ultra are REAL codex levels (per-model gated in the UI) — no longer clamped down (the old
+  // max→xhigh clamp WRONGLY downgraded a 5.6 model that supports them).
+  assert.equal(codexEffort("max"), "max")
+  assert.equal(codexEffort("ultra"), "ultra")
   assert.equal(codexEffort(undefined), undefined)
   assert.equal(codexEffort("bogus"), undefined)
 })

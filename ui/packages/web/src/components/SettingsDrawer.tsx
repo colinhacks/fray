@@ -12,13 +12,14 @@ import { Field } from "./NewThreadModal.tsx"
 import { Select } from "./ui/Select.tsx"
 import { Tooltip } from "./Tooltip.tsx"
 import {
-  MODEL_GROUPS_SETTINGS,
+  modelGroups,
   EFFORT_OPTIONS_SETTINGS,
-  CODEX_EFFORT_OPTIONS_SETTINGS,
+  codexEffortOptions,
+  codexModelFor,
   backendForModel,
   permOptionsFor,
   permValueFor,
-  codexEffortValue,
+  codexEffortForModel,
 } from "../lib/options.ts"
 
 type NotifPerm = "default" | "granted" | "denied" | "unsupported"
@@ -36,6 +37,10 @@ function prefersReducedMotion() {
 
 export function SettingsDrawer() {
   const settings = useQuery({ queryKey: ["settingsGet"], queryFn: () => rpc.settingsGet() })
+  // Codex model catalogue + per-model effort options from the authoritative ~/.codex cache (never a
+  // hand-maintained list). [] until it loads; the option builders fall back to a compiled-in mirror.
+  const codexModels = useQuery({ queryKey: ["codexModels"], queryFn: () => rpc.codexModels() })
+  const codexList = codexModels.data ?? []
   const [draft, setDraft] = useState<Settings | null>(null)
   const [perm, setPerm] = useState<NotifPerm>(currentPerm())
 
@@ -92,7 +97,9 @@ export function SettingsDrawer() {
   // The backend the current model selection implies — drives which permission/effort axis the
   // dependent controls present. Derived from the model (the single source of truth) rather than the
   // persisted `backend`, so the controls react the instant the model changes.
-  const backend = backendForModel(draft?.model)
+  const backend = backendForModel(draft?.model, codexList)
+  // The selected codex model (when this is one) — gates the effort dropdown to exactly its cache efforts.
+  const codexModel = codexModelFor(draft?.model, codexList)
 
   return (
     <div
@@ -123,8 +130,9 @@ export function SettingsDrawer() {
               <Select
                 variant="bordered"
                 value={draft.model ?? ""}
-                onValueChange={(v) => setDraft({ ...draft, model: v || undefined, backend: backendForModel(v || undefined) })}
-                groups={MODEL_GROUPS_SETTINGS}
+                onValueChange={(v) => setDraft({ ...draft, model: v || undefined, backend: backendForModel(v || undefined, codexList) })}
+                groups={modelGroups(codexList, { withDefault: true })}
+                indicatorPosition="right"
                 ariaLabel="Model"
               />
             </Field>
@@ -144,9 +152,10 @@ export function SettingsDrawer() {
             <Field label="Effort">
               <Select
                 variant="bordered"
-                value={backend === "codex" ? codexEffortValue(draft.effort ?? "") : (draft.effort ?? "")}
+                value={backend === "codex" ? codexEffortForModel(codexModel, draft.effort ?? "") : (draft.effort ?? "")}
                 onValueChange={(v) => setDraft({ ...draft, effort: (v || undefined) as Settings["effort"] })}
-                options={backend === "codex" ? CODEX_EFFORT_OPTIONS_SETTINGS : EFFORT_OPTIONS_SETTINGS}
+                options={backend === "codex" ? codexEffortOptions(codexModel, { withDefault: true }) : EFFORT_OPTIONS_SETTINGS}
+                indicatorPosition="right"
                 ariaLabel="Effort"
               />
             </Field>

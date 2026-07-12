@@ -1,4 +1,4 @@
-import type { BoardSnapshot, Settings, DispatchInput, FollowUpInput, TranscriptMessage, GithubStatus, GithubItem, GithubBatchInput, GithubBatchResult } from "@fray-ui/shared"
+import type { BoardSnapshot, Settings, DispatchInput, FollowUpInput, TranscriptMessage, GithubStatus, GithubItem, GithubBatchInput, GithubBatchResult, CodexModel } from "@fray-ui/shared"
 import { noteServerBootId } from "./boot.ts"
 
 // Typed surface of the server's rpc router. This mirrors the procedures defined
@@ -35,6 +35,10 @@ export interface Api {
   archiveThread(input: { slug: string }): Promise<void>
   killAgent(input: { slug: string }): Promise<void>
   renameThread(input: { slug: string }): Promise<void>
+  // The selectable Codex models + per-model effort options, read server-side from the authoritative
+  // ~/.codex/models_cache.json (never a hand-maintained list). The model picker's Codex section and its
+  // effort dropdown are driven by this; a tiny client fallback covers the loading/no-cache state.
+  codexModels(): Promise<CodexModel[]>
   settingsGet(): Promise<Settings>
   settingsSet(input: Settings): Promise<void>
   settingsReset(): Promise<Settings>
@@ -73,6 +77,7 @@ const PROCEDURES: Record<keyof Api, ProcType> = {
   archiveThread: "mutation",
   killAgent: "mutation",
   renameThread: "mutation",
+  codexModels: "query",
   settingsGet: "query",
   settingsSet: "mutation",
   settingsReset: "mutation",

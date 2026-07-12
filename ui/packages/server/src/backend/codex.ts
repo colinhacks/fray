@@ -52,15 +52,16 @@ function composeSpawnPrompt(o: SpawnOpts): string {
 }
 
 // ---- spawn / resume argv ----
-// Codex reasoning-effort values are {low,medium,high,xhigh} (per ~/.codex/models_cache.json — every
-// listed model exposes these four; corrected 2026-07-12, was wrongly {minimal,…,high} clamping xhigh→high).
-// fray's enum also has "max", which codex lacks → clamp max→xhigh (codex's ceiling). Unknown → undefined
-// (codex then uses the model's default_reasoning_level).
-const CODEX_EFFORTS = new Set(["low", "medium", "high", "xhigh"])
+// Codex reasoning-effort universe (per ~/.codex/models_cache.json): low/medium/high/xhigh/max/ultra.
+// It is PER-MODEL which of these a given model accepts (gpt-5.6-sol/terra → all six, luna → …max, 5.5 →
+// …xhigh) — that gating happens in the UI, which offers only the chosen model's cache `efforts`. This
+// server-side check is just the OUTER universe: pass through any real codex effort (no more max→xhigh
+// clamp, which WRONGLY downgraded a 5.6 model that supports max/ultra); only a genuinely-unknown value →
+// undefined (codex then uses the model's default_reasoning_level).
+const CODEX_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max", "ultra"])
 export function codexEffort(effort?: string): string | undefined {
   if (!effort) return undefined
   if (CODEX_EFFORTS.has(effort)) return effort
-  if (effort === "max") return "xhigh"
   return undefined
 }
 

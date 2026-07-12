@@ -8,15 +8,15 @@ import { Composer } from "./Composer.tsx"
 import { GithubTrigger } from "./GithubTrigger.tsx"
 import { Select } from "./ui/Select.tsx"
 import {
-  MODEL_GROUPS_CONCRETE,
+  modelGroups,
   EFFORT_OPTIONS,
-  CODEX_EFFORT_OPTIONS,
-  EFFORTS,
+  codexEffortOptions,
+  codexModelFor,
   PERMISSION_COLOR,
   backendForModel,
   permOptionsFor,
   permValueFor,
-  codexEffortValue,
+  codexEffortForModel,
 } from "../lib/options.ts"
 
 // THE dispatch prompt box — composer + quiet selects row — shared by every surface that can start a
@@ -34,11 +34,15 @@ export function DispatchForm({
   planPath?: string
 }) {
   const settings = useQuery({ queryKey: ["settingsGet"], queryFn: () => rpc.settingsGet() })
+  // The codex model catalogue + per-model effort options, from the authoritative ~/.codex cache (never a
+  // hand-maintained list). [] until it loads; the option builders fall back to a compiled-in mirror.
+  const codexModels = useQuery({ queryKey: ["codexModels"], queryFn: () => rpc.codexModels() })
+  const codexList = codexModels.data ?? []
 
   const [prompt, setPrompt] = useState("")
   const [permissionMode, setPermissionMode] = useState<PermissionMode | "">("")
   const [model, setModel] = useState("")
-  const [effort, setEffort] = useState<(typeof EFFORTS)[number] | "">("")
+  const [effort, setEffort] = useState<string>("")
 
   // Dispatch does NOT navigate anywhere: you stay on the queue, the new thread appears in the
   // sidebar, and the toast walks through the lifecycle — an immediate spinner while the server
@@ -59,8 +63,10 @@ export function DispatchForm({
   const effectiveMode = permissionMode || (settings.data?.permissionMode ?? "auto")
   const effectiveModel = model || settings.data?.model || "opus"
   const effectiveEffort = effort || settings.data?.effort || "high"
-  // The model DRIVES the backend; the permission/effort readouts then present that backend's axis.
-  const backend = backendForModel(effectiveModel)
+  // The model DRIVES the backend; the permission/effort readouts then present that backend's axis. The
+  // codex model (when this is a codex model) gates the effort dropdown to exactly its supported levels.
+  const backend = backendForModel(effectiveModel, codexList)
+  const codexModel = codexModelFor(effectiveModel, codexList)
 
   function submit() {
     if (!prompt.trim()) return
@@ -72,7 +78,7 @@ export function DispatchForm({
       permissionMode: permValueFor(backend, effectiveMode),
       model: effectiveModel,
       backend,
-      effort: (backend === "codex" ? codexEffortValue(effectiveEffort) : effectiveEffort) as (typeof EFFORTS)[number],
+      effort: (backend === "codex" ? codexEffortForModel(codexModel, effectiveEffort) : effectiveEffort) as DispatchInput["effort"],
       ...(planPath ? { planPath } : {}),
     })
   }
@@ -95,7 +101,8 @@ export function DispatchForm({
           className="petite-caps"
           value={effectiveModel}
           onValueChange={setModel}
-          groups={MODEL_GROUPS_CONCRETE}
+          groups={modelGroups(codexList, { withDefault: false })}
+          indicatorPosition="right"
           ariaLabel="Model"
         />
         <Select
@@ -109,16 +116,17 @@ export function DispatchForm({
         <Select
           variant="readout"
           className="petite-caps"
-          value={backend === "codex" ? codexEffortValue(effectiveEffort) : effectiveEffort}
-          onValueChange={(v) => setEffort(v as (typeof EFFORTS)[number])}
-          options={backend === "codex" ? CODEX_EFFORT_OPTIONS : EFFORT_OPTIONS_CONCRETE}
+          value={backend === "codex" ? codexEffortForModel(codexModel, effectiveEffort) : effectiveEffort}
+          onValueChange={(v) => setEffort(v)}
+          options={backend === "codex" ? codexEffortOptions(codexModel, { withDefault: false }) : EFFORT_OPTIONS_CONCRETE}
+          indicatorPosition="right"
           ariaLabel="Effort"
         />
       </>
     ),
-    // Model is now FIRST (it drives the backend); `backend` is derived from effectiveModel so it's
-    // already covered, but list it so the readout swaps the moment the family changes.
-    [effectiveMode, effectiveModel, effectiveEffort, backend],
+    // Model is now FIRST (it drives the backend); `backend`/`codexModel` are derived from effectiveModel
+    // so they're covered, but list them so the readout + effort set swap the moment the family/model changes.
+    [effectiveMode, effectiveModel, effectiveEffort, backend, codexModel, codexList],
   )
 
   return (
@@ -144,7 +152,7 @@ export function DispatchForm({
 }
 
 // Readout option lists have NO empty "default" row — the readout always shows a concrete value. The
-// model readout uses the sectioned MODEL_GROUPS_CONCRETE (Claude Code / Codex) directly.
+// model readout uses the sectioned modelGroups() (Claude Code / Codex from the codexModels RPC) directly.
 const EFFORT_OPTIONS_CONCRETE = EFFORT_OPTIONS.filter((o) => o.value !== "")
 
 // The anywhere-modal behind the pill button: same form in a centered dialog. Esc closes (captured
