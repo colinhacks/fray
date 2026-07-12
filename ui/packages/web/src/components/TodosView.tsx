@@ -280,7 +280,7 @@ const QueueCard = memo(function QueueCard({ thread, onResolve }: { thread: Threa
           under it, so the actions stay reachable through a long card. COLLAPSED, the header IS the
           whole card: full rounding, no bottom rule (the expanded chrome — rounded-top-only plus a
           border-b — read as squared corners and a doubled bottom edge inside the card shell). */}
-      <div className={`sticky top-0 z-10 flex items-start gap-2 bg-panel px-5 py-3.5 ${collapsed ? "rounded-lg" : "rounded-t-lg border-b border-border/60"}`}>
+      <div className={`sticky top-0 z-10 flex items-center gap-2 bg-panel px-5 py-3.5 ${collapsed ? "rounded-lg" : "rounded-t-lg border-b border-border/60"}`}>
         <div className="min-w-0 flex-1">
           <div className="font-semibold text-[15px] leading-snug truncate" title={displayTitle(thread)}>
             {displayTitle(thread)}
@@ -294,9 +294,10 @@ const QueueCard = memo(function QueueCard({ thread, onResolve }: { thread: Threa
             </div>
           )}
         </div>
-        {/* SHARED icon actions (parity with the thread header): collapse, rename, open-in-drawer
-            (queue-only), dismiss, mark-done at the far right. Open-thread slides in the side drawer —
-            an overlay, NOT a nav switch, so the queue scroll/selection stays put. */}
+        {/* SHARED icon actions (parity with the thread header): collapse, open-in-drawer (queue-only),
+            dismiss, mark-done at the far right. (Rename now lives by the title in the thread drawer, not
+            here — the queue is a triage surface.) Open-thread slides in the side drawer — an overlay,
+            NOT a nav switch, so the queue scroll/selection stays put. */}
         <HeaderActions
           thread={thread}
           collapsed={collapsed}
