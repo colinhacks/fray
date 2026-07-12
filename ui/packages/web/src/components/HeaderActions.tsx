@@ -1,5 +1,5 @@
 import { useState, type ComponentType } from "react"
-import { Archive, ArrowUpRight, ChevronsDownUp, ChevronsUpDown, FileText, Loader2, RefreshCw, RotateCcw, Trash2 } from "lucide-react"
+import { Archive, ArrowUpRight, ChevronsDownUp, ChevronsUpDown, FileText, Loader2, RotateCcw, Trash2 } from "lucide-react"
 import type { ThreadView } from "@fray-ui/shared"
 import { rpc } from "../api/rpc.ts"
 import { showToast } from "../store.ts"
@@ -10,11 +10,12 @@ import { canDismiss } from "../lib/status.ts"
 // THE shared whole-thread action icons, rendered IDENTICALLY by the queue card header and the thread
 // header so the two can never drift. Order left→right runs least→most important, so the primary verb
 // sits at the far RIGHT. The verbs SPLIT on kind:
-//   • SESSION (non-foreign): rename (live) · doc/open nav · Kill (live) · Archive / Reopen. NO Mark-as —
+//   • SESSION (non-foreign): doc/open nav · Kill (live) · Archive / Reopen. NO Mark-as —
 //     completing/dismissing/adopting are .fray verbs. Archive is the ui.db lifecycle write (the done
-//     fence mutates nothing); Reopen un-archives.
-//   • SESSION (foreign): read-only. Only the doc/open NAVIGATION affordances — no rename/kill/archive.
-//   • LEGACY (kind !== "session"): the vestigial Mark-as split button + rename, exactly as before.
+//     fence mutates nothing); Reopen un-archives. Rename now lives next to the title in ThreadHeader
+//     (ChatView.tsx) instead of here — it is no longer part of the shared icon row.
+//   • SESSION (foreign): read-only. Only the doc/open NAVIGATION affordances — no kill/archive.
+//   • LEGACY (kind !== "session"): the vestigial Mark-as split button, exactly as before.
 export function HeaderActions({
   thread,
   onOpen,
@@ -43,13 +44,6 @@ export function HeaderActions({
   const isSession = thread.kind === "session"
   const isForeign = thread.foreign === true
   const archived = thread.state === "archived"
-  // /rename injects a slash-command into the live session — only safe when the agent is AT THE PROMPT
-  // (turn-idle). Firing it mid-turn (running/spawning) or on a permission prompt would queue behind the
-  // turn or be swallowed as the prompt's answer, never round-tripping into a fresh title. Gating on idle
-  // also degrades honestly for a busy/drifted thread (e.g. a compacted session whose transcript never
-  // landed on disk) — the button disables instead of firing a "Renaming…" toast that never completes.
-  // The doc-side round-trip still depends on the tailer reading that transcript; see session-transcript-drift.
-  const renameReady = thread.runtime === "turn-idle"
 
   return (
     <div className="flex shrink-0 items-center gap-0.5">
@@ -59,21 +53,6 @@ export function HeaderActions({
           icon={collapsed ? ChevronsUpDown : ChevronsDownUp}
           size={13}
           onClick={onCollapse}
-        />
-      )}
-      {/* Rename: registered threads only (a foreign session has no session we own to rename). */}
-      {!isForeign && (
-        <IconBtn
-          label={renameReady ? "Regenerate name" : "Regenerate name (agent must be idle)"}
-          icon={RefreshCw}
-          size={13}
-          disabled={!renameReady}
-          onClick={() =>
-            rpc
-              .renameThread({ slug: thread.id })
-              .then(() => showToast("Renaming…"))
-              .catch((e) => showToast(`Rename failed: ${(e as Error).message.slice(0, 60)}`))
-          }
         />
       )}
       {onDoc && <IconBtn label="Fray document" icon={FileText} size={14} onClick={onDoc} />}

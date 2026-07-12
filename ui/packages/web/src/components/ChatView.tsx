@@ -1,6 +1,6 @@
 import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import { useMutation, useQuery } from "@tanstack/react-query"
-import { AlertTriangle, Archive, ArrowUpRight, Check, ChevronRight, Clock, HelpCircle, KeyRound, ListChecks, ShieldCheck, X } from "lucide-react"
+import { AlertTriangle, Archive, ArrowUpRight, Check, ChevronRight, Clock, HelpCircle, KeyRound, ListChecks, RefreshCw, ShieldCheck, X } from "lucide-react"
 import type { AwaitingHint, PendingAsk, TranscriptEdit, TranscriptMessage } from "@fray-ui/shared"
 import { store, threadBySlug, pushDrawer, pushSubAgentDrawer, showToast } from "../store.ts"
 import { useBoard, useTranscript, useSocketTranscripts, type ChatMessage } from "../hooks.ts"
@@ -16,6 +16,7 @@ import { useLiveAnswering } from "../lib/answering.ts"
 import { TerminalPane } from "./TerminalPane.tsx"
 import { ThreadActionBar } from "./ThreadActionBar.tsx"
 import { HeaderActions } from "./HeaderActions.tsx"
+import { Tooltip } from "./Tooltip.tsx"
 
 // Answer types moved to lib/questionBlocks.ts (shared by the queue card, the thread view, and the
 // answering controller). Re-exported here so existing importers keep working.
@@ -292,12 +293,43 @@ export function ThreadHeader({ slug, tab, onTab, onStatusApplied, onClose }: { s
   if (!thread) return null
   const showTerminal = thread.foreign !== true // no tmux session we own to attach for a foreign thread
   const showScratch = !!thread.scratchpadPath
+  // Rename is a SESSION-only verb (a foreign session has no session we own to rename), and only safe to
+  // fire when the agent is AT THE PROMPT (turn-idle) — see the identical gating note this button used to
+  // carry in HeaderActions before it moved next to the title.
+  const isForeign = thread.foreign === true
+  const renameReady = thread.runtime === "turn-idle"
   return (
     <header className="sticky top-0 z-10 shrink-0 flex items-center gap-2.5 px-3 h-12 border-b border-border bg-panel">
-      <div className="min-w-0 pl-1 flex-1">
-        <div className="font-semibold truncate text-[15px]" title={displayTitle(thread)}>
+      <div className="min-w-0 pl-1 flex-1 flex items-center gap-1">
+        <button
+          type="button"
+          title={displayTitle(thread)}
+          onClick={() => {
+            navigator.clipboard.writeText(displayTitle(thread))
+            showToast("Copied title")
+          }}
+          className="min-w-0 truncate rounded px-0.5 -mx-0.5 font-semibold text-[15px] text-left cursor-pointer transition-colors hover:bg-panel-2"
+        >
           {displayTitle(thread)}
-        </div>
+        </button>
+        {!isForeign && (
+          <Tooltip label={renameReady ? "Regenerate name" : "Regenerate name (agent must be idle)"}>
+            <button
+              type="button"
+              aria-label="Regenerate name"
+              disabled={!renameReady}
+              onClick={() =>
+                rpc
+                  .renameThread({ slug: thread.id })
+                  .then(() => showToast("Renaming…"))
+                  .catch(() => {})
+              }
+              className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted outline-none transition-colors hover:bg-panel-2 hover:text-fg disabled:hover:bg-transparent disabled:hover:text-muted disabled:opacity-40"
+            >
+              <RefreshCw size={13} strokeWidth={2} />
+            </button>
+          </Tooltip>
+        )}
       </div>
       <div className="flex items-center gap-1 rounded-lg bg-panel-2 p-0.5 text-[11px]">
         <Tab active={tab === "chat"} onClick={() => onTab("chat")} label="Chat" />
