@@ -56,14 +56,19 @@ export const CLAUDE_MODELS: SelectOption[] = [
   { value: "haiku", label: "Haiku" },
 ]
 
-// Codex (OpenAI) models — the `codex -m <id>` values, ONLY from the authoritative local catalogue
-// ~/.codex/models_cache.json (visibility="list" entries). gpt-5.5 is the newest codex supports.
-// NEVER add an unverified id: codex 400s on an unknown model ("model 'X' is not supported when using
-// Codex with a ChatGPT account"), which KILLS the spawn — a dead, silent thread. (gpt-5.6 was added
-// 2026-07-12 on a bad guess and REVERTED after codex rejected it live.) gpt-5.3-codex-spark is
-// `supported_in_api=false` but selectable in the interactive TUI (how fray spawns codex).
+// Codex (OpenAI) models — the `codex -m <id>` values, from the authoritative local catalogue
+// ~/.codex/models_cache.json (visibility="list" entries), ordered by its `priority`. 5.6 ships as
+// THREE versioned variants (sol/terra/luna) — NOT a bare "gpt-5.6", which codex 400s ("model not
+// supported when using Codex with a ChatGPT account"), silently killing the spawn. gpt-5.6-sol
+// (priority 1) is the default; VERIFIED live (`codex exec -m gpt-5.6-sol` replied "OK"). NOTE: effort
+// sets differ PER MODEL (5.6 goes to max/ultra; 5.5 stops at xhigh) — the single CODEX_EFFORTS below is
+// the safe common subset; the durable fix reads per-model efforts from the cache (codex-model-cache
+// thread). gpt-5.3-codex-spark is api=false but TUI-selectable (how fray spawns codex).
 export const CODEX_MODELS: SelectOption[] = [
-  { value: "gpt-5.5", label: "GPT-5.5", title: "GPT-5.5 — frontier coding/research model (codex default)" },
+  { value: "gpt-5.6-sol", label: "GPT-5.6 Sol", title: "GPT-5.6-Sol — newest frontier codex model (default)" },
+  { value: "gpt-5.6-terra", label: "GPT-5.6 Terra", title: "GPT-5.6-Terra" },
+  { value: "gpt-5.6-luna", label: "GPT-5.6 Luna", title: "GPT-5.6-Luna" },
+  { value: "gpt-5.5", label: "GPT-5.5", title: "GPT-5.5 — frontier coding/research model" },
   { value: "gpt-5.4", label: "GPT-5.4" },
   { value: "gpt-5.4-mini", label: "GPT-5.4 Mini", title: "GPT-5.4 Mini — faster, lighter" },
   { value: "gpt-5.3-codex-spark", label: "GPT-5.3 Codex Spark", title: "GPT-5.3-Codex-Spark — TUI only (not in the Responses API)" },
