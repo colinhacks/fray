@@ -124,6 +124,20 @@
   overflow-y: hidden;
 }
 
+/* Codex exec output: a second pane below the command in a BashBlock (the shell result codex records
+   in the rollout — Claude Bash calls have none). The label bar is the divider (border-top); the output
+   body drops its own top border so the two don't stack a double line. */
+.fray-bash-output-label {
+  padding: 3px 10px;
+  font-size: 10.5px;
+  color: var(--color-muted);
+  background: var(--color-panel-2);
+  border-top: 1px solid var(--color-border);
+}
+.fray-bash-output-body {
+  border-top: none;
+}
+
 /* Token colours — coarse kinds emitted by highlight.ts */
 .ftk-kw    { color: #f47067; }
 .ftk-type  { color: #f69d50; }

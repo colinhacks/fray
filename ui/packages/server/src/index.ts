@@ -97,7 +97,7 @@ export async function startServer(opts: StartOptions = {}) {
     transcriptChange: ctx.transcriptChange,
     boardSnapshot: () => ctx.board.snapshot(),
     currentSeq: () => ctx.board.currentSeq(),
-    readTranscript: makeTranscriptReader(ctx.project, ctx.storage),
+    readTranscript: makeTranscriptReader(ctx.project, ctx.storage, ctx.backendFor),
   })
   await ctx.board.start()
   ctx.tailer.start() // resume tailing every registered session (live + orphaned) from disk offset 0

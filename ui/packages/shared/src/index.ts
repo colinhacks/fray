@@ -447,6 +447,12 @@ export const TranscriptToolCall = z.object({
   // family as Bash/Edit) that expands to the excerpt. Absent for older transcripts / pre-restart
   // servers, in which case the client falls back to the compact one-line Read summary.
   read: z.string().optional(),
+  // A capped excerpt of a SHELL command's captured stdout/stderr — set only for a command call whose
+  // backend surfaces its output inline (codex's exec_command/shell tool ships the result in the same
+  // rollout, unlike Claude, whose Bash results aren't recorded in the transcript). The client renders
+  // it as a second pane below the command in the BashBlock card. Absent for Claude Bash calls and
+  // pre-restart servers, in which case the BashBlock shows the command alone (the prior behavior).
+  output: z.string().optional(),
   // ---- Agent (sub-agent dispatch) block ----
   // Set only for an `Agent` tool_use that carried a `prompt`. The client promotes such a call into an
   // AgentBlock (same collapsed-card family as Bash/Read): the `detail` is the dispatch description,

@@ -429,6 +429,10 @@ interface CollapsedTool {
   // The model-authored one-line description for a Bash command block (the collapsed block's header).
   // Falls back to `detail` (the command's first line) when the model gave no description.
   desc?: string
+  // A shell command's captured stdout/stderr (codex's exec_command/shell ships its result in the
+  // rollout; Claude Bash results aren't recorded). Rendered as a second pane below the command in the
+  // BashBlock. Absent for Claude Bash calls → the command shows alone (the prior behavior).
+  output?: string
   // Set for a Read call whose result shipped an excerpt: the (capped) file content, rendered as its
   // own collapsed card. Like edits/command, a read entry stands alone (never folds into a repeat
   // count). Absent pre-restart / for older transcripts → the Read renders as a header-only card.
@@ -462,7 +466,7 @@ function collapseTools(tools: TranscriptMessage["tools"]): CollapsedTool[] {
       if (last && last.edits && last.edits[0].file === t.edit.file) last.edits.push(t.edit)
       else out.push({ name: t.name, detail: t.detail, edits: [t.edit], count: 1 })
     } else if (t.command) {
-      out.push({ name: t.name, detail: t.detail, command: t.command, desc: t.desc, count: 1 })
+      out.push({ name: t.name, detail: t.detail, command: t.command, desc: t.desc, output: t.output, count: 1 })
     } else if (t.read) {
       // A Read that shipped an excerpt renders as its own expandable card — never folds into a ×N run.
       out.push({ name: t.name, detail: t.detail, read: t.read, count: 1 })
@@ -557,7 +561,7 @@ function ToolCalls({ tools, dense }: { tools: CollapsedTool[]; dense?: boolean }
 // is a header-only card. All share the same bordered card family so no call ever reads as bare text.
 function ToolCardRouter({ t }: { t: CollapsedTool }) {
   if (t.edits) return <DiffBlock edits={t.edits} />
-  if (t.command) return <BashBlock command={t.command} desc={t.desc ?? t.detail} />
+  if (t.command) return <BashBlock command={t.command} desc={t.desc ?? t.detail} output={t.output} />
   if (t.read) return <ReadBlock detail={t.detail} read={t.read} />
   if (t.prompt) return <AgentBlock detail={t.detail} prompt={t.prompt} subagentType={t.subagentType} agentId={t.agentId} agentStatus={t.agentStatus} agentElapsedMs={t.agentElapsedMs} />
   if (t.sendTo !== undefined || t.sendBody !== undefined) return <SendMessageCard to={t.sendTo} summary={t.sendSummary} body={t.sendBody ?? ""} type={t.sendType} />
@@ -609,11 +613,16 @@ function ToolCard({ name, detail, count }: { name: string; detail?: string; coun
 // the header reveals the raw command in mono — pre-wrapped so long lines wrap (wide unbreakable
 // content scrolls INSIDE the block, never the page). Past ~16 lines the open body clamps too.
 const BASH_MAX_LINES = 16
-function BashBlock({ command, desc }: { command: string; desc?: string }) {
+function BashBlock({ command, desc, output }: { command: string; desc?: string; output?: string }) {
   const [open, setOpen] = useState(false)
   const [expanded, setExpanded] = useState(false)
+  const [outExpanded, setOutExpanded] = useState(false)
   const lineCount = useMemo(() => command.split("\n").length, [command])
   const long = lineCount > BASH_MAX_LINES
+  // Codex ships the command's stdout/stderr in the same rollout (Claude doesn't), so a codex Bash card
+  // carries an `output` pane below the command — clamped + independently expandable like the command.
+  const outLineCount = useMemo(() => (output ? output.split("\n").length : 0), [output])
+  const outLong = outLineCount > BASH_MAX_LINES
   return (
     <div className="fray-bash">
       <button
@@ -640,6 +649,22 @@ function BashBlock({ command, desc }: { command: string; desc?: string }) {
             >
               {expanded ? "Collapse" : `Show all ${lineCount} lines`}
             </button>
+          )}
+          {output && (
+            <>
+              <div className="fray-bash-output-label petite-caps">output</div>
+              <pre className={`fray-bash-body fray-bash-output-body${outLong && !outExpanded ? " fray-bash-clamp" : ""}`}>{output}</pre>
+              {outLong && (
+                <button
+                  type="button"
+                  onClick={() => setOutExpanded((v) => !v)}
+                  onMouseDown={(e) => e.preventDefault()}
+                  className="fray-bash-expand petite-caps px-2.5 pb-1.5"
+                >
+                  {outExpanded ? "Collapse" : `Show all ${outLineCount} lines`}
+                </button>
+              )}
+            </>
           )}
         </>
       )}
@@ -1256,7 +1281,9 @@ function FenceCard({ fenceKind, body, hints, wrap, onArchive }: { fenceKind: Fen
         <div className="mt-2 flex flex-wrap gap-1.5">
           {hints.map((h, i) => (
             <span key={i} className="flex items-center gap-1 rounded-md border border-border bg-panel px-2 py-0.5 text-[11px] text-fg/80">
-              <span className="petite-caps text-[9.5px] text-muted/60">{h.kind}</span>
+              {/* petite-caps sit on the baseline → ~1px low under items-center (see styles.css); lift the
+                  label onto the value's optical midline so "ci"/"pr" and the ref read on one line. */}
+              <span className="petite-caps relative -top-px text-[9.5px] text-muted/60">{h.kind}</span>
               <span className="font-mono-keep">{h.value}</span>
               {/* A live countdown to a timer wait — fray-ui OWNS the wake (it resumes the session when
                   this fires), so the card shows the human exactly when that happens. */}
@@ -1312,7 +1339,7 @@ export function BackgroundOpsStrip({ slug }: { slug: string }) {
   }, [total])
   if (total === 0) return null
   return (
-    <div className="flex flex-col gap-1 border-t border-border bg-panel px-4 py-2">
+    <div className="flex flex-col gap-0.5 px-4 pb-2 pt-1">
       {agents.map((s, i) => (
         <OpRow
           key={`a${i}`}
@@ -1340,13 +1367,18 @@ function OpRow({ kind, label, state, startedAt, onOpen }: { kind: "AGENT" | "SHE
       onClick={onOpen}
       onMouseDown={clickable ? (e) => e.stopPropagation() : undefined}
       title={clickable ? "Open sub-agent transcript" : undefined}
-      className={`group flex items-center gap-2 min-w-0 text-[12px] ${clickable ? "cursor-pointer" : ""}`}
+      className={`group flex items-center gap-1.5 min-w-0 text-[11.5px] ${clickable ? "cursor-pointer" : ""}`}
     >
-      <span className="flex w-[9px] shrink-0 justify-center">{state !== "stale" ? <LiveSpinner /> : null}</span>
-      <span className="petite-caps shrink-0 w-[42px] text-[10px] text-muted/55">{kind}</span>
-      <span className={`min-w-0 truncate text-fg/80 ${clickable ? "group-hover:underline" : ""}`}>{label}</span>
-      <span className="shrink-0 text-muted/55">— {state === "stale" ? "stale" : "running"}{when && ` ${when}`}</span>
-      {clickable && <ArrowUpRight size={12} className="shrink-0 text-transparent transition-colors group-hover:text-muted/60" />}
+      {/* ⤷ the SAME down-right arrow as the sidebar's sub-agent rows — a subtle, borderless list that
+          reads as ambient status hanging under the composer, not chrome (maintainer 2026-07-11). */}
+      <span aria-hidden className="shrink-0 text-[11px] leading-none text-muted/40">⤷</span>
+      <span className="flex w-[9px] shrink-0 justify-center">
+        {state !== "stale" ? <LiveSpinner /> : <span className="block h-1.5 w-1.5 rounded-full bg-muted/25" title="stale — no recent output" />}
+      </span>
+      <span className="petite-caps shrink-0 text-[9.5px] text-muted/45">{kind}</span>
+      <span className={`min-w-0 truncate text-muted/70 ${clickable ? "group-hover:text-fg/80 group-hover:underline" : ""}`}>{label}</span>
+      {when && <span className="shrink-0 text-muted/40">{when}</span>}
+      {clickable && <ArrowUpRight size={11} className="shrink-0 text-transparent transition-colors group-hover:text-muted/50" />}
     </div>
   )
 }

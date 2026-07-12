@@ -7,6 +7,7 @@ import type { Bus } from "./bus.ts"
 import type { Emitter } from "./bus.ts"
 import type { Project } from "./project.ts"
 import type { Storage } from "./storage.ts"
+import type { AgentBackend } from "./backend/types.ts"
 import { readThreadTranscript } from "./transcript.ts"
 
 // Stage-2 multiplex: a SECOND noServer WebSocket at /ws (beside the terminal WS) carrying the board
@@ -112,8 +113,12 @@ export interface AppSocketDeps {
 // Build the transcript reader index.ts injects — resolves a thread slug to its rendered transcript the
 // SAME way router.ts's threadTranscript does (registry row → its session's JSONL; foreign slug → the
 // session id itself; else []). Shared via readThreadTranscript so both paths render foreign threads.
-export function makeTranscriptReader(project: Project, storage: Storage): (slug: string) => TranscriptMessage[] {
-  return (slug: string) => readThreadTranscript(project, storage, slug)
+export function makeTranscriptReader(
+  project: Project,
+  storage: Storage,
+  backendFor?: (kind?: string) => AgentBackend,
+): (slug: string) => TranscriptMessage[] {
+  return (slug: string) => readThreadTranscript(project, storage, slug, backendFor)
 }
 
 export interface AppSocketServer {

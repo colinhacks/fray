@@ -124,6 +124,43 @@ test("parseCodexLine: response_item/function_call_output → tool-result with ca
   assert.match(ev.text, /test file/)
 })
 
+test("parseCodexLine: response_item/custom_tool_call (apply_patch) → tool-call carrying the raw patch STRING input", () => {
+  // Codex delivers file edits (apply_patch) as a custom_tool_call whose .input is the V4A patch string,
+  // NOT a function_call with JSON arguments. Missing this dropped every codex edit from the fold + drawer.
+  const line = JSON.stringify({
+    timestamp: "2026-07-11T00:00:00.000Z",
+    type: "response_item",
+    payload: {
+      type: "custom_tool_call",
+      call_id: "call_abc",
+      name: "apply_patch",
+      input: "*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch\n",
+    },
+  })
+  const evs = parseCodexLine(line)
+  assert.equal(evs.length, 1)
+  const ev = evs[0] as any
+  assert.equal(ev.kind, "tool-call")
+  assert.equal(ev.name, "apply_patch")
+  assert.equal(ev.id, "call_abc")
+  assert.equal(typeof ev.input, "string")
+  assert.match(ev.input, /Begin Patch/)
+})
+
+test("parseCodexLine: response_item/custom_tool_call_output → tool-result with call_id + output text", () => {
+  const line = JSON.stringify({
+    timestamp: "2026-07-11T00:00:00.000Z",
+    type: "response_item",
+    payload: { type: "custom_tool_call_output", call_id: "call_abc", output: "Success. Updated the following files:\nM a.txt\n" },
+  })
+  const evs = parseCodexLine(line)
+  assert.equal(evs.length, 1)
+  const ev = evs[0] as any
+  assert.equal(ev.kind, "tool-result")
+  assert.equal(ev.id, "call_abc")
+  assert.match(ev.text, /Success/)
+})
+
 test("parseCodexLine: NO DOUBLE COUNT — response_item/message (the assistant/prompt echo) yields nothing", () => {
   const asstEcho = firstLineOf((r) => r.type === "response_item" && r.payload?.type === "message" && r.payload?.role === "assistant")
   const userEcho = firstLineOf((r) => r.type === "response_item" && r.payload?.type === "message" && r.payload?.role === "user")

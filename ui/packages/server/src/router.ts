@@ -79,7 +79,8 @@ export function createRouter(ctx: AppContext) {
       output: z.object({ messages: z.array(TranscriptMessage) }),
       handler: async ({ input }) => {
         // Registry row → its session's transcript; foreign slug (a session id) → resolved directly; else [].
-        return { messages: readThreadTranscript(ctx.project, ctx.storage, input.slug) }
+        // backendFor routes a codex thread through the codex rollout reader (else it renders empty).
+        return { messages: readThreadTranscript(ctx.project, ctx.storage, input.slug, ctx.backendFor) }
       },
     }),
 

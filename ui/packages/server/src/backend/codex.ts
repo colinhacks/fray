@@ -100,6 +100,9 @@ export interface CodexBackendOptions {
 //   event_msg/user_message        → user-message (genuine human turn; codex has no synthetic peer echo)
 //   response_item/function_call        → tool-call  (args JSON in .arguments, id in .call_id)
 //   response_item/function_call_output → tool-result (output in .output, id in .call_id)
+//   response_item/custom_tool_call        → tool-call  (freeform tools — apply_patch: .input is the raw
+//                                          V4A patch STRING, not a JSON args object; id in .call_id)
+//   response_item/custom_tool_call_output → tool-result (output in .output, id in .call_id)
 // DELIBERATELY SKIPPED (the no-double-count rule, §6):
 //   response_item/message          — the raw API echo of agent_message (role=assistant) AND the prompt
 //                                    echo (role=user/developer). Counting it would double the assistant
@@ -161,6 +164,20 @@ export function parseCodexLine(line: string): NormalizedEvent[] {
       return [{ kind: "tool-call", at, id, name, input: parseToolArguments(p.arguments) }]
     }
     if (pt === "function_call_output") {
+      const id = typeof p.call_id === "string" ? p.call_id : ""
+      const text = typeof p.output === "string" ? p.output : stringifyOutput(p.output)
+      return [{ kind: "tool-result", at, id, text }]
+    }
+    // Freeform ("custom") tools — codex delivers apply_patch (its file-edit tool) this way, NOT as a
+    // function_call. The payload carries `input` as a RAW STRING (the V4A patch for apply_patch), so we
+    // pass it through as-is; the renderer/fold sees a normal tool-call and maps the patch to a diff.
+    // Without this, every codex file edit was invisible in the board fold AND the chat drawer.
+    if (pt === "custom_tool_call") {
+      const id = typeof p.call_id === "string" ? p.call_id : ""
+      const name = typeof p.name === "string" ? p.name : ""
+      return [{ kind: "tool-call", at, id, name, input: typeof p.input === "string" ? p.input : (p.input ?? {}) }]
+    }
+    if (pt === "custom_tool_call_output") {
       const id = typeof p.call_id === "string" ? p.call_id : ""
       const text = typeof p.output === "string" ? p.output : stringifyOutput(p.output)
       return [{ kind: "tool-result", at, id, text }]

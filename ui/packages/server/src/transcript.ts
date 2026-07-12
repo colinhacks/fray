@@ -4,6 +4,8 @@ import { homedir } from "node:os"
 import type { TranscriptMessage, TranscriptToolCall } from "@fray-ui/shared"
 import type { Project } from "./project.ts"
 import type { Storage } from "./storage.ts"
+import type { AgentBackend, NormalizedEvent } from "./backend/types.ts"
+import { parseCodexLine, createCodexBackend } from "./backend/codex.ts"
 import { discoverTranscriptId, DISCOVERY_GRACE_MS } from "./discover.ts"
 
 // Parse a session JSONL into a renderable conversation — mechanically, no AI. Same defensive
@@ -515,15 +517,267 @@ function logDirOf(project: Project): string {
   return join(homedir(), ".claude", "projects", project.cwdSlug)
 }
 
+// ---- Codex rollout → renderable conversation ----
+// Codex writes a DIFFERENT transcript schema than Claude: each rollout line is {timestamp,type,payload}
+// (see ~/.codex/sessions/**/rollout-*.jsonl). The AUTHORITATIVE record→event mapping already lives in
+// backend/codex.ts parseCodexLine — the SAME mapping the tailer folds for board telemetry — so we reuse
+// it verbatim here; the drawer and the board can then never disagree about what a codex record means.
+// This function GROUPS that normalized event stream into the TranscriptMessage[] the chat drawer
+// renders: the codex analogue of parseTranscript. Event handling (see NormalizedEvent):
+//   assistant-text → assistant prose (commentary + final_answer both render; final carries the fence)
+//   tool-call      → a tool card (exec_command/shell → Bash; apply_patch → diff; else generic)
+//   tool-result    → back-filled onto the matching call's `output` by call_id
+//   user-message   → a human bubble (the first strips the dispatch scaffolding + discovery sentinel)
+//   turn-start     → ignored (a bracket, not content)
+//   turn-end       → ignored unless it carries finalText no assistant-text already surfaced (defensive)
+//   title          → ignored (board telemetry only)
+// Same defensive posture as parseTranscript: a bad line → parseCodexLine [] → skipped, never throws.
+export function parseCodexTranscript(raw: string): TranscriptMessage[] {
+  const out: TranscriptMessage[] = []
+  // The open assistant message the current turn's text/tool events append to. A user turn closes it
+  // (→ null) so the next assistant content starts a fresh message.
+  let cur: TranscriptMessage | null = null
+  // Tool calls awaiting their function_call_output, keyed by call_id — the codex analogue of pendingReads.
+  const pendingCalls = new Map<string, TranscriptToolCall>()
+  // The last FINAL assistant text rendered, so a task_complete.last_agent_message that merely echoes it
+  // isn't surfaced twice (the common case); a genuinely-different finalText is a defensive fallback.
+  let lastFinalText: string | null = null
+  // Whether the CURRENT turn already emitted a FINAL answer (agent_message/final_answer) — reset by
+  // turn-start / a user turn. Gates the turn-end fallback: only a turn that produced NO final answer
+  // falls back to task_complete.last_agent_message, so a commentary-only turn whose answer lives ONLY
+  // on the bracket is still surfaced, while a normal turn's echoed answer never double-renders. Tracked
+  // as a flag (not read off `cur`) because TS can't narrow the closure-mutated `cur`.
+  let sawFinalAnswer = false
+
+  const openAssistant = (at?: string): TranscriptMessage => {
+    if (cur) return cur
+    cur = { role: "assistant", text: "", tools: [], parts: [], at }
+    out.push(cur)
+    return cur
+  }
+
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue
+    for (const ev of parseCodexLine(line)) {
+      switch (ev.kind) {
+        case "assistant-text": {
+          const m = openAssistant(ev.at)
+          pushTextPart(m, ev.text)
+          m.text = m.text ? `${m.text}\n\n${ev.text}` : ev.text
+          if (ev.final) {
+            lastFinalText = ev.text
+            sawFinalAnswer = true
+          }
+          break
+        }
+        case "tool-call": {
+          const m = openAssistant(ev.at)
+          const call = codexToolCall(ev.name, ev.input)
+          pushToolPart(m, call)
+          m.tools.push(call)
+          if (ev.id) pendingCalls.set(ev.id, call)
+          break
+        }
+        case "tool-result": {
+          const call = ev.id ? pendingCalls.get(ev.id) : undefined
+          if (!call) break
+          pendingCalls.delete(ev.id)
+          const cleaned = cleanExecOutput(ev.text)
+          if (cleaned) call.output = capRead(cleaned)
+          break
+        }
+        case "user-message": {
+          cur = null // a human turn closes the assistant message and breaks the merge chain
+          sawFinalAnswer = false
+          let text = typeof ev.text === "string" ? normalizeNewlines(ev.text).trim() : ""
+          text = stripCodexSentinel(text)
+          if (!text || isInjectedNoise(text)) break
+          // The first user message is the composed dispatch prompt (worker contract + orientation + TASK
+          // + sentinel). Only the TASK is the human's words — mirror parseTranscript's first-message strip.
+          if (out.length === 0) {
+            const cut = text.indexOf("\nTASK:\n")
+            if (cut !== -1) text = text.slice(cut + "\nTASK:\n".length).trim()
+          }
+          if (text) out.push({ role: "user", text, tools: [], parts: [], at: ev.at })
+          break
+        }
+        case "turn-start":
+          sawFinalAnswer = false // a fresh turn opens; a later final_answer sets this
+          break
+        case "turn-end": {
+          // Defensive: a turn that produced NO final_answer but whose task_complete carried a distinct
+          // last_agent_message still surfaces it (commentary-only turns). The lastFinalText dedupe keeps
+          // the ordinary case — where final_answer already rendered the identical text — from doubling.
+          const ft = ev.finalText?.trim()
+          if (ft && !sawFinalAnswer && ft !== lastFinalText?.trim()) {
+            const m = openAssistant(ev.at)
+            pushTextPart(m, ev.finalText!)
+            m.text = m.text ? `${m.text}\n\n${ev.finalText!}` : ev.finalText!
+            sawFinalAnswer = true
+          }
+          break
+        }
+        // title: sidecar, not renderable content.
+        default:
+          break
+      }
+    }
+  }
+
+  return out.length > MAX_MESSAGES ? out.slice(-MAX_MESSAGES) : out
+}
+
+// A codex tool_call → a renderable TranscriptToolCall. Codex's tool surface differs from Claude's: the
+// dominant tool is exec_command/shell (a shell command whose stdout/stderr rides the rollout, unlike
+// Claude), and file edits arrive either as shell redirects or an apply_patch call. We normalize onto the
+// SAME card family Claude uses — a shell command → the Bash card (carrying its captured output),
+// apply_patch → a diff card — so a codex thread reads just like a Claude one. An unrecognized tool
+// degrades to a generic card carrying whatever hint its input reveals (never a throw, never a blank).
+function codexToolCall(name: string, input: unknown): TranscriptToolCall {
+  const obj = input && typeof input === "object" && !Array.isArray(input) ? (input as Record<string, unknown>) : {}
+  const cmd = extractShellCommand(obj)
+  if (cmd) return { name: "Bash", detail: bashSummary(cmd), command: capCommand(cmd) }
+  const patch = name === "apply_patch" || name === "patch" ? extractPatch(input, obj) : undefined
+  if (patch) {
+    const edit = parseApplyPatch(patch)
+    if (edit) return { name: "Edit", detail: edit.file, edit }
+    // Unparseable/complex patch → still show the raw patch body as a command card so the edit isn't invisible.
+    return { name: "apply_patch", detail: patchSummary(patch), command: capCommand(patch) }
+  }
+  return { name: name && name.trim() ? name.trim() : "tool", detail: toolDetail(input) }
+}
+
+// The shell command a codex exec/shell tool ran. exec_command ships it as `cmd` (a string); the older
+// `shell`/`local_shell` tool ships `command` as either a string or an argv array (often ["bash","-lc",
+// "<script>"] — we surface the script the shell actually runs). Returns undefined for a non-shell tool.
+function extractShellCommand(obj: Record<string, unknown>): string | undefined {
+  if (typeof obj.cmd === "string" && obj.cmd.trim()) return obj.cmd.trim()
+  const command = obj.command
+  if (typeof command === "string" && command.trim()) return command.trim()
+  if (Array.isArray(command) && command.length) {
+    const parts = command.filter((c): c is string => typeof c === "string")
+    const flag = parts.findIndex((c) => c === "-c" || c === "-lc" || c === "-lic")
+    if (flag !== -1 && typeof parts[flag + 1] === "string" && parts[flag + 1].trim()) return parts[flag + 1].trim()
+    const joined = parts.join(" ").trim()
+    if (joined) return joined
+  }
+  return undefined
+}
+
+// The V4A patch text an apply_patch call carried — `{input|patch|diff: "*** Begin Patch…"}`, or the raw
+// string when codex passes the patch positionally. Undefined when no patch body is present.
+function extractPatch(input: unknown, obj: Record<string, unknown>): string | undefined {
+  if (typeof input === "string" && input.includes("Begin Patch")) return input
+  return strField(obj.input) ?? strField(obj.patch) ?? strField(obj.diff)
+}
+
+// Best-effort parse of a codex apply_patch V4A body into a SINGLE-file diff. Handles the common
+// "Update File"/"Add File" single-file hunk; anything more complex (multi-file, delete) returns
+// undefined so the caller falls back to rendering the raw patch. old/new are reconstructed from the hunk
+// lines (context shared, '-' removed-only, '+' added-only) with the leading marker stripped. CAVEATS
+// (acceptable for a best-effort card): a multi-hunk single-file update concatenates its `@@` regions
+// into one old/new pair (the hunk headers are dropped), and a `*** Move to:` rename renders the diff
+// under the SOURCE path (the move directive is ignored) rather than the destination.
+function parseApplyPatch(patch: string): TranscriptToolCall["edit"] | undefined {
+  const lines = patch.split("\n")
+  let file: string | undefined
+  let mode: "update" | "add" | undefined
+  const oldLines: string[] = []
+  const newLines: string[] = []
+  let started = false
+  for (const raw of lines) {
+    const m = raw.match(/^\*\*\* (Update|Add|Delete) File: (.+)$/)
+    if (m) {
+      if (file) return undefined // a second file → multi-file, bail to raw render
+      file = m[2].trim()
+      mode = m[1] === "Add" ? "add" : m[1] === "Update" ? "update" : undefined
+      if (!mode) return undefined // Delete (no reconstructable body) → bail to raw render
+      started = true
+      continue
+    }
+    if (!started) continue
+    if (raw.startsWith("*** ")) continue // *** End Patch / next-file marker
+    if (raw.startsWith("@@")) continue // hunk header
+    if (raw.startsWith("+")) newLines.push(raw.slice(1))
+    else if (raw.startsWith("-")) oldLines.push(raw.slice(1))
+    else {
+      const ctx = raw.startsWith(" ") ? raw.slice(1) : raw
+      oldLines.push(ctx)
+      newLines.push(ctx)
+    }
+  }
+  if (!file) return undefined
+  return { file, old: mode === "add" ? "" : capEdit(oldLines.join("\n")), new: capEdit(newLines.join("\n")) }
+}
+
+// The file an apply_patch touches, for the fallback command-card header.
+function patchSummary(patch: string): string {
+  const m = patch.match(/^\*\*\* (?:Update|Add|Delete) File: (.+)$/m)
+  return m ? m[1].trim() : "apply_patch"
+}
+
+// Strip the trailing per-dispatch discovery sentinel (`<!-- fray-session:… -->`) buildSpawn appends to
+// the FIRST codex prompt so post-spawn discovery can pin the rollout — plumbing the human never typed.
+function stripCodexSentinel(text: string): string {
+  return text.replace(/\n*<!--\s*fray-session:[^>]*-->\s*$/, "").replace(/\s+$/, "")
+}
+
+// Codex's exec_command output rides an envelope: "Chunk ID: …\nWall time: …\nProcess exited with code
+// N\nOriginal token count: …\nOutput:\n<stdout/stderr>". Strip it to the actual output, prepending a
+// compact "[exit N]" only when the command FAILED (a non-zero exit is signal the reader wants). A result
+// that doesn't match the envelope (a `shell`-tool result, an already-bare string) is returned trimmed.
+function cleanExecOutput(text: string): string {
+  const t = typeof text === "string" ? text : ""
+  const marker = t.indexOf("\nOutput:\n")
+  if (marker === -1) return t.trim()
+  const body = t.slice(marker + "\nOutput:\n".length).replace(/\s+$/, "")
+  const exit = t.match(/Process exited with code (\d+)/)
+  if (exit && exit[1] !== "0") return `[exit ${exit[1]}]${body ? `\n${body}` : ""}`
+  return body
+}
+
+// A lazily-built default CodexBackend for the render path when no per-request backendFor is threaded
+// (e.g. a unit test that calls readThreadTranscript directly). Uses $CODEX_HOME (default ~/.codex), so
+// prod behavior is identical whether or not the caller passes its wired backendFor.
+let _defaultCodexBackend: AgentBackend | null = null
+function defaultCodexBackend(): AgentBackend {
+  return (_defaultCodexBackend ??= createCodexBackend({}))
+}
+
+// Parse a codex rollout from an ABSOLUTE file path (the located ~/.codex/sessions/**/rollout-*.jsonl).
+// Missing/unreadable file → [] (the drawer renders its spinner / "transcript unavailable" state).
+export function readCodexTranscriptFile(absPath: string): TranscriptMessage[] {
+  try {
+    return parseCodexTranscript(readFileSync(absPath, "utf8"))
+  } catch {
+    return []
+  }
+}
+
 // Resolve a thread slug to its rendered transcript: a registry row's DISCOVERED transcript (transcript_id)
 // if one was cached, else its pinned session_id; for a foreign thread the slug itself as a session id;
 // else empty. When the pinned transcript renders empty and nothing's been cached yet, a best-effort
 // content discovery (scratchpad sentinel, same as the tailer) re-links a drifted transcript so the drawer
 // isn't blank while the tailer catches up. The single resolution the threadTranscript RPC and the /ws
 // transcript producer share, so foreign threads render identically on both paths. Degrades to [].
-export function readThreadTranscript(project: Project, storage: Storage, slug: string): TranscriptMessage[] {
+export function readThreadTranscript(
+  project: Project,
+  storage: Storage,
+  slug: string,
+  backendFor?: (kind?: string) => AgentBackend,
+): TranscriptMessage[] {
   const row = storage.getSession(slug)
   if (row) {
+    // Codex threads write a DIFFERENT transcript schema in a DIFFERENT place (~/.codex/sessions,
+    // date-sharded, located by the discovered rollout id) — route them through the codex reader+parser
+    // so the drawer renders codex messages + tool calls instead of an empty pane. The rollout id is
+    // `agent_session_id` (the id codex minted, pinned post-discovery); until discovery pins it,
+    // transcriptPath returns undefined → [] and the drawer keeps its spinner (the tailer catches up).
+    if (row.backend === "codex") {
+      const backend = backendFor?.("codex") ?? defaultCodexBackend()
+      const path = backend.transcriptPath(row.agent_session_id ?? row.session_id)
+      return path ? readCodexTranscriptFile(path) : []
+    }
     const msgs = readTranscript(project, row.transcript_id ?? row.session_id)
     if (msgs.length || row.transcript_id) return msgs
     // The pinned transcript rendered empty and nothing's cached. GATE the fallback on the spin-up grace:
