@@ -1,7 +1,7 @@
 ---
 name: gh
-description: The gh-CLI playbook for a fray-ui worker signed into GitHub (invoke as fray:gh). Load this whenever your effort touches GitHub — reading or triaging an issue or PR, reviewing a diff, checking CI/release status, or searching issues/PRs — to use `gh` eagerly and correctly: the read-vs-write boundary (never comment/label/close/merge unless the human asks), the toon absolute-path shim for large JSON, concrete read recipes, and how to tie a CI or PR watch into your ```awaiting signal fence. Only meaningful when you are signed in (`gh auth status --active` exit 0); the session-seed hook injects a pointer here when you are.
-version: 0.1.0
+description: The gh-CLI playbook for a fray-ui worker signed into GitHub (invoke as fray:gh). Load this whenever your effort touches GitHub — reading or triaging an issue or PR, reviewing a diff, checking CI/release status, or searching issues/PRs — to use `gh` eagerly and correctly: the read-vs-write boundary (never comment/label/close/merge unless the human asks), the toon absolute-path shim for large JSON, concrete read recipes, and active Monitor/background-Bash CI/PR watches. Only meaningful when you are signed in (`gh auth status --active` exit 0); the session-seed hook injects a pointer here when you are.
+version: 0.1.1
 metadata:
   internal: true
 ---
@@ -10,7 +10,7 @@ metadata:
 
 You are a **fray-ui worker** and you are **signed into the `gh` CLI in a GitHub repo** (the session-seed hook confirmed `gh auth status --active` before pointing you here). `gh` is the fastest path to issue / PR / CI / release context — reach for it before guessing, and prefer it over scraping the web UI or reasoning from memory.
 
-This skill is the full playbook the injected `⟦gh available⟧` block summarizes: the **read-vs-write boundary**, the **toon shim** for large JSON, concrete **read recipes**, and how to tie a **CI/PR watch** into your ` ```awaiting ` signal fence.
+This skill is the full playbook the injected `⟦gh available⟧` block summarizes: the **read-vs-write boundary**, the **toon shim** for large JSON, concrete **read recipes**, and how to keep a **CI/PR watch** active until the next actionable event.
 
 ## The one hard rule — READ freely, WRITE only when asked
 
@@ -79,24 +79,29 @@ gh api repos/OWNER/REPO/commits/SHA/check-runs --jq '.check_runs[] | {name, conc
 gh api "repos/OWNER/REPO/issues?state=open&labels=bug&per_page=50" | "$HOME/.nvm/versions/node/v24.14.0/bin/toon"
 ```
 
-## Tie a CI or PR watch into your ```awaiting fence
+## Keep GitHub automation active
 
-You are a worker: **do not block on a poll loop** (no `Monitor`, no background-shell `while` on `gh run watch`, no foreground CI watch — a held process can't survive a rest). When your next step depends on a **machine** finishing on GitHub — CI completing, a PR merging/closing — read the current state ONCE, then **rest with an ` ```awaiting ` fence** carrying the hint the fray-ui scheduler wakes on. It resumes your session the moment the condition fires, hours or days later.
+CI, automated review, releases, merge queues, and already-authorized merge progression are work you
+can observe with `gh`; they do not earn an `awaiting` fence. Keep a live operation attached to the
+thread and continue when it reports.
 
-- Waiting on **CI** for a ref/PR → after `gh pr checks N` shows checks still running, rest with:
-  ```
-  ```awaiting
-  ci: OWNER/REPO#N
-  Pushed the fix; watching PR checks. Wake me when they finish and I'll fold in any failure.
-  ```
-- Waiting on a **PR to merge/close** →
-  ```
-  ```awaiting
-  pr: OWNER/REPO#N
-  Review posted per your ask; waiting on merge. Wake me when it lands.
-  ```
+- One-shot completion: launch `Bash` with `run_in_background: true`, for example
+  `gh run watch RUN_ID -R OWNER/REPO --exit-status` or a repo watcher that exits when all PR checks
+  settle. The completion task-notification re-invokes you. Diagnose/fix on red; continue the authorized
+  release/merge path on green.
+- State transitions: use `Monitor` with a quiet loop that prints only changes or the terminal event.
+  Finite monitors run up to one hour; `persistent: true` runs until `TaskStop` or the Claude session
+  ends. Stop a watch once its gate is obsolete.
+- A background Bash launch exposes an output-file path. Use `Read` on that path only for diagnostics;
+  `TaskOutput` is deprecated. Do not fake waiting with `echo waiting` or sleep-only Bash calls.
 
-`ci:` fires when the checks finish (pass or fail); `pr:` fires on merge/close. You wake with a steer (`✅ CI is green on …` / `❌ CI failed on …` / `✅ PR … merged`), then continue. Put *what to re-check* in the prose so future-you knows why it's waiting. Never use `awaiting` for a human wait — that's a ` ```question `.
+Both mechanisms are session-bound. If the next check deliberately belongs at a named wall-clock
+instant, park with a durable `timer:` fence. If a specific external human reviewer/approver is the
+only remaining gate, park with `human: <actor + exact action>`. For a GitHub PR, pair it with
+`github-review: OWNER/REPO#NUMBER`: fray-ui baselines current reviews/comments and wakes only on NEW
+non-bot human activity after the fence, durably across restarts. Otherwise optionally pair a timer for
+a scheduled recheck. The dashboard operator's own go/no-go remains a ` ```question ` block. `pr:` / `ci:` /
+`session:` awaiting hints are legacy compatibility only — do not emit them for new automated waits.
 
 ## Fitting gh work into your thread type
 

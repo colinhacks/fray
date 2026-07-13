@@ -1,0 +1,20 @@
+{
+  "name": "fray",
+  "interface": {
+    "displayName": "Fray"
+  },
+  "plugins": [
+    {
+      "name": "fray-codex",
+      "source": {
+        "source": "local",
+        "path": "./codex"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

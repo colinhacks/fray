@@ -1,15 +1,59 @@
 # fray
 
-**fray** is an orchestrator-first methodology for driving a large, mixed push — investigations + decided fixes + verifications — toward a goal through individually-dispatched background sub-agents. One main session stays the orchestrator and the only decider; sub-agents are instruments. A per-project `.fray/` thread board is the control surface, hooks handle dispatch and reconciliation, and a board/validator CLI keeps the whole effort legible.
+**fray** is an orchestrator-first methodology for driving a large, mixed push — investigations + decided fixes + verifications — toward a goal through individually-dispatched background sub-agents. One main session stays the orchestrator and the only decider; sub-agents are instruments. Each port uses the smallest control surface its harness needs: Claude Code uses a `.fray/` board, hooks, and a CLI, while Codex uses native agent state plus a prompt-first coordination skill packaged as a plugin.
 
 This repository is a **monorepo of fray ports**, one per agent harness:
 
 | Dir | Harness | What it is |
 | --- | --- | --- |
 | [`cc/`](cc/) | [Claude Code](https://claude.ai/code) | A Claude Code **plugin** — skill + hooks + board CLI, loaded globally, dormant per-repo until you run `/fray`. |
+| [`codex/`](codex/) | [Codex](https://developers.openai.com/codex) | A minimal Codex **plugin** whose first component is the Fray orchestration skill; the plugin shell leaves room for future skills and lifecycle hooks. |
 | [`pi/`](pi/) | [Pi](https://github.com/earendil-works) | The Pi port — extensions, prompts, and skill for the Pi coding agent. |
+| [`codexold/`](codexold/) | Codex (legacy) | The archived hook-heavy Codex plugin and predecessor Orchestrator skill. Not installed or active. |
 
-The [`codex/`](codex/) and [`opencode/`](opencode/) ports are also present.
+The [`opencode/`](opencode/) port is also present.
+
+## Codex plugin (`codex/`)
+
+The Codex port is an explicit, prompt-first orchestration plugin. Its classic in-chat mode is the
+`fray-orchestrator` skill: once invoked, the root chat coordinates and delegates substantive work to
+native Codex agents with explicit model and reasoning-effort choices. It uses native agent state and
+completion returns instead of recreating Claude Fray's mandatory `.fray/` board and lifecycle hooks.
+
+Install the public plugin directly from this GitHub repository:
+
+```sh
+codex plugin marketplace add colinhacks/fray --ref main
+codex plugin add fray-codex@fray
+```
+
+Start a new Codex thread, then invoke the plugin skill explicitly as
+`$fray-codex:fray-orchestrator`. Codex namespaces plugin skills; the shorter
+`$fray-orchestrator` handle is used only by the direct development install below. The skill is not
+implicitly discoverable, so ordinary tasks—and Fray UI workers in particular—do not enter portfolio
+orchestration mode accidentally.
+
+Current Codex builds may initially expose native spawning without per-dispatch `model` and
+`reasoning_effort`. On first use, Fray checks that schema and can configure Multi-Agent v2 under the
+non-reserved `fray` tool namespace; that one-time change requires one more new Codex thread. Fray
+does not claim explicit compute routing when those fields were not actually passed.
+
+See [`codex/README.md`](codex/README.md) for the complete setup, routing matrix, Fray UI boundary,
+limitations, updates, and troubleshooting.
+
+For in-place development, contributors can hardlink the bundled skill into `~/.codex/skills`:
+
+```sh
+node scripts/install-codex-skill.mjs install
+node scripts/install-codex-skill.mjs check
+```
+
+The shortcut validates and hardlinks the complete `fray-orchestrator` skill, configures native dynamic
+routing, and supports `update`, `check`, and `uninstall`. It also moves a recognized legacy
+`~/.codex/skills/fray` install outside skill discovery so the former broad trigger cannot remain
+active beside `fray-orchestrator`. Do not enable the direct skill and the marketplace-installed
+plugin simultaneously. The hook-heavy predecessor remains archived under
+[`codexold/`](codexold/) for reference only.
 
 ## Claude Code plugin (`cc/`)
 
@@ -36,13 +80,13 @@ A marketplace install copies the plugin into `~/.claude/plugins/cache`, so edits
 
 ### Bumping the plugin version
 
-The Claude Code plugin version lives in two files that MUST stay in lockstep — `cc/.claude-plugin/plugin.json` (`"version"`) and the `cc/skills/fray/SKILL.md` frontmatter (`version:`). Never edit them by hand (they drifted once that way). Bump both atomically:
+The Claude Code plugin version lives in two files that MUST stay in lockstep — `cc/.claude-plugin/plugin.json` (`"version"`) and the `cc/skills/fray/SKILL.md` frontmatter (`version:`). Never edit them by hand (they drifted once that way). Update both through the version script, which replaces each file atomically:
 
 ```sh
 node scripts/set-version.ts 1.8.0     # or: nub scripts/set-version.ts 1.8.0
 ```
 
-The script validates the semver, writes both files, and prints what changed. `node scripts/set-version.ts --check` verifies they agree and exits nonzero on drift — CI (`.github/workflows/version-check.yml`) runs it on every push/PR. The other ports (`codex/`, `pi/`, `opencode/`) are on independent version tracks and are deliberately not touched by this script.
+The script validates the semver, writes both files, and prints what changed. `node scripts/set-version.ts --check` verifies they agree and exits nonzero on drift — CI (`.github/workflows/version-check.yml`) runs it on every pull request and on pushes to `main`. The Codex plugin and the other ports (`pi/`, `opencode/`) have independent version tracks and are deliberately not touched by this script.
 
 ### Per-session enable/disable (toggleable mid-session)
 

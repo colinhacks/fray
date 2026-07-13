@@ -1,23 +1,26 @@
 {
   "name": "fray-codex",
-  "version": "0.2.0",
-  "description": "Codex adapter for the repo-local Fray orchestration workflow.",
+  "version": "0.5.0",
+  "description": "Explicit, prompt-first orchestration with model-routed Codex subagents.",
   "author": {
-    "name": "Colin McDonnell"
+    "name": "Colin McDonnell",
+    "url": "https://github.com/colinhacks"
   },
+  "homepage": "https://github.com/colinhacks/fray/tree/main/codex",
+  "repository": "https://github.com/colinhacks/fray",
+  "keywords": ["codex", "subagents", "orchestration", "multi-agent", "model-routing"],
   "skills": "./skills/",
-  "hooks": "./hooks/hooks.json",
   "interface": {
     "displayName": "Fray for Codex",
-    "shortDescription": "Run the Fray orchestration workflow in Codex.",
-    "longDescription": "Adds Codex-native Fray instructions and helper scripts while preserving the shared .fray control surface used by this repository.",
+    "shortDescription": "Explicitly orchestrate concurrent Codex workstreams.",
+    "longDescription": "Adds explicit-only Fray orchestration with native per-dispatch model and effort routing, scoped delegation, worker-owned scratchpads when useful, return reconciliation, and outcome-oriented reporting.",
     "developerName": "Colin McDonnell",
     "category": "Productivity",
-    "capabilities": ["Sub-agents", "Project Management"],
+    "capabilities": ["Subagents", "Orchestration", "Model Routing", "Review"],
     "defaultPrompt": [
-      "Use Fray for this launch push.",
-      "Show the current Fray board.",
-      "Preflight this Fray dispatch."
+      "Use $fray-codex:fray-orchestrator to delegate these workstreams.",
+      "Use $fray-codex:fray-orchestrator to run this audit as a campaign.",
+      "Use $fray-codex:fray-orchestrator and add this ask without dropping active work."
     ]
   }
 }

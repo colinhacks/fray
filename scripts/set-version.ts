@@ -7,11 +7,12 @@
  *   - cc/skills/fray/SKILL.md        (YAML frontmatter `version:`)
  * These drifted once (plugin.json at 1.6.3 while SKILL.md frontmatter fell to
  * 1.0.x) because each was bumped by hand independently. This script makes them
- * a single atomic write so they can never disagree again.
+ * one command with an atomic replacement per file. A process crash between the
+ * two renames can still leave temporary drift, which `--check` detects.
  *
  * DELIBERATELY EXCLUDED (independent version tracks — NOT bumped here):
- *   - codex/.codex-plugin/plugin.json — the Codex port is a separate harness on
- *     its own release cadence (currently 0.2.0). Its SKILL.md has no version.
+ *   - codex/.codex-plugin/plugin.json — the Codex plugin has an independent
+ *     version track. Its skill carries no separate version field.
  *   - pi/package.json — private (`"private": true`, 0.0.0), never published.
  *   - opencode/package.json — carries no version field at all (only a dep pin).
  *   - .claude-plugin/marketplace.json — the marketplace manifest has no version.

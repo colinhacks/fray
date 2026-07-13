@@ -1,0 +1,4 @@
+interface:
+  display_name: "Orchestrator"
+  short_description: "Coordinate multi-agent work without losing tasks"
+  default_prompt: "Use $orchestrator to coordinate this multi-task request with a truthful ledger, slot-aware delegation, review, and live verification."

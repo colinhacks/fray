@@ -103,7 +103,7 @@ the worker SKILL.md additionally tells the worker not to run `fray on` / load th
 
 ## plugin.json
 
-`name: "fray"` (renamed from `fray-worker` on 2026-07-08 — see the follow-up note), `version: "0.1.0"`,
+`name: "fray"` (renamed from `fray-worker` on 2026-07-08 — see the follow-up note), `version: "0.1.2"`,
 `license: "MIT"`. Hooks are auto-discovered from `hooks/hooks.json` (same as cc — plugin.json carries
 no explicit hooks reference); every hook command is wired via `${CLAUDE_PLUGIN_ROOT}`.
 
@@ -291,19 +291,20 @@ so the write-side can't prevent it — the read-side repair is the safety net th
 click.
 
 ## 2026-07-09: v2 worker contract — the session-first rebuild (fences + scratchpad; thread-file contract DELETED)
-The maintainer settled fray-ui on a SESSION-FIRST model: threads ARE claude sessions, the human's
-dashboard shows the session TRANSCRIPT, and the queue inverts — a thread at rest is "awaiting the
-human" UNLESS it excused itself with a signal fence. The entire `.fray/<slug>.md` ownership contract
-is GONE: no thread files, no frontmatter, no `status`/`activity`/`status_text`, no `needs-human`, no
+The maintainer settled fray-ui on a SESSION-FIRST model: threads ARE claude sessions and the human's
+dashboard shows the session TRANSCRIPT. Queue membership is explicit: `question` hands off to the
+human, `done` queues a checked completion, process-level blocks surface themselves, `awaiting`
+excuses a machine wait, and bare rest stays quiet. The entire `.fray/<slug>.md` ownership contract is
+GONE: no thread files, no frontmatter, no `status`/`activity`/`status_text`, no `needs-human`, no
 `blocked` machine fields, no `hasPlan`/`## Plan`, no `fray-update`. Workers now SIGNAL through their
 FINAL MESSAGE and PERSIST through a SCRATCHPAD. This is the cc-worker-side realignment.
 
 **The new signal model (taught in `ui/WORKER_PROMPT.md` §"End-of-turn signals" + `skills/worker/SKILL.md`):**
-- **Bare rest = "your move"** — a rested thread with no fence lands in the human's Needs-you queue
-  (chat semantics: you handed it back).
+- **Bare rest is quiet** — a rested thread with no fence does NOT enter Needs-you and is not a human
+  handoff. Human handoff is explicit via `question` (or a real process-level block).
 - **` ```done `** — work complete + stands; body = 1–4 lines of what shipped + where. Renders a
-  success card with Archive; the fence MUTATES NOTHING (maintainer-settled) — it only excuses from
-  the queue; a follow-up may still wake the worker.
+  checked success card in the queue until explicit Archive; the fence MUTATES NOTHING
+  (maintainer-settled), and a follow-up may still wake the worker.
 - **` ```awaiting `** — waiting on a MACHINE (CI/PR/timer/session); body may lead with `kind: value`
   hint lines, kind ∈ pr|ci|timer|session. NEVER for a human wait.
 - **` ```question `** — unchanged grammar (question / approval / multi / danger; trailing `- A. …`
@@ -328,7 +329,8 @@ path is server-established convention already wired through `shared` (`scratchpa
   "for reference" then). Its sole job was nudging the worker to flush state into its thread FILE —
   dead with the thread-file contract gone. No `hooks.json` entry to remove (it was never re-wired).
 - **`hooks/session-seed.mjs`** — reseeded to the v2 contract: signal via the final message (bare rest
-  = your move; done/awaiting/question fences) + the scratchpad, whose concrete path is derived from
+  is quiet; done queues checked completion; awaiting excuses a machine wait; question asks) + the
+  scratchpad, whose concrete path is derived from
   the SessionStart `session_id` (`currentSessionId(input.session_id)` → `.fray/scratch/<sid>.md`) and
   named in the seed. FRAY_UI_THREAD gating + the cc double-hook `off`-sentinel defense KEPT verbatim;
   the compact re-grounding now points at the scratchpad, not a thread file.
@@ -368,3 +370,68 @@ the seed hook NAMES that concrete path to the worker, so dispatch must keep pinn
 ("You own `.fray/<slug>.md` … set `status: blocked` … Set `status: done`") — that is server-vertical
 scope (not editable here), but it now CONTRADICTS the v2 WORKER_PROMPT and must be rewritten to the
 fence/scratchpad model (or dropped) by the dispatch owner. Flagged to server-core.
+
+## 2026-07-12: awaiting reversal — park only human/timestamp gates; keep automation active
+
+The v2 rule above made `awaiting` a broad machine-wait bucket. In practice workers emitted a fence
+for CI, bots, releases, and merge progression, then returned with no process actually owning the
+next transition. The rail's hourglass therefore implied a watcher that often did not exist. The
+contract is now narrower:
+
+- `awaiting` is a deliberate PARK for either `human: <actor + exact external review/approval>` or
+  `timer: <ISO-8601 instant>`. The dashboard operator's own decision remains `question`.
+- CI, automated review, releases/deploys, merge queues, and already-authorized merge progression
+  stay ACTIVE. Claude workers use a background `Bash` one-shot or `Monitor`; Codex workers keep a
+  blocking exec session alive and poll it. Their completion/event re-invokes the worker.
+- `pr:` / `ci:` / `session:` continue to parse so old transcripts do not break. The existing PR/CI
+  waker remains a compatibility bridge, but workers must not create new waits with those hints.
+  `timer:` remains the durable scheduler path across process/session restart. `human:` is descriptive
+  and intentionally not auto-fired.
+- Every follow-up clears the old fence. “Back to awaiting” requires a fresh check: re-emit a current
+  human/timer fence, or re-arm automation and remain active.
+
+Claude Code 2.1.207 was audited before teaching this. fray-ui does not pass `--tools`,
+`--allowedTools`, or `--disallowedTools`, and its helper profiles only select model/effort, so wait
+tools are available to top-level workers and helpers. `Monitor` defaults to 300,000 ms (maximum
+3,600,000 ms); `persistent:true` runs until `TaskStop` or session end. Background Bash reports an
+output path; `TaskOutput` exists but is deprecated, so workers should `Read` that path for diagnostics.
+Both Monitor and background Bash are session/process-bound, which is why durable wall-clock checks
+remain `timer:` fences. Helpers must not return a final handoff while they still own a live watcher;
+the top-level worker owns long-lived CI/PR/merge progression.
+
+## 2026-07-13: ordinary rest returns to Queue; human Snooze/Archive own triage
+
+The quiet-bare-rest rule above was reversed after live use showed that an owned Fray worker could
+come to rest without choosing a fence and disappear from the only surface the operator routinely
+triages. Queue membership is now server-derived from process rest, not dependent on perfect worker
+signaling:
+
+- Every owned, open session whose top-level turn is genuinely at rest enters Queue by default.
+- A live child/Monitor still counts as in-flight work. A truthful external-human or future-timer
+  `awaiting` fence remains dimmed in Held. Legacy CI/PR/session and hintless waits do not excuse rest.
+- A human may durably Snooze an ordinary handoff (default one day, presets/custom exact instant) or
+  Archive it. Due snoozes automatically re-enter Queue; Archive never does.
+- Questions, permissions/native approvals, typed interactions, and crashes break through Snooze so a
+  provider cannot be stranded behind an invisible hard gate. `done` remains the checked presentation,
+  but it is still a resting handoff and can be snoozed.
+
+The worker contract still teaches explicit `question`, `done`, and narrow `awaiting` fences because
+they improve priority and presentation. A fence is no longer required merely to make a rested worker
+discoverable.
+
+## 2026-07-12: runtime release gate — real CDP evidence plus independent review
+
+Major UI, server, and control-plane work may no longer reach `done` from unit/integration/mocked
+evidence alone. The canonical `ui/WORKER_PROMPT.md` contract now requires real Chrome CDP QA against
+a disposable full stack, relevant active/idle/error/restart coverage, desktop+narrow screenshots,
+console/network inspection, and an explicit correctness+aesthetics assessment. `agent-browser` is the
+preferred driver when available; mocked DOM/routes can supplement but cannot be the sole evidence.
+
+Completion also requires two distinct review passes: the implementer's self-review of diff+evidence,
+then an independent fresh-context adversarial review; confirmed findings are fixed and affected gates
+rerun. The exception is proportional and narrow: trivial non-runtime docs-only or provably mechanical
+changes may skip CDP/independent review, while uncertainty applies the gate. This rule is mirrored in
+`skills/worker/SKILL.md` (v0.2.2) and the SessionStart seed; the backend-aware prompt contract test pins
+all four delivered surfaces, and the Claude expansion golden changes intentionally. The Codex addendum
+no longer mislabels an author's inline second read as independent review: use delegation when available,
+or report the gate unmet.

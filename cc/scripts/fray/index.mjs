@@ -30,7 +30,7 @@
  * Computed on demand from the scanned statuses — there is no stored dependency graph.
  */
 
-import { readFileSync, readdirSync, existsSync } from 'node:fs';
+import { closeSync, constants, openSync, readFileSync, readdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   loadConfig,
@@ -277,7 +277,7 @@ const OWNER_STALE_MIN = ownerStaleMin(cfg);
 // of crashing on a missing directory (the board ships globally and may be run anywhere).
 let frayEntries;
 try {
-  frayEntries = readdirSync(FRAY_DIR);
+  frayEntries = readdirSync(FRAY_DIR, { withFileTypes: true });
 } catch {
   console.log(`No .fray/ in ${PROJECT_DIR} — fray is not active here. Run the /fray skill to bootstrap it (creates .fray/ + a default config.yml).`);
   process.exit(0);
@@ -293,11 +293,26 @@ const downstream = downstreamThreads(PROJECT_DIR);
 const restedIds = restedAgentIds(PROJECT_DIR);
 
 const threads = frayEntries
-  .filter((f) => f.endsWith('.md') && !f.startsWith('_') && !f.startsWith('.')) // `_`-prefixed = non-thread meta (e.g. a stray _board.md); `.`-prefixed = hook-internal scratch (e.g. `.stop-context.md`), never a thread
+  // Only direct regular files are thread documents. `Dirent.isFile()` deliberately excludes
+  // symlinks: a board refresh must never follow `.fray/foo.md -> /outside/secret` merely to decide
+  // whether `foo` is adoptable or renderable.
+  .filter((entry) => entry.isFile() && entry.name.endsWith('.md') && !entry.name.startsWith('_') && !entry.name.startsWith('.')) // `_`-prefixed = non-thread meta (e.g. a stray _board.md); `.`-prefixed = hook-internal scratch (e.g. `.stop-context.md`), never a thread
+  .map((entry) => entry.name)
   .sort()
   .map((f) => {
     const id = f.replace(/\.md$/, ''); // the filename slug IS the id
-    const src = readFileSync(join(FRAY_DIR, f), 'utf8');
+    // Keep the Dirent check true at open time too. O_NOFOLLOW turns a file→symlink swap between
+    // readdir and read into a skipped row instead of an out-of-project read.
+    let fd;
+    let src;
+    try {
+      fd = openSync(join(FRAY_DIR, f), constants.O_RDONLY | constants.O_NOFOLLOW);
+      src = readFileSync(fd, 'utf8');
+    } catch {
+      return null;
+    } finally {
+      if (fd !== undefined) closeSync(fd);
+    }
     const fm = frontmatter(src);
     /** @type {string[]} */
     const errors = [];
@@ -397,7 +412,8 @@ const threads = frayEntries
       warnings, // seeded with any status-specific validation warnings computed above; the pass below appends more
       dropRisk: false, // set true when the blocked-machine-but-all-deps-terminal heuristic fires
     };
-  });
+  })
+  .filter((thread) => thread !== null);
 
 // THREAD-slug deps reference other threads — validate they resolve. A dangling slug (no
 // matching `.fray/<slug>.md`) is an error, surfaced like any frontmatter error so the
