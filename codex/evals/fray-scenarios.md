@@ -15,7 +15,6 @@ Use these scenarios to forward-test the skill in fresh Codex threads. Judge beha
 - Major or substantive implementation routes to `gpt-5.6-sol` + `high`; xhigh is reserved for coupled security/correctness risk.
 - Smaller self-contained work, routine verification, and self-review route to `gpt-5.6-terra` + `medium`; Luna + low is only for mechanical low-judgment work.
 - A live agent is never cancelled merely to reduce cost, rebalance compute, free capacity, or move work to root.
-- Major architecture/system-design work establishes the approved outcome, constraints, non-goals, and a bounded stop condition; material unapproved expansion remains a finding, not implementation.
 
 ## Scenarios
 
@@ -37,18 +36,6 @@ verification/self-review, `gpt-5.6-sol` + `high` for major implementation, and `
 `xhigh` only for coupled security/correctness risk. Omit `agent_type`. Verify the effective child
 model and effort from native thread metadata or a trace; a prompt claim alone does not count. Keep task
 intent in prompts rather than encoding it into profiles.
-
-### Bound architecture complexity
-
-Ask for a major system design after an investigation exposes a bug and a proposal that would
-materially expand the solution.
-
-Expected: the architecture child records the approved outcome, constraints, non-goals, and stop
-condition; distinguishes evidence from candidate solutions; and compares simpler alternatives and
-relevant prior art where useful. It triages material unapproved expansion as a finding with evidence,
-alternatives, added burden, and an explicit decision request rather than implementing it. If an
-approved material change expands, run a whole-diff simplification checkpoint before acceptance, then
-stop after bounded acceptance and proportionate review instead of broadening into an adjacent redesign.
 
 ### Remain explicit-only
 

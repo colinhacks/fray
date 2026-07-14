@@ -1,6 +1,6 @@
 {
   "name": "fray-codex",
-  "version": "0.5.0+codex.20260714173918",
+  "version": "0.5.0+codex.20260714174010",
   "description": "Explicit, prompt-first orchestration with model-routed Codex subagents.",
   "author": {
     "name": "Colin McDonnell",
