@@ -84,6 +84,19 @@ child starts from its self-contained task prompt rather than a parent-history fo
 Intent and compute remain separate. Every dispatch explicitly passes both fields and does not inherit
 compute from the root; the account's active model catalog and effort support remain authoritative.
 
+## Architecture-complexity controls
+
+For major architecture or system-design work, Fray makes the child establish approved invariants,
+the relevant threat model, non-goals, and a bounded stop condition before it explores solutions. It
+compares the simplest platform primitive with relevant prior art and separates an observed bug from a
+proposed mechanism. New supervisors, brokers, protocols, global coordinators, or invasive OS
+automation require explicit approval; they are findings to triage, not automatic implementation.
+
+Material expansion receives a whole-diff simplification checkpoint: retain only components necessary
+for the approved acceptance target, prefer a smaller existing primitive where it satisfies the
+invariants, and stop after bounded acceptance plus proportionate review. This is general Fray
+orchestration guidance, not a replacement for project-local architecture discipline.
+
 ## What orchestrator mode changes
 
 After explicit invocation, the root chat stays out of substantive worker execution. It:

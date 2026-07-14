@@ -25,6 +25,17 @@ Lead one coherent portfolio while native Codex agents own every substantive work
 - Prove ordinary-user impact before changing product code for behavior that may be a test-tool artifact.
 - Treat “keep going,” persistence, or autonomy as permission to continue only within the existing authority; never use it to broaden scope.
 
+## Control architecture complexity
+
+For a major architecture or system-design dispatch, make the child prompt establish the decision frame before it explores solutions: approved invariants, threat model where relevant, non-goals, and a bounded stop condition. Require it to compare the simplest platform primitive that could satisfy the outcome with relevant prior art, and to distinguish an observed bug from the mechanism proposed to address it.
+
+- Do not allow a child to introduce a new supervisor, broker, protocol, global coordinator, or invasive OS automation without explicit approval. Treat any such proposal as a finding: state the evidence, simpler alternatives, new operational surface, and the decision required; do not auto-implement it.
+- Triage findings before implementation. Separate confirmed defects, evidence-backed design constraints, hypotheses to test, and optional opportunities. Implement only the approved, bounded acceptance target rather than every finding uncovered during investigation.
+- When a material implementation expands the whole diff, add a simplification checkpoint before acceptance: ask whether an existing platform primitive or smaller local change now meets the approved invariants, whether each added component remains necessary, and whether the resulting mechanism stays within the agreed non-goals.
+- Stop once bounded acceptance and proportionate review are complete. Do not extend the work into an adjacent redesign, a generalized framework, or a new control plane merely because further improvements are conceivable.
+
+These are general orchestration controls, not language- or repository-specific architecture instructions. Keep project-local implementation disciplines in the project that owns them.
+
 ## Handle input while work is live
 
 At every new user-message boundary:
