@@ -80,7 +80,7 @@ Every dispatch passes its model and reasoning effort explicitly; never inherit c
 4. Reuse the owner for follow-up inside the same scope. Use a fresh agent for a genuinely new unit or independent review.
 5. Resolve overlapping writes centrally. Do not let multiple agents race on the same files.
 6. When nested delegation is supported and useful, the delegating agent owns its children, reconciles or cancels them before returning, and reports one synthesized result to its parent.
-7. After dispatch, continue useful non-overlapping root work. Rely on completion notifications; wait only when a required result is the real dependency barrier, and never busy-poll.
+7. After dispatch, continue useful non-overlapping root work. When agent returns are the remaining dependency and no useful root work remains, print the active count and a one-line summary of each lane, then call the blocking native `wait_agent` tool with a substantive timeout. Do not end the turn or yield on the assumption that a completion notification will autonomously start a new root turn. Reconcile each return, then wait again as needed until every relevant agent is handled or new user input supersedes the wait. Never busy-poll with repeated short waits.
 
 Ask each agent to return the outcome, artifacts or changed paths, verification and evidence, remaining uncertainty or blocker, and concrete follow-ups. This is a useful handoff, not a mandatory Fray state packet.
 
