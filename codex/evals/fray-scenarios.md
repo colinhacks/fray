@@ -5,12 +5,16 @@ Use these scenarios to forward-test the skill in fresh Codex threads. Judge beha
 ## Global invariants
 
 - No unsuperseded user outcome disappears.
-- Native agent state, not the plan, supplies live concurrency status.
+- The built-in visible plan is the canonical human-facing outcome ledger; native agent state, not the plan, supplies live concurrency status.
+- The plan has one coordination umbrella in progress, while delegated outcomes remain pending until root review/reconciliation.
 - A returned result is not complete until inspected and integrated.
 - The agent does not busy-poll, duplicate a live owner, or finalize with required agents running.
 - Checkpoints and final answers group information by user outcome rather than dumping agent reports.
 - A fresh session in the same repository does not inherit ownership from another session without an explicit durable handoff.
 - Every Fray dispatch selects an explicit model and reasoning-effort cell; inherited compute is never an unannounced fallback.
+- Major or substantive implementation routes to `gpt-5.6-sol` + `high`; xhigh is reserved for coupled security/correctness risk.
+- Smaller self-contained work, routine verification, and self-review route to `gpt-5.6-terra` + `medium`; Luna + low is only for mechanical low-judgment work.
+- A live agent is never cancelled merely to reduce cost, rebalance compute, free capacity, or move work to root.
 
 ## Scenarios
 
@@ -22,9 +26,16 @@ Expected: run the bundled native-routing check, install the Multi-Agent v2 routi
 
 ### Select literal compute cells
 
-In a fresh thread after setup, dispatch one fully scripted harvest and one load-bearing adversarial review.
+In a fresh thread after setup, dispatch one fully scripted mechanical collection, one routine
+verification or self-review, one major implementation, and one security/correctness task with coupled
+risk.
 
-Expected: pass `model`, `reasoning_effort`, and `fork_context: false` directly on each native spawn call, choosing `gpt-5.6-luna` + `low` for the scripted harvest and `gpt-5.6-sol` + `high` or higher for the load-bearing review. Omit `agent_type`. Verify the effective child model and effort from native thread metadata or a trace; a prompt claim alone does not count. Keep harvest/review behavior in the task prompts rather than encoding those intents into profiles.
+Expected: pass `model`, `reasoning_effort`, and `fork_context: false` directly on each native spawn
+call. Use `gpt-5.6-luna` + `low` for the mechanical task, `gpt-5.6-terra` + `medium` for routine
+verification/self-review, `gpt-5.6-sol` + `high` for major implementation, and `gpt-5.6-sol` +
+`xhigh` only for coupled security/correctness risk. Omit `agent_type`. Verify the effective child
+model and effort from native thread metadata or a trace; a prompt claim alone does not count. Keep task
+intent in prompts rather than encoding it into profiles.
 
 ### Remain explicit-only
 
@@ -42,7 +53,21 @@ Expected: the orchestration skill is absent from that worker's active skill cata
 
 Start two independent delegated tasks, then add a third independent request while both are active.
 
-Expected: preserve the first two; record and dispatch the third when capacity exists, or queue it explicitly when capacity is full; report what changed and what continues.
+Expected: refresh native agent state, merge or add the third outcome to the visible plan before
+materially acting, and preserve the first two. Keep one coordination umbrella in progress and all
+delegated outcomes pending until review/reconciliation; do not use the plan to claim worker state.
+Dispatch the third when capacity exists, or queue it explicitly when capacity is full; report what
+changed and what continues.
+
+### Preserve live work during cost or status pressure
+
+Start a substantive agent, then ask for quota status, ask to free capacity for another task, or ask
+whether a cheaper model should be used.
+
+Expected: report or queue as appropriate without interrupting the live agent. Cost management applies
+to future dispatches through explicit model/effort routing, queuing, or limiting new work. Interrupt
+only when the outcome is obsolete or superseded, continuation is unsafe, or the user explicitly
+cancels it. If interrupted accidentally, promptly resume the exact existing thread.
 
 ### Correct one active thread
 
@@ -96,4 +121,7 @@ Expected: derive the next action from the outcome set and artifacts. Do not decl
 
 Complete research, implementation, and verification through separate agents.
 
-Expected: lead with the combined outcome, place evidence beside the relevant result, name only genuine blockers or decisions, and omit raw agent-by-agent transcripts.
+Expected: before finalizing, run a zero-drop audit comparing conversation requests, visible-plan
+entries, and live/completed agents; resolve or report every mismatch. Then lead with the combined
+outcome, place evidence beside the relevant result, name only genuine blockers or decisions, and omit
+raw agent-by-agent transcripts.

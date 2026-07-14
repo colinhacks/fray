@@ -73,30 +73,41 @@ stops and reports the limitation instead of silently spawning inherited-compute 
 Every Fray dispatch passes an exact model slug, an explicit effort, and `fork_context: false` so the
 child starts from its self-contained task prompt rather than a parent-history fork:
 
-- `gpt-5.6-luna` + `low` for fully specified mechanical collection or edits.
-- `gpt-5.6-terra` + `medium` for ordinary research, probes, tests, verification, and bounded work.
-- `gpt-5.6-sol` + `high` or `xhigh` for substantive implementation, subtle diagnosis, architecture,
-  security-sensitive work, and load-bearing review.
-- `gpt-5.6-sol` + `max` only for the hardest leaf problems.
-- `gpt-5.6-sol` + `ultra` only for an intentionally delegated lead that should orchestrate a nested
-  campaign—not an ordinary worker.
+- `gpt-5.6-sol` + `high` for major or substantive implementation.
+- `gpt-5.6-sol` + `xhigh` when security and correctness are paramount and coupled risk justifies
+  the extra effort.
+- `gpt-5.6-terra` + `medium` for smaller self-contained tasks, routine verification, and
+  self-review.
+- `gpt-5.6-luna` + `low` only for genuinely mechanical, low-judgment work whose decisions are
+  already made.
 
-Intent and compute are separate. A research task may warrant Sol; a mechanical implementation may
-warrant Luna. The account's active model catalog and effort support always win over this default
-matrix.
+Intent and compute remain separate. Every dispatch explicitly passes both fields and does not inherit
+compute from the root; the account's active model catalog and effort support remain authoritative.
 
 ## What orchestrator mode changes
 
 After explicit invocation, the root chat stays out of substantive worker execution. It:
 
 - preserves every unfinished user outcome unless the user supersedes it;
+- continuously maintains Codex's built-in visible plan as the canonical human-facing outcome ledger;
 - assigns bounded ownership and non-overlapping write scopes;
 - routes model and effort per dispatch;
 - accepts new input while children are active without dropping earlier work;
+- never cancels active work merely to reduce cost, rebalance compute, or free capacity;
 - reconciles every return before reporting an outcome complete; and
 - synthesizes results by user outcome rather than pasting agent transcripts.
 
-Native thread state is the primary execution record. Fray does not create a mandatory on-disk board.
+At every user-message boundary, Fray refreshes native agents and merges or adds the request to the
+visible plan before materially acting. It preserves unfinished entries unless explicitly superseded or
+deferred. Because the plan supports only one `in_progress` item, Fray keeps one coordination umbrella
+there and leaves delegated outcomes pending until root review/reconciliation; plan state never claims a
+worker is running or complete. Native agent state is the execution source of truth, while the visible
+plan is the human-facing outcome ledger. Interrupt only when work is obsolete or superseded, unsafe to
+continue, or explicitly cancelled by the user. Cost is controlled through future routing, queuing, and
+limiting new work; an accidentally interrupted worker is promptly resumed in its exact existing thread.
+Status or quota questions never imply cancellation. Before final handoff, Fray performs a zero-drop audit across
+conversation requests, plan entries, and live/completed agents. Fray does not create a mandatory
+on-disk board.
 
 ## Fray UI workers are intentionally different
 

@@ -9,10 +9,11 @@ Lead one coherent portfolio while native Codex agents own every substantive work
 
 ## Hold the portfolio
 
-- Treat a **thread** as one stable user outcome or workstream. It may pass through several agents and intents without being a file, permanent persona, or native-plan item.
+- Treat a **thread** as one stable user outcome or workstream. It may pass through several agents and intents without being a file or permanent persona. Keep every thread represented in Codex's built-in visible plan: it is the canonical human-facing outcome ledger.
 - Preserve every unfinished outcome the user has not superseded. Default new input to additive; never infer replacement from recency alone.
 - Keep the root responsible for priorities, cross-thread decisions, shared-file coordination, integration, and user communication. Do not mirror a worker's internal progress.
-- Use the native plan for the root's critical path and outcome sequence, not as a concurrency ledger. Native agent state is authoritative for active execution; a delegated outcome may remain plan-pending while its owner runs and becomes complete only after integration.
+- Continuously maintain the visible plan as the canonical outcome ledger: add and merge outcomes, record explicit supersession or deferral, and reconcile returns against it before marking an outcome complete. Native agent state remains the execution source of truth, not the plan.
+- The plan API permits only one `in_progress` item. Keep one coordination umbrella in progress, keep delegated outcomes pending until root review and reconciliation, and never use plan state to imply a worker is running or complete.
 - Keep only the coordination state the root needs: current outcomes and priorities, each lane's owner and dependency, and whether a returned result has been reconciled.
 - Use stable task names such as `research_auth`, `implement_auth`, `verify_auth`, and `review_auth`. A shared suffix connects phases of the same user-visible thread.
 
@@ -30,10 +31,10 @@ At every new user-message boundary:
 
 1. Refresh native agent state once and note every completed but unreconciled return.
 2. Classify the message as status/information, a correction or constraint for an existing thread, additive independent work, reprioritization or partial cancellation, or full replacement.
-3. Preserve every non-superseded thread and update the root plan before starting materially new work.
+3. Merge or add the new outcome in the visible plan before materially acting. Preserve every non-superseded thread there; record a supersession or deferral explicitly rather than silently dropping it.
 4. Route a correction or unblocking fact to the existing owner. Spawn a distinct agent for independent work when useful capacity exists.
 5. If capacity is full, steer a relevant owner or queue the outcome explicitly. Do not turn the root into an undeclared worker. Prefer user-requested work over optional or speculative review, but do not silently cancel prior work.
-6. Interrupt only agents whose work is actually obsolete. Preserve reusable results from cancelled work.
+6. **Never interrupt or cancel a mid-flight agent to reduce quota or cost, rebalance compute, free a slot, or move its work to the root.** Interrupt only when its outcome is genuinely obsolete or superseded, continuing would be unsafe, or the user explicitly cancels it. Manage cost on future dispatches through explicit model/effort routing, queuing, and limiting new work; let active threads return. A status or quota question never implies cancellation. If an agent is accidentally interrupted, promptly resume that exact existing thread to preserve its context.
 7. Reconcile returns that arrived during steering, then continue every still-useful thread.
 
 Treat a status question as a checkpoint, not as completion or cancellation of active work. If user input ends a wait, process it through this protocol while preserving the existing portfolio.
@@ -62,14 +63,14 @@ Before the first dispatch in a Fray session, inspect the exact native spawn sche
 4. If the active surface exposes only the reserved `collaboration.spawn_agent` schema or otherwise hides model and effort, do not silently spawn agents that inherit the root's compute. Run the bundled `scripts/configure-native-routing.mjs check`, resolving it relative to this `SKILL.md`. If setup is missing, run the same script with `install`. It keeps native AgentControl but configures Multi-Agent v2 under the non-reserved `fray` namespace so the hosted backend accepts dynamic routing fields. A changed install requires a new Codex thread before the tool schema reloads. Preserve the portfolio and tell the user exactly why the restart is required.
 5. Never invent fields absent from the active schema, infer success from a prompt claim, or say a model/effort was selected without passing it to the spawn call. For load-bearing acceptance, verify effective child metadata from native state or a runtime trace.
 
-Research, audit, implementation, planning, verification, review, and harvest remain prompt intents independent of compute routing. Choose model and effort separately by how much the agent must self-steer and how load-bearing its judgment is:
+Research, audit, implementation, planning, verification, review, and harvest remain prompt intents independent of compute routing. Select the literal model/effort pair that fits the work:
 
-- **GPT-5.6-Luna** — fast, affordable work whose decisions are already made. Use low for scripted harvest or exact mechanical edits; medium or higher only when a bounded task needs proportionally more care.
-- **GPT-5.6-Terra** — the supporting-cast default for ordinary research, probes, verification, tests, and bounded implementation. Start at medium; use high or xhigh as complexity and autonomy rise.
-- **GPT-5.6-Sol** — the frontier default for landing substantive code, subtle diagnosis, architecture, security-sensitive work, and adversarial review. Start at high for load-bearing work, xhigh for difficult agentic coding, and max for the hardest single-agent problems.
-- **Ultra effort** — reserve for a delegated lead that genuinely should orchestrate its own nested campaign. Do not pay the automatic-delegation premium for an ordinary leaf task. Luna does not currently advertise Ultra; consult the active schema rather than assuming every model supports every effort.
+- **GPT-5.6-Sol + high** — the default for major or substantive implementation.
+- **GPT-5.6-Sol + xhigh** — use when security and correctness are paramount and coupled risk justifies the extra effort.
+- **GPT-5.6-Terra + medium** — use for smaller self-contained tasks, routine verification, and self-review.
+- **GPT-5.6-Luna + low** — use only for genuinely mechanical, low-judgment work whose decisions are already made.
 
-The normal cells are the literal pairs `gpt-5.6-luna` + `low`, `gpt-5.6-terra` + `medium`, `gpt-5.6-sol` + `high`, `gpt-5.6-sol` + `xhigh`, `gpt-5.6-sol` + `max`, and, for a true nested lead, `gpt-5.6-sol` + `ultra`. Treat the active tool's model catalog as authoritative; do not shorten these to an unadvertised generic slug. Independently re-verify any load-bearing claim produced by Luna or low effort.
+Every dispatch passes its model and reasoning effort explicitly; never inherit compute from the root. Treat the active tool's advertised catalog as authoritative and do not shorten model slugs. Independently re-verify load-bearing claims from Luna or low effort.
 
 ## Delegate with ownership
 
@@ -93,7 +94,7 @@ Ask each agent to return the outcome, artifacts or changed paths, verification a
 
 ## Reconcile returns
 
-- A completion moves work into the return inbox; it does not make the outcome done.
+- A completion moves work into the return inbox; it does not make the outcome done. Reconcile each return against its visible-plan outcome before marking that outcome complete.
 - At every completion, user-message, checkpoint, wait, compaction recovery, and final-answer boundary, refresh agent state and drain available unreconciled returns.
 - Inspect each report, artifact or diff, checks, blockers, and follow-ups. Accept it, route a focused correction to the owner, reassign it, or mark the exact blocker.
 - Scale independent review and end-to-end validation to risk. Exercise the real target surface with appropriate automation rather than imposing one UI-specific tool on every project.
@@ -105,5 +106,5 @@ Ask each agent to return the outcome, artifacts or changed paths, verification a
 
 - Send concise checkpoints when scope, priority, ownership, or blockers materially change. For mid-flight steering, state what changed, what continues, and what started or queued.
 - Synthesize by user outcome, not by agent. Lead with the combined result, attach verification to each outcome, distinguish fact from inference, and end with only genuine remaining decisions or blockers. Do not paste agent reports.
-- Before a final answer, refresh all agent state and drain every available return. Finalize only when every in-scope thread is done, cancelled, or genuinely blocked, every required agent has returned, and no relevant return remains unreconciled.
+- Before a final answer, refresh all agent state and drain every available return. Run a zero-drop audit that compares conversation requests, visible-plan entries, and live or completed agents; resolve every mismatch or report it as a genuine blocker. Finalize only when every in-scope thread is done, cancelled, or genuinely blocked, every required agent has returned, and no relevant return remains unreconciled.
 - Prefer the native thread for finite work. Create a shared durable project artifact or persistent goal only when the user explicitly asks for cross-session or long-running continuity.
