@@ -271,7 +271,7 @@ Reuse `Overlay` from `NewThreadModal.tsx` (export it if not already — it IS ex
 ```
 <Overlay onClose>
   <div class="… bg-panel p-5" onKeyDownCapture={Esc→onClose}>
-    header: "Dispatch from GitHub — {nameWithOwner}"
+    header: "Investigate this issue and make recommendations — {nameWithOwner}"
     tabs:   [ Issues | PRs ]           -> local state `kind`
     sort:   [ Recent | Reactions ]     -> local state `sort` (Select/segmented)
     list:   useQuery(["githubList", {kind, sort}]) -> rows:

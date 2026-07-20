@@ -2,12 +2,14 @@ import { useEffect, useMemo, useRef, useState } from "react"
 import { useSnapshot } from "valtio"
 import { useMutation, useQuery } from "@tanstack/react-query"
 import { X } from "lucide-react"
-import { store, threadBySlug, showToast, markDrawerClosing } from "../store.ts"
+import { store, threadBySlug, showToast, markDrawerClosing, removeDrawerAfterExit } from "../store.ts"
 import type { BoardSnapshot } from "@fray-ui/shared"
 import { rpc } from "../api/rpc.ts"
 import { registerDrawerClose } from "../lib/overlays.ts"
 import { mdToHtml, stripFrontmatter } from "../lib/markdown.ts"
+import { canAdoptThread } from "../lib/adoption.ts"
 import { Composer } from "./Composer.tsx"
+import { draftKey, draftStore, useDraft, useProjectDir } from "../lib/drafts.ts"
 
 // The fray-document drawer: a RIGHT side sheet (same slide/backdrop family as settings and the
 // Open-thread sheet — nothing renders as a centered dialog) showing the thread's .fray/<slug>.md body
@@ -26,9 +28,8 @@ function prefersReducedMotion() {
   return typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
 }
 
-export function ThreadDrawer({ id, slug, title, depth }: { id: number; slug: string; title: string; depth: number }) {
+export function ThreadDrawer({ id, slug, title, depth, widthDepth }: { id: number; slug: string; title: string; depth: number; widthDepth: number }) {
   const [shown, setShown] = useState(false)
-  const [closing, setClosing] = useState(false)
   // Mirrors `closing` for async callbacks (state would be a stale closure there) — see the adopt swap.
   const closingRef = useRef(false)
   const body = useQuery({
@@ -42,13 +43,12 @@ export function ThreadDrawer({ id, slug, title, depth }: { id: number; slug: str
   }, [])
 
   function close() {
-    if (closing) return
-    setClosing(true)
+    if (closingRef.current) return
     closingRef.current = true
     markDrawerClosing(id) // stop URL/topThreadSlug counting this layer the instant it slides out
     setShown(false)
     window.setTimeout(() => {
-      store.drawers = store.drawers.filter((d) => d.id !== id)
+      removeDrawerAfterExit(id)
     }, prefersReducedMotion() ? 0 : CLOSE_MS)
   }
 
@@ -63,6 +63,11 @@ export function ThreadDrawer({ id, slug, title, depth }: { id: number; slug: str
   // signal to re-read it while the drawer is open.
   const snap = useSnapshot(store)
   useEffect(() => {
+    if (snap.drawers.find((drawer) => drawer.id === id)?.closing || !closingRef.current) return
+    closingRef.current = false
+    setShown(true)
+  }, [snap.drawers, id])
+  useEffect(() => {
     body.refetch()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [snap.board])
@@ -72,8 +77,10 @@ export function ThreadDrawer({ id, slug, title, depth }: { id: number; slug: str
   // lands as the worker's first steer via tmux stdin), then swap this doc layer into the CHAT layer
   // in place — the chat view's "Session starting…" spinner covers the spawn.
   const thread = threadBySlug(snap.board as BoardSnapshot | null, slug)
-  const adoptable = thread?.runtime === "none"
-  const [message, setMessage] = useState("")
+  const adoptable = canAdoptThread(thread)
+  const projectDir = useProjectDir()
+  const messageKey = draftKey.adopt(projectDir, slug)
+  const [message, setMessage, clearMessage] = useDraft(messageKey)
   // Once the drawer is animating out, a late adopt success must NOT re-kind the entry mid-close —
   // the swap would remount it as a fresh chat sheet for its last 200ms. The session still started;
   // the user just closed the drawer first.
@@ -89,7 +96,10 @@ export function ThreadDrawer({ id, slug, title, depth }: { id: number; slug: str
       if (closingRef.current) return
       store.drawers = store.drawers.map((d) => (d.id === id ? { ...d, kind: "thread" as const } : d))
     },
-    onError: (e) => showToast(`Start failed: ${(e as Error).message.slice(0, 80)}`),
+    onError: (e, submitted) => {
+      if (!draftStore.get(messageKey)) setMessage(submitted)
+      showToast(`Start failed: ${(e as Error).message.slice(0, 80)}`)
+    },
   })
 
   const html = useMemo(() => mdToHtml(stripFrontmatter(body.data?.markdown ?? "")), [body.data?.markdown])
@@ -110,7 +120,7 @@ export function ThreadDrawer({ id, slug, title, depth }: { id: number; slug: str
         // fix per the audit was a real third Chat|Terminal|Doc tab, deferred this pass: it collides with
         // the existing scratchpad "Doc" tab (a DIFFERENT file) and the runtime-none entry path — a design
         // call left for the maintainer.
-        style={{ width: `min(${720 - Math.max(0, depth - 1) * 28}px, ${80 - Math.max(0, depth - 1) * 4}vw)` }}
+        style={{ width: `min(${720 - Math.max(0, widthDepth - 1) * 28}px, ${80 - Math.max(0, widthDepth - 1) * 4}vw)` }}
         onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="shrink-0 flex items-center gap-2 border-b border-border px-5 h-12">
@@ -147,7 +157,10 @@ export function ThreadDrawer({ id, slug, title, depth }: { id: number; slug: str
               onChange={setMessage}
               onSubmit={() => {
                 if (!message.trim() || adopt.isPending) return
-                adopt.mutate(message)
+                const submitted = message
+                clearMessage()
+                showToast("Starting thread…", { spinner: true, sticky: true })
+                adopt.mutate(submitted)
               }}
               placeholder="Kick off work on this thread…"
               minHeight={44}

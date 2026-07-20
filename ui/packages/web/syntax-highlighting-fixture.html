@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Fray syntax highlighting fixture</title>
+    <script type="module" src="/src/styles.css"></script>
+    <style>
+      .fixture-shell { width: min(1320px, calc(100% - 32px)); margin: 24px auto 48px; }
+      .fixture-head { margin-bottom: 18px; }
+      .fixture-head h1 { margin: 0; font-size: 16px; font-weight: 600; }
+      .fixture-head p { margin: 4px 0 0; color: var(--color-muted); }
+      .fixture-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 390px); gap: 22px; align-items: start; }
+      .fixture-surface { min-width: 0; border: 1px solid var(--color-border); border-radius: 10px; background: var(--color-panel); padding: 18px; }
+      .fixture-label { margin-bottom: 12px; color: var(--color-muted); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+      .fixture-queue { padding: 14px; }
+      .fixture-queue .md-body { overflow-wrap: anywhere; }
+      .fixture-queue .md-body pre { white-space: pre-wrap; word-break: break-all; }
+      @media (max-width: 700px) {
+        .fixture-shell { width: calc(100% - 20px); margin-top: 12px; }
+        .fixture-grid { grid-template-columns: minmax(0, 1fr); gap: 14px; }
+        .fixture-surface { padding: 13px; }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="fixture-shell">
+      <header class="fixture-head">
+        <h1>Shared message renderer — fenced code</h1>
+        <p>Thread overflow and Queue wrapping policies rendered from the same sanitized markdown path.</p>
+      </header>
+      <div class="fixture-grid">
+        <section class="fixture-surface" aria-labelledby="thread-label">
+          <div class="fixture-label" id="thread-label">Thread transcript</div>
+          <div id="thread" class="md-body"></div>
+        </section>
+        <section class="fixture-surface fixture-queue" aria-labelledby="queue-label">
+          <div class="fixture-label" id="queue-label">Queue transcript</div>
+          <div id="queue" class="md-body"></div>
+        </section>
+      </div>
+    </main>
+    <script type="module">
+      import { mdToHtml } from "/src/lib/markdown.ts"
+
+      window.__syntaxFixtureXss = 0
+      const threadLongToken = "thread_" + "fedcba9876543210".repeat(28)
+      const threadMarkdown = `Adjacent prose with inline \`const untouched = true\`, a [safe link](https://example.com), and no inline highlighting.
+
+\`\`\`ts title=worker.ts
+type Job = { id: string; ready: boolean }
+export const next: Job = { id: "alpha", ready: true }
+console.log(next.id)
+\`\`\`
+
+The JavaScript fence follows without swallowing adjacent markdown:
+
+\`\`\`jsx
+const Button = ({ label }) => <button aria-label={label}>{label}</button>
+\`\`\`
+
+\`\`\`json
+{
+  "agent": "fray",
+  "features": ["safe", "streaming"],
+  "enabled": true
+}
+\`\`\`
+
+\`\`\`bash
+set -euo pipefail
+pnpm --filter @fray-ui/web build
+printf '%s\\n' "done"
+\`\`\`
+
+\`\`\`rust
+fn main() {
+    let message: &str = "borrowed, not executed";
+    println!("{message}");
+}
+\`\`\`
+
+\`\`\`python
+def greet(name: str) -> str:
+    return f"hello, {name}"
+\`\`\`
+
+Long line scrolls inside the roomier thread block:
+
+\`\`\`text
+${threadLongToken}
+\`\`\`
+
+After the fences, **nested adjacency survives**:
+
+- list item before code
+  \`inline_code()\` stays plain inline code
+- list item after code`
+
+      const longToken = "queue_" + "0123456789abcdef".repeat(18)
+      const queueMarkdown = `No-language plaintext:\n\n\`\`\`\nplain <tag> & symbols stay literal\n\`\`\`\n\nUnknown language falls back safely:\n\n\`\`\`made-up title=unknown.txt\n</code><img src=x onerror="window.__syntaxFixtureXss = 1">\n\`\`\`\n\nLong line wraps inside Queue:\n\n\`\`\`text\n${longToken}\n\`\`\`\n\nStreaming/incomplete TypeScript fence:\n\n\`\`\`ts\nconst stillStreaming: boolean = true\nconsole.log(stillStreaming)`
+
+      document.querySelector("#thread").innerHTML = mdToHtml(threadMarkdown)
+      document.querySelector("#queue").innerHTML = mdToHtml(queueMarkdown)
+
+      // Raw HTML remains untrusted too: neither its event handler nor javascript: URL survives.
+      const probe = document.createElement("div")
+      probe.id = "sanitizer-probe"
+      probe.hidden = true
+      probe.innerHTML = mdToHtml('<img src=x onerror="window.__syntaxFixtureXss = 2"><a href="javascript:window.__syntaxFixtureXss = 3">unsafe</a>')
+      document.body.append(probe)
+      window.__syntaxFixtureReady = true
+    </script>
+  </body>
+</html>

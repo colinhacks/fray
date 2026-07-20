@@ -4,6 +4,8 @@ import { store } from "../store.ts"
 import { BoardStream } from "./board-stream.ts"
 import { connectSSE } from "./sse.ts"
 import { mergeOptimistic, type QueuedMessage } from "../lib/transcript-sync.ts"
+import { reconcileLiveMessages, type PaginatedTranscriptData } from "../lib/transcriptPagination.ts"
+import { invalidateInteractionQueries } from "./interaction-cache.ts"
 
 // The stage-2 multiplexed client: ONE WebSocket("/ws") carrying the board channel (keyframe + deltas +
 // notify, driven through the shared BoardStream) AND per-thread transcript push (replacing the 1.5s
@@ -21,6 +23,7 @@ let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 let health: ReturnType<typeof setInterval> | null = null
 let failures = 0
 let lastMsg = 0
+let protocolReady = false
 // /ws proved live at least once this session (onopen fired). A PERMANENT latch by design: after the first
 // confirm, later drops reconnect on /ws with backoff and never fall back. Bounces are forward-only (/ws is
 // only ever ADDED), so a hypothetical restart to a /ws-less build would retry (backoff-capped, not a storm)
@@ -35,7 +38,12 @@ const subs = new Map<string, number>()
 
 // Board seq-gap resync = reconnect the socket (mirror sse.ts): drop + immediately re-open; the connect
 // handshake re-sends a full keyframe with the current seq. Deliberately skips the backoff/failure counter.
-const stream = new BoardStream(() => resync())
+const stream = new BoardStream(
+  () => resync(),
+  (event) => {
+    if (qc) void invalidateInteractionQueries(qc, event)
+  },
+)
 
 // Server pushes a 10s heartbeat; if we go quiet past this we assume the socket is dead and reconnect.
 const HEARTBEAT_TIMEOUT = 35_000
@@ -49,12 +57,12 @@ function connect(): void {
   if (store.connection !== "open") store.connection = "connecting"
   const sock = new WebSocket(wsUrl())
   ws = sock
+  protocolReady = false
   lastMsg = Date.now()
 
   sock.onopen = () => {
     // The server spoke WebSocket on /ws → the route exists → commit to socket mode.
     confirmed = true
-    failures = 0
     lastMsg = Date.now()
     store.connection = "open"
     store.socketTranscripts = true
@@ -62,13 +70,21 @@ function connect(): void {
       clearTimeout(reconnectTimer)
       reconnectTimer = null
     }
-    resubscribe() // replay every active transcript subscription on the fresh socket
   }
 
   sock.onmessage = (e) => {
     lastMsg = Date.now()
     try {
-      handle(JSON.parse(e.data) as SocketServerMsg)
+      const msg = JSON.parse(e.data) as SocketServerMsg
+      const healthy = handle(msg)
+      // A TCP upgrade alone is not proof of a healthy protocol session: a server that accepts and then
+      // immediately rejects would otherwise reset this counter forever. Reset only after useful protocol
+      // traffic. Typed payload downgrades deliberately return false and choose their stable fallback path.
+      if (healthy) failures = 0
+      if (healthy && msg.t === "event" && msg.event.type === "board") {
+        protocolReady = true
+        resubscribe() // replay subscriptions only after this generation delivered a valid base keyframe
+      }
     } catch (err) {
       console.error("bad /ws message", err)
     }
@@ -90,6 +106,7 @@ function connect(): void {
 function dropWs(): void {
   const sock = ws
   ws = null
+  protocolReady = false
   if (!sock) return
   sock.onopen = null
   sock.onmessage = null
@@ -170,38 +187,91 @@ function forceReconnect(immediate = false): void {
   scheduleReconnect(immediate)
 }
 
-function fallBackToSSE(): void {
+function fallBackToSSE(boardFallback?: { actualBytes: number; maxBytes: number }): void {
   if (fellBack) return
   fellBack = true
+  if (boardFallback) {
+    store.socketBoardFallback = boardFallback
+    store.socketTranscriptFallbacks = {}
+  }
+  // A typed board downgrade arrives on an OPEN socket. Detach its handlers before closing so this
+  // intentional handoff cannot enter the reconnect path; the SSE keyframe becomes the sole board source.
+  dropWs()
   store.socketTranscripts = false // useTranscript resumes its 1.5s poll (today's behavior)
   // Hand the board channel + notifications to the proven SSE path.
-  connectSSE()
+  connectSSE(qc ?? undefined)
 }
 
-function handle(msg: SocketServerMsg): void {
+function handle(msg: SocketServerMsg): boolean {
   switch (msg.t) {
     case "event":
       stream.handle(msg.event)
-      break
+      if (msg.event.type === "board") store.socketBoardFallback = null
+      return true
     case "transcript":
       // Write server truth into the SAME cache useTranscript reads — components are unchanged. PRESERVE any
       // optimistic `queued` bubble the incoming truth doesn't yet carry (mergeOptimistic), so a just-sent
       // follow-up never vanishes in the window before the server's own copy lands (the S1 sync-audit fix).
-      qc?.setQueryData<{ messages: QueuedMessage[] }>(["transcript", msg.slug], (prev) => ({
-        messages: mergeOptimistic(prev?.messages, msg.messages as QueuedMessage[]),
-      }))
-      break
+      qc?.setQueryData<PaginatedTranscriptData | { messages: QueuedMessage[] }>(["transcript", msg.slug], (prev) => {
+        const reconciled = reconcileLiveMessages(prev as PaginatedTranscriptData | undefined, msg.messages)
+        return {
+          ...reconciled,
+          messages: mergeOptimistic(prev?.messages, reconciled.messages as QueuedMessage[]),
+        }
+      })
+      delete store.socketTranscriptFallbacks[msg.slug]
+      return true
+    case "payload-too-large":
+      if (msg.channel === "board") {
+        if (!store.socketBoardFallback) {
+          console.warn("[fray] live board payload exceeded the socket limit; using SSE", {
+            actualBytes: msg.actualBytes,
+            maxBytes: msg.maxBytes,
+          })
+        }
+        fallBackToSSE({ actualBytes: msg.actualBytes, maxBytes: msg.maxBytes })
+      } else {
+        if (!store.socketTranscriptFallbacks[msg.slug]) {
+          console.warn("[fray] live transcript payload exceeded the socket limit; updates paused", {
+            slug: msg.slug,
+            actualBytes: msg.actualBytes,
+            maxBytes: msg.maxBytes,
+          })
+        }
+        store.socketTranscriptFallbacks[msg.slug] = {
+          kind: "payload-too-large",
+          actualBytes: msg.actualBytes,
+          maxBytes: msg.maxBytes,
+        }
+      }
+      return false
+    case "resource-limited":
+      if (!store.socketTranscriptFallbacks[msg.slug]) {
+        console.warn("[fray] live transcript read budget reached; updates paused", {
+          slug: msg.slug,
+          scope: msg.scope,
+          retryAfterMs: msg.retryAfterMs,
+        })
+      }
+      store.socketTranscriptFallbacks[msg.slug] = {
+        kind: "read-budget",
+        scope: msg.scope,
+        retryAfterMs: msg.retryAfterMs,
+      }
+      return false
     case "hb":
-      break // lastMsg already bumped
+      return true // lastMsg already bumped
   }
 }
 
 function send(msg: SocketClientMsg): void {
-  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg))
+  if (protocolReady && ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg))
 }
 
 function resubscribe(): void {
-  for (const slug of subs.keys()) send({ t: "sub", topic: "transcript", slug })
+  for (const slug of subs.keys()) {
+    if (!store.socketTranscriptFallbacks[slug]) send({ t: "sub", topic: "transcript", slug })
+  }
 }
 
 // ── Public API (used by useTranscript) ───────────────────────────────────────────────────────────────
@@ -211,7 +281,7 @@ function resubscribe(): void {
 export function subscribeTranscript(slug: string): void {
   const n = (subs.get(slug) ?? 0) + 1
   subs.set(slug, n)
-  if (n === 1) send({ t: "sub", topic: "transcript", slug })
+  if (n === 1 && !store.socketTranscriptFallbacks[slug]) send({ t: "sub", topic: "transcript", slug })
 }
 
 // Drop one surface's interest. The LAST one sends `unsub` and forgets the slug (no leak); others decrement.
@@ -223,6 +293,15 @@ export function unsubscribeTranscript(slug: string): void {
   } else {
     subs.set(slug, n)
   }
+}
+
+// Human-triggered recovery for a per-thread logical overflow or read-budget rejection. The server removed
+// the failed subscription, so one explicit retry is at most one budgeted read + serialization. Success
+// resumes push; another typed rejection restores the stable warning without reconnecting the board socket.
+export function retryTranscriptSocket(slug: string): void {
+  if (!store.socketTranscriptFallbacks[slug]) return
+  delete store.socketTranscriptFallbacks[slug]
+  if (subs.has(slug)) send({ t: "sub", topic: "transcript", slug })
 }
 
 // Entry point (replaces connectSSE in main.tsx). Deferred to `load` so the socket doesn't consume one of

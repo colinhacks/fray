@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useId, useMemo, useState } from "react"
 import { useSnapshot } from "valtio"
-import { ChevronRight } from "lucide-react"
 import type { TranscriptEdit } from "@fray-ui/shared"
 import { renderDiff, type DiffHunk } from "../lib/diff/index.ts"
 import "../lib/diff/diff.css"
 import { prefs } from "../lib/prefs.ts"
+import { ToolDisclosureHeader } from "./ToolDisclosureHeader.ts"
 
 // Open a file in the user's editor. The absolute path already carries its leading slash, so it
 // concatenates directly onto the scheme's empty authority (cursor://file + /Users/… ). An optional
@@ -35,9 +35,10 @@ function basename(p: string): string {
 // (clickable file path + summed +N/−N counts) and a syntax-highlighted, line-numbered body. Multiple
 // edits stack as sequential hunk groups under the one header, divided by a hairline. Wide diffs
 // scroll horizontally INSIDE the body (never the page). In compact mode the body is hidden — the
-// header alone shows — and clicking a header expands that one block.
-export function DiffBlock({ edits }: { edits: TranscriptEdit[] }) {
+// header alone shows — and its explicit chevron control expands that one block.
+export function DiffBlock({ edits, meta }: { edits: TranscriptEdit[]; meta?: React.ReactNode }) {
   const { compactDiffs } = useSnapshot(prefs)
+  const bodyId = useId()
   const file = edits[0].file
   const diffs = useMemo(() => edits.map((e) => renderDiff(e.old, e.new, e.file)), [edits])
   const additions = diffs.reduce((n, d) => n + d.additions, 0)
@@ -53,36 +54,33 @@ export function DiffBlock({ edits }: { edits: TranscriptEdit[] }) {
 
   return (
     <div className="fray-diff">
-      <button
-        type="button"
-        onClick={() => setOverride(!open)}
-        onMouseDown={(e) => e.preventDefault()}
-        className="fray-diff-header w-full cursor-pointer text-left outline-none"
+      <ToolDisclosureHeader
+        className="fray-diff-header"
+        controls={bodyId}
+        expanded={open}
+        label={`${open ? "Collapse" : "Expand"} Edit diff: ${file}`}
+        onToggle={() => setOverride(!open)}
+        meta={meta}
+        chevronSize={11}
       >
         {/* Left group: petite-caps "Edit" label (sibling of Bash/Read), file path, +N −M summary. The
             chevron is pushed to the far right by the header's space-between (aligns the three families). */}
-        <span className="flex min-w-0 items-center gap-2">
-          <span className="petite-caps fray-bash-label shrink-0">Edit</span>
-          {/* The path link swallows its own click so opening the file doesn't also toggle the block. */}
-          <span className="fray-diff-file" onClick={(e) => e.stopPropagation()}>
-            <PathLink path={file} className="text-inherit no-underline">
-              {basename(file)}
-            </PathLink>
-          </span>
-          {additions > 0 && <span className="fray-diff-add tabular-nums shrink-0">+{additions}</span>}
-          {deletions > 0 && <span className="fray-diff-del tabular-nums shrink-0">−{deletions}</span>}
+        <span className="petite-caps fray-bash-label shrink-0">Edit</span>
+        <span className="fray-diff-file">
+          <PathLink path={file} className="text-inherit no-underline">
+            {basename(file)}
+          </PathLink>
         </span>
-        <ChevronRight size={11} className={`shrink-0 transition-transform ${open ? "rotate-90" : ""}`} />
-      </button>
-      {open && (
-        <div className="fray-diff-body">
-          {diffs.map((d, i) => (
-            <div key={i} className={i > 0 ? "fray-diff-editsep" : undefined}>
-              <DiffBody hunks={d.hunks} collapsedAfter={d.collapsedAfter} />
-            </div>
-          ))}
-        </div>
-      )}
+        {additions > 0 && <span className="fray-diff-add tabular-nums shrink-0">+{additions}</span>}
+        {deletions > 0 && <span className="fray-diff-del tabular-nums shrink-0">−{deletions}</span>}
+      </ToolDisclosureHeader>
+      <div id={bodyId} className="fray-diff-body" hidden={!open}>
+        {open && diffs.map((d, i) => (
+          <div key={i} className={i > 0 ? "fray-diff-editsep" : undefined}>
+            <DiffBody hunks={d.hunks} collapsedAfter={d.collapsedAfter} />
+          </div>
+        ))}
+      </div>
     </div>
   )
 }

@@ -20,6 +20,7 @@ export function closeSettingsAnimated(): boolean {
 
 // Per-drawer-instance closers, keyed by the stack entry's id.
 const drawerClosers = new Map<number, () => void>()
+const drawerFocusers = new Map<number, () => void>()
 
 export function registerDrawerClose(id: number, fn: (() => void) | null): void {
   if (fn) drawerClosers.set(id, fn)
@@ -34,4 +35,13 @@ export function closeDrawerAnimated(id: number): boolean {
     return true
   }
   return false
+}
+
+export function registerDrawerFocus(id: number, fn: (() => void) | null): void {
+  if (fn) drawerFocusers.set(id, fn)
+  else drawerFocusers.delete(id)
+}
+
+export function focusDrawer(id: number): void {
+  drawerFocusers.get(id)?.()
 }

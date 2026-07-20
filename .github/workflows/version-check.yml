@@ -19,3 +19,7 @@ jobs:
           node-version: "22.x"
       - name: Check plugin version sync
         run: node scripts/set-version.ts --check
+      - name: Check portable monitor copies
+        run: node scripts/sync-portable-monitors.mjs --check
+      - name: Test portable monitors
+        run: node --test monitors/*.test.mjs

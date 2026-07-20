@@ -21,6 +21,8 @@
     "react": { "optional": true }
   },
   "devDependencies": {
+    "@tanstack/react-query": "^5",
+    "react": "^19",
     "typescript": "^5.7"
   }
 }

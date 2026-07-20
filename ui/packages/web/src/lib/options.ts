@@ -33,14 +33,15 @@ export const PERMISSION_OPTIONS: SelectOption[] = PERMISSION_MODES.filter((m) =>
   title: PERMISSION_MODE_LABELS[m],
 }))
 
-// Claude Code's own permission color language: red = bypass, yellow = auto, purple = accept-edits,
-// cyan = plan. Applied to the dispatch form's mode readout so the risk level reads at a glance.
+// Claude Code-inspired permission accents for the dispatch form's mode readout. Bypass/full access
+// intentionally uses the ordinary readout color rather than danger-red: it is the default operating
+// mode here, while actual errors and destructive actions retain their dedicated warning styling.
 export const PERMISSION_COLOR: Record<(typeof PERMISSION_MODES)[number], string> = {
   auto: "text-accent",
   default: "text-muted",
   acceptEdits: "text-purple-400",
   plan: "text-cyan-400",
-  bypassPermissions: "text-red-400",
+  bypassPermissions: "text-muted",
 }
 
 // ---- Model selector: two backend sections (Codex-support epic, Phase 3) ----

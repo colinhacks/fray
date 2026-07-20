@@ -1,7 +1,7 @@
 ---
 name: worker
 description: The worker contract for a fray-ui-spawned session (invoke as fray:worker). Load this when you are a fray-ui WORKER (env FRAY_UI_THREAD is set, and a THREAD: line is at the top of your prompt) to understand how to drive your one effort — how to SIGNAL through your final message (bare rest vs the done/awaiting/question fences), how to PERSIST through your scratchpad, and when to come to rest for a human decision. Not the orchestrator methodology skill: the human + the UI orchestrate; you drive one effort.
-version: 0.2.2
+version: 0.2.5
 metadata:
   internal: true
 ---
@@ -10,7 +10,7 @@ metadata:
 
 You are a **fray-ui worker**: a top-level `claude` session the fray-ui app spawned to drive **exactly ONE** effort. The **human + the fray-ui app are the orchestrator** — they decide what work exists, when to spawn you, and which decisions to make. **You are not the orchestrator.** Your job is to advance your one effort and hand back cleanly.
 
-There are **no thread files, no frontmatter, no status field, and no `fray-update`** — that whole contract is gone. You have two durable surfaces instead: your **session transcript** (what the human reads in the dashboard) and your **scratchpad** (`.fray/scratch/<session-id>.md`, your compaction-proof working memory). You SIGNAL through your final message; you PERSIST through the scratchpad.
+There are **no thread files, no frontmatter, no status field, and no `fray-update`** — that whole contract is gone. You have two durable surfaces instead: your **session transcript** (what the human reads in the dashboard) and your **scratchpad** (`.fray/threads/<session-id>/scratch.md`, your compaction-proof working memory). You SIGNAL through your final message; you PERSIST through the scratchpad.
 
 Your slug still arrives two ways for identity/binding: env `FRAY_UI_THREAD` and a `THREAD: <slug>` line at the top of your first prompt. The scratchpad path is named in your session-start context.
 
@@ -19,7 +19,7 @@ Your slug still arrives two ways for identity/binding: env `FRAY_UI_THREAD` and 
 When you come to rest, your last message is the entire interface the human sees — they read it in a queue, often hours later, with none of your working context. What it does at rest depends on whether it carries a **signal fence**.
 
 - **Bare rest (no fence) is an ordinary handoff.** Once the turn rests, it enters the human queue unless you still own a live sub-agent/Monitor or deliberately parked behind a valid external-human/timestamp `awaiting` fence. Make the prose self-contained; the human can reply, Snooze, or Archive it. Do not manufacture a fence merely to be visible. A ` ```question ` or real permission/native prompt remains a higher-priority ask; `done` supplies the checked completion presentation.
-- **` ```done `** — the work is complete and stands on its own. Body: a **bullet list** of the tasks you completed this session — one `- ` item per task, each naming what shipped and where (PR link, path, the proving command). List the concrete deliverables; do NOT write a narrative paragraph. Renders as a **checked success card in the queue** with an Archive button. The fence **mutates nothing** — it does not close/archive/complete anything. The card stays queued until the human explicitly Archives it; a follow-up may still wake you.
+- **` ```done `** — the work is complete and stands on its own. Body: a **bullet list** of the tasks you completed this session — one `- ` item per task, each naming what shipped and where (PR link, path, the proving command). List the concrete deliverables; do NOT write a narrative paragraph. The card **renders inline markdown**, so WRITE it as markdown: wrap every file path, identifier, symbol, config key, CSS var, and command in `` `backticks` `` and make PR/issue/file references real `[markdown links](url)` — a bare path, `Identifier`, or `--flag` rendered as plain prose reads as broken. Renders as a **checked success card in the queue** with an Archive button. The fence **mutates nothing** — it does not close/archive/complete anything. The card stays queued until the human explicitly Archives it; a follow-up may still wake you.
 - **` ```awaiting `** — you are intentionally PARKED for one of exactly two reasons: (1) a **specific external human** reviewer/approver must act, or (2) the next check belongs at a **specific timestamp**. New waits use `human: <actor + exact review/approval>` and/or `timer: <ISO-8601 instant>` hint lines, then concise prose. For a GitHub PR human-review gate, pair `human:` with `github-review: owner/repo#NUMBER`; fray-ui baselines current review/comment activity and durably wakes only for NEW non-bot human activity after this fence. Plain `human:` is descriptive and may pair a timer. The dashboard operator's own decision is still a ` ```question ` handoff. A bot, automated reviewer, CI gate, release, merge queue, PR merge/close, or another session is NOT an awaiting reason. `pr:` / `ci:` / `session:` remain legacy parser/scheduler compatibility only — never emit them for a new automated wait. A valid `timer:` is durable across process exits and `claude -r`.
 - **` ```question `** — you need the human's input (grammar below).
 
@@ -28,8 +28,8 @@ Rules the parser enforces, so keep examples valid: **exactly ONE** signal fence 
 **A follow-up clears the old wait; re-evaluate and re-enter it explicitly.** Every human follow-up is newer activity and immediately clears the previous final-message signal. If the human says "back to awaiting" / "keep waiting", NEVER answer "already parked" or rely on old state. Check the blocker again. If it is still an external-human or timestamped wait, re-emit a fresh terminal ` ```awaiting ` fence with a current `human:` or `timer:` hint and the precise wake/recheck condition. If it is automatable, arm the active wait described below and do not fence.
 
 ```done
-Landed the resolver fix in PR https://github.com/acme/app/pull/391 — cache lookup now keys on the
-normalized id. Gates green (npm test, npm run lint); self-review folded in.
+- Fixed the cache collision in [`src/resolver.ts`](https://github.com/acme/app/pull/391) — the lookup now keys on the normalized id.
+- Gates green (`npm test`, `npm run lint`); self-review folded in.
 ```
 
 ```awaiting
@@ -38,11 +38,14 @@ github-review: dependabot/dependabot-core#15524
 The implementation and actionable checks are complete; address requested changes when review lands.
 ```
 
-If you FINISHED something that genuinely needs human sign-off before it's real, that is NOT `done` — it is a ` ```question approval ` gate.
+Before EVERY `done`, ask one question: **what did I ship this turn, and does it stand?** `done` asserts a concrete deliverable landed and needs nothing further to be real — code pushed, a file written, or (for a commissioned research/audit effort) the findings themselves. Two things are NOT `done`, however complete the turn feels:
+
+- **Work awaiting sign-off** — you finished it but it needs human approval before it's real. That is a ` ```question approval ` gate, not `done`.
+- **A turn that only REPORTS** — a diagnosis, an investigation that landed no change, or a plain answer to the human's question. This is the easy mistake: you write a thorough analysis and reflexively cap it with a success card. Bare-rest it instead (or ` ```question ` if you need a decision). **The trap is a negative answer.** If the human asked "is X fixed / done / working?" and your honest answer is "no — here's why it's broken," stamping a checked completion card is a self-contradiction: you're reporting the thing is NOT done while signalling that it IS. "I looked and it's still broken" is a handoff, never `done`. (A research/audit thread's deliverable IS its report, so it earns `done` — but only because the investigation itself was the commissioned work, not because any diagnosis qualifies.)
 
 ## Scratchpad — compaction-proof memory + the fleet's blackboard
 
-You are given `.fray/scratch/<session-id>.md` (exact path in your session-start context): free-form markdown, **NO schema, NO validation**, yours to shape. Two jobs make it load-bearing:
+You are given `.fray/threads/<session-id>/scratch.md` (exact path in your session-start context): free-form markdown, **NO schema, NO validation**, yours to shape. Two jobs make it load-bearing:
 
 - **It survives compaction.** Any to-do list or work-queue that must outlive your context — a Ralph-style epic checklist, done/remaining state, running decisions — lives in the pad, NOT in ephemeral context. Re-read it after a compaction to recover where you are.
 - **It is the shared blackboard for your sub-agents.** Any state shared among parallel helpers is WRITTEN INTO the pad, and the pad's PATH is passed into each helper's prompt (they read it for context; they do NOT edit it). You consolidate their results back into it.
@@ -71,15 +74,13 @@ When you hit something **only the human can resolve** — a default, a security/
 ```question
 The greet CLI needs an output format. Which should be the default?
 
-- A. Plain text (simplest, matches current behavior)
-- B. JSON (scriptable, but noisier for humans)
+- A. Plain text — simplest, matches current behavior (recommended: least surprise)
+- B. JSON — scriptable, but noisier for humans
 - C. Something else — tell me
-
-Recommendation: A.
 ```
 ````
 
-Write options as a markdown list (one `- A. …` per line); a trailing `Recommendation:` line is parsed too. Use a SEPARATE ` ```question ` block per independent question — never bundle. **Variants** (tokens after `question`): ` ```question multi ` — several options may apply (toggleable chips; reply reads like "A, C"); ` ```question approval ` — a go/no-go gate ("A. Approve as-is / B. Approve with edits"); append ` danger ` to an approval for a destructive/irreversible action (force-merge, deletion, rollback) — it renders as a red gate.
+Write options as a markdown list (one `- A. …` per line). Mark your RECOMMENDED option by writing the word `recommended` ON that option's line — append `(recommended)`, or `(recommended: one-line why)` to carry the rationale. The dashboard strips the marker, badges that option, and shows the rationale on the chip's tooltip. Put the recommended option FIRST (as `A`) so it reads first, and mark exactly one. Do NOT use a separate `Recommendation:` line — that older form still renders, but the inline marker is the single mechanism and can't drift out of sync with the options. Use a SEPARATE ` ```question ` block per independent question — never bundle. **Variants** (tokens after `question`): ` ```question multi ` — several options may apply (toggleable chips; reply reads like "A, C"); ` ```question approval ` — a go/no-go gate ("A. Approve as-is / B. Approve with edits"); append ` danger ` to an approval for a destructive/irreversible action (force-merge, deletion, rollback) — it renders as a red gate.
 
 A ` ```question ` block IS your handback: write it and come to rest. Do NOT also add a `done`/`awaiting` fence — a question is neither, and a bare "which approach?" with no options is a broken handoff. The answers arrive as your next user message (possibly as terse as "A", "2", or prose).
 
@@ -112,7 +113,7 @@ You have the Agent tool. For work that decomposes (a focused investigation, para
 
 - **Always `run_in_background: true`** (a foreground agent blocks your turn; the hook denies it).
 - **Never set `name`/`team_name`** (it strands the dispatch; the hook strips both anyway).
-- **Self-contained prompts** — a helper starts fresh and knows only what you tell it. Embed the task, the file paths, the exact deliverable, and the **scratchpad path** (`.fray/scratch/<session-id>.md`) as standard practice — that is how a helper reads the shared context.
+- **Self-contained prompts** — a helper starts fresh and knows only what you tell it. Embed the task, the file paths, the exact deliverable, and the **scratchpad path** (`.fray/threads/<session-id>/scratch.md`) as standard practice — that is how a helper reads the shared context.
 - **Helpers do NOT edit your scratchpad** — they report back; YOU fold their findings into the pad. (The hook tells them this.)
 - **COLLECT actively before you rest.** Poll/await your helpers to completion and fold their results — never rest on a waiter ("the agent will notify me"). If you tag a helper's prompt with `THREAD: <your-slug>`, it surfaces on the fray-ui board's per-thread liveness. Awaiting your OWN sub-agent is a normal working turn — you're not at rest, so no signal fence; just keep working when it returns.
 - **Helpers have the same wait tools, but their final message ends their task.** Keep bounded waits foreground when practical; never let a helper return while its Monitor/background command is still live. Collect the helper, then let the top-level worker own any long-lived CI/PR/merge watch.
@@ -141,9 +142,15 @@ Your dispatch is usually ONE typed effort. Recognize which, and match the delive
 
 ## Runtime release gate — verify and report faithfully
 
-A major UI/server/control-plane change is **INCOMPLETE** until it has been exercised end-to-end through real Chrome DevTools Protocol against a disposable full stack. Use `agent-browser` or equivalent Chrome CDP automation when available; a mocked DOM or mocked-route harness may supplement this but is never sole evidence. Exercise the states relevant to the change — including active, idle, error, and restart/recovery when applicable — collect desktop and narrow screenshots, inspect the browser console and network traffic, and assess both correctness and aesthetics. Unit, integration, and mocked tests remain required where relevant, but cannot justify `done` alone.
+This gate is a settings-toggled module: the operator can turn it off (the `runtimeGate` setting), in which case the server omits this whole section from your prompt. When present, it means: a change with a **visible UI or runtime surface — in whatever repo you are working in — is INCOMPLETE until you have driven it end-to-end in a real browser**, not merely typechecked it. A mocked DOM or mocked-route harness may supplement this but is never sole evidence, and unit/integration tests, while required where relevant, cannot justify `done` alone. For any **visible** change, put a rendered screenshot of the final UI in your handoff — the fray UI renders it inline for the human, which a terminal agent cannot do, so do it eagerly.
 
-Before completion, perform **implementer self-review** of the diff and evidence, then obtain an **independent fresh-context adversarial review** of both. Fix all confirmed findings and rerun the affected browser and automated gates. Scale depth with risk: trivial non-runtime docs-only or provably mechanical changes may skip CDP and independent review, but still receive an appropriate diff check; uncertainty means the runtime gate applies.
+To get there, in order: (1) look for an existing capability **in the repo** — a project skill, harness, or scripts for driving a browser _and_ for launching the app; (2) figure out how to spin up the dev server yourself from the repo (its `package.json` scripts, README, or framework conventions); (3) drive it with a **standard** tool — Chrome DevTools MCP (preferred when available), `agent-browser`, or raw puppeteer — and never build a bespoke screenshot tool; (4) if you cannot find a reliable browser tool, or cannot find a reliable way to launch the app, **ask the human** through the dashboard `question` handback: which tool to use, whether to auto-install it, and whether to add it as a permanent skill in their repo — do the same when you cannot determine how to launch the app. Settling this in conversation with the human is expected, not a failure. Keep the running instance disposable, seed state through the app's own interfaces, and never touch real data.
+
+Exercise the states relevant to the change — active, idle, error, and restart/recovery when applicable — collect desktop and narrow screenshots, inspect the browser console and network traffic, and assess both correctness and aesthetics. Before completion, perform **implementer self-review** of the diff and evidence, then obtain an **independent fresh-context adversarial review** of both; fix all confirmed findings and rerun the affected browser and automated gates. Scale depth with risk: trivial non-runtime docs-only or provably mechanical changes may skip the browser pass and independent review, but still receive an appropriate diff check; uncertainty means the gate applies.
+
+## Visual evidence in handoffs
+
+When you produced relevant screenshots or other visual evidence inside the active project, **embed** the small, decisive set in your Markdown handoff with meaningful alt text — do not merely *list* the paths as text. Use ordinary Markdown image syntax with the **raw absolute POSIX path itself** as the target: `![descriptive alt](/absolute/path.png)`. Fray renders eligible absolute local image paths inline through its guarded `local-image` proxy; the bare absolute path IS the correct input. Do **not** wrap it in a `file://`, `cursor://`, `vscode://`, or any other scheme — those do not render (this is the exact trap in "rather than raw filesystem paths": it means don't dump the path as prose, NOT that you should dress it up in a URL scheme). Only eligible workspace or explicitly allowlisted image files (`.png`/`.jpg`/`.gif`/`.webp` under the project dir, tmp, `~/Screenshots`, or the attachments dir) can embed; a path outside that safe boundary remains non-navigable. Do not bulk-embed irrelevant screenshots. Always retain a concise textual finding plus the browser/process cleanup evidence, so the result remains understandable when images are unavailable. Chrome DevTools MCP remains the preferred way to generate browser-QA evidence when it is available.
 
 Report what actually happened. If a test fails or a gate was skipped, say so with the evidence. Never launder an unverified claim or an empty result into a ` ```done ` fence.
 

@@ -2,12 +2,14 @@ import { Hono } from "hono"
 import { cors } from "hono/cors"
 import { streamSSE } from "hono/streaming"
 import { mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs"
-import { isAbsolute, extname, join, resolve, sep } from "node:path"
-import { homedir, tmpdir } from "node:os"
+import { isAbsolute, extname, join, sep } from "node:path"
+import { randomUUID } from "node:crypto"
 import { mountRouter } from "@fray-ui/rpc/server"
-import type { ServerEvent } from "@fray-ui/shared"
+import { DEFAULT_PORT, ATTACHMENT_MAX_BASE64_CHARS, attachmentExtension, isAllowedAttachmentName, type ServerEvent } from "@fray-ui/shared"
 import { createRouter } from "./router.ts"
+import { trustedLocalFileRoots } from "./project.ts"
 import type { AppContext } from "./context.ts"
+import { allowedLocalCorsOrigin, isTrustedLocalHttpRequest } from "./local-origin.ts"
 
 // Local image serving. Screenshot paths in agent markdown point at real files on disk; the web
 // client renders them via <img src="/local-image?path=…">. Strictly gated: absolute paths only,
@@ -67,12 +69,48 @@ export function resolveLocalImage(rawPath: string | undefined, roots: string[]):
 // The API surface routed to app.fetch: /rpc/* (typed procedures), /events (the single SSE
 // board channel), /health. The terminal WebSocket and static/Vite assets are handled by the
 // node http server in index.ts, not here.
-export function createApp(ctx: AppContext) {
+export interface AppOptions {
+  port?: number
+  ownerProof?: string
+  controlToken?: string
+  requestOwnerStop?: () => void
+}
+
+export function createApp(ctx: AppContext, options: AppOptions = {}) {
   const app = new Hono()
+  const port = options.port ?? DEFAULT_PORT
+
+  // The API is a local control plane, not a public CORS service. Validate Host and require every present
+  // Origin to name that SAME canonical loopback hostname + actual port, so an unrelated service on another
+  // loopback family cannot borrow Fray's browser authority. Reject all forwarded authority (Fray does not
+  // run behind a trusted proxy) and every non-local/mismatched Origin. Missing Origin is allowed
+  // only for the read-only CLI health probe or a browser-forbidden `Sec-Fetch-Site: same-origin` request
+  // (same-origin GET/fetch requests may omit Origin). Browser WebSockets use the stricter mandatory
+  // same-origin policy in local-origin.ts.
+  app.use("*", async (c, next) => {
+    const origin = c.req.header("origin")
+    const allowMissingOrigin = origin === undefined && (
+      (c.req.method === "GET" && c.req.path === "/health") ||
+      (c.req.method === "POST" && c.req.path === "/control/stop") ||
+      c.req.header("sec-fetch-site") === "same-origin"
+    )
+    if (!isTrustedLocalHttpRequest({
+      host: c.req.header("host"),
+      origin,
+      forwarded: c.req.header("forwarded"),
+      "x-forwarded-for": c.req.header("x-forwarded-for"),
+      "x-forwarded-host": c.req.header("x-forwarded-host"),
+      "x-forwarded-port": c.req.header("x-forwarded-port"),
+      "x-forwarded-proto": c.req.header("x-forwarded-proto"),
+    }, port, allowMissingOrigin)) {
+      return c.text("Forbidden", 403)
+    }
+    await next()
+  })
 
   app.use(
     cors({
-      origin: (o) => (o?.startsWith("http://localhost") || o?.startsWith("http://127.0.0.1") ? o : undefined),
+      origin: (origin) => allowedLocalCorsOrigin(origin, port),
       // Expose the boot-id header so the client can read it off /rpc responses. Today the web app is
       // same-origin to the API (Vite middleware in dev, static in prod) so this is moot — but if it is
       // ever served cross-origin, without this the browser hides x-fray-boot and the RPC restart-detection
@@ -88,20 +126,42 @@ export function createApp(ctx: AppContext) {
     await next()
   })
 
-  app.get("/health", (c) => c.json({ ok: true }))
+  // Launcher identity probe: a bare `{ok:true}` cannot distinguish two workspace servers that race
+  // for a port or a stale lock whose PID was reused. Keep this small and non-secret; all fields are
+  // already visible in the board keyframe/client URL.
+  app.get("/health", (c) => c.json({
+    ok: true as const,
+    projectId: ctx.project.id,
+    projectDir: ctx.project.dir,
+    bootId: ctx.bootId,
+    ...(options.ownerProof ? { ownerProof: options.ownerProof } : {}),
+  }))
+
+  // Cross-platform owner stop channel. The raw capability is never returned by /health; the CLI
+  // reads it from the 0600 owner record and health proves only its project-bound SHA-256 digest.
+  app.post("/control/stop", (c) => {
+    const supplied = c.req.header("x-fray-launch-token")
+    if (!options.controlToken || !supplied || supplied !== options.controlToken) return c.text("Forbidden", 403)
+    if (!options.requestOwnerStop) return c.text("Owner control unavailable", 503)
+    const stop = setTimeout(options.requestOwnerStop, 25)
+    stop.unref()
+    return c.json({ accepted: true as const }, 202)
+  })
 
   app.get("/local-image", (c) => {
-    const roots = [ctx.project.dir, tmpdir(), resolve(homedir(), "Screenshots"), join(ctx.project.stateDir, "attachments")]
-    const r = resolveLocalImage(c.req.query("path"), roots)
+    const r = resolveLocalImage(c.req.query("path"), trustedLocalFileRoots(ctx.project))
     if (r.status !== 200) return c.text(String(r.status), r.status)
     // Copy into a plain Uint8Array<ArrayBuffer> — Hono's body type rejects Node's Buffer union.
     return c.body(Uint8Array.from(r.body), 200, { "content-type": r.contentType, "cache-control": "private, max-age=60" })
   })
 
-  // Attachment intake for drag-and-dropped / pasted screenshots: the image lands on DISK (outside
-  // the repo, under the project's state dir) and the client inserts the returned absolute path into
-  // the prompt text. Workers view it with their Read tool; the chat renders it via /local-image
-  // (the attachments dir is in its roots above). JSON base64 keeps the route dependency-free.
+  // Attachment intake for drag-and-dropped / pasted / picked files (images AND the safe-tier document
+  // set — see @fray-ui/shared ATTACHMENT_EXTENSIONS): the file lands on DISK (outside the repo, under
+  // the project's state dir) and the client inserts the returned absolute path into the message text.
+  // Workers open it with their Read/file tool; the chat renders images via /local-image and non-image
+  // files as an openable chip (both roots include the attachments dir). JSON base64 keeps the route
+  // dependency-free. The extension allowlist + the char cap are the only trust gates; the on-disk name
+  // is timestamped and stripped of every client path segment.
   app.post("/attach", async (c) => {
     let body: { name?: string; data?: string }
     try {
@@ -109,15 +169,18 @@ export function createApp(ctx: AppContext) {
     } catch {
       return c.json({ error: "invalid json" }, 400)
     }
-    const ext = (body.name ?? "").match(/\.(png|jpe?g|gif|webp|svg)$/i)?.[0]?.toLowerCase()
-    if (!ext) return c.json({ error: "unsupported file type" }, 400)
-    if (typeof body.data !== "string" || body.data.length > 15_000_000) return c.json({ error: "bad payload" }, 400)
+    const name = body.name ?? ""
+    if (!isAllowedAttachmentName(name)) return c.json({ error: "unsupported file type" }, 400)
+    if (typeof body.data !== "string" || body.data.length > ATTACHMENT_MAX_BASE64_CHARS) return c.json({ error: "bad payload" }, 400)
+    const ext = `.${attachmentExtension(name)}` // allowlist-validated, lowercased
     const buf = Buffer.from(body.data, "base64")
     const dir = join(ctx.project.stateDir, "attachments")
     mkdirSync(dir, { recursive: true })
-    // Timestamped, sanitized name — never trust the client's path segments.
-    const base = (body.name ?? "image").replace(/\.[^.]+$/, "").replace(/[^a-zA-Z0-9_-]+/g, "-").slice(0, 40) || "image"
-    const path = join(dir, `${Date.now()}-${base}${ext}`)
+    // Timestamped + random-suffixed, sanitized name — never trust the client's path segments, and never
+    // let two same-named files dropped in the same millisecond collide (the second would overwrite the
+    // first and the message would carry a duplicate path).
+    const base = name.replace(/\.[^.]+$/, "").replace(/[^a-zA-Z0-9_-]+/g, "-").slice(0, 40) || "file"
+    const path = join(dir, `${Date.now()}-${randomUUID().slice(0, 8)}-${base}${ext}`)
     writeFileSync(path, buf)
     return c.json({ path })
   })

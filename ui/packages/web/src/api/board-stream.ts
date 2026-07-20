@@ -14,8 +14,20 @@ export class BoardStream {
   // The seq of the last board frame we adopted/applied. -1 = no keyframe yet. A full "board" keyframe
   // sets it; each delta must be exactly currentSeq+1 (see deltaAction) or we resync.
   private currentSeq = -1
+  private readonly resync: () => void
+  private readonly interactionsInvalidated: (
+    event: Extract<ServerEvent, { type: "interactions-invalidated" }>,
+  ) => void
 
-  constructor(private readonly resync: () => void) {}
+  constructor(
+    resync: () => void,
+    interactionsInvalidated: (
+      event: Extract<ServerEvent, { type: "interactions-invalidated" }>,
+    ) => void = () => {},
+  ) {
+    this.resync = resync
+    this.interactionsInvalidated = interactionsInvalidated
+  }
 
   // Drop the adopted seq — call on (re)connect so any stray delta arriving before the next keyframe
   // forces a resync rather than applying against a torn base.
@@ -48,6 +60,9 @@ export class BoardStream {
         break
       case "notify":
         notify(event)
+        break
+      case "interactions-invalidated":
+        this.interactionsInvalidated(event)
         break
     }
   }

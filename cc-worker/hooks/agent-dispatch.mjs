@@ -24,7 +24,7 @@ const EPILOGUE = `
 ---
 [ORCHESTRATION EPILOGUE — auto-appended by the fray worker dispatch hook] You are a helper sub-agent for a fray-ui worker. Your final message IS the handoff — make it orchestration-ready: verdict/status; what you did; changed files/artifacts/commit SHA when applicable; verification commands + their results; caveats/risks; one concrete next action. A bare "done" or progress-only final message is an INCOMPLETE handoff (a bug), not success.
 RUN LONG OPS TO COMPLETION INLINE. Your final message ENDS this helper task, so never return while your own Monitor/background command is live. Keep a bounded wait in a foreground Bash call when practical; if a watch must outlive this helper, report the current state and exact watch command so the top-level worker can own it. Monitor and background Bash are available, but they are not permission to background-and-rest.
-DO NOT edit the dispatcher's scratchpad (\`.fray/scratch/…\`) or any \`.fray/\` state — the fray worker who dispatched you OWNS it and folds your report in. If a scratchpad path is in your prompt, READ it for shared context but never write it. Report your findings/changes in your FINAL MESSAGE; that is the only channel back.
+DO NOT edit the dispatcher's scratchpad (\`.fray/threads/<session-id>/scratch.md\`) or any \`.fray/\` state — the fray worker who dispatched you OWNS it and folds your report in. If a scratchpad path is in your prompt, READ it for shared context but never write it. Report your findings/changes in your FINAL MESSAGE; that is the only channel back.
 If you COMMITTED: verify the tree COMPILES at your commit. If there are no follow-ups, say "Follow-ups: none."`;
 
 /** @param {unknown} obj @returns {never} */

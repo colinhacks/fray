@@ -1,23 +1,27 @@
-import { useMemo, useState, type ReactNode } from "react"
+import * as RadixDialog from "@radix-ui/react-dialog"
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import { useSnapshot } from "valtio"
-import { useMutation, useQuery } from "@tanstack/react-query"
-import { PermissionMode, type DispatchInput } from "@fray-ui/shared"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import type { DispatchInput, SetDispatchPreferenceInput } from "@fray-ui/shared"
 import { rpc } from "../api/rpc.ts"
 import { showToast, store } from "../store.ts"
 import { Composer } from "./Composer.tsx"
 import { GithubTrigger } from "./GithubTrigger.tsx"
+import { ProfileGridSelector } from "./ProfileGridSelector.tsx"
 import { Select } from "./ui/Select.tsx"
 import {
-  modelGroups,
-  EFFORT_OPTIONS,
-  codexEffortOptions,
-  codexModelFor,
   PERMISSION_COLOR,
-  backendForModel,
   permOptionsFor,
-  permValueFor,
-  codexEffortForModel,
 } from "../lib/options.ts"
+import {
+  applyDispatchPreferenceUpdate,
+  dispatchProfileGroups,
+  resolveDispatchPreferences,
+} from "../lib/dispatchPreferences.ts"
+import { captureDispatchProfile } from "../lib/githubDispatch.ts"
+import { handleDialogEscape } from "../lib/selectOverlay.ts"
+import { draftKey, draftStore, useDraft, useProjectDir } from "../lib/drafts.ts"
+import { PROMPT_CONTROL_TYPOGRAPHY_CLASS } from "../lib/promptControlTypography.ts"
 
 // THE dispatch prompt box — composer + quiet selects row — shared by every surface that can start a
 // thread: the queue's inline section and the anywhere-modal. There is no title field — the server
@@ -33,16 +37,34 @@ export function DispatchForm({
   // oriented to the plan and the thread is associated with it.
   planPath?: string
 }) {
-  const settings = useQuery({ queryKey: ["settingsGet"], queryFn: () => rpc.settingsGet() })
+  const queryClient = useQueryClient()
+  const preferences = useQuery({ queryKey: ["dispatchPreferencesGet"], queryFn: () => rpc.dispatchPreferencesGet() })
   // The codex model catalogue + per-model effort options, from the authoritative ~/.codex cache (never a
   // hand-maintained list). [] until it loads; the option builders fall back to a compiled-in mirror.
   const codexModels = useQuery({ queryKey: ["codexModels"], queryFn: () => rpc.codexModels() })
   const codexList = codexModels.data ?? []
+  const projectDir = useProjectDir()
+  // Queue and modal are the same semantic new-thread composer. A plan gets a distinct intent because
+  // dispatching it changes the worker's durable context.
+  const [prompt, setPrompt, clearPrompt] = useDraft(draftKey.dispatch(projectDir, planPath))
+  const promptKey = draftKey.dispatch(projectDir, planPath)
+  const submittedDraftRef = useRef("")
+  const [pendingDispatch, setPendingDispatch] = useState<string | null>(null)
 
-  const [prompt, setPrompt] = useState("")
-  const [permissionMode, setPermissionMode] = useState<PermissionMode | "">("")
-  const [model, setModel] = useState("")
-  const [effort, setEffort] = useState<string>("")
+  const preference = useMutation({
+    mutationFn: (update: SetDispatchPreferenceInput) => rpc.dispatchPreferenceSet(update),
+    // TanStack serializes mutations sharing this scope. This prevents a fast pair of selections from
+    // reaching SQLite out of order while optimistic query data keeps every mounted composer in sync.
+    scope: { id: "dispatch-preferences" },
+    onMutate: (update) => {
+      const current = queryClient.getQueryData<Awaited<ReturnType<typeof rpc.dispatchPreferencesGet>>>(["dispatchPreferencesGet"])
+      if (current) queryClient.setQueryData(["dispatchPreferencesGet"], applyDispatchPreferenceUpdate(current, update))
+    },
+    onError: (error) => {
+      void queryClient.invalidateQueries({ queryKey: ["dispatchPreferencesGet"] })
+      showToast(`Could not save new-thread preference: ${(error as Error).message.slice(0, 80)}`)
+    },
+  })
 
   // Dispatch does NOT navigate anywhere: you stay on the queue, the new thread appears in the
   // sidebar, and the toast walks through the lifecycle — an immediate spinner while the server
@@ -51,83 +73,118 @@ export function DispatchForm({
     mutationFn: (input: DispatchInput) => rpc.dispatch(input),
     onMutate: () => showToast("Starting thread…", { spinner: true, sticky: true }),
     onSuccess: (res) => {
-      setPrompt("")
+      // The board stream now owns the durable thread row. Drop our local bridge as soon as the
+      // server acknowledges it, preventing an optimistic card + server card duplicate.
+      setPendingDispatch(null)
       onDispatched?.()
       showToast("Thread started", { link: { label: "Open thread", slug: res.slug } })
     },
-    onError: (e) => showToast(`Dispatch failed: ${(e as Error).message.slice(0, 80)}`),
+    onError: (e, input) => {
+      // A submit clears before the RPC starts. Restore only into a still-empty field so retry is
+      // effortless without overwriting text typed during the failed request.
+      if (!draftStore.get(promptKey)) setPrompt(submittedDraftRef.current || input.prompt)
+      setPendingDispatch(null)
+      showToast(`Dispatch failed: ${(e as Error).message.slice(0, 80)}`)
+    },
   })
 
-  // Every control resolves to a CONCRETE value (shown in the readout): mode from settings, model
-  // defaulting to OPUS and effort to HIGH unless settings or the user say otherwise.
-  const effectiveMode = permissionMode || (settings.data?.permissionMode ?? "auto")
-  const effectiveModel = model || settings.data?.model || "opus"
-  const effectiveEffort = effort || settings.data?.effort || "high"
-  // The model DRIVES the backend; the permission/effort readouts then present that backend's axis. The
-  // codex model (when this is a codex model) gates the effort dropdown to exactly its supported levels.
-  const backend = backendForModel(effectiveModel, codexList)
-  const codexModel = codexModelFor(effectiveModel, codexList)
+  // Do not render Opus/high while durable intent is still loading. In particular, a saved Codex model
+  // must not be classified as Claude merely because the Codex catalogue has not hydrated yet.
+  const controlsReady = !!preferences.data && !!codexModels.data
+  const resolved = useMemo(
+    () => controlsReady ? resolveDispatchPreferences(preferences.data!, codexList) : undefined,
+    [controlsReady, preferences.data, codexList],
+  )
+  const githubProfile = useMemo(() => captureDispatchProfile(resolved), [resolved])
+
+  function savePreference(update: SetDispatchPreferenceInput) {
+    preference.mutate(update)
+  }
 
   function submit() {
-    if (!prompt.trim()) return
+    if (!prompt.trim() || !resolved) return
+    if (!resolved.modelAvailable) {
+      showToast("Saved model is unavailable — choose a model before starting the thread")
+      return
+    }
+    if (!resolved.effortAvailable) {
+      showToast("Saved reasoning level is unavailable for this model — choose another level")
+      return
+    }
+    const submittedPrompt = prompt.trim()
+    // Dispatch has no transcript slug yet, so its immediate optimistic representation is the
+    // starting-thread toast. Crucially the controlled prompt clears in this same event turn.
+    submittedDraftRef.current = prompt
+    clearPrompt()
+    setPendingDispatch(submittedPrompt)
     dispatch.mutate({
-      prompt: prompt.trim(),
+      prompt: submittedPrompt,
       // For codex the stored permissionMode is mapped to the sandbox-facing value shown in the
       // readout, so the dispatch carries exactly what the user sees (the server's codexSandbox then
-      // maps it to `-s`). Effort is clamped to the codex-accepted set (xhigh/max→high).
-      permissionMode: permValueFor(backend, effectiveMode),
-      model: effectiveModel,
-      backend,
-      effort: (backend === "codex" ? codexEffortForModel(codexModel, effectiveEffort) : effectiveEffort) as DispatchInput["effort"],
+      // maps it to `-s`). Model and effort were already validated against the hydrated catalogue.
+      permissionMode: resolved.permissionMode,
+      model: resolved.model,
+      backend: resolved.backend,
+      effort: resolved.effort as DispatchInput["effort"],
       ...(planPath ? { planPath } : {}),
     })
   }
 
-  // The mode/model/effort readouts live INSIDE the box, along its bottom edge — petite caps,
+  // The profile/permission readouts live INSIDE the box, along its bottom edge — petite caps,
   // very quiet. Not dropdowns at rest: plain values (mode color-coded like Claude Code's
   // permission palette); hover materializes the border, click opens the menu.
   //
   // useMemo (measured in the render-perf profile): the footer used to be rebuilt inline on every
-  // render, so each prompt KEYSTROKE re-rendered all three Radix Select trees — ~222 component
-  // renders per keystroke, ~all of them Select internals. A keystroke only changes `prompt`; keeping
-  // the footer element's identity stable lets React bail out of the whole Select subtree, and the
-  // element is rebuilt exactly when a readout value actually changes. (The setXxx setters are
-  // identity-stable, so the effective values are the complete dependency set.)
-  const footer = useMemo(
-    () => (
+  // render, so each prompt KEYSTROKE re-rendered every picker tree — ~222 component renders per
+  // keystroke. A keystroke only changes `prompt`; keeping the footer element's identity stable lets
+  // React bail out of the whole control subtree, and the
+  // element is rebuilt exactly when durable preference data or the model catalogue changes.
+  const footer = useMemo(() => {
+    if (!resolved) {
+      return (
+        <>
+          <ProfileGridSelector
+            groups={[]}
+            value={undefined}
+            onValueChange={() => {}}
+            placeholder={preferences.isError || codexModels.isError ? "Profile unavailable" : "Profile loading…"}
+            ariaLabel="Model and effort loading"
+            disabled
+          />
+          <Select variant="readout" className={PROMPT_CONTROL_TYPOGRAPHY_CLASS} value="" onValueChange={() => {}} options={[]} placeholder="Loading…" ariaLabel="Permission mode loading" indicatorPosition="right" disabled />
+        </>
+      )
+    }
+    const profileGroups = dispatchProfileGroups(codexList)
+    return (
       <>
-        <Select
-          variant="readout"
-          className="petite-caps"
-          value={effectiveModel}
-          onValueChange={setModel}
-          groups={modelGroups(codexList, { withDefault: false })}
-          indicatorPosition="right"
-          ariaLabel="Model"
+        <ProfileGridSelector
+          groups={profileGroups}
+          value={{ provider: resolved.backend, model: resolved.model, effort: resolved.effort }}
+          onValueChange={(selection) => savePreference({
+            field: "profile",
+            backend: selection.provider as typeof resolved.backend,
+            model: selection.model,
+            effort: selection.effort as DispatchInput["effort"] & string,
+          })}
+          ariaLabel="Model and effort"
+          title={resolved.modelAvailable && resolved.effortAvailable
+            ? "Model and reasoning effort"
+            : "Saved model or reasoning effort unavailable — choose a supported pair"}
+          className="max-w-[min(21rem,72vw)]"
         />
         <Select
           variant="readout"
-          className={`petite-caps ${PERMISSION_COLOR[permValueFor(backend, effectiveMode)]}`}
-          value={permValueFor(backend, effectiveMode)}
-          onValueChange={(v) => setPermissionMode(v as PermissionMode)}
-          options={permOptionsFor(backend)}
-          ariaLabel={backend === "codex" ? "Sandbox" : "Permission mode"}
-        />
-        <Select
-          variant="readout"
-          className="petite-caps"
-          value={backend === "codex" ? codexEffortForModel(codexModel, effectiveEffort) : effectiveEffort}
-          onValueChange={(v) => setEffort(v)}
-          options={backend === "codex" ? codexEffortOptions(codexModel, { withDefault: false }) : EFFORT_OPTIONS_CONCRETE}
+          className={`${PROMPT_CONTROL_TYPOGRAPHY_CLASS} ${PERMISSION_COLOR[resolved.permissionMode]}`}
+          value={resolved.permissionMode}
+          onValueChange={(value) => savePreference({ field: "permissionMode", backend: resolved.backend, value: value as typeof resolved.permissionMode })}
+          options={permOptionsFor(resolved.backend)}
           indicatorPosition="right"
-          ariaLabel="Effort"
+          ariaLabel={resolved.backend === "codex" ? "Sandbox" : "Permission mode"}
         />
       </>
-    ),
-    // Model is now FIRST (it drives the backend); `backend`/`codexModel` are derived from effectiveModel
-    // so they're covered, but list them so the readout + effort set swap the moment the family/model changes.
-    [effectiveMode, effectiveModel, effectiveEffort, backend, codexModel, codexList],
-  )
+    )
+  }, [resolved, codexList, preferences.isError, codexModels.isError])
 
   return (
     <div className="w-full flex flex-col gap-3">
@@ -142,51 +199,85 @@ export function DispatchForm({
         maxHeight={340}
         busy={dispatch.isPending}
         footer={footer}
-        leftAction={<GithubTrigger />}
+        leftAction={<GithubTrigger
+          profile={githubProfile.ok ? githubProfile.profile : undefined}
+          profileError={githubProfile.ok ? undefined : githubProfile.error}
+        />}
       />
       {dispatch.isError && (
         <span className="px-0.5 text-[11px] text-red-400 truncate">{(dispatch.error as Error).message}</span>
+      )}
+      {pendingDispatch && (
+        <div data-pending-dispatch role="status" className="rounded-lg border border-border bg-panel-2 px-3 py-2.5">
+          <div className="flex items-center gap-2 text-[11px] text-muted">
+            <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-accent" aria-hidden="true" />
+            <span>Starting thread…</span>
+          </div>
+          <p className="mt-1 line-clamp-2 whitespace-pre-wrap text-[12px] leading-relaxed text-fg">{pendingDispatch}</p>
+        </div>
       )}
     </div>
   )
 }
 
-// Readout option lists have NO empty "default" row — the readout always shows a concrete value. The
-// model readout uses the sectioned modelGroups() (Claude Code / Codex from the codexModels RPC) directly.
-const EFFORT_OPTIONS_CONCRETE = EFFORT_OPTIONS.filter((o) => o.value !== "")
-
 // The anywhere-modal behind the pill button: same form in a centered dialog. Esc closes (captured
 // here BEFORE the composer's own Escape-blurs handler can swallow it).
 export function NewThreadDialog({ onClose }: { onClose: () => void }) {
-  // Seeded from a plan? (store.newThreadPlanPath, set by "New thread from plan"). The dispatch then
+  // Seeded from a plan? (store.newThreadPlanPath, set by "Implement this"). The dispatch then
   // carries planPath; a quiet line names the plan the thread works from.
   const planPath = useSnapshot(store).newThreadPlanPath
   const planName = planPath ? planPath.split("/").pop() : null
+  const contentRef = useRef<HTMLDivElement>(null)
+  // Fray opens this dialog by writing store state, not through RadixDialog.Trigger. Capture the real
+  // opener during the mount render so close can restore it explicitly (including plan-drawer openers).
+  const openerRef = useRef<HTMLElement | null>(
+    typeof document !== "undefined" && document.activeElement instanceof HTMLElement ? document.activeElement : null,
+  )
+  useEffect(() => () => {
+    const opener = openerRef.current
+    window.setTimeout(() => {
+      if (opener?.isConnected) opener.focus({ preventScroll: true })
+    }, 0)
+  }, [])
   return (
-    <Overlay onClose={onClose}>
-      <div
-        className="w-[640px] max-w-[86vw] rounded-xl border border-border bg-panel p-5 shadow-2xl shadow-black/50"
-        onKeyDownCapture={(e) => {
-          if (e.key === "Escape") {
-            e.stopPropagation()
-            onClose()
-          }
-        }}
-      >
-        <h2 className="mb-1 text-[14px] font-medium">New thread</h2>
-        {planName && <p className="mb-3 text-[11.5px] text-muted/80">From plan <span className="font-mono-keep text-muted">{planName}</span></p>}
-        <DispatchForm autoFocus onDispatched={onClose} planPath={planPath ?? undefined} />
-      </div>
-    </Overlay>
+    <RadixDialog.Root open onOpenChange={(open) => { if (!open) onClose() }}>
+      <RadixDialog.Portal>
+        {/* Frosted glass: heavy blur + saturation over a light black wash, so the board reads as a
+            texture behind the dialog rather than going fully dark. */}
+        <RadixDialog.Overlay className="fixed inset-0 z-50 bg-black/30 backdrop-blur-md backdrop-saturate-150" />
+        <RadixDialog.Content
+          ref={contentRef}
+          aria-modal="true"
+          aria-describedby={undefined}
+          onEscapeKeyDown={handleDialogEscape}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault()
+            const opener = openerRef.current
+            if (opener?.isConnected) opener.focus({ preventScroll: true })
+          }}
+          onOpenAutoFocus={(event) => {
+            event.preventDefault()
+            contentRef.current?.querySelector<HTMLTextAreaElement>("textarea")?.focus({ preventScroll: true })
+          }}
+          className="fixed left-1/2 top-1/2 z-50 w-[640px] max-w-[86vw] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-border bg-panel p-5 shadow-2xl shadow-black/50 outline-none"
+        >
+          <RadixDialog.Title className="mb-1 text-[14px] font-medium">New thread</RadixDialog.Title>
+          {planName && <p className="mb-3 text-[11.5px] text-muted/80">From plan <span className="font-mono-keep text-muted">{planName}</span></p>}
+          <DispatchForm autoFocus onDispatched={onClose} planPath={planPath ?? undefined} />
+        </RadixDialog.Content>
+      </RadixDialog.Portal>
+    </RadixDialog.Root>
   )
 }
 
 export function Overlay({ children, onClose }: { children: ReactNode; onClose: () => void }) {
   return (
     // Frosted glass: heavy blur + saturation over a light black wash, so the board reads as a
-    // texture behind the dialog rather than going fully dark.
+    // texture behind the dialog rather than going fully dark. z-[200] matches the shared Radix Dialog
+    // tier so the centered picker sits ABOVE the sidebar/prompt box (z-[100] on desktop) rather than
+    // behind it.
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-md backdrop-saturate-150"
+      className="fixed inset-0 z-[200] flex items-center justify-center bg-black/30 backdrop-blur-md backdrop-saturate-150"
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose()
       }}

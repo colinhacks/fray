@@ -11,7 +11,7 @@ const STATUS_LABEL: Record<string, string> = {
   blocked: "Blocked",
   done: "Done",
   dismissed: "Dismissed",
-  archived: "Archived",
+  archived: "Done",
 }
 
 // Workpane view for a status-count nav row: the full thread list in that fray status ("archived"

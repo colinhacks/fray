@@ -1,6 +1,6 @@
 interface:
   display_name: "Fray Orchestrator"
   short_description: "Explicit multi-workstream orchestration mode"
-  default_prompt: "Use $fray-orchestrator to delegate these workstreams, preserve later asks, and reconcile every agent return."
+  default_prompt: "Use $fray-orchestrator to keep concise session-specific scratch notes and open items summarized in the visible plan, use native blocking request_user_input for material unresolved choices, let every spawned agent reach a terminal return, and reconcile every return before calling an outcome complete."
 policy:
   allow_implicit_invocation: false

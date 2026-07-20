@@ -7,6 +7,9 @@
 .claude/worktrees/
 .claude/jobs/
 
+# ad hoc CDP verification screenshots (ui/scripts/shot.mjs output; see fray:adhoc-cdp skill)
+.adhoc-shots/
+
 # dependencies + build artifacts
 node_modules/
 dist/
@@ -16,6 +19,11 @@ out/
 .turbo/
 .cache/
 coverage/
+.vite/
+web-dist/
+/tmp/
+/artifacts/
+/ui/artifacts/
 
 # os / editor cruft
 .DS_Store

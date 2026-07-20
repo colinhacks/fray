@@ -1,0 +1,65 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Queue successor card scroll fixture</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; color: #e7e7eb; background: #111217; font: 14px/1.4 ui-sans-serif, system-ui; }
+  main { width: min(860px, calc(100% - 32px)); margin: 0 auto; padding: 120px 0 180px; }
+  nav { position: fixed; right: 18px; top: 18px; display: grid; gap: 8px; padding: 10px; border: 1px solid #545966; border-radius: 9px; background: #1b1d25e8; }
+  nav button { color: #e7e9f4; background: #353a48; }
+  .note { color: #a8abb7; margin: 0 0 26px; }
+  .card { border: 1px solid #545966; border-radius: 12px; background: #1b1d25; box-shadow: 0 12px 28px #0005; margin: 42px 0; overflow: clip; }
+  .card header { padding: 16px 20px; border-bottom: 1px solid #3d414d; font-weight: 650; background: #1b1d25; }
+  .card p { min-height: 680px; margin: 0; padding: 20px; color: #c4c6d0; }
+  .reply { display: flex; gap: 8px; padding: 16px 20px; border-top: 1px solid #3d414d; }
+  textarea { min-width: 0; flex: 1; padding: 10px; border: 1px solid #5a6070; border-radius: 7px; color: inherit; background: #12141a; }
+  button { padding: 9px 13px; border: 0; border-radius: 7px; color: #181a20; background: #e7e9f4; font-weight: 650; }
+  .gone { display: none; }
+  @media (max-width: 800px) { main { width: calc(100% - 20px); padding-top: 70px; } .card p { min-height: 820px; } nav { top: auto; bottom: 16px; right: 10px; } }
+</style>
+<main>
+  <h1>Queue successor alignment</h1>
+  <p class="note">Sidebar jumps and a successor after submitting both place the selected bordered outer root at 12px. Answering the final card does not wrap to an earlier card.</p>
+  <section class="card" data-queue-card="first">
+    <header>First tall Queue card</header><p>Scroll into this body, then submit an answer.</p>
+    <form class="reply"><textarea aria-label="Reply to first card" placeholder="Reply to the agent"></textarea><button>Send answer</button></form>
+  </section>
+  <section class="card" data-queue-card="second"><header>Second tall Queue card</header><p>The successor outer border should appear 12px below the viewport after the first card exits.</p></section>
+  <section class="card" data-queue-card="third"><header>Third Queue card</header><p>Answering this final card leaves the viewport here; it never wraps to an earlier card.</p></section>
+</main>
+<nav aria-label="Sidebar queue cards"><button data-scroll-to="second">Sidebar: second card</button><button data-scroll-to="third">Sidebar: final card</button></nav>
+<script>
+  const targetTop = 12
+  const first = document.querySelector('[data-queue-card="first"]')
+  const form = first.querySelector('form')
+  const reply = first.querySelector('textarea')
+  document.querySelectorAll('[data-scroll-to]').forEach((button) => button.addEventListener('click', () => {
+    const card = document.querySelector(`[data-queue-card="${button.dataset.scrollTo}"]`)
+    window.scrollBy({ top: card.getBoundingClientRect().top - targetTop, behavior: 'smooth' })
+    setTimeout(() => console.info('queue-sidebar-card-top', card.dataset.queueCard, card.getBoundingClientRect().top), 450)
+  }))
+  reply.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter') return
+    if (event.altKey) {
+      event.preventDefault()
+      const start = reply.selectionStart
+      const end = reply.selectionEnd
+      reply.setRangeText('\n', start, end, 'end')
+      return
+    }
+    if (!event.shiftKey) {
+      event.preventDefault()
+      form.requestSubmit()
+    }
+  })
+  form.addEventListener('submit', (event) => {
+    event.preventDefault()
+    first.classList.add('gone')
+    requestAnimationFrame(() => {
+      const successor = document.querySelector('[data-queue-card="second"]')
+      window.scrollBy({ top: successor.getBoundingClientRect().top - targetTop, behavior: 'auto' })
+      console.info('queue-successor-card-top', successor.dataset.queueCard, successor.getBoundingClientRect().top)
+    })
+  })
+</script>

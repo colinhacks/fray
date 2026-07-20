@@ -1,14 +1,26 @@
 {
-  "name": "fray-ui",
+  "name": "frayui",
   "version": "0.0.1",
-  "private": true,
+  "private": false,
+  "description": "Local orchestration surface for Fray projects",
+  "engines": {
+    "node": ">=26"
+  },
   "type": "module",
-  "bin": { "fray-ui": "./src/index.ts" },
+  "bin": {
+    "frayui": "./src/production.ts",
+    "fray-dev": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "web-dist"
+  ],
+  "scripts": {
+    "prepack": "node ./scripts/prepare-package.mjs"
+  },
   "dependencies": {
     "@fray-ui/server": "workspace:*",
-    "@fray-ui/shared": "workspace:*"
-  },
-  "devDependencies": {
-    "typescript": "^5.7"
+    "@fray-ui/shared": "workspace:*",
+    "esbuild": "^0.25.0"
   }
 }

@@ -12,6 +12,7 @@ import {
   modelGroups,
   CODEX_MODELS_FALLBACK,
   CLAUDE_MODELS,
+  PERMISSION_COLOR,
 } from "./options.ts"
 
 // A live RPC catalogue stub (per-model effort gating: sol → …/ultra, 5.5 → …/xhigh) — proves the
@@ -84,6 +85,11 @@ test("claudePermValue: plan→auto, everything else passes through", () => {
   assert.equal(claudePermValue("auto"), "auto")
   assert.equal(claudePermValue("bypassPermissions"), "bypassPermissions")
   assert.equal(claudePermValue("acceptEdits"), "acceptEdits")
+})
+
+test("bypass/full-access uses the ordinary permission readout color", () => {
+  assert.equal(PERMISSION_COLOR.bypassPermissions, PERMISSION_COLOR.default)
+  assert.equal(PERMISSION_COLOR.bypassPermissions, "text-muted")
 })
 
 test("permValueFor: dispatches to the codex vs claude mapper by backend", () => {

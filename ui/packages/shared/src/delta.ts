@@ -1,4 +1,4 @@
-import type { BoardSnapshot, ThreadView, BoardMeta, BoardDelta } from "./index.ts"
+import type { BoardSnapshot, ThreadView, BoardMeta, BoardDelta, ThreadSlug } from "./index.ts"
 
 // Keyed thread-level delta engine — the server side of the /events delta protocol. Type-only imports
 // above (erased at compile time) so this file has NO runtime dependency on index.ts and can't form an
@@ -28,7 +28,7 @@ function metaOf(b: BoardSnapshot): BoardMeta {
 }
 
 // The shape the differ hands back — the payload of a `board-delta` event minus the type/bootId envelope.
-export type BoardDiff = { seq: number; upserts: ThreadView[]; removed: string[]; meta?: BoardMeta }
+export type BoardDiff = { seq: number; upserts: ThreadView[]; removed: ThreadSlug[]; meta?: BoardMeta }
 
 export class BoardDiffer {
   // id -> serialized ThreadView JSON, for the last snapshot we emitted a diff for.
@@ -119,11 +119,14 @@ export function deltaAction(currentSeq: number, deltaSeq: number): "apply" | "ig
 // none yet); `incoming` = the boot id on a fresh server frame/response.
 //   - NOOP   when there's no incoming id (pre-restart server / unknown), or it matches what we know.
 //   - RECORD the id on first sight (nothing to compare against yet).
-//   - RELOAD once when it differs — the server restarted under a stale page. The caller records the new
-//     id BEFORE reloading, so the reloaded page sees known===incoming → NOOP → no reload loop.
-export function bootReloadDecision(known: string | null, incoming: string | null | undefined): "record" | "noop" | "reload" {
+//   - ADOPT a different id in place. The board transport obtains a new keyframe; mounted UI state
+//     remains intact instead of being discarded by document navigation.
+// A boot transition is transport information, not a navigation request.  The board connection will
+// acquire a fresh keyframe after a server restart; forcing a document reload here destroys local UI
+// state (notably an in-progress queue reply) exactly when a board delta is arriving.
+export function bootReloadDecision(known: string | null, incoming: string | null | undefined): "record" | "noop" | "adopt" {
   if (!incoming) return "noop"
   if (known === null) return "record"
   if (known === incoming) return "noop"
-  return "reload"
+  return "adopt"
 }

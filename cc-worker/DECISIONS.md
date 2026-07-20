@@ -7,7 +7,7 @@ consumed by fray-ui worker sessions: one interactive top-level
 human + the fray-ui app are the orchestrator; the worker just drives its one thread. This records
 what was ported from the orchestrator `cc/` plugin, what was dropped, and why.
 
-## Shared, never forked
+## Shared source, bundled runtime closure
 
 - **`scripts/fray/config.mjs` and `scripts/fray/agent-bindings.mjs` are THIN SHIMS** that
   `export *` from `../../../cc/scripts/fray/*.mjs`. cc-worker never copies config/vocab/binding
@@ -18,6 +18,10 @@ what was ported from the orchestrator `cc/` plugin, what was dropped, and why.
   `../../cc/scripts/fray/{index,thread-update}.mjs` relative to the bin file (cwd-independent). They
   land on the worker's Bash PATH the way cc's do. `fray-update` is the worker's primary tool for
   owning its one thread file; `fray` lets it read/validate the board.
+- **Portable artifact rule:** `ui/packages/cli/src/artifacts.ts` copies the exact sibling
+  `cc/scripts/fray/` module closure to `runtime/cc/scripts/fray/`, beside `runtime/cc-worker/`.
+  The existing shims therefore resolve inside an immutable artifact when the source checkout is gone;
+  both the worker and cc closure are hashed in `manifest.runtimeFiles` and required at read time.
 - **`agents/*.md`** are copied UNCHANGED from `cc/agents/` (16 profiles) — a worker dispatches its
   own helpers at the same model/effort cells as the orchestrator.
 
@@ -106,6 +110,17 @@ the worker SKILL.md additionally tells the worker not to run `fray on` / load th
 `name: "fray"` (renamed from `fray-worker` on 2026-07-08 — see the follow-up note), `version: "0.1.2"`,
 `license: "MIT"`. Hooks are auto-discovered from `hooks/hooks.json` (same as cc — plugin.json carries
 no explicit hooks reference); every hook command is wired via `${CLAUDE_PLUGIN_ROOT}`.
+
+## Claude settings-source isolation — deliberately deferred
+
+The portable worker launch passes its per-session plugin with `--plugin-dir` on both spawn and
+resume, and clears only `CLAUDE_CODE_SUBAGENT_MODEL` plus `CLAUDE_CODE_EFFORT_LEVEL`: those inherited
+variables would silently defeat Fray's selected worker/profile. It deliberately does **not** replace
+`HOME`, `CLAUDE_CONFIG_DIR`, or Claude's settings sources. Doing so would also change authentication,
+user-approved permissions, MCP configuration, and global plugin behavior; that is a product-policy
+decision, not an artifact-portability implementation detail. A future isolation policy must specify
+which settings/auth surfaces are preserved before adding `--settings`, a config-home override, or a
+global-plugin disable mechanism.
 
 ## 2026-07-02: Stop hook removed
 stop-flush.mjs is no longer wired (script kept for reference). User call: under fray-ui the
@@ -313,13 +328,13 @@ FINAL MESSAGE and PERSIST through a SCRATCHPAD. This is the cc-worker-side reali
   `ThreadFence` kind ∈ done|awaiting, `AwaitingHint` kind ∈ pr|ci|timer|session). Opening line is
   exactly ` ```done `/` ```awaiting ` (nothing after the language word); exactly one fence, at the end.
 
-**The scratchpad (`.fray/scratch/<session-id>.md`) — new §"Scratchpad" in both docs:** free-form
+**The scratchpad (`.fray/threads/<session-id>/scratch.md`) — new §"Scratchpad" in both docs:** free-form
 markdown, NO schema, NO validation. It is the worker's compaction-proof working memory (survive-
 compaction to-do lists / work queues / Ralph-style epic checklists live here, not in ephemeral
 context) AND the shared blackboard for parallel sub-agents (shared state is written into it; its PATH
 is passed into every sub-agent prompt; helpers READ it, the worker folds their results back in). The
 path is server-established convention already wired through `shared` (`scratchpadPath`), `router.ts`
-(reads `.fray/scratch/<session_id>.md`), and `dispatch.ts`.
+(reads `.fray/threads/<session_id>/scratch.md`), and `dispatch.ts`.
 
 **Hooks changed:**
 - **DELETED `hooks/thread-frontmatter-validate.mjs`** + its `hooks.json` PostToolUse `Edit|Write|
@@ -331,11 +346,11 @@ path is server-established convention already wired through `shared` (`scratchpa
 - **`hooks/session-seed.mjs`** — reseeded to the v2 contract: signal via the final message (bare rest
   is quiet; done queues checked completion; awaiting excuses a machine wait; question asks) + the
   scratchpad, whose concrete path is derived from
-  the SessionStart `session_id` (`currentSessionId(input.session_id)` → `.fray/scratch/<sid>.md`) and
+  the SessionStart `session_id` (`currentSessionId(input.session_id)` → `.fray/threads/<sid>/scratch.md`) and
   named in the seed. FRAY_UI_THREAD gating + the cc double-hook `off`-sentinel defense KEPT verbatim;
   the compact re-grounding now points at the scratchpad, not a thread file.
 - **`hooks/agent-dispatch.mjs`** — epilogue no longer says "don't edit `.fray/` thread files or
-  config.yml"; now "don't edit the dispatcher's scratchpad (`.fray/scratch/…`) — READ it for shared
+  config.yml"; now "don't edit the dispatcher's scratchpad (`.fray/threads/<session-id>/scratch.md`) — READ it for shared
   context if its path is in your prompt, report in your FINAL MESSAGE." Background/name-strip
   enforcement unchanged.
 - **`hooks/deny-ask.mjs`** — redirect retargeted off `fray-update … --status needs-human`: now "ask
@@ -363,7 +378,7 @@ section adds "pass the scratchpad path into helper prompts." `skills/dialectic` 
 + scratchpad blackboard + sub-agent profiles + deny-ask/deny-plan.
 
 **What the server/web verticals must know:** (a) FRAY_UI_THREAD must keep being passed at spawn — every
-hook still gates on it. (b) The scratchpad path convention is `.fray/scratch/<session-id>.md` where
+hook still gates on it. (b) The scratchpad path convention is `.fray/threads/<session-id>/scratch.md` where
 `<session-id>` is the pinned `--session-id` (the same id the SessionStart hook sees as `session_id`);
 the seed hook NAMES that concrete path to the worker, so dispatch must keep pinning `--session-id`.
 (c) `ui/packages/server/src/dispatch.ts` `composePrompt()` STILL emits the dead per-thread contract
@@ -424,8 +439,9 @@ discoverable.
 Major UI, server, and control-plane work may no longer reach `done` from unit/integration/mocked
 evidence alone. The canonical `ui/WORKER_PROMPT.md` contract now requires real Chrome CDP QA against
 a disposable full stack, relevant active/idle/error/restart coverage, desktop+narrow screenshots,
-console/network inspection, and an explicit correctness+aesthetics assessment. `agent-browser` is the
-preferred driver when available; mocked DOM/routes can supplement but cannot be the sole evidence.
+console/network inspection, and an explicit correctness+aesthetics assessment. Chrome DevTools MCP is
+preferred when it is available to the current provider; `agent-browser` or the repository Puppeteer
+harness are explicit fallbacks. Mocked DOM/routes can supplement but cannot be the sole evidence.
 
 Completion also requires two distinct review passes: the implementer's self-review of diff+evidence,
 then an independent fresh-context adversarial review; confirmed findings are fixed and affected gates

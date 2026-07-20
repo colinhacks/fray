@@ -1,5 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
+import { GITHUB_DISPATCH_UI_BOUNDARY } from "@fray-ui/shared"
 import {
   sumReactions,
   commentCount,
@@ -167,6 +168,23 @@ test("renderGithubPrompt: substitutes all tokens + prepends the THREAD tag", () 
   assert.ok(p.includes("When I switch accounts the token is wrong."))
 })
 
+test("renderGithubPrompt: generated compact lead precedes an exact UI boundary; full template remains below it", () => {
+  const template = "INTERNAL TEMPLATE\nRepo={repo}\nBody={body}\n<!-- ordinary-custom-comment -->"
+  const p = renderGithubPrompt(template, "cli/cli", issue, "investigate-cli-cli-326", "issue")
+  const marker = `\n\n${GITHUB_DISPATCH_UI_BOUNDARY}\n\n`
+  const cut = p.indexOf(marker)
+  assert.notEqual(cut, -1)
+  assert.equal(
+    p.slice(0, cut),
+    "THREAD: investigate-cli-cli-326\n\nInvestigate this issue and make recommendations\n\nIssue #326: Support multiple accounts\nRepository: cli/cli\nURL: https://github.com/cli/cli/issues/326",
+  )
+  assert.equal(
+    p.slice(cut + marker.length),
+    "INTERNAL TEMPLATE\nRepo=cli/cli\nBody=When I switch accounts the token is wrong.\n<!-- ordinary-custom-comment -->",
+  )
+  assert.equal(p.split(GITHUB_DISPATCH_UI_BOUNDARY).length - 1, 1)
+})
+
 test("renderGithubPrompt: empty labels render 'none'", () => {
   const p = renderGithubPrompt("Labels: {labels}", "cli/cli", { ...issue, labels: [] }, "s", "issue")
   assert.ok(p.includes("Labels: none"))
@@ -200,15 +218,21 @@ test("DEFAULT_ISSUE_PROMPT: branches on bug vs feature; DEFAULT_PR_PROMPT is the
   assert.ok(DEFAULT_ISSUE_PROMPT.includes("REPRODUCE"))
   assert.ok(DEFAULT_ISSUE_PROMPT.includes("IMPACT"))
   assert.ok(DEFAULT_ISSUE_PROMPT.includes("read-only"))
+  assert.ok(DEFAULT_ISSUE_PROMPT.includes("```done```"))
+  assert.ok(!DEFAULT_ISSUE_PROMPT.includes("bare rest"))
   // The defaults are TEMPLATES: they carry {token}s and NOT the THREAD tag (the server prepends it).
   assert.ok(DEFAULT_ISSUE_PROMPT.includes("{repo}") && DEFAULT_ISSUE_PROMPT.includes("{n}"))
   assert.ok(!DEFAULT_ISSUE_PROMPT.includes("THREAD:"))
   // PR default is the adversarial audit template.
   assert.ok(DEFAULT_PR_PROMPT.includes("AUDIT thread"))
   assert.ok(DEFAULT_PR_PROMPT.includes("gh pr diff {n} -R {repo}"))
+  assert.ok(DEFAULT_PR_PROMPT.includes("keep CI/bot/merge"))
+  assert.ok(DEFAULT_PR_PROMPT.includes("backend wait primitive"))
+  assert.ok(DEFAULT_PR_PROMPT.includes("```done```"))
+  assert.ok(!DEFAULT_PR_PROMPT.includes("bare rest"))
   assert.ok(!DEFAULT_PR_PROMPT.includes("THREAD:"))
-  // The body is NOT inlined in the shipped defaults — the worker fetches it via the gh CLI, so the
-  // dispatched first-message bubble stays small (a giant issue/PR body used to flood the whole thread UI).
+  // The body is NOT inlined in the shipped defaults — the worker fetches it via the gh CLI, keeping
+  // prompt transport small (the generated UI boundary separately keeps the visible bubble compact).
   assert.ok(!DEFAULT_ISSUE_PROMPT.includes("{body}"), "issue default must not inline the body")
   assert.ok(!DEFAULT_PR_PROMPT.includes("{body}"), "PR default must not inline the body")
   assert.ok(DEFAULT_ISSUE_PROMPT.includes("gh issue view {n} -R {repo}"))

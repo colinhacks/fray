@@ -210,6 +210,29 @@ test("applyRecord: ai-title captures latest non-empty title without moving turn 
   assert.equal(computeTurn(s, Date.parse("2026-07-01T00:00:01.000Z")), "idle")
 })
 
+test("applyRecord: custom-title carries a monotonic native /rename revision separate from ai-title churn", () => {
+  const s = newTailState("t", "s", "/x")
+  applyRecord(s, { type: "ai-title", aiTitle: "Automatic title" })
+  assert.equal(s.customTitleRevision, 0)
+  assert.equal(s.customTitle, undefined)
+  applyRecord(s, { type: "custom-title", customTitle: "First native rename" })
+  applyRecord(s, { type: "custom-title", customTitle: "Second native rename" })
+  applyRecord(s, { type: "custom-title", customTitle: "   " })
+  assert.equal(s.customTitleRevision, 2)
+  assert.equal(s.customTitle, "Second native rename")
+  assert.equal(s.aiTitle, "Automatic title", "unconfirmed native rename records never reach board/file title surfaces")
+})
+
+test("applyRecord: /rename's isMeta user reminder does not wake an idle model turn", () => {
+  const s = newTailState("t", "s", "/x")
+  applyRecord(s, { type: "assistant", timestamp: "2026-07-01T00:00:00.000Z", message: { stop_reason: "end_turn", content: [{ type: "text", text: "done" }] } })
+  const activity = s.lastActivityAt
+  applyRecord(s, { type: "user", isMeta: true, timestamp: "2026-07-01T00:00:01.000Z", message: { content: "Session title is now Readable" } })
+  assert.equal(s.lastKind, "assistant")
+  assert.equal(s.lastActivityAt, activity)
+  assert.equal(computeTurn(s, Date.parse("2026-07-01T00:00:02.000Z")), "idle")
+})
+
 test("applyRecord: sidecar metadata records never move turn state", () => {
   const s = newTailState("t", "s", "/x")
   applyRecord(s, { type: "assistant", timestamp: "2026-07-01T00:00:00.000Z", message: { stop_reason: "end_turn", content: [{ type: "text", text: "done" }] } })
@@ -218,6 +241,18 @@ test("applyRecord: sidecar metadata records never move turn state", () => {
   applyRecord(s, { type: "attachment", timestamp: "2026-07-01T00:00:05.000Z" })
   assert.equal(s.lastKind, "assistant")
   assert.equal(s.lastStopReason, "end_turn")
+  assert.equal(computeTurn(s, Date.parse("2026-07-01T00:00:01.000Z")), "idle")
+})
+
+test("applyRecord: Claude permission-mode sidecars update the observed mode without moving turn state", () => {
+  const s = newTailState("t", "s", "/x")
+  applyRecord(s, { type: "assistant", timestamp: "2026-07-01T00:00:00.000Z", message: { stop_reason: "end_turn", content: [] } })
+  applyRecord(s, { type: "permission-mode", permissionMode: "auto" })
+  assert.equal(s.permissionMode, "auto")
+  applyRecord(s, { type: "permission-mode", permissionMode: "bypassPermissions" })
+  assert.equal(s.permissionMode, "bypassPermissions")
+  applyRecord(s, { type: "permission-mode", permissionMode: "not-a-real-mode" })
+  assert.equal(s.permissionMode, "bypassPermissions", "malformed sidecars never erase the last authoritative value")
   assert.equal(computeTurn(s, Date.parse("2026-07-01T00:00:01.000Z")), "idle")
 })
 
@@ -259,6 +294,14 @@ function bashBg(id: string, description: string | null, command: string) {
     message: { stop_reason: "tool_use", content: [{ type: "tool_use", name: "Bash", id, input: { command, run_in_background: true, ...(description != null ? { description } : {}) } }] },
   }
 }
+// A Claude Code Monitor is inherently a background watcher; persistent=true removes its timeout.
+function monitorUse(id: string, description: string, command: string, persistent = true) {
+  return {
+    type: "assistant",
+    timestamp: "2026-07-01T00:00:01.000Z",
+    message: { stop_reason: "tool_use", content: [{ type: "tool_use", name: "Monitor", id, input: { command, description, persistent } }] },
+  }
+}
 // A native AskUserQuestion tool_use (the safety-net trigger).
 function askUse(id: string, questions: unknown) {
   return {
@@ -280,6 +323,18 @@ test("applyRecord: a BACKGROUND Bash registers a SHELL op; a FOREGROUND Bash doe
   const e = s.subAgents.get("toolu_sh")
   assert.equal(e?.kind, "shell")
   assert.equal(e?.label, "Watch origin/main CI")
+})
+
+test("applyRecord: a Monitor registers the same live SHELL op and clears only on terminal notification", () => {
+  const s = newTailState("t", "s", "/x")
+  applyRecord(s, monitorUse("toolu_mon", "Watch PR checks", "gh pr checks 443 --watch"))
+  assert.equal(s.subAgents.get("toolu_mon")?.kind, "shell")
+  assert.equal(s.subAgents.get("toolu_mon")?.label, "Watch PR checks")
+  applyRecord(s, resultText("toolu_mon", "Monitor started with ID: mon-12. You will be notified when events arrive."))
+  assert.equal(s.subAgents.size, 1, "a Monitor launch ack must not retire the live watcher")
+  applyRecord(s, taskNotification("toolu_mon", "completed"))
+  assert.equal(s.subAgents.size, 0)
+  assert.equal(s.retiredSubAgents.size, 0, "Monitors are display-only like background Bash")
 })
 
 test("applyRecord: a background shell without a description labels from the command's first line", () => {
@@ -311,11 +366,12 @@ test("applyRecord: a shell's REAL launch ack ('Command running in background…'
   assert.equal(s.subAgents.get("toolu_sh")?.outputFile, "/tmp/tasks/b8p363n40.output", "sentence period stripped from the captured path")
 })
 
-test("applyRecord: a shell tool_result NEVER retires it, even non-ack-shaped (notification is the only terminal)", () => {
+test("applyRecord: a non-ack shell tool_result retires a failed synchronous launch (no phantom live op)", () => {
   const s = newTailState("t", "s", "/x")
   applyRecord(s, bashBg("toolu_sh", "Watch CI", "gh run watch"))
-  applyRecord(s, resultText("toolu_sh", "some unexpected result text"))
-  assert.equal(s.subAgents.size, 1)
+  applyRecord(s, resultText("toolu_sh", "Error: Monitor is unavailable"))
+  assert.equal(s.subAgents.size, 0)
+  assert.equal(s.retiredSubAgents.size, 0)
 })
 
 test("applyRecord: the mailbox agent ack ('Spawned successfully…', no path) keeps tracking + derives the subagents path from agentId", () => {
@@ -461,6 +517,39 @@ test("tailer: surfaces running vs stale sub-agents (via injected mtime) and clea
   t.tick()
   assert.deepEqual(t.get("t")?.subAgents, [])
   assert.ok(h.changes.n > before2, "clearing a sub-agent marks the board dirty")
+})
+
+test("tailer: a dead pane clears its background shells — a shell cannot outlive the agent process", () => {
+  const h = harness()
+  h.storage.upsertSession(row())
+  const shellLine = JSON.stringify(bashBg("toolu_sh", "Watch CI", "gh run watch"))
+  const ackLine = JSON.stringify(resultText("toolu_sh", "Command running in background with ID: b8p. Output is being written to: /tmp/tasks/b8p.output. You will be notified when it completes."))
+  fixture(h.logDir, "sid", [IN_FLIGHT, shellLine, ackLine])
+  const shellMtime = Date.parse("2026-07-01T00:00:02.000Z")
+  const t = createTailer({
+    project: { cwdSlug: "x" } as Project,
+    storage: h.storage,
+    bus: h.bus,
+    onChange: () => h.changes.n++,
+    now: () => h.clock.ms,
+    paneDead: () => h.dead.v,
+    capturePane: () => h.pane.text,
+    sessionLogDir: h.logDir,
+    mtimeMs: () => shellMtime,
+  })
+
+  h.clock.ms = Date.parse("2026-07-01T00:01:00.000Z") // <5min since shell output → live
+  t.tick()
+  assert.deepEqual(t.get("t")?.bgShells, [{ label: "Watch CI", startedAt: "2026-07-01T00:00:01.000Z", state: "running" }])
+
+  // The agent process dies (its tmux pane went dead) WITHOUT a terminal notification landing for the
+  // shell. The shell is a child of that process, so it died with it — the board must stop reporting it
+  // as live (otherwise it would breathe "alive" forever).
+  h.dead.v = true
+  const before = h.changes.n
+  t.tick()
+  assert.deepEqual(t.get("t")?.bgShells, [], "a dead pane owns no live background shells")
+  assert.ok(h.changes.n > before, "the shell vanishing marks the board dirty")
 })
 
 test("tailer: subAgent() resolves a LIVE child, then its RETAINED completion, then undefined for unknown", () => {
@@ -609,13 +698,19 @@ const PANE_PERM_EDIT = [
   " Esc to cancel · Tab to amend",
 ].join("\n")
 
-// Negative: a normal streaming turn (spinner + "esc to interrupt"), no modal.
+// Negative: a normal streaming turn. A real mid-turn pane KEEPS the whole composer (divider, `❯` row,
+// divider, project line, mode line) — verified against live claude 2.1.214 — so this fixture carries it
+// and therefore exercises the composer gate, not only the content gate.
 const PANE_STREAMING = [
   "❯ Use the Edit tool to change the word hello to goodbye in file.txt",
   "  Reading 1 file…",
   "  ⎿  file.txt",
   "✳ Canoodling… (11s · ↑ 95 tokens)",
-  "  esc to interrupt",
+  "────────────────────────────────────────",
+  "❯ ",
+  "────────────────────────────────────────",
+  "  permtest · main · Fable 5 · 3%",
+  "  ⏵⏵ auto mode on (shift+tab to cycle)",
 ].join("\n")
 
 // Negative: idle at the prompt.
@@ -630,9 +725,87 @@ const PANE_MODEL_LIST = [
   "  Which would you prefer?",
 ].join("\n")
 
-test("matchesPermPrompt: fires on real Bash + Edit approval panes", () => {
+// Real capture of the PRE-BOOT workspace-trust prompt — a third modal shape, and the one every fresh
+// worker in an untrusted cwd hits. No question line; the footer alone must carry it.
+const PANE_PERM_TRUST = [
+  " Accessing workspace:",
+  " /tmp/repro",
+  " Quick safety check: Is this a project you created or one you trust?",
+  " Claude Code'll be able to read, edit, and execute files here.",
+  " Security guide",
+  " ❯ 1. Yes, I trust this folder",
+  "   2. No, exit",
+  " Enter to confirm · Esc to cancel",
+].join("\n")
+
+// Real capture (2026-07-18, claude 2.x, live worker) of the FALSE POSITIVE that parked healthy auto-mode
+// threads in Needs-you: the agent's own reply quotes a prompt's lines while the composer — `❯` row,
+// divider, project line, `⏸ manual mode on` — is still on screen and accepting input. Content-only
+// matching fires here; the composer's presence in the last rows proves it must not.
+const PANE_QUOTING_PROMPT = [
+  "⏺ Do you want to proceed?",
+  "  1. Yes",
+  "  2. No",
+  "  Esc to cancel",
+  "✻ Crunched for 1s",
+  "────────────────────────────────────────",
+  "❯ ",
+  "────────────────────────────────────────",
+  "  repro · main · Haiku 4.5 · 17%                    /rc",
+  "  ⏸ manual mode on · ← 3 agents",
+].join("\n")
+
+// Same quote under every other mode line, since the mode the worker runs in must not change the verdict.
+const quotingUnderMode = (mode: string) => PANE_QUOTING_PROMPT.replace("⏸ manual mode on", mode)
+
+// The modal shape scrolled up into history, with real output below it and the composer at the bottom —
+// the same class as above but with the signals well outside the modal's tail window.
+const PANE_SCROLLED_PAST_PROMPT = [
+  " Do you want to proceed?",
+  " ❯ 1. Yes",
+  "   2. No",
+  " Esc to cancel · Tab to amend",
+  ...Array.from({ length: 14 }, (_, i) => `⏺ later output line ${i}`),
+  "❯ ",
+  "  repro · main · Opus 4.8 · 7%",
+  "  ⏵⏵ auto mode on · ← 3 agents",
+].join("\n")
+
+// Real capture of the ExitPlanMode approval (claude 2.1.214). It shares NEITHER original content
+// spelling — the question is "Would you like to proceed?" and the footer is "ctrl+g to edit in VS Code"
+// — so it was silently invisible. A miss here hangs the worker forever: `detectNativeInput` is a Codex-
+// only backend hook, leaving this matcher as the sole blocking-modal signal for a Claude worker.
+const PANE_PERM_EXIT_PLAN = [
+  "   Claude has written up a plan and is ready to execute. Would you like to proceed?",
+  "   ❯ 1. Yes, and use auto mode",
+  "     2. Yes, manually approve edits",
+  "     3. No, refine with Ultraplan on Claude Code on the web",
+  "     4. Tell Claude what to change",
+  "        shift+tab to approve with this feedback",
+  "   ctrl+g to edit in VS Code · ~/.claude/plans/plan-name.md",
+].join("\n")
+
+// Real capture shape of `ctrl+o`'s detailed-transcript view: it REPLACES the composer with its own
+// footer, so the pane is composer-less yet fully live — and the toggle is sticky for the session. A
+// worker quoting prompt text under it re-tripped the matcher until this footer counted as a composer.
+const PANE_TRANSCRIPT_VIEW = [
+  "⏺ Do you want to proceed?",
+  "  1. Yes",
+  "  2. No",
+  "  Esc to cancel",
+  "  Showing detailed transcript · ctrl+o to toggle · ↑↓ scroll · v to open in code · ? for shortcuts    verbose",
+].join("\n")
+
+test("matchesPermPrompt: fires on real Bash + Edit + trust + ExitPlanMode approval panes", () => {
   assert.equal(matchesPermPrompt(PANE_PERM_BASH), true)
   assert.equal(matchesPermPrompt(PANE_PERM_EDIT), true)
+  assert.equal(matchesPermPrompt(PANE_PERM_TRUST), true)
+  assert.equal(matchesPermPrompt(PANE_PERM_EXIT_PLAN), true)
+})
+
+// The ctrl+o view is composer-less but LIVE, so it must not be read as a modal.
+test("matchesPermPrompt: the ctrl+o transcript view counts as a live composer", () => {
+  assert.equal(matchesPermPrompt(PANE_TRANSCRIPT_VIEW), false)
 })
 
 test("matchesPermPrompt: rejects streaming / idle / a model's own numbered list / empty", () => {
@@ -642,6 +815,26 @@ test("matchesPermPrompt: rejects streaming / idle / a model's own numbered list 
   assert.equal(matchesPermPrompt(""), false)
 })
 
+// A live composer in the last rows means the TUI is accepting input, so every prompt signal on screen
+// is transcript text. Without this the thread oscillated between the sidebar's running band and
+// Needs-you on every ≥PERM_SNIFF_MS quiet gap (reported 2026-07-18).
+test("matchesPermPrompt: a visible composer footer beats quoted prompt text in any mode", () => {
+  assert.equal(matchesPermPrompt(PANE_QUOTING_PROMPT), false)
+  for (const mode of ["⏵⏵ auto mode on (shift+tab to cycle)", "⏵ accept edits on", "⏵⏵ bypass permissions on", "⏸ plan mode on"]) {
+    assert.equal(matchesPermPrompt(quotingUnderMode(mode)), false, mode)
+  }
+})
+
+test("matchesPermPrompt: only the modal's own tail counts — scrolled-past prompt text does not", () => {
+  assert.equal(matchesPermPrompt(PANE_SCROLLED_PAST_PROMPT), false)
+})
+
+// Fail-safe direction: the composer gate reads only the last rows, so an agent that merely PRINTS a
+// mode line mid-transcript can never suppress a genuine prompt sitting at the bottom of the pane.
+test("matchesPermPrompt: a mode line in transcript history does not suppress a real prompt", () => {
+  assert.equal(matchesPermPrompt(["⏺ The footer reads: ⏵⏵ auto mode on", ...PANE_PERM_BASH.split("\n")].join("\n")), true)
+})
+
 // ---- integration: tick loop over a fixture transcript ----
 
 // A couple of real-shaped lines (copied from the corpus schema) plus sidecar noise.
@@ -649,6 +842,9 @@ const IN_FLIGHT = JSON.stringify({ type: "user", timestamp: "2026-07-01T00:00:00
 const TOOL = JSON.stringify({ type: "assistant", timestamp: "2026-07-01T00:00:01.000Z", message: { stop_reason: "tool_use", content: [{ type: "tool_use", name: "Bash" }] } })
 const DONE = JSON.stringify({ type: "assistant", timestamp: "2026-07-01T00:00:02.000Z", message: { stop_reason: "end_turn", content: [{ type: "text", text: "all done" }] } })
 const TITLE = JSON.stringify({ type: "ai-title", aiTitle: "x" })
+const PERMISSION_AUTO = JSON.stringify({ type: "permission-mode", permissionMode: "auto", sessionId: "sid" })
+const PERMISSION_DEFAULT = JSON.stringify({ type: "permission-mode", permissionMode: "default", sessionId: "sid" })
+const PERMISSION_BYPASS = JSON.stringify({ type: "permission-mode", permissionMode: "bypassPermissions", sessionId: "sid" })
 
 function fixture(dir: string, sessionId: string, lines: string[]) {
   writeFileSync(join(dir, `${sessionId}.jsonl`), lines.map((l) => l + "\n").join(""))
@@ -662,7 +858,7 @@ interface Harness {
   changes: { n: number }
   clock: { ms: number }
   dead: { v: boolean }
-  pane: { text: string }
+  pane: { text: string; reads: number }
 }
 
 function harness(): Harness {
@@ -671,7 +867,7 @@ function harness(): Harness {
   const bus = new Bus()
   const events: ServerEvent[] = []
   bus.subscribe((e) => events.push(e))
-  return { storage, bus, events, logDir: dir, changes: { n: 0 }, clock: { ms: 1000 }, dead: { v: false }, pane: { text: "" } }
+  return { storage, bus, events, logDir: dir, changes: { n: 0 }, clock: { ms: 1000 }, dead: { v: false }, pane: { text: "", reads: 0 } }
 }
 
 function makeTailer(h: Harness) {
@@ -682,13 +878,18 @@ function makeTailer(h: Harness) {
     onChange: () => h.changes.n++,
     now: () => h.clock.ms,
     paneDead: () => h.dead.v,
-    capturePane: () => h.pane.text,
+    capturePane: () => {
+      h.pane.reads++
+      return h.pane.text
+    },
     sessionLogDir: h.logDir,
   })
 }
 
 function row(over: Partial<SessionRow> = {}): SessionRow {
-  return { slug: "t", session_id: "sid", tmux_name: "fray-t", spawned_at: "2026-07-01T00:00:00.000Z", last_read_at: null, unread: 0, exited: 0, archived: 0, rested_at: null, title_auto: 0, title: null, state: null, meta: null, seen_at: null, plan_path: null, transcript_id: null, ...over }
+  const result = { slug: "t", session_id: "sid", tmux_name: "fray-t", spawned_at: "2026-07-01T00:00:00.000Z", last_read_at: null, unread: 0, exited: 0, archived: 0, rested_at: null, title_auto: 0, title: null, state: null, meta: null, seen_at: null, plan_path: null, transcript_id: null, ...over }
+  if (over.slug !== undefined && over.tmux_name === undefined) result.tmux_name = `fray-${result.slug}`
+  return result
 }
 
 test("tailer: primes an already-finished transcript WITHOUT a turn-done notify", () => {
@@ -705,6 +906,208 @@ test("tailer: primes an already-finished transcript WITHOUT a turn-done notify",
   assert.equal(tele?.lastAssistant, "all done")
   assert.equal(tele?.lastActivityAt, "2026-07-01T00:00:02.000Z")
   assert.equal(tele?.aiTitle, "x") // ai-title sidecar surfaces through telemetry
+})
+
+test("tailer: finalized adoption capture is atomic and never falls through to a same-name pane", () => {
+  const h = harness()
+  const token = "11111111-1111-4111-8111-111111111111"
+  assert.equal(h.storage.reserveAdoptionClaim({ slug: "t", attemptToken: token, sessionId: "sid", reservedAtMs: 1, leaseExpiresAtMs: 2 }), true)
+  assert.equal(h.storage.recordAdoptionPane("t", token, { paneId: "%15", panePid: 1500, sessionCreated: 15000 }, 2), true)
+  assert.equal(h.storage.finalizeAdoptionClaim("t", token, row(), 2), true)
+  fixture(h.logDir, "sid", [IN_FLIGHT])
+  h.clock.ms = Date.parse("2026-07-01T00:00:03.000Z")
+  let slugCaptures = 0
+  let exactCaptures = 0
+  const t = createTailer({
+    project: { cwdSlug: "x" } as Project,
+    storage: h.storage,
+    bus: h.bus,
+    onChange: () => {},
+    now: () => h.clock.ms,
+    paneDead: () => false,
+    capturePane: () => { slugCaptures++; return "COMPETITOR APPROVAL SCREEN" },
+    findExpectedAdoptionPane: () => ({
+      kind: "found",
+      pane: { paneId: "%15", panePid: 1500, sessionCreated: 15000, dead: false, adoptionAttemptToken: token },
+    }),
+    captureExpectedAdoptionPane: () => {
+      exactCaptures++
+      return { kind: "unavailable" } // owner replaced inside the one conditional capture
+    },
+    sessionLogDir: h.logDir,
+  })
+  t.tick()
+  h.clock.ms += 2_000
+  t.tick()
+  assert.ok(exactCaptures > 0)
+  assert.equal(slugCaptures, 0, "a failed exact capture never reads the reusable-name competitor")
+  assert.equal(t.get("t")?.permPrompt, false)
+})
+
+test("tailer rejects a stale row snapshot without name-dead checks or name capture", () => {
+  const h = harness()
+  const stale = row({ session_id: "owner-a", runtime_generation: 4 })
+  h.storage.upsertSession(stale)
+  h.storage.upsertSession(row({ session_id: "owner-b", runtime_generation: 0 }))
+  fixture(h.logDir, stale.session_id, [IN_FLIGHT])
+  const staleStorage = new Proxy(h.storage, {
+    get(target, property, receiver) {
+      if (property === "allSessions") return () => [stale]
+      const value = Reflect.get(target, property, receiver)
+      return typeof value === "function" ? value.bind(target) : value
+    },
+  })
+  let nameDeadChecks = 0
+  let nameCaptures = 0
+  const t = createTailer({
+    project: { cwdSlug: "x" } as Project,
+    storage: staleStorage,
+    bus: h.bus,
+    onChange: () => {},
+    now: () => h.clock.ms,
+    paneDead: () => { nameDeadChecks++; return false },
+    capturePane: () => { nameCaptures++; return "COMPETITOR APPROVAL SCREEN" },
+    sessionLogDir: h.logDir,
+  })
+  t.tick()
+  h.clock.ms += 10_000
+  t.tick()
+  assert.equal(nameDeadChecks, 0)
+  assert.equal(nameCaptures, 0)
+  assert.equal(t.get(stale.slug), undefined, "cached telemetry for stale A is never exposed under replacement B")
+})
+
+test("tailer: Claude permission mode initializes from the transcript and persists later live transitions", () => {
+  const h = harness()
+  h.storage.upsertSession(row({ backend: "claude", permission_mode: null }))
+  fixture(h.logDir, "sid", [PERMISSION_AUTO, IN_FLIGHT, DONE])
+  const t = makeTailer(h)
+  t.tick()
+  assert.equal(t.get("t")?.permissionMode, "auto")
+  assert.equal(h.storage.getSession("t")?.permission_mode, "auto", "hard reload starts from the observed runtime mode")
+
+  h.pane.text = "history\n❯\u00a0\n────────\n  bypass permissions on"
+  appendFileSync(join(h.logDir, "sid.jsonl"), PERMISSION_BYPASS + "\n")
+  t.tick()
+  assert.equal(t.get("t")?.permissionMode, "bypassPermissions")
+  assert.equal(h.storage.getSession("t")?.permission_mode, "bypassPermissions", "a live backend transition becomes durable")
+})
+
+test("tailer: restart replay cannot clobber a newer persisted Claude reattach mode with an old sidecar", () => {
+  const h = harness()
+  h.storage.upsertSession(row({ backend: "claude", permission_mode: "bypassPermissions" }))
+  fixture(h.logDir, "sid", [PERMISSION_AUTO, IN_FLIGHT, DONE])
+  const t = makeTailer(h)
+  t.tick()
+  assert.equal(t.get("t")?.permissionMode, "auto", "the historical fold remains observable")
+  assert.equal(h.storage.getSession("t")?.permission_mode, "bypassPermissions", "the exact newer launch flag remains authoritative")
+})
+
+test("tailer: a new runtime generation resets its byte cursor before reading replacement output", () => {
+  const h = harness()
+  h.storage.upsertSession(row({ backend: "claude", permission_mode: "auto" }))
+  fixture(h.logDir, "sid", [IN_FLIGHT, DONE])
+  const t = makeTailer(h)
+  t.tick()
+  assert.equal(t.get("t")?.lastAssistant, "all done")
+
+  const saved = h.storage.getSession("t")!
+  assert.equal(
+    h.storage.beginRuntimeGeneration(
+      "t",
+      { sessionId: saved.session_id, generation: saved.runtime_generation ?? 0, permissionPending: null },
+      "2026-07-01T00:00:03.000Z",
+    ),
+    1,
+  )
+  const replacementText = "replacement generation output is deliberately longer than the old transcript cursor"
+  fixture(h.logDir, "sid", [
+    JSON.stringify({
+      type: "assistant",
+      timestamp: "2026-07-01T00:00:04.000Z",
+      message: { stop_reason: "end_turn", content: [{ type: "text", text: replacementText }] },
+    }),
+  ])
+  t.tick()
+  assert.equal(t.get("t")?.lastAssistant, replacementText)
+  assert.equal(h.events.length, 0, "generation replacement primes silently instead of emitting historical completion")
+})
+
+test("tailer: a late old-Claude sidecar cannot overwrite the verified current pane footer", () => {
+  const h = harness()
+  h.storage.upsertSession(row({ backend: "claude", permission_mode: "bypassPermissions" }))
+  fixture(h.logDir, "sid", [PERMISSION_AUTO, IN_FLIGHT, DONE])
+  h.pane.text = "history\n❯\u00a0\n────────\n  bypass permissions on"
+  const t = makeTailer(h)
+  t.tick()
+  t.notePermissionMode?.("t", "bypassPermissions")
+
+  appendFileSync(join(h.logDir, "sid.jsonl"), PERMISSION_DEFAULT + "\n")
+  t.tick()
+  assert.equal(t.get("t")?.permissionMode, "bypassPermissions")
+  assert.equal(h.storage.getSession("t")?.permission_mode, "bypassPermissions")
+})
+
+test("tailer: a permanently mismatched Claude sidecar expires without a capture/write hot loop", () => {
+  const h = harness()
+  h.storage.upsertSession(row({ backend: "claude", permission_mode: "bypassPermissions" }))
+  fixture(h.logDir, "sid", [PERMISSION_BYPASS, IN_FLIGHT, DONE])
+  h.pane.text = "history\n❯\u00a0\n────────\n  bypass permissions on"
+  const t = makeTailer(h)
+  t.tick()
+
+  let writes = 0
+  const persistObserved = h.storage.setObservedPermissionIfCurrent.bind(h.storage)
+  h.storage.setObservedPermissionIfCurrent = (...args) => {
+    writes++
+    return persistObserved(...args)
+  }
+  h.pane.reads = 0
+  appendFileSync(join(h.logDir, "sid.jsonl"), PERMISSION_DEFAULT + "\n")
+  t.tick() // arrival poll: old footer still wins
+  t.tick() // redraw opportunity one
+  t.tick() // redraw opportunity two: stable mismatch expires
+
+  const readsAfterExpiry = h.pane.reads
+  const changesAfterExpiry = h.changes.n
+  t.tick()
+  t.tick()
+  assert.equal(h.pane.reads, readsAfterExpiry, "expired candidates stop synchronous capture-pane polling")
+  assert.equal(writes, 0, "an unchanged authoritative footer never causes a SQLite write")
+  assert.equal(h.changes.n, changesAfterExpiry, "expired candidates stop producing board changes")
+  assert.equal(h.storage.getSession("t")?.permission_mode, "bypassPermissions")
+})
+
+test("tailer: the handoff barrier folds an old-process sidecar before recording the launch fallback", () => {
+  const h = harness()
+  h.clock.ms = Date.parse("2026-07-01T00:00:10.000Z")
+  h.storage.upsertSession(row({ backend: "claude", permission_mode: "auto" }))
+  fixture(h.logDir, "sid", [PERMISSION_AUTO, IN_FLIGHT, DONE])
+  const t = makeTailer(h)
+  t.tick()
+
+  // The permission controller performs this exact post-reattach tick before notePermissionMode: every
+  // sidecar flushed by the killed pane is consumed first.
+  h.pane.text = "history\n❯\u00a0\n────────\n  auto mode on"
+  appendFileSync(join(h.logDir, "sid.jsonl"), PERMISSION_DEFAULT + "\n")
+  t.tick()
+  assert.equal(t.get("t")?.permissionMode, "auto", "the still-current pane footer defers its one-redraw-early sidecar")
+  h.pane.text = "history\n❯\u00a0\n────────\n  manual mode on"
+  t.tick()
+  assert.equal(t.get("t")?.permissionMode, "default", "the candidate survives until its matching footer redraw lands")
+  assert.equal(h.storage.getSession("t")?.permission_mode, "default")
+
+  h.storage.setPermissionMode("t", "bypassPermissions")
+  t.notePermissionMode?.("t", "bypassPermissions")
+  assert.equal(t.get("t")?.permissionMode, "bypassPermissions")
+  assert.equal(h.storage.getSession("t")?.permission_mode, "bypassPermissions", "the launch fallback is recorded after the barrier")
+
+  // Any profile appended after that barrier belongs to the current backend and is authoritative. This
+  // covers model/version coercion as well as a human-native permission transition.
+  h.pane.text = "history\n❯\u00a0\n────────\n  manual mode on"
+  appendFileSync(join(h.logDir, "sid.jsonl"), PERMISSION_DEFAULT + "\n")
+  t.tick()
+  assert.equal(h.storage.getSession("t")?.permission_mode, "default", "a later backend report is observed immediately")
 })
 
 test("tailer: in-flight → idle fires exactly one turn-done + sets unread", () => {
@@ -834,21 +1237,27 @@ test("parseSignalFence: END-ANCHORED — a fence with prose after it is quoted/e
   assert.deepEqual(parseSignalFence("all done\n\n```done\nShipped.\n```\n  \n"), { kind: "done", body: "Shipped.", hints: [] })
 })
 
-test("parseSignalFence: an awaiting fence parses pr/ci/timer/session hints + a prose body", () => {
-  const f = parseSignalFence("```awaiting\npr: 391\nci: build #42\ntimer: 2026-07-02T00:00:00Z\nsession: abc-123\nWaiting on green CI before merge.\n```")
+test("parseSignalFence: an awaiting fence parses current human/timer and legacy pr/ci/session hints", () => {
+  const f = parseSignalFence("```awaiting\nhuman: repo maintainer must approve fork CI\ntimer: 2026-07-02T00:00:00Z\npr: 391\nci: build #42\nsession: abc-123\nWaiting on a named gate.\n```")
   assert.equal(f?.kind, "awaiting")
-  assert.equal(f?.body, "Waiting on green CI before merge.")
+  assert.equal(f?.body, "Waiting on a named gate.")
   assert.deepEqual(f?.hints, [
+    { kind: "human", value: "repo maintainer must approve fork CI" },
+    { kind: "timer", value: "2026-07-02T00:00:00Z" },
     { kind: "pr", value: "391" },
     { kind: "ci", value: "build #42" },
-    { kind: "timer", value: "2026-07-02T00:00:00Z" },
     { kind: "session", value: "abc-123" },
   ])
 })
 
 test("parseSignalFence: hint kind is case-insensitive, lowercased on output; hints-only body is empty", () => {
-  const f = parseSignalFence("```awaiting\nPR: 391\nCi: green\n```")
-  assert.deepEqual(f?.hints, [{ kind: "pr", value: "391" }, { kind: "ci", value: "green" }])
+  const f = parseSignalFence("```awaiting\nHUMAN: Alice must approve\nTiMeR: 2026-07-15T17:00:00Z\nPR: 391\nCi: green\n```")
+  assert.deepEqual(f?.hints, [
+    { kind: "human", value: "Alice must approve" },
+    { kind: "timer", value: "2026-07-15T17:00:00Z" },
+    { kind: "pr", value: "391" },
+    { kind: "ci", value: "green" },
+  ])
   assert.equal(f?.body, "")
 })
 
@@ -1051,7 +1460,7 @@ const PAST_GRACE = Date.parse("2026-07-01T00:01:01.000Z") // 61s after SPAWN (> 
 
 // A drifted transcript: lives at `fileId`.jsonl but carries `ownerId`'s scratchpad sentinel in content.
 function driftedFixture(dir: string, fileId: string, ownerId: string, tail: string[] = [DONE]) {
-  const sentinel = JSON.stringify({ type: "user", timestamp: SPAWN, message: { role: "user", content: `Your scratchpad is \`.fray/scratch/${ownerId}.md\` — keep state here.` } })
+  const sentinel = JSON.stringify({ type: "user", timestamp: SPAWN, message: { role: "user", content: `Your scratchpad is \`.fray/threads/${ownerId}/scratch.md\` — keep state here.` } })
   fixture(dir, fileId, [sentinel, ...tail])
 }
 
@@ -1145,6 +1554,49 @@ test("tailer: discovers a drifted transcript by sentinel, re-links + caches tran
   assert.equal(h.events.length, before, "a discovered transcript replays as a SILENT prime — no spurious turn-done notify")
 })
 
+test("tailer: a replacement during transcript discovery cannot inherit or transiently expose the stale transcript", () => {
+  const h = harness()
+  const stale = row({ session_id: "owner-a", runtime_generation: 3 })
+  h.storage.upsertSession(stale)
+  driftedFixture(h.logDir, "owner-a-drifted", stale.session_id, [DONE])
+  let replaced = false
+  const racingStorage = new Proxy(h.storage, {
+    get(target, property, receiver) {
+      if (property === "setTranscriptIdIfCurrent") {
+        return (slug: string, sessionId: string, generation: number, transcriptId: string | null) => {
+          if (!replaced) {
+            replaced = true
+            target.upsertSession(row({ slug, session_id: "owner-b", runtime_generation: 0, transcript_id: null }))
+          }
+          return target.setTranscriptIdIfCurrent(slug, sessionId, generation, transcriptId)
+        }
+      }
+      const value = Reflect.get(target, property, receiver)
+      return typeof value === "function" ? value.bind(target) : value
+    },
+  })
+  const t = createTailer({
+    project: { cwdSlug: "x" } as Project,
+    storage: racingStorage,
+    bus: h.bus,
+    onChange: () => {},
+    now: () => PAST_GRACE,
+    paneDead: () => false,
+    capturePane: () => "",
+    sessionLogDir: h.logDir,
+  })
+
+  t.tick()
+  assert.equal(replaced, true)
+  assert.equal(h.storage.getSession(stale.slug)?.session_id, "owner-b")
+  assert.equal(h.storage.getSession(stale.slug)?.transcript_id, null)
+  assert.equal(t.get(stale.slug), undefined, "stale A telemetry is hidden until B gets its own tail state")
+
+  t.tick()
+  assert.notEqual(t.get(stale.slug)?.lastAssistant, "all done")
+  assert.equal(h.storage.getSession(stale.slug)?.transcript_id, null)
+})
+
 test("tailer: a row with a cached transcript_id binds THAT file, not <session_id>.jsonl", () => {
   const h = harness()
   h.storage.upsertSession(row({ transcript_id: "forked-id" })) // <sid>.jsonl does NOT exist
@@ -1181,6 +1633,25 @@ const cxTaskStarted = JSON.stringify({ timestamp: "2026-07-10T21:58:43.255Z", ty
 const cxAgentFinal = (text: string) => JSON.stringify({ timestamp: "2026-07-10T21:58:50.000Z", type: "event_msg", payload: { type: "agent_message", message: text, phase: "final_answer" } })
 const cxTaskComplete = (last: string) => JSON.stringify({ timestamp: "2026-07-10T21:59:00.000Z", type: "event_msg", payload: { type: "task_complete", turn_id: "turn-1", last_agent_message: last } })
 const CX_DONE = "All wired.\n\n```done\nwired\n```"
+const PANE_CODEX_GITHUB_APPROVAL = [
+  "Field 1/1",
+  "Allow GitHub to create a Git blob?",
+  "Repository: a/repository-name-that-must-not-leak",
+  "Content: a-secret-payload-that-must-not-leak",
+  "encoding: base64",
+  "› 1. Allow                   Run the tool and continue.",
+  "  2. Allow for this session  Allow this tool for the rest of the session.",
+  "  3. Always allow            Always allow this tool.",
+  "  4. Cancel                  Cancel this tool call.",
+  "enter to submit | esc to cancel",
+].join("\n")
+const PANE_CODEX_PERMISSION_MENU = [
+  "Update Model Permissions",
+  "› 1. Ask for approval",
+  "  2. Approve for me",
+  "  3. Full Access",
+  "Press enter to confirm or esc to go back",
+].join("\n")
 
 // Write a rollout into a $CODEX_HOME date-sharded sessions dir (filename suffix = the codex id, which
 // findRolloutById locates by). Returns the path so the test can append to it mid-tick.
@@ -1218,6 +1689,59 @@ function pinCodexRow(h: Harness, codexId: string) {
   h.storage.setBackend("t", "codex")
   h.storage.setAgentSession("t", codexId)
 }
+
+test("tailer: a Codex tool approval is structured on prime/restart, then clears when the terminal modal disappears", () => {
+  const h = harness()
+  const codexHome = tmp("fray-codexhome-")
+  const codexId = "019f4e09-aaaa-bbbb-cccc-ddddeeeeffff"
+  writeCodexRollout(codexHome, codexId, [cxMeta(codexId, "/x"), cxTaskStarted])
+  pinCodexRow(h, codexId)
+  h.pane.text = PANE_CODEX_GITHUB_APPROVAL
+  h.clock.ms = Date.parse("2026-07-10T21:58:50.000Z") // >4s quiet after task_started
+
+  const first = codexTailer(h, codexHome)
+  first.tick() // first server instance primes while the modal is already present
+  assert.deepEqual(first.get("t")?.nativeInputRequired, {
+    kind: "tool-approval",
+    title: "GitHub tool approval required",
+  })
+  assert.doesNotMatch(JSON.stringify(first.get("t")?.nativeInputRequired), /repository-name|secret-payload/)
+  assert.equal(h.events.length, 0, "native modal telemetry never auto-notifies or marks a completed turn")
+  assert.equal(h.storage.getSession("t")?.unread, 0)
+
+  // A server reload has no in-memory modal state, but re-sniffs the still-live pane on its prime tick.
+  const restarted = codexTailer(h, codexHome)
+  restarted.tick()
+  assert.deepEqual(restarted.get("t")?.nativeInputRequired, first.get("t")?.nativeInputRequired)
+
+  // Escape/Cancel happens in Terminal (Fray never sends it). Once the chrome vanishes, telemetry clears
+  // immediately even before the rollout writes another record, unblocking the controller/queue path.
+  h.pane.text = "› Describe what you want changed\n\n  gpt-5.6 high · 97% left · esc to interrupt"
+  restarted.tick()
+  assert.equal(restarted.get("t")?.nativeInputRequired, undefined)
+})
+
+test("tailer: native permission and tool approvals remain visible even beside stale pending metadata", () => {
+  const h = harness()
+  const codexHome = tmp("fray-codexhome-")
+  const codexId = "019f4e09-1111-2222-3333-444455556666"
+  writeCodexRollout(codexHome, codexId, [cxMeta(codexId, "/x"), cxTaskStarted])
+  pinCodexRow(h, codexId)
+  h.storage.setPermissionPending("t", "bypassPermissions")
+  h.clock.ms = Date.parse("2026-07-10T21:58:50.000Z")
+  h.pane.text = PANE_CODEX_PERMISSION_MENU
+  const t = codexTailer(h, codexHome)
+  t.tick()
+  assert.deepEqual(t.get("t")?.nativeInputRequired, { kind: "permission", title: "Choose model permissions" })
+
+  // Stale control metadata must not mask an unrelated connector approval either.
+  h.pane.text = PANE_CODEX_GITHUB_APPROVAL
+  t.tick()
+  assert.deepEqual(t.get("t")?.nativeInputRequired, {
+    kind: "tool-approval",
+    title: "GitHub tool approval required",
+  })
+})
 
 test("tailer: a codex rollout primes to in-flight, then transitions to idle+fence THROUGH the tick", () => {
   const h = harness()
@@ -1259,4 +1783,83 @@ test("tailer: a codex rollout already at task_complete PRIMES straight to idle (
   t.tick() // prime a fully-bracketed rollout
   assert.equal(t.get("t")?.turn, "idle", "a primed, fully-bracketed codex rollout is idle — computeTurn respects it")
   assert.equal(h.events.length, 0, "priming never notifies (the completion pre-dates first sight)")
+})
+
+test("tailer: a real-shaped first Codex title comment persists its title and replay never restores the transport", () => {
+  const h = harness()
+  const codexHome = tmp("fray-codexhome-")
+  const codexId = "019f4e0c-1111-2222-3333-444455556666"
+  const final = '<!-- fray title="Fix queue focus" -->\nVisible answer'
+  writeCodexRollout(codexHome, codexId, [
+    cxMeta(codexId, "/x"),
+    cxTaskStarted,
+    cxAgentFinal(final),
+    cxTaskComplete(final),
+  ])
+  h.storage.upsertSession(row({
+    session_id: "fray-uuid",
+    title: "raw initial prompt",
+    title_auto: 1,
+  }))
+  h.storage.setBackend("t", "codex")
+  h.storage.setAgentSession("t", codexId)
+
+  const first = codexTailer(h, codexHome)
+  first.tick()
+  assert.equal(first.get("t")?.aiTitle, "Fix queue focus")
+  assert.equal(first.get("t")?.lastAssistant, "Visible answer")
+  assert.equal(h.storage.getSession("t")?.title, "Fix queue focus", "prime persists the transcript-backed title")
+  assert.equal(h.storage.getSession("t")?.title_auto, 1, "automatic provenance remains distinct from a human rename")
+
+  const restarted = codexTailer(h, codexHome)
+  restarted.tick()
+  assert.equal(restarted.get("t")?.aiTitle, "Fix queue focus")
+  assert.equal(restarted.get("t")?.lastAssistant, "Visible answer", "full replay keeps the transport line hidden")
+  assert.equal(h.storage.getSession("t")?.title, "Fix queue focus")
+})
+
+test("tailer: an omitted real-shaped Codex final retains the bounded dispatch fallback rather than an internal slug", () => {
+  const h = harness()
+  const codexHome = tmp("fray-codexhome-")
+  const codexId = "019f4e0d-1111-2222-3333-444455556666"
+  const final = "`hello.txt` says: tui file.\n\n```done\ntui-ok\n```"
+  writeCodexRollout(codexHome, codexId, [
+    cxMeta(codexId, "/x"),
+    cxTaskStarted,
+    cxAgentFinal(final),
+    cxTaskComplete(final),
+  ])
+  h.storage.upsertSession(row({ session_id: "fray-uuid", title: "Fix queue focus…", title_auto: 1 }))
+  h.storage.setBackend("t", "codex")
+  h.storage.setAgentSession("t", codexId)
+
+  codexTailer(h, codexHome).tick()
+  assert.equal(h.storage.getSession("t")?.title, "Fix queue focus…")
+  assert.equal(h.storage.getSession("t")?.title_auto, 1)
+})
+
+test("tailer: a later Codex marker cannot overwrite a manual title after an omitted-marker dispatch fallback", () => {
+  const h = harness()
+  const codexHome = tmp("fray-codexhome-")
+  const codexId = "019f4e0e-1111-2222-3333-444455556666"
+  const path = writeCodexRollout(codexHome, codexId, [cxMeta(codexId, "/x"), cxTaskStarted])
+  h.storage.upsertSession(row({ session_id: "fray-uuid", title: "Audit registry auth…", title_auto: 1 }))
+  h.storage.setBackend("t", "codex")
+  h.storage.setAgentSession("t", codexId)
+  const t = codexTailer(h, codexHome)
+  t.tick()
+
+  const omitted = "Completed the requested check."
+  appendFileSync(path, cxAgentFinal(omitted) + "\n" + cxTaskComplete(omitted) + "\n")
+  t.tick()
+  assert.equal(h.storage.getSession("t")?.title, "Audit registry auth…")
+
+  h.storage.setTitle("t", "Manual title wins")
+  const later = "# Recovered generated title\nSecond response"
+  appendFileSync(path, cxTaskStarted + "\n" + cxAgentFinal(later) + "\n" + cxTaskComplete(later) + "\n")
+  t.tick()
+
+  assert.equal(t.get("t")?.aiTitle, "Recovered generated title", "live telemetry may observe the later signal")
+  assert.equal(h.storage.getSession("t")?.title, "Manual title wins")
+  assert.equal(h.storage.getSession("t")?.title_auto, 0, "the storage CAS preserves explicit provenance")
 })

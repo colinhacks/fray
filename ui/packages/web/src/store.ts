@@ -1,9 +1,19 @@
 import { proxy } from "valtio"
-import type { BoardSnapshot, ThreadView, BoardDelta } from "@fray-ui/shared"
-import { applyBoardDelta } from "@fray-ui/shared"
-import { closeDrawerAnimated } from "./lib/overlays.ts"
+import type { BoardSnapshot, ThreadView, BoardDelta, DispatchProfileSnapshot } from "@fray-ui/shared"
+import { applyBoardDelta, DispatchProfileSnapshot as DispatchProfileSnapshotSchema } from "@fray-ui/shared"
+import { closeDrawerAnimated, focusDrawer } from "./lib/overlays.ts"
+
+// Where the sidebar's scroll-to-card lands a card's outer border below the viewport top (px).
+const QUEUE_CARD_VIEWPORT_TOP = 12
 
 export type ConnectionState = "connecting" | "open" | "closed"
+export interface SocketPayloadFallback {
+  actualBytes: number
+  maxBytes: number
+}
+export type SocketTranscriptFallback =
+  | ({ kind: "payload-too-large" } & SocketPayloadFallback)
+  | { kind: "read-budget"; scope: "origin" | "global"; retryAfterMs: number }
 
 // What the workpane (the centered main column) shows: "todos" (the queue — cards + dispatch box, the
 // resting page) or "status:<s>" (URL-only per-status lists). THREADS render in the side-drawer stack
@@ -17,6 +27,16 @@ export const store = proxy({
   board: null as BoardSnapshot | null,
   view: "todos" as View,
   connection: "connecting" as ConnectionState,
+  // The durable supervisor, rather than a disposable board child, owns this truth. While it is
+  // restarting, all text remains in the session-backed draft store but write RPCs are held locally.
+  // This prevents a successful-looking old UI from racing a successor artifact.
+  controlPlaneState: "ready" as "ready" | "restarting" | "failed",
+  controlPlaneMessage: null as string | null,
+  // A user-initiated update+restart flips the overlay on OPTIMISTICALLY (before the POST is acked) so
+  // the block is instant. While this is true, the status poll must not apply a "ready" it reads in the
+  // brief pre-ack window — that would tear the overlay down and could reload onto the old child. Cleared
+  // the instant the supervisor acks the transition (at which point /status is authoritative again).
+  controlPlaneRestartPending: false,
   showSettings: false,
   showPalette: false,
   // The anywhere-modal behind the "New thread" pill (Gmail-compose style).
@@ -24,7 +44,10 @@ export const store = proxy({
   // The GitHub picker modal (Issues/PRs tabs → multi-select → batch dispatch). Its trigger appears
   // only when gh is authed AND the project is a GitHub repo; see GithubTrigger + openGithubPicker.
   showGithubPicker: false,
-  // When the New-thread modal was opened FROM a plan ("New thread from plan"), the plan's path — passed
+  // Immutable prompt-box values captured at the instant its GitHub button is clicked. The modal and
+  // every item in its batch consume this tuple; no Settings/global fallback participates afterward.
+  githubDispatchProfile: null as DispatchProfileSnapshot | null,
+  // When the New-thread modal was opened FROM a plan ("Implement this"), the plan's path — passed
   // as dispatch.planPath so the worker is oriented to the plan. Null for an ordinary new thread. Cleared
   // when the modal closes.
   newThreadPlanPath: null as string | null,
@@ -41,12 +64,13 @@ export const store = proxy({
     id: number
     kind: "thread" | "doc" | "subagent" | "plan"
     slug: string
-    terminal?: boolean
+    routed?: boolean // URL/deep-link-created thread: visible on first paint, never an invisible animated backdrop
     subId?: string // subagent: the dispatch tool_use id (the RPC handle + dedupe key)
     label?: string // subagent: the dispatch description (header title) / plan: the plan title
     path?: string // plan: the PlanView.path (.fray/plans/*.md) the drawer renders + dispatches from
     subagentType?: string // subagent: the model+effort cell tag
     startedAt?: string // subagent: ISO8601 dispatch time (drives the header's running elapsed)
+    openedAt?: number // bumped when an existing logical layer is focused/reopened
     closing?: boolean // set the instant this layer's slide-OUT begins, so URL/topThreadSlug stop
     // counting it before its 210ms removal (prevents a phantom /thread history push when a view
     // change races the close — see markDrawerClosing).
@@ -58,6 +82,11 @@ export const store = proxy({
   // cache). useTranscript reads this to DROP its 1.5s poll + subscribe instead; false before the socket
   // confirms and on SSE fallback (a pre-restart server without /ws), where polling stays exactly as today.
   socketTranscripts: false,
+  // Explicit transport downgrades reported by the multiplex server. A board overflow switches the whole
+  // board channel to SSE once; a transcript overflow/read-budget rejection pauses only that slug's live
+  // subscription while the last complete copy remains visible and manually refreshable. All reset on reload.
+  socketBoardFallback: null as SocketPayloadFallback | null,
+  socketTranscriptFallbacks: {} as Record<string, SocketTranscriptFallback>,
   // Transient bottom-center toast (e.g. "Steered" on an eager queue reply). `id` bumps per call so
   // repeat toasts re-trigger the fade. Rendered by <Toaster>; null when nothing is showing.
   toast: null as { id: number; text: string; spinner?: boolean; sticky?: boolean; duration?: number; link?: { label: string; slug: string } } | null,
@@ -71,8 +100,14 @@ export function openNewThread(planPath?: string): void {
 
 // Open the GitHub picker modal (batch-dispatch from issues/PRs). The trigger that calls this is
 // itself gated on gh being authed + in a GitHub repo, so the modal only opens when the RPCs can serve.
-export function openGithubPicker(): void {
+export function openGithubPicker(profile: DispatchProfileSnapshot): void {
+  store.githubDispatchProfile = DispatchProfileSnapshotSchema.parse(profile)
   store.showGithubPicker = true
+}
+
+export function closeGithubPicker(): void {
+  store.showGithubPicker = false
+  store.githubDispatchProfile = null
 }
 
 let toastSeq = 0
@@ -82,20 +117,45 @@ export function showToast(text: string, opts?: { spinner?: boolean; sticky?: boo
 
 // ── drawer stack ─────────────────────────────────────────────────────────────────────────────────
 let drawerSeq = 0
-export function pushDrawer(kind: "thread" | "doc", slug: string, opts?: { terminal?: boolean }): void {
-  // Re-pushing the slug already on top is a no-op (double-click, repeated toast link).
-  const top = store.drawers[store.drawers.length - 1]
-  if (top && top.kind === kind && top.slug === slug) return
-  store.drawers.push({ id: ++drawerSeq, kind, slug, terminal: opts?.terminal })
+let drawerOpenSeq = 0
+type Drawer = (typeof store.drawers)[number]
+
+// Kind is part of the identity: a chat thread and its document can deliberately stack, while a
+// second request for that same chat (or document) must reuse the existing layer.
+function sameDrawer(a: Drawer, b: Pick<Drawer, "kind" | "slug" | "path" | "subId">): boolean {
+  if (a.kind !== b.kind) return false
+  if (a.kind === "plan") return a.path === b.path
+  if (a.kind === "subagent") return a.subId === b.subId
+  return a.slug === b.slug
+}
+
+function openOrRaiseDrawer(next: Omit<Drawer, "id" | "closing" | "openedAt">): void {
+  const matches = store.drawers.filter((drawer) => sameDrawer(drawer, next))
+  if (!matches.length) {
+    store.drawers.push({ ...next, id: ++drawerSeq, openedAt: ++drawerOpenSeq })
+    return
+  }
+
+  // Keep the newest non-closing instance. This heals old duplicate state too: one logical layer
+  // remains, so closing a drawer can never reveal an identical one beneath it.
+  const existing = [...matches].reverse().find((drawer) => !drawer.closing) ?? matches[matches.length - 1]!
+  const { closing: _closing, ...liveExisting } = existing
+  const reopened = { ...liveExisting, ...next, openedAt: ++drawerOpenSeq }
+  store.drawers = [...store.drawers.filter((drawer) => !sameDrawer(drawer, next)), reopened]
+  // Existing layers are already mounted. Let their local focus manager restore focus after Valtio
+  // publishes the reordered/reopened stack without manufacturing another component instance.
+  queueMicrotask(() => focusDrawer(existing.id))
+}
+
+export function pushDrawer(kind: "thread" | "doc", slug: string, opts?: { routed?: boolean }): void {
+  openOrRaiseDrawer({ kind, slug, routed: opts?.routed })
 }
 
 // Open a sub-agent's transcript as a new drawer layer OVER whatever's on top (typically the thread it
 // was dispatched from). `slug` is the PARENT thread; `subId` is the dispatch tool_use id (the RPC
 // handle). Deduped on subId so a double-click / re-click doesn't stack duplicates.
 export function pushSubAgentDrawer(slug: string, subId: string, opts: { label: string; subagentType?: string; startedAt?: string }): void {
-  const top = store.drawers[store.drawers.length - 1]
-  if (top && top.kind === "subagent" && top.subId === subId) return
-  store.drawers.push({ id: ++drawerSeq, kind: "subagent", slug, subId, label: opts.label, subagentType: opts.subagentType, startedAt: opts.startedAt })
+  openOrRaiseDrawer({ kind: "subagent", slug, subId, label: opts.label, subagentType: opts.subagentType, startedAt: opts.startedAt })
 }
 
 // Open a thread from a listing/notification click-through. Routing by runtime: a thread with NO
@@ -109,14 +169,22 @@ export function openThread(slug: string): void {
 }
 
 // A thread that's ALREADY in the queue (needsYou) has its full card in the main column — clicking its
-// sidebar row should SCROLL to that card, not open a redundant drawer over it (maintainer 2026-07-09:
-// "the queue is how you know"). Returns false if no card is mounted (not queued / not rendered), so the
-// caller falls back to opening the drawer.
+// sidebar row SCROLLS to that card and stops there; it does NOT open a redundant drawer over it
+// (maintainer 2026-07-09: "the queue is how you know"; 2026-07-15: "just auto-scroll to the item in the
+// queue"). Returns false if no card is mounted (not queued / not rendered), so the caller falls back to
+// opening the drawer instead.
 export function scrollToQueueCard(slug: string): boolean {
   if (typeof document === "undefined") return false
   const el = document.querySelector(`[data-queue-card="${CSS.escape(slug)}"]`)
   if (!el) return false
-  el.scrollIntoView({ behavior: "smooth", block: "center" })
+  // The outer slot includes the inter-card rule. The bordered card root is the visual identity a
+  // sidebar click promises to reveal, especially for a very tall narrow-layout transcript.
+  const root = el.querySelector<HTMLElement>(`[data-queue-card-root="${CSS.escape(slug)}"]`) ?? el
+  const targetY = Math.max(0, window.scrollY + root.getBoundingClientRect().top - QUEUE_CARD_VIEWPORT_TOP)
+  // Absolute scroll is intentional. A narrow layout may have just changed document geometry while a
+  // drawer finished closing; a relative scroll in that transition can be applied to the old root and
+  // strand the reader midway through a tall card. Land the bordered root atomically.
+  if (Math.abs(window.scrollY - targetY) > 0.5) window.scrollTo({ top: targetY, left: 0, behavior: "auto" })
   el.classList.add("queue-flash")
   window.setTimeout(() => el.classList.remove("queue-flash"), 1100)
   return true
@@ -127,9 +195,7 @@ export function scrollToQueueCard(slug: string): boolean {
 // so a re-click doesn't stack duplicates. Uses the path as the entry `slug` too (a stable key for the
 // layer) — plan layers never resolve a thread, so the slug is only an identity handle here.
 export function pushPlanDrawer(path: string, title: string): void {
-  const top = store.drawers[store.drawers.length - 1]
-  if (top && top.kind === "plan" && top.path === path) return
-  store.drawers.push({ id: ++drawerSeq, kind: "plan", slug: path, path, label: title })
+  openOrRaiseDrawer({ kind: "plan", slug: path, path, label: title })
 }
 
 export function popDrawer(): void {
@@ -148,6 +214,13 @@ export function topDrawer() {
 export function markDrawerClosing(id: number): void {
   const d = store.drawers.find((x) => x.id === id)
   if (d) d.closing = true
+}
+
+// Exit timers are intentionally conditional. If the same logical drawer is reopened before its
+// transition finishes, `openOrRaiseDrawer` clears closing and this old timer becomes a no-op.
+export function removeDrawerAfterExit(id: number): void {
+  const drawer = store.drawers.find((entry) => entry.id === id)
+  if (drawer?.closing) store.drawers = store.drawers.filter((entry) => entry.id !== id)
 }
 
 // Unwind drawer-stack entries by id THROUGH their registered animated closers (the slide-out plays)

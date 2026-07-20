@@ -1,24 +1,15 @@
 import { useState, type ComponentType } from "react"
 import { useMutation, useQuery } from "@tanstack/react-query"
 import { Check, CircleCheck, CircleDot, GitMerge, GitPullRequest, GitPullRequestClosed, GitPullRequestDraft, Github, Inbox, Loader2, MessageSquare } from "lucide-react"
-import { PermissionMode, type GithubItem } from "@fray-ui/shared"
+import type { DispatchProfileSnapshot, GithubBatchInput, GithubItem } from "@fray-ui/shared"
 import { rpc } from "../api/rpc.ts"
 import { showToast } from "../store.ts"
 import { Overlay } from "./NewThreadModal.tsx"
-import { Select } from "./ui/Select.tsx"
-import { PERMISSION_OPTIONS, CLAUDE_MODELS, EFFORT_OPTIONS, EFFORTS, PERMISSION_COLOR, backendForModel, claudePermValue } from "../lib/options.ts"
+import { EFFORT_LABEL, PERMISSION_COLOR, permOptionsFor } from "../lib/options.ts"
+import { buildGithubBatchInput, dispatchProfileError } from "../lib/githubDispatch.ts"
 
 type Kind = "issues" | "prs"
 type Sort = "recent" | "reactions"
-
-// Readout option lists carry no empty "default" row — the footer readouts always show a concrete value
-// (the modal defaults model→opus, effort→high, mode→auto unless settings/user override), matching the
-// new-thread composer's footer.
-// The GitHub batch-dispatch path is Claude-only for now (the batch RPC does not forward a backend —
-// see githubDispatchBatch); Codex in the picker is a Phase-3 follow-up. So this footer lists only the
-// Claude models (already concrete — no empty "default" row).
-const MODEL_OPTIONS_CONCRETE = CLAUDE_MODELS
-const EFFORT_OPTIONS_CONCRETE = EFFORT_OPTIONS.filter((o) => o.value !== "")
 
 // Mirrors GithubBatchInput.items `.max(20)` in shared/src/index.ts — the picker never lets the
 // selection exceed the server's per-batch cap, so a dispatch can't fail the schema with a cryptic
@@ -27,16 +18,21 @@ const MAX_BATCH = 20
 
 // THE GitHub picker: a wider anywhere-modal (reusing NewThreadModal's Overlay) that lists the repo's
 // Issues or PRs (tabs), sortable by recency or reactions, with multi-select checkboxes and a
-// model/effort/permission footer. "Dispatch N thread(s)" spins up one fray thread per checked item
+// frozen inherited profile/permission footer. "Dispatch N thread(s)" spins up one fray thread per checked item
 // (each ISSUE an investigate/reproduce/recommend thread, each PR a review thread) via
 // rpc.githubDispatchBatch — the server hydrates + templates each fresh, reusing the normal dispatch
 // flow; the new sidebar rows paint via the board SSE. The trigger that opens this is auth-gated, so
 // the RPCs are guaranteed serviceable when it's mounted.
-export function GithubPickerModal({ onClose }: { onClose: () => void }) {
+export function GithubPickerModal({
+  profile,
+  onClose,
+}: {
+  profile: DispatchProfileSnapshot
+  onClose: () => void
+}) {
   const status = useQuery({ queryKey: ["githubStatus"], queryFn: () => rpc.githubStatus() })
-  const settings = useQuery({ queryKey: ["settingsGet"], queryFn: () => rpc.settingsGet() })
-  // Codex catalogue (authoritative ~/.codex cache) — used only to correctly recognize an inherited codex
-  // default so the Claude-only batch path clamps it back to a Claude model even for a brand-new slug.
+  // Re-read only the authoritative Codex catalogue, never Settings/default preferences. A cache refresh
+  // can invalidate the captured pair while the picker is open, in which case final dispatch fails closed.
   const codexModels = useQuery({ queryKey: ["codexModels"], queryFn: () => rpc.codexModels() })
 
   const [kind, setKind] = useState<Kind>("issues")
@@ -45,32 +41,14 @@ export function GithubPickerModal({ onClose }: { onClose: () => void }) {
   // dodges the issue#N-vs-pr#N number collision a shared set would hit). Documented choice per plan §6.
   const [selected, setSelected] = useState<ReadonlySet<number>>(() => new Set())
 
-  const [permissionMode, setPermissionMode] = useState<PermissionMode | "">("")
-  const [model, setModel] = useState("")
-  const [effort, setEffort] = useState<(typeof EFFORTS)[number] | "">("")
-  // The batch path is Claude-only (no backend forwarded — see MODEL_OPTIONS_CONCRETE note), but Phase 3
-  // now lets a user PERSIST a Codex model as the global default. CLAMP an inherited codex default back
-  // to a Claude model (and a codex-only `plan` sandbox back to `auto`), so the readout never blanks and
-  // the batch never dispatches `claude --model gpt-5.x` (a guaranteed spawn error).
-  const inheritedModel = model || settings.data?.model || "opus"
-  const effectiveModel = backendForModel(inheritedModel, codexModels.data ?? []) === "codex" ? "opus" : inheritedModel
-  const effectiveMode = claudePermValue(permissionMode || (settings.data?.permissionMode ?? "auto"))
-  const effectiveEffort = effort || settings.data?.effort || "high"
-
   // Server order is AUTHORITATIVE (the gh --search sort) — render items exactly as returned, never
   // re-sort client-side. The query re-keys on {kind, sort}, so a tab/sort flip refetches.
   const list = useQuery({ queryKey: ["githubList", kind, sort], queryFn: () => rpc.githubList({ kind, sort }) })
   const items = list.data?.items ?? []
 
   const dispatch = useMutation({
-    mutationFn: () =>
-      rpc.githubDispatchBatch({
-        items: [...selected].map((number) => ({ kind: kind === "issues" ? "issue" : "pr", number })),
-        model: effectiveModel,
-        effort: effectiveEffort,
-        permissionMode: effectiveMode,
-      }),
-    onMutate: () => showToast(`Starting ${selected.size} thread${selected.size === 1 ? "" : "s"}…`, { spinner: true, sticky: true }),
+    mutationFn: (input: GithubBatchInput) => rpc.githubDispatchBatch(input),
+    onMutate: (input) => showToast(`Starting ${input.items.length} thread${input.items.length === 1 ? "" : "s"}…`, { spinner: true, sticky: true }),
     onSuccess: (res) => {
       const ok = res.dispatched.length
       const failed = res.failed.length
@@ -104,6 +82,27 @@ export function GithubPickerModal({ onClose }: { onClose: () => void }) {
 
   const nameWithOwner = status.data?.nameWithOwner ?? "this repo"
   const n = selected.size
+  const profileError = profile.backend === "codex" && !codexModels.data
+    ? codexModels.isError
+      ? "Could not validate the captured Codex profile — reopen after the catalogue loads"
+      : "Validating the captured Codex profile…"
+    : dispatchProfileError(profile, codexModels.data ?? [])
+  const modelLabel = profile.backend === "codex"
+    ? codexModels.data?.find((model) => model.slug === profile.model)?.displayName ?? profile.model
+    : profile.model.charAt(0).toUpperCase() + profile.model.slice(1)
+  const effortLabel = EFFORT_LABEL[profile.effort] ?? profile.effort
+  const permissionLabel = permOptionsFor(profile.backend).find((option) => option.value === profile.permissionMode)?.label ?? profile.permissionMode
+
+  function startDispatch() {
+    if (profileError) {
+      showToast(profileError)
+      return
+    }
+    dispatch.mutate(buildGithubBatchInput(
+      profile,
+      [...selected].map((number) => ({ kind: kind === "issues" ? "issue" : "pr", number })),
+    ))
+  }
 
   return (
     <Overlay onClose={onClose}>
@@ -119,7 +118,7 @@ export function GithubPickerModal({ onClose }: { onClose: () => void }) {
         {/* Header */}
         <h2 className="mb-4 flex items-center gap-2 text-[14px] font-medium">
           <Github size={15} className="text-muted" />
-          <span>Dispatch from GitHub</span>
+          <span>Investigate this issue and make recommendations</span>
           <span className="text-muted/40">—</span>
           <span className="font-mono-keep text-[12.5px] text-muted">{nameWithOwner}</span>
         </h2>
@@ -166,41 +165,23 @@ export function GithubPickerModal({ onClose }: { onClose: () => void }) {
           )}
         </div>
 
-        {/* Footer: model/effort/permission readouts + the batch-dispatch button */}
-        <div className="mt-4 flex items-center justify-between gap-3">
-          <div className="flex items-center gap-0.5">
-            <Select
-              variant="readout"
-              className={`petite-caps ${PERMISSION_COLOR[effectiveMode]}`}
-              value={effectiveMode}
-              onValueChange={(v) => setPermissionMode(v as PermissionMode)}
-              options={PERMISSION_OPTIONS}
-              ariaLabel="Permission mode"
-            />
-            <Select
-              variant="readout"
-              className="petite-caps"
-              value={effectiveModel}
-              onValueChange={setModel}
-              options={MODEL_OPTIONS_CONCRETE}
-              indicatorPosition="right"
-              ariaLabel="Model"
-            />
-            <Select
-              variant="readout"
-              className="petite-caps"
-              value={effectiveEffort}
-              onValueChange={(v) => setEffort(v as (typeof EFFORTS)[number])}
-              options={EFFORT_OPTIONS_CONCRETE}
-              indicatorPosition="right"
-              ariaLabel="Effort"
-            />
+        {/* Footer: the exact immutable prompt-box snapshot + the batch-dispatch button. */}
+        <div className="mt-4 flex items-end justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px]">
+              <span className="petite-caps text-muted/55">Inherited</span>
+              <span className="truncate text-muted" title={`${profile.backend} · ${profile.model} · ${profile.effort}`}>
+                {profile.backend === "codex" ? "Codex" : "Claude Code"} · {modelLabel} / {effortLabel}
+              </span>
+              <span className={`petite-caps ${PERMISSION_COLOR[profile.permissionMode]}`}>{permissionLabel}</span>
+            </div>
+            {profileError && <p className="mt-1 max-w-[430px] text-[10.5px] text-red-400">{profileError}</p>}
           </div>
           <div className="flex items-center gap-3">
             {n >= MAX_BATCH && <span className="petite-caps text-[11px] text-muted/60">{MAX_BATCH} max per batch</span>}
             <button
-              disabled={n === 0 || dispatch.isPending}
-              onClick={() => dispatch.mutate()}
+              disabled={n === 0 || dispatch.isPending || !!profileError}
+              onClick={startDispatch}
               onMouseDown={(e) => e.preventDefault()}
               className="flex items-center gap-2 rounded-md bg-fg px-3.5 py-1.5 text-[12.5px] font-medium text-bg outline-none transition-all hover:opacity-90 active:scale-95 disabled:opacity-30 disabled:hover:opacity-30"
             >

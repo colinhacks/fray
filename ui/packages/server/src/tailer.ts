@@ -1,12 +1,16 @@
 import { statSync, openSync, readSync, closeSync, readdirSync, mkdirSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { homedir, tmpdir } from "node:os"
+import { PermissionMode } from "@fray-ui/shared"
 import type { Bus } from "./bus.ts"
 import type { Project } from "./project.ts"
 import type { Storage, SessionRow } from "./storage.ts"
 import { discoverTranscriptId, DISCOVERY_GRACE_MS } from "./discover.ts"
-import type { AgentBackend, FoldState, NormalizedEvent, NormalizedTail } from "./backend/types.ts"
+import type { AgentBackend, FoldState, NativeInputRequiredData, NormalizedEvent, NormalizedTail } from "./backend/types.ts"
 import * as tmux from "./tmux.ts"
+import { detectClaudePermissionMode } from "./permission-controller.ts"
+import { adoptionRuntimeBinding } from "./adoption-recovery.ts"
+import { normalizeObservedThreadModel, validateThreadProfile } from "./backend/thread-profiles.ts"
 
 // The JSONL tailer: incrementally reads each registered session's Claude Code transcript
 // (~/.claude/projects/<cwdSlug>/<session_id>.jsonl) to derive liveness telemetry — last activity
@@ -42,6 +46,10 @@ import * as tmux from "./tmux.ts"
 
 const IDLE_BACKSTOP_MS = 5000
 const POLL_MS = 1000
+// Claude writes an untimestamped permission sidecar just before (or alongside) its footer redraw.
+// Give the footer the arrival poll plus two more redraw polls, then discard a stable mismatch so a
+// killed pane's late sidecar cannot cause a permanent capture-pane/SQLite hot loop.
+const CLAUDE_PERMISSION_CONFIRM_POLLS = 3
 // A tracked background sub-agent whose transcript file has gone this long without an append is
 // treated as "stale" — a liveness fallback for a completion record we somehow missed (the child
 // died, or the worker session ended before the <task-notification> landed). ~5min: comfortably
@@ -89,7 +97,7 @@ export interface SubAgentView {
 export interface FenceView {
   kind: "done" | "awaiting"
   body: string
-  hints: { kind: "pr" | "ci" | "timer" | "session"; value: string }[]
+  hints: { kind: "human" | "github-review" | "timer" | "pr" | "ci" | "session"; value: string }[]
 }
 
 // Per-session derived telemetry surfaced to the board overlay. Structurally a NormalizedTail (the
@@ -98,9 +106,19 @@ export interface FenceView {
 export interface SessionTelemetry extends NormalizedTail {
   turn: TurnState
   permPrompt: boolean // paused on an interactive permission prompt (pane-sniffed; no jsonl signal)
+  // A verified backend-native modal that blocks transcript progress. Its fixed presentation-safe
+  // title/kind are the ONLY pane-derived data exposed; option/detail content never leaves the server.
+  nativeInputRequired?: NativeInputRequiredData
+  // Monotonic within this tail state. The permission controller uses it to distinguish an
+  // authoritative profile emitted by the freshly attached backend from the pre-reattach fold.
+  permissionModeRevision?: number
   lastActivityAt?: string // ISO8601 of the last timestamped record
   lastAssistant?: string // trimmed preview (~200 chars) of the last assistant text block
   aiTitle?: string // Claude's own auto-generated session title (latest ai-title sidecar record)
+  // Claude's native `/rename` is distinguished from ordinary ai-title churn so the control plane can
+  // prove that a title record was emitted AFTER its exact command submission.
+  customTitle?: string
+  customTitleRevision?: number
   subAgents: SubAgentView[] // live background sub-agents this session dispatched (empty when none)
   bgShells: BgShellView[] // live background shells this session launched (empty when none)
   pendingAsk?: PendingAskData // a pending native AskUserQuestion the session is frozen on (else absent)
@@ -135,18 +153,58 @@ export interface SessionTelemetry extends NormalizedTail {
 //     3. No
 //   Esc to cancel · Tab to amend
 //
-// Stable across tools: a question line beginning "Do you want", a numbered "1. Yes" option, and the
-// modal footer "Esc to cancel" (a streaming turn shows "esc to interrupt" instead; an idle prompt
-// shows neither). We require the "1. Yes" option AND (the question OR the footer) — two independent
-// signals, so a model merely printing "Do you want…" or its own numbered list can't trip it.
+// Recurring across tools: a question line ("Do you want…"), a numbered "1. Yes" option, and the modal
+// footer "Esc to cancel" (an idle prompt shows neither). We require the "1. Yes" option AND (the
+// question OR the footer) — two independent signals, so a model merely printing "Do you want…" or its
+// own numbered list can't trip it.
+//
+// The wording is NOT stable across every modal, so both signals carry alternates. ExitPlanMode's
+// approval asks "Would you like to proceed?" and footers with "ctrl+g to edit in VS Code · …" — it
+// matches NEITHER original spelling and was invisible here (adversarial review, claude 2.1.214). That
+// is a hang-forever miss, not a cosmetic one: `detectNativeInput` is registered on the Codex backend
+// ONLY (backend/codex.ts), so for a Claude worker this matcher is the single blocking-modal signal.
+//
+// Those content signals alone are NOT enough, because the capture is the whole visible pane: any
+// TRANSCRIPT text on screen counts. A worker that quotes an approval prompt, reads this very file, or
+// pastes a probe's terminal output re-trips the matcher on every ≥PERM_SNIFF_MS quiet gap and the
+// thread oscillates between the sidebar's running band and Needs-you (reported 2026-07-18). Two
+// STRUCTURAL gates fix that, both empirically grounded in 81 real-prompt captures (claude 2.x — the
+// pre-boot trust prompt, a Bash approval, an Edit/Write approval) against 87 negatives (69 captures of
+// a live pane merely quoting a prompt, plus every live worker pane on this box):
+//
+//   1. A live composer means the pane is ACCEPTING INPUT, so anything on it is transcript. A modal
+//      replaces the composer: not one real-prompt capture carries the composer's mode line
+//      ("⏵⏵ auto mode on", "⏸ manual mode on", "⏵⏵ accept edits on", "bypass permissions on"), while
+//      every idle AND streaming Claude pane does. `ctrl+o`'s detailed-transcript view is the one other
+//      composer-less-but-live screen (its own footer replaces the composer, and it is sticky for the
+//      session), so it counts as a composer here — without it, a worker toggled into that view kept
+//      re-tripping on quoted text. Scoped to the last rows, never the whole pane, so an agent that
+//      merely PRINTS "auto mode on" mid-transcript cannot suppress a genuine prompt.
+//   2. The modal is always the BOTTOM block. Its option row and footer land within the last handful
+//      of non-blank rows, so only that tail is scanned — history scrolled above it is not evidence.
 const PERM_YES_OPTION = /(^|\n)\s*(❯\s*)?1\.\s+Yes\b/
-const PERM_QUESTION = /\bDo you want\b/
+const PERM_QUESTION = /\b(?:Do you want|Would you like)\b/
 const PERM_FOOTER = /\bEsc to (cancel|reject)\b/
+// The four mode-footer spellings, plus plan mode and the ctrl+o transcript view. permission-controller's
+// detectClaudePermissionMode() reads the same footer for a DIFFERENT purpose (which mode is active, from
+// a narrower anchor), so the two intentionally do not share a regex — but a TUI wording change must be
+// applied to both. NOTE: that one has no `plan` branch and returns undefined on a plan-mode pane.
+const PERM_COMPOSER_FOOTER = /\bbypass permissions on\b|\baccept edits(?: mode)? on\b|\b(?:auto|manual|plan) mode on\b|\bShowing detailed transcript\b/i
+// Rows of the modal's own tail that must contain the signals. Deepest `1. Yes` row observed is
+// ExitPlanMode's at 6 rows from the end (Bash 4, trust 3); this keeps real margin over that.
+const PERM_MODAL_TAIL_ROWS = 16
+// Rows the composer occupies at the bottom of an input-accepting pane (divider, prompt row, divider,
+// project line, mode line) — the mode line is always last, so this window need not cover all five.
+const PERM_COMPOSER_TAIL_ROWS = 4
 
 export function matchesPermPrompt(pane: string): boolean {
   if (!pane) return false
-  if (!PERM_YES_OPTION.test(pane)) return false
-  return PERM_QUESTION.test(pane) || PERM_FOOTER.test(pane)
+  const rows = pane.split("\n").filter((row) => row.trim() !== "")
+  if (rows.length === 0) return false
+  if (rows.slice(-PERM_COMPOSER_TAIL_ROWS).some((row) => PERM_COMPOSER_FOOTER.test(row))) return false
+  const tail = rows.slice(-PERM_MODAL_TAIL_ROWS).join("\n")
+  if (!PERM_YES_OPTION.test(tail)) return false
+  return PERM_QUESTION.test(tail) || PERM_FOOTER.test(tail)
 }
 
 // One tracked live background sub-agent, keyed in TailState by its dispatch tool_use id (the
@@ -209,6 +267,8 @@ const RETAINED_SUBAGENTS_MAX = 20
 export interface TailState extends FoldState {
   slug: string
   sessionId: string
+  nativeSessionId: string
+  runtimeGeneration: number
   path: string
   // A FOREIGN thread (a maintainer terminal discovered from the log dir, no registry row). Structural
   // guarantee that this state can NEVER shell out to tmux — no pane-sniff, no pane-death, no notify /
@@ -232,6 +292,7 @@ export interface TailState extends FoldState {
   // transition tracking (dedupe)
   primed: boolean // first tick restores state WITHOUT firing transition notifies (boot/restart)
   permPrompt: boolean // last pane-sniff verdict (see matchesPermPrompt)
+  nativeInputRequired?: NativeInputRequiredData // last structured native-modal verdict
   paneDead: boolean
   // ---- read-side transcript discovery (registered rows only; foreign states never touch these) ----
   // The pinned `<session_id>.jsonl` never appeared and discovery found no drifted transcript: a boot
@@ -241,6 +302,13 @@ export interface TailState extends FoldState {
   nextDiscoverMs: number
   // One-shot guard so a stall's pane is captured/logged once, not every tick.
   stallLogged: boolean
+  customTitle?: string
+  customTitleRevision: number
+  // Claude permission sidecars are untimestamped. Hold an incremental observation until the live
+  // footer redraw proves which generation emitted it; do not lose a genuine record that arrived a
+  // tick before the footer became visible.
+  unconfirmedPermissionMode?: PermissionMode
+  unconfirmedPermissionPolls?: number
 }
 
 // A single parsed JSONL record — only the fields the derivation needs are typed; the rest are
@@ -248,18 +316,29 @@ export interface TailState extends FoldState {
 interface Record {
   type?: string
   timestamp?: string
+  isMeta?: boolean // `/rename <title>` reminder record: CLI metadata, not a user/model turn
   aiTitle?: string // present only on ai-title sidecar records
   customTitle?: string // present only on custom-title records (written by /rename)
+  permissionMode?: unknown // present only on Claude permission-mode sidecars
   content?: unknown // top-level string on queue-operation records — carries the <task-notification> XML
   promptSource?: string // on user records: typed/queued (human) · "system" (peer msg / task-notification)
-  message?: { stop_reason?: string; content?: unknown }
+  message?: { stop_reason?: string; content?: unknown; model?: string }
 }
 
 // A fresh, unread tail cursor for a session (exported for tick + tests).
-export function newTailState(slug: string, sessionId: string, path: string, foreign = false): TailState {
+export function newTailState(
+  slug: string,
+  sessionId: string,
+  path: string,
+  foreign = false,
+  nativeSessionId = sessionId,
+  runtimeGeneration = 0,
+): TailState {
   return {
     slug,
     sessionId,
+    nativeSessionId,
+    runtimeGeneration,
     path,
     foreign,
     offset: 0,
@@ -271,10 +350,12 @@ export function newTailState(slug: string, sessionId: string, path: string, fore
     primed: false,
     turn: "in-flight",
     permPrompt: false,
+    nativeInputRequired: undefined,
     paneDead: false,
     noTranscript: false,
     nextDiscoverMs: 0,
     stallLogged: false,
+    customTitleRevision: 0,
   }
 }
 
@@ -338,7 +419,7 @@ export function hasQuestionBlock(text: string | undefined): boolean {
 const SIGNAL_FENCE_RE = /^```(done|awaiting)[ \t]*\n([\s\S]*?)\n```[ \t]*$/gm
 // An awaiting-body hint line: `<kind>: <value>`. Kind is case-insensitive (lowercased on output); the
 // value must start with a non-space char (a bare `pr:` with nothing after is prose, not a hint).
-const AWAITING_HINT_RE = /^(pr|ci|timer|session):\s*(\S.*)$/i
+const AWAITING_HINT_RE = /^(human|github-review|timer|pr|ci|session):\s*(\S.*)$/i
 const FENCE_BODY_MAX = 500 // defensive: never let a worker's fence body fatten the snapshot
 const HINT_MAX = 8 // defensive cap on parsed hint lines
 const HINT_VALUE_MAX = 200 // defensive cap on a single hint value
@@ -375,9 +456,9 @@ export function parseSignalFence(text: string | undefined): FenceView | undefine
   for (const line of raw.split("\n")) {
     const hm = line.match(AWAITING_HINT_RE)
     const k = hm?.[1].toLowerCase()
-    // Only the four real hint kinds become hints; any other `word:` line is prose (a stray colon-line
+    // Only real hint kinds become hints; any other `word:` line is prose (a stray colon-line
     // like "note: …" must not mint a phantom hint that then glosses as leaked internals). 2026-07-10.
-    if (hm && (k === "pr" || k === "ci" || k === "timer" || k === "session")) {
+    if (hm && (k === "human" || k === "github-review" || k === "timer" || k === "pr" || k === "ci" || k === "session")) {
       const value = hm[2].trim()
       hints.push({ kind: k, value: value.length > HINT_VALUE_MAX ? value.slice(0, HINT_VALUE_MAX) : value })
     } else {
@@ -426,8 +507,9 @@ function shellSummary(command: unknown): string {
 //   • an `Agent` dispatch (unless run_in_background:false — a foreground/blocking child the spinner
 //     already covers; Agent defaults to background) → kind "agent" (drill-in + [type] tag).
 //   • a `Bash` with run_in_background:true (a persist-across-rest shell — a CI watcher, a long build)
-//     → kind "shell" (display-only). A FOREGROUND-blocking wait (e.g. a Monitor until-loop) keeps the
-//     turn in-flight, so the existing "Working…" spinner covers it — deliberately NOT tracked here.
+//     → kind "shell" (display-only).
+//   • a `Monitor` (always background in Claude Code; finite or session-persistent) → kind "shell" too.
+//     Tracking it keeps an off-turn worker in Active while the monitor owns an automatable wait.
 // Re-seeing the same id preserves any outputFile already resolved from its launch result.
 function trackDispatches(state: TailState, rec: Record): void {
   const content = rec.message?.content
@@ -447,23 +529,24 @@ function trackDispatches(state: TailState, rec: Record): void {
       // The worker-profile cell (model+effort), shown verbatim as a "[type]" tag — no stripping.
       const subagentType = typeof input.subagent_type === "string" && input.subagent_type.trim() ? input.subagent_type.trim() : undefined
       state.subAgents.set(id, { kind: "agent", toolUseId: id, label: desc ?? "sub-agent", startedAt, subagentType, outputFile })
-    } else if (b.name === "Bash" && input.run_in_background === true) {
+    } else if ((b.name === "Bash" && input.run_in_background === true) || b.name === "Monitor") {
       state.subAgents.set(id, { kind: "shell", toolUseId: id, label: desc ?? shellSummary(input.command), startedAt, outputFile })
     }
   }
 }
 
 // Corpus-verified LAUNCH-ACK shapes (2026-07-09; surveyed across the real transcripts in
-// ~/.claude/projects — three Agent ack wordings + the Bash shell ack coexist in the wild):
+// ~/.claude/projects — three Agent ack wordings + the Bash/Monitor shell acks coexist in the wild):
 //   • "Async agent launched successfully…"  — older Agent ack; MAY carry "output_file: <path>"
 //   • "Spawned successfully…"               — newer mailbox/teammate ack; carries "agentId: <id>", NO path
 //   • "Command running in background…"      — Bash shell ack; carries "Output is being written to: <path>"
+//   • "Monitor started…"                    — Monitor ack; task id but no output path
 // A tracked id's tool_result matching one of these means the child is now RUNNING DETACHED — keep
 // tracking. Anything else on a tracked AGENT id is the synchronous (foreground) call's final report —
 // its completion (an error/denial result also means the dispatch is over). The earlier discriminator
 // ("no output_file: token ⇒ foreground") retired live background children of the two path-less ack
 // shapes — including every mailbox-style Agent and every background shell — on their own launch ack.
-const LAUNCH_ACK_RE = /^\s*(Async agent launched successfully|Spawned successfully|Command running in background)/
+const LAUNCH_ACK_RE = /^\s*(Async agent launched successfully|Spawned successfully|Command running in background|Monitor started)/
 
 // Move a tracked AGENT entry into the bounded retained ring (drawer review), evicting the oldest.
 // Shared by the foreground-completion path and the <task-notification> path.
@@ -503,8 +586,9 @@ function launchOutputFile(state: TailState, text: string): string | undefined {
 // path (staleness clock) and keep tracking; retire a tracked AGENT whose tool_result is NOT a launch
 // ack (a synchronous call's final report / an error — no task-notification ever fires for those;
 // missing this leaked 26 phantom "running" sub-agents on a busy session, found 2026-07-09). A tracked
-// SHELL is NEVER retired here — run_in_background:true always acks, and its only terminal signal is a
-// <task-notification> (the earlier version deleted shells on their own ack).
+// SHELL follows the same launch discriminator: a recognized background/Monitor ack stays live; any
+// synchronous error/non-ack result means no detached operation exists and is removed immediately.
+// Once launched, its terminal signal remains the <task-notification>.
 function trackLaunchResults(state: TailState, rec: Record): void {
   if (state.subAgents.size === 0) return
   const content = rec.message?.content
@@ -519,8 +603,11 @@ function trackLaunchResults(state: TailState, rec: Record): void {
     if (!entry) continue
     const text = toolResultText(b.content)
     if (!entry.outputFile) entry.outputFile = launchOutputFile(state, text)
-    if (entry.kind === "shell") continue // shells: ack-only here; retirement is the notification's job
-    if (LAUNCH_ACK_RE.test(text)) continue // background launch ack — the child is alive, keep tracking
+    if (LAUNCH_ACK_RE.test(text)) continue // background launch ack — the child/shell is alive, keep tracking
+    if (entry.kind === "shell") {
+      state.subAgents.delete(id) // synchronous launch failure: no notification will ever arrive
+      continue
+    }
     // Foreground completion (or a failed dispatch): the tool_result IS the terminal signal.
     state.subAgents.delete(id)
     retireToRing(state, entry, typeof rec.timestamp === "string" ? rec.timestamp : undefined, "completed")
@@ -649,13 +736,32 @@ export function applyRecord(state: TailState, rec: Record): void {
   // flip too, which made a thread look IDLE/stalled while the agent was actually resuming after a
   // sub-agent returned — no shimmer, then a message appeared out of nowhere. Found 2026-07-09.)
   const systemUserRec = type === "user" && rec.promptSource === "system"
-  if (typeof rec.timestamp === "string" && (type === "assistant" || type === "user" || type === "system")) {
+  // Native slash commands can append a type:user,isMeta:true reminder without invoking the model.
+  // Treating that as a real user record leaves an idle session falsely in-flight forever because no
+  // assistant record follows. It is sidecar metadata: no activity, turn, fence, or row-order change.
+  const metaUserRec = type === "user" && rec.isMeta === true
+  if (typeof rec.timestamp === "string" && (type === "assistant" || (type === "user" && !metaUserRec) || type === "system")) {
     state.lastActivityAt = rec.timestamp
   }
-  if (type === "assistant") {
+  if (type === "permission-mode") {
+    const parsed = PermissionMode.safeParse(rec.permissionMode)
+    if (parsed.success) {
+      state.permissionMode = parsed.data
+      state.permissionModeRevision = (state.permissionModeRevision ?? 0) + 1
+    }
+  } else if (type === "assistant") {
     state.sawRecords = true
     state.lastKind = "assistant"
     state.lastStopReason = typeof rec.message?.stop_reason === "string" ? rec.message.stop_reason : undefined
+    // Claude records the actual resolved model on every assistant message. It does NOT record the
+    // launch effort, so that half continues to come from the persisted dispatch profile. Ignore the
+    // synthetic placeholder some generated/error records use rather than overwriting a real model.
+    const observedModel = typeof rec.message?.model === "string" ? rec.message.model.trim() : ""
+    if (observedModel && observedModel !== "<synthetic>") {
+      state.model = observedModel
+      state.profileAt = typeof rec.timestamp === "string" ? rec.timestamp : undefined
+      state.profileRevision = (state.profileRevision ?? 0) + 1
+    }
     const raw = lastTextBlock(rec.message?.content)
     if (raw !== undefined) {
       const preview = previewText(raw)
@@ -669,7 +775,7 @@ export function applyRecord(state: TailState, rec: Record): void {
     }
     trackDispatches(state, rec) // register any background Agent dispatches + background shells
     trackAsk(state, rec) // capture a pending native AskUserQuestion (frozen at a TUI dialog)
-  } else if (type === "user") {
+  } else if (type === "user" && !metaUserRec) {
     state.sawRecords = true
     // A user record — human turn, tool_result, OR a re-invoking system record (peer/notification) —
     // flips the turn to IN-FLIGHT: the model is about to respond, so the thread reads as WORKING
@@ -692,11 +798,16 @@ export function applyRecord(state: TailState, rec: Record): void {
     // identical) as the session evolves — take the latest non-empty. Never touches turn state.
     if (typeof rec.aiTitle === "string" && rec.aiTitle.trim()) state.aiTitle = rec.aiTitle.trim()
   } else if (type === "custom-title") {
-    // Written by /rename (bare /rename auto-generates; /rename <name> sets it). Same title slot —
-    // latest of either record kind wins, in file order.
-    if (typeof rec.customTitle === "string" && rec.customTitle.trim()) state.aiTitle = rec.customTitle.trim()
+    // Written by /rename (bare /rename auto-generates a slug; /rename <name> sets it). Keep it in a
+    // dedicated observation slot only: the rename controller must confirm the readable second record
+    // and atomically persist it before any board/file surface changes. Promoting an intermediate or
+    // mismatched record to aiTitle leaked rejected slugs into the UI and paired .fray files.
+    if (typeof rec.customTitle === "string" && rec.customTitle.trim()) {
+      state.customTitle = rec.customTitle.trim()
+      state.customTitleRevision++
+    }
   }
-  // all other types (attachment, queue-operation, last-prompt, permission-mode, mode,
+  // all other types (attachment, queue-operation, last-prompt, mode,
   // bridge-session, file-history-snapshot, system) are sidecar metadata — ignored for turn state.
   // Sub-agent completion rides queue-operation records (a top-level <task-notification> string), so
   // it's checked for EVERY record regardless of type (the helper self-guards on shape + tracked ids).
@@ -759,7 +870,10 @@ export function applyEvent(state: FoldState, ev: NormalizedEvent): void {
       state.turn = "in-flight"
       state.lastAssistantHasQuestion = false
       state.lastFence = undefined
-      if (!ev.synthetic && typeof ev.at === "string") state.lastUserAt = ev.at
+      if (!ev.synthetic) {
+        if (typeof ev.at === "string") state.lastUserAt = ev.at
+        if (typeof ev.text === "string") state.lastUserText = ev.text
+      }
       break
     case "tool-call":
     case "tool-result":
@@ -829,6 +943,10 @@ export interface Tailer {
   // (forgetSession) so a stale TailState bound to the gone transcript can't mis-tail a later same-slug
   // re-dispatch. A no-op for an unknown slug.
   forget(slug: string): void
+  // Record the launch value after the controller has synchronously folded every sidecar written
+  // during the handoff. Any later backend record remains authoritative (for example a model/version
+  // that rejects or coerces a requested mode).
+  notePermissionMode?(slug: string, permissionMode: PermissionMode): void
   start(): void
   stop(): void
   tick(): void // exposed for tests + boot; the interval calls it every POLL_MS
@@ -846,6 +964,8 @@ export interface TailerDeps {
   now?: () => number // injectable clock (tests)
   paneDead?: (slug: string) => boolean // injectable liveness (tests)
   capturePane?: (slug: string) => string // injectable pane text (tests); defaults to tmux
+  findExpectedAdoptionPane?: (expected: tmux.ExpectedAdoptionPane) => tmux.AdoptionPaneLookup
+  captureExpectedAdoptionPane?: (expected: tmux.ExpectedAdoptionPane) => tmux.ExactPaneCapture
   sessionLogDir?: string // injectable transcript dir (tests); defaults to the Claude Code path
   mtimeMs?: (path: string) => number | undefined // injectable file mtime (tests); a sub-agent transcript's staleness clock
   // The agent backend that locates + folds a session's transcript (Codex-support epic). Injected by
@@ -878,7 +998,7 @@ export function defaultLogDir(project: Project): string {
 
 // The slice of AgentBackend the tailer drives: locate a session's transcript, fold a raw line into
 // the accumulator, and (registered sessions only) sniff the pane for a permission prompt.
-type TailBackend = Pick<AgentBackend, "transcriptPath" | "foldLine" | "matchesPermPrompt">
+type TailBackend = Pick<AgentBackend, "transcriptPath" | "foldLine" | "matchesPermPrompt" | "detectNativeInput">
 
 export function createTailer(deps: TailerDeps): Tailer {
   const now = deps.now ?? Date.now
@@ -886,8 +1006,31 @@ export function createTailer(deps: TailerDeps): Tailer {
   // subprocess per row per second, a standing event-loop tax that grew with thread count.
   const paneDead = deps.paneDead ?? tmux.paneDeadCached
   const capturePane = deps.capturePane ?? tmux.capturePane
+  const findExpectedAdoptionPane = deps.findExpectedAdoptionPane ?? tmux.findExpectedAdoptionPane
+  const captureExpectedAdoptionPane = deps.captureExpectedAdoptionPane ?? tmux.captureExpectedAdoptionPane
   const logDir = deps.sessionLogDir ?? defaultLogDir(deps.project)
   const mtimeMs = deps.mtimeMs ?? defaultMtimeMs
+
+  function adoptionBinding(row: SessionRow) {
+    const binding = adoptionRuntimeBinding(deps.storage, row)
+    return binding
+  }
+
+  function paneDeadForRow(row: SessionRow): boolean {
+    const binding = adoptionBinding(row)
+    if (binding.kind === "unbound") return paneDead(row.slug)
+    if (binding.kind === "conflict") return true
+    const current = findExpectedAdoptionPane(binding.claim)
+    return current.kind !== "found" || current.pane.dead
+  }
+
+  function capturePaneForRow(row: SessionRow): string {
+    const binding = adoptionBinding(row)
+    if (binding.kind === "unbound") return capturePane(row.slug)
+    if (binding.kind === "conflict") return ""
+    const captured = captureExpectedAdoptionPane(binding.claim)
+    return captured.kind === "captured" ? captured.text : ""
+  }
   // Default backend = this file's own corpus-verified Claude fold (identical to the injected
   // ClaudeBackend, which reuses the same applyRecord/parseLine/matchesPermPrompt). Tests never inject
   // a backend, so this default is the regression-proof path.
@@ -907,6 +1050,21 @@ export function createTailer(deps: TailerDeps): Tailer {
   // foreign maintainer terminal) this is the corpus-verified Claude fold — byte-identical to before.
   function resolveBackend(kind?: string): TailBackend {
     return deps.backendFor?.(kind) ?? deps.backend ?? defaultBackend
+  }
+
+  function persistCodexAutoTitle(row: SessionRow, state: TailState, runtimeGeneration: number): boolean {
+    if (row.backend !== "codex" || !state.aiTitle?.trim()) return false
+    try {
+      return deps.storage.setAutoTitleIfCurrent(row.slug, state.aiTitle.trim(), {
+        sessionId: row.session_id,
+        nativeSessionId: row.agent_session_id ?? null,
+        runtimeGeneration,
+      })
+    } catch {
+      // Telemetry still carries the transcript-backed title for this process. A transient registry
+      // write failure must not break tailing; the full replay on restart safely retries the same CAS.
+      return false
+    }
   }
 
   // Derive the surfaced view of a session's live sub-agents (insertion = dispatch order). A tracked
@@ -933,8 +1091,13 @@ export function createTailer(deps: TailerDeps): Tailer {
   }
 
   // Derive the surfaced view of a session's live background SHELLS (kind "shell"; display-only).
+  // A background Bash/Monitor is a CHILD of the agent process inside this session's tmux pane — it
+  // cannot outlive it. So a dead pane (the agent exited/crashed WITHOUT emitting each shell's terminal
+  // <task-notification>) means every tracked shell died with it: report none rather than leaving them
+  // to read as live (the UI would otherwise show them "alive", quietly breathing, forever). The normal
+  // path — a shell exiting while the agent lives — still clears via its terminal notification.
   function bgShellViews(state: TailState, nowMs: number): BgShellView[] {
-    if (state.subAgents.size === 0) return []
+    if (state.subAgents.size === 0 || state.paneDead) return []
     const out: BgShellView[] = []
     for (const e of state.subAgents.values()) {
       if (e.kind !== "shell") continue
@@ -959,7 +1122,7 @@ export function createTailer(deps: TailerDeps): Tailer {
   // to both (never dispatched, or aged out of the ring) → the router maps that to "gone".
   function subAgentLookup(slug: string, id: string): { outputFile?: string; state: "running" | "stale" | "done" } | undefined {
     const state = states.get(slug)
-    if (!state) return undefined
+    if (!state || !registeredStateIsCurrent(state)) return undefined
     const live = state.subAgents.get(id)
     if (live) return { outputFile: live.outputFile, state: entryStale(live, now()) ? "stale" : "running" }
     const dead = state.retiredSubAgents.get(id)
@@ -967,16 +1130,39 @@ export function createTailer(deps: TailerDeps): Tailer {
     return undefined
   }
 
-  // Perm-prompt verdict for a session: only worth a capture-pane once a still-in-flight turn has
-  // gone quiet for PERM_SNIFF_MS (see the constant). A perm prompt can't precede the tool_use
-  // record that stamps lastActivityAt, so a session with no activity yet never sniffs.
-  function sniffPerm(state: TailState, turn: TurnState, nowMs: number, backend: TailBackend): boolean {
-    if (state.foreign) return false // structural: a foreign thread has no tmux pane to sniff
-    if (turn !== "in-flight" || !state.lastActivityAt) return false
-    const at = Date.parse(state.lastActivityAt)
-    if (!Number.isFinite(at) || nowMs - at < PERM_SNIFF_MS) return false
-    // codex omits matchesPermPrompt (`-a never` → no in-turn approval modal), so `?.` yields false.
-    return backend.matchesPermPrompt?.(capturePane(state.slug)) ?? false
+  interface PaneSniff {
+    permPrompt: boolean
+    nativeInputRequired?: NativeInputRequiredData
+  }
+
+  function sameNativeInput(a: NativeInputRequiredData | undefined, b: NativeInputRequiredData | undefined): boolean {
+    return a?.kind === b?.kind && a?.title === b?.title
+  }
+
+  // Native-modal verdict for a session: only spend one capture-pane after an in-flight turn has gone
+  // quiet for PERM_SNIFF_MS. Both the legacy Claude permission matcher and the structured backend
+  // detector consume that same capture. Once a structured modal is visible, keep capturing each tick
+  // until it disappears so the blocker clears promptly even before the rollout appends again.
+  function sniffPane(
+    state: TailState,
+    row: SessionRow,
+    turn: TurnState,
+    nowMs: number,
+    backend: TailBackend,
+  ): PaneSniff {
+    if (state.foreign) return { permPrompt: false } // structural: foreign threads never touch tmux
+    if (!state.nativeInputRequired) {
+      if (turn !== "in-flight" || !state.lastActivityAt) return { permPrompt: false }
+      const at = Date.parse(state.lastActivityAt)
+      if (!Number.isFinite(at) || nowMs - at < PERM_SNIFF_MS) return { permPrompt: false }
+    }
+
+    const pane = capturePaneForRow(row)
+    const detected = backend.detectNativeInput?.(pane)
+    return {
+      permPrompt: backend.matchesPermPrompt?.(pane) ?? false,
+      nativeInputRequired: detected,
+    }
   }
   const states = new Map<string, TailState>()
   // FOREIGN thread tails, keyed by session id (separate map so a session-id key can never collide
@@ -1044,6 +1230,9 @@ export function createTailer(deps: TailerDeps): Tailer {
     }
     const prevActivity = state.lastActivityAt
     const prevAssistant = state.lastAssistant
+    const prevModel = state.model
+    const prevEffort = state.effort
+    const prevPermissionMode = state.permissionMode
     const prevOffset = state.offset
     consume(state, backend)
     if (state.offset !== prevOffset) transcriptDirty.push(state.slug)
@@ -1058,7 +1247,13 @@ export function createTailer(deps: TailerDeps): Tailer {
       state.subAgentsSig = sig
       dirty = true
     }
-    if (state.lastActivityAt !== prevActivity || state.lastAssistant !== prevAssistant) dirty = true
+    if (
+      state.lastActivityAt !== prevActivity ||
+      state.lastAssistant !== prevAssistant ||
+      state.model !== prevModel ||
+      state.effort !== prevEffort ||
+      state.permissionMode !== prevPermissionMode
+    ) dirty = true
     return dirty
   }
 
@@ -1117,7 +1312,7 @@ export function createTailer(deps: TailerDeps): Tailer {
     state.stallLogged = true
     let pane = ""
     try {
-      pane = capturePane(state.slug)
+      pane = capturePaneForRow(row)
     } catch {
       pane = ""
     }
@@ -1139,8 +1334,8 @@ export function createTailer(deps: TailerDeps): Tailer {
   // file engages discovery (throttled); on a hit it re-links + caches the drifted transcript and replays
   // it silently (primed=false → the next prime adopts it with no notify), on a miss it flags the row
   // no-transcript (a boot failure) so the board shows a degraded state, not an eternal spinner.
-  function resolveTranscript(state: TailState, row: SessionRow, nowMs: number): void {
-    if (state.offset > 0) return // already bound to a real transcript — the normal path, untouched
+  function resolveTranscript(state: TailState, row: SessionRow, nowMs: number): boolean {
+    if (state.offset > 0) return true // already bound to a real transcript — the normal path, untouched
     // Presence alone isn't enough: a worker that creates `<id>.jsonl` then crashes before writing a
     // single record leaves a permanent 0-byte file. Treat empty-or-missing alike so a touched-but-never-
     // written transcript can't silently defeat the crash-net (found in review). A stat failure → size 0.
@@ -1154,16 +1349,30 @@ export function createTailer(deps: TailerDeps): Tailer {
       // Real content present (or just appeared) — clear any prior degraded state and let consume bind it.
       state.noTranscript = false
       state.stallLogged = false
-      return
+      return true
     }
     // Empty/missing but still within the grace window → an ordinary just-spawned session (spinner). Wait.
     const spawnedMs = Date.parse(row.spawned_at)
-    if (Number.isFinite(spawnedMs) && nowMs - spawnedMs < DISCOVERY_GRACE_MS) return
+    if (Number.isFinite(spawnedMs) && nowMs - spawnedMs < DISCOVERY_GRACE_MS) return true
     // Past grace, still missing: attempt discovery (throttled), else declare the transcript missing.
-    if (nowMs < state.nextDiscoverMs) return
+    if (nowMs < state.nextDiscoverMs) return true
     state.nextDiscoverMs = nowMs + DISCOVER_RETRY_MS
     const found = discoverTranscriptId(logDir, row.session_id, { nowMs, exclude: claimedIds(row.slug) })
     if (found && found !== row.session_id) {
+      // Commit ownership before touching the in-memory path. A stale A snapshot must never bind A's
+      // discovered transcript under a same-slug replacement B, even transiently between tail ticks.
+      let committed = false
+      try {
+        committed = deps.storage.setTranscriptIdIfCurrent(
+          row.slug,
+          row.session_id,
+          row.runtime_generation ?? 0,
+          found,
+        )
+      } catch {
+        committed = false
+      }
+      if (!committed) return false
       // Re-link to the drifted transcript: rebind the read path, cache it (survives restart + dedupes
       // foreign discovery), and replay it as a fresh prime so no historical turn-done fires spuriously.
       state.path = join(logDir, `${found}.jsonl`)
@@ -1172,16 +1381,12 @@ export function createTailer(deps: TailerDeps): Tailer {
       state.primed = false
       state.noTranscript = false
       state.stallLogged = false
-      try {
-        deps.storage.setTranscriptId(row.slug, found)
-      } catch {
-        // best-effort persistence — discovery still holds for this run without it
-      }
-      return
+      return true
     }
     // Nothing to bind: the worker never wrote a transcript → degraded/stalled, captured once for triage.
     state.noTranscript = true
     captureStall(state, row)
+    return true
   }
 
   function tick(): void {
@@ -1202,12 +1407,18 @@ export function createTailer(deps: TailerDeps): Tailer {
       const backend = resolveBackend(row.backend)
       const nativeId = row.agent_session_id ?? row.transcript_id ?? row.session_id
       let state = states.get(row.slug)
-      if (!state) {
+      const runtimeGeneration = row.runtime_generation ?? 0
+      if (
+        !state ||
+        state.sessionId !== row.session_id ||
+        state.nativeSessionId !== nativeId ||
+        state.runtimeGeneration !== runtimeGeneration
+      ) {
         // claude.transcriptPath always returns the logDir join; codex.transcriptPath resolves the
         // date-sharded rollout by id (or undefined before its id is pinned → the join is a harmless
         // placeholder until discovery pins it).
         const path = backend.transcriptPath(nativeId) ?? join(logDir, `${nativeId}.jsonl`)
-        state = newTailState(row.slug, row.session_id, path)
+        state = newTailState(row.slug, row.session_id, path, false, nativeId, runtimeGeneration)
         states.set(row.slug, state)
       }
 
@@ -1218,7 +1429,7 @@ export function createTailer(deps: TailerDeps): Tailer {
       // locates its rollout by the agent_session_id pinned at dispatch, so running claude discovery on it
       // would wrongly flag noTranscript (a codex discovery-miss is a separate follow-up).
       const prevNoTranscript = state.noTranscript
-      if (row.backend !== "codex") resolveTranscript(state, row, nowMs)
+      if (row.backend !== "codex" && !resolveTranscript(state, row, nowMs)) continue
 
       // First sighting of a session (fresh dispatch OR restored after a server restart): read the
       // whole transcript to date and adopt its state as the baseline WITHOUT firing turn-done /
@@ -1226,18 +1437,51 @@ export function createTailer(deps: TailerDeps): Tailer {
       if (!state.primed) {
         const primeOffset = state.offset
         consume(state, backend)
+        persistCodexAutoTitle(row, state, runtimeGeneration)
         if (state.offset !== primeOffset) transcriptDirty.push(row.slug)
         state.turn = computeTurn(state, nowMs)
-        state.permPrompt = sniffPerm(state, state.turn, nowMs, backend)
-        state.paneDead = paneDead(row.slug)
+        const pane = sniffPane(
+          state,
+          row,
+          state.turn,
+          nowMs,
+          backend,
+        )
+        state.permPrompt = pane.permPrompt
+        state.nativeInputRequired = pane.nativeInputRequired
+        state.paneDead = paneDeadForRow(row)
         state.subAgentsSig = derivedSignature(state, nowMs)
         state.primed = true
+        if (state.permissionMode) {
+          const saved = PermissionMode.safeParse(row.permission_mode)
+          const observedAt = state.permissionModeAt ? Date.parse(state.permissionModeAt) : NaN
+          const spawnedAt = Date.parse(row.spawned_at)
+          // An idle reattach is not guaranteed to append a new profile sidecar before the next turn
+          // (verified on both standalone TUIs). Preserve a valid exact launch mode across restart;
+          // backfill only unknown legacy rows, or accept a timestamped Codex event from this process
+          // generation. Incremental sidecars below still persist genuine live transitions.
+          const observedIsCurrent = !saved.success || (row.backend === "codex" && Number.isFinite(observedAt) && Number.isFinite(spawnedAt) && observedAt >= spawnedAt)
+          if (observedIsCurrent && (!saved.success || saved.data !== state.permissionMode)) {
+            deps.storage.setObservedPermissionIfCurrent(
+              row.slug,
+              row.session_id,
+              runtimeGeneration,
+              state.permissionMode,
+            )
+          }
+        }
         dirty = true // surface the restored overlay
         continue
       }
 
       const prevActivity = state.lastActivityAt
       const prevAssistant = state.lastAssistant
+      const prevAiTitle = state.aiTitle
+      const prevModel = state.model
+      const prevEffort = state.effort
+      const prevProfileRevision = state.profileRevision ?? 0
+      const prevPermissionMode = state.permissionMode
+      const prevPermissionRevision = state.permissionModeRevision ?? 0
       const prevOffset = state.offset
       // Snapshot the turn BEFORE the fold. A codex fold (applyEvent) writes state.turn INLINE on
       // task_started/task_complete, so by the time we diff below state.turn already holds the new value
@@ -1246,6 +1490,26 @@ export function createTailer(deps: TailerDeps): Tailer {
       // byte-identical. This makes the transition edge backend-agnostic.
       const prevTurn = state.turn
       consume(state, backend)
+      const profileRecordLanded = (state.profileRevision ?? 0) !== prevProfileRevision
+      if (profileRecordLanded && state.model && state.profileAt) {
+        const observedAt = Date.parse(state.profileAt)
+        const spawnedAt = Date.parse(row.spawned_at)
+        const model = normalizeObservedThreadModel(row.backend ?? "claude", state.model)
+        const effort = state.effort?.trim() || row.effort?.trim()
+        if (model && effort && Number.isFinite(observedAt) && Number.isFinite(spawnedAt) && observedAt >= spawnedAt) {
+          try {
+            validateThreadProfile(row.backend ?? "claude", model, effort)
+            deps.storage.setObservedProfileIfCurrent(
+              row.slug,
+              { sessionId: row.session_id, generation: runtimeGeneration },
+              { model, effort },
+            )
+          } catch {
+            // Unknown/incomplete provider telemetry is visible but never becomes a future launch target.
+          }
+        }
+      }
+      if (state.aiTitle !== prevAiTitle) persistCodexAutoTitle(row, state, runtimeGeneration)
       if (state.offset !== prevOffset) transcriptDirty.push(row.slug)
 
       // turn transition (in-flight → idle): a completed turn. Mark unread + notify, gated on
@@ -1253,7 +1517,7 @@ export function createTailer(deps: TailerDeps): Tailer {
       const nextTurn = computeTurn(state, nowMs)
       if (prevTurn !== nextTurn) {
         if (prevTurn === "in-flight" && nextTurn === "idle") {
-          onTurnDone(row.slug, state)
+          onTurnDone(row, state)
           dirty = true
         } else {
           dirty = true // idle → in-flight (a new turn started): refresh the overlay badge
@@ -1264,14 +1528,22 @@ export function createTailer(deps: TailerDeps): Tailer {
       // interactive permission prompt: no jsonl signal, so pane-sniff a quiet in-flight turn.
       // Cleared automatically once jsonl activity resumes (turn no longer quiet) or the pane stops
       // matching. Rides the board snapshot only — no notify, no unread (it's not a completed turn).
-      const perm = sniffPerm(state, nextTurn, nowMs, backend)
-      if (perm !== state.permPrompt) dirty = true
-      state.permPrompt = perm
+      const pane = sniffPane(
+        state,
+        row,
+        nextTurn,
+        nowMs,
+        backend,
+      )
+      if (pane.permPrompt !== state.permPrompt) dirty = true
+      if (!sameNativeInput(pane.nativeInputRequired, state.nativeInputRequired)) dirty = true
+      state.permPrompt = pane.permPrompt
+      state.nativeInputRequired = pane.nativeInputRequired
 
       // pane death (tmux remain-on-exit pane went dead) — the agent process exited.
-      const dead = paneDead(row.slug)
+      const dead = paneDeadForRow(row)
       if (dead && !state.paneDead) {
-        onPaneDeath(row.slug)
+        onPaneDeath(row)
         dirty = true
       }
       state.paneDead = dead
@@ -1284,7 +1556,43 @@ export function createTailer(deps: TailerDeps): Tailer {
         dirty = true
       }
 
-      if (state.lastActivityAt !== prevActivity || state.lastAssistant !== prevAssistant) dirty = true
+      if (state.lastActivityAt !== prevActivity || state.lastAssistant !== prevAssistant || state.aiTitle !== prevAiTitle) dirty = true
+      const permissionRecordLanded = (state.permissionModeRevision ?? 0) !== prevPermissionRevision
+      if (permissionRecordLanded && state.permissionMode) {
+        if (row.backend === "codex") {
+          deps.storage.setObservedPermissionIfCurrent(row.slug, row.session_id, runtimeGeneration, state.permissionMode)
+        } else {
+          state.unconfirmedPermissionMode = state.permissionMode
+          state.unconfirmedPermissionPolls = 0
+        }
+      }
+      if (row.backend !== "codex" && state.unconfirmedPermissionMode) {
+        const candidateMode = state.unconfirmedPermissionMode
+        const confirmationPoll = (state.unconfirmedPermissionPolls ?? 0) + 1
+        state.unconfirmedPermissionPolls = confirmationPoll
+        const saved = PermissionMode.safeParse(row.permission_mode)
+        const paneMode = detectClaudePermissionMode(capturePaneForRow(row))
+        if (paneMode) {
+          // A footer can redraw one or more polls after its sidecar. Keep a mismatched candidate:
+          // the still-visible old footer remains authoritative for this tick, but must not consume
+          // the revision edge that makes us retry once the matching footer appears.
+          state.permissionMode = paneMode
+          if (!saved.success || saved.data !== paneMode) {
+            deps.storage.setObservedPermissionIfCurrent(row.slug, row.session_id, runtimeGeneration, paneMode)
+          }
+          if (paneMode === candidateMode || confirmationPoll >= CLAUDE_PERMISSION_CONFIRM_POLLS) {
+            state.unconfirmedPermissionMode = undefined
+            state.unconfirmedPermissionPolls = undefined
+          }
+        } else {
+          if (saved.success) state.permissionMode = saved.data
+          if (confirmationPoll >= CLAUDE_PERMISSION_CONFIRM_POLLS) {
+            state.unconfirmedPermissionMode = undefined
+            state.unconfirmedPermissionPolls = undefined
+          }
+        }
+      }
+      if (state.model !== prevModel || state.effort !== prevEffort || state.permissionMode !== prevPermissionMode) dirty = true
       // A no-transcript flip (grace expired with no file / a re-link cleared it) changes the derived
       // runtime but touches no activity/turn — mark dirty so the board rebuilds without waiting for the
       // periodic reconcile.
@@ -1317,45 +1625,61 @@ export function createTailer(deps: TailerDeps): Tailer {
 
   // in-flight → idle: the turn finished. Badge unread if this completion post-dates the last read,
   // and fire a one-shot turn-done notify (the transition itself is the dedupe).
-  function onTurnDone(slug: string, state: TailState): void {
-    const row = deps.storage.getSession(slug)
-    if (!row) return
+  function onTurnDone(row: SessionRow, state: TailState): void {
+    const generation = row.runtime_generation ?? 0
     const eventAt = state.lastActivityAt ?? new Date(now()).toISOString()
     // The rest moment drives the nav's most-recently-rested-first order. A DISCRETE event (once
     // per turn end), so rows move rarely and meaningfully — unlike continuous activity sorting.
-    deps.storage.setRestedAt(slug, eventAt)
-    if (landsAfterRead(eventAt, row.last_read_at)) deps.storage.setUnread(slug, true)
+    if (!deps.storage.setRestedAtIfCurrent(row.slug, row.session_id, generation, eventAt)) return
+    if (landsAfterRead(eventAt, row.last_read_at)) {
+      deps.storage.setUnreadIfCurrent(row.slug, row.session_id, generation, true)
+    }
     deps.bus.publish({
       type: "notify",
-      slug,
+      slug: row.slug,
       kind: "turn-done",
-      title: slug,
+      title: row.slug,
       body: state.lastAssistant,
     })
   }
 
   // pane death: stamp exited (keeps the stored column honest for the overlay) + badge unread +
   // one-shot exited notify.
-  function onPaneDeath(slug: string): void {
-    const row = deps.storage.getSession(slug)
-    if (!row) return
-    if (row.exited !== 1) deps.storage.setExited(slug, true)
+  function onPaneDeath(row: SessionRow): void {
+    const generation = row.runtime_generation ?? 0
     const eventAt = new Date(now()).toISOString()
-    deps.storage.setRestedAt(slug, eventAt)
-    if (landsAfterRead(eventAt, row.last_read_at)) deps.storage.setUnread(slug, true)
-    deps.bus.publish({ type: "notify", slug, kind: "exited", title: slug, body: "Agent session ended" })
+    if (!deps.storage.setRestedAtIfCurrent(row.slug, row.session_id, generation, eventAt)) return
+    if (row.exited !== 1) {
+      deps.storage.setExitedIfCurrent(row.slug, row.session_id, generation, true)
+    }
+    if (landsAfterRead(eventAt, row.last_read_at)) {
+      deps.storage.setUnreadIfCurrent(row.slug, row.session_id, generation, true)
+    }
+    deps.bus.publish({ type: "notify", slug: row.slug, kind: "exited", title: row.slug, body: "Agent session ended" })
+  }
+
+  function registeredStateIsCurrent(state: TailState): boolean {
+    const current = deps.storage.getSession(state.slug)
+    return Boolean(
+      current &&
+      current.session_id === state.sessionId &&
+      (current.runtime_generation ?? 0) === state.runtimeGeneration,
+    )
   }
 
   return {
     get(slug) {
       // Registered states win the key; a foreign thread resolves by its session id (its thread id).
-      const s = states.get(slug) ?? foreignStates.get(slug)
+      const registered = states.get(slug)
+      const s = registered && registeredStateIsCurrent(registered)
+        ? registered
+        : registered ? undefined : foreignStates.get(slug)
       if (!s) return undefined
       // pendingQuestion is DERIVED: the turn is at rest AND the latest assistant message still carries
       // an unanswered ```question fence (a user reply clears the flag and flips the turn in-flight).
       const pendingQuestion = s.turn === "idle" && s.lastAssistantHasQuestion
       const nowMs = now()
-      return { turn: s.turn, permPrompt: s.permPrompt, lastActivityAt: s.lastActivityAt, lastAssistant: s.lastAssistant, aiTitle: s.aiTitle, subAgents: subAgentViews(s, nowMs), bgShells: bgShellViews(s, nowMs), pendingAsk: s.pendingAsk, pendingQuestion, lastUserAt: s.lastUserAt, lastFence: s.lastFence, noTranscript: s.noTranscript }
+      return { turn: s.turn, permPrompt: s.permPrompt, nativeInputRequired: s.nativeInputRequired, model: s.model, effort: s.effort, profileAt: s.profileAt, profileRevision: s.profileRevision, permissionMode: s.permissionMode, permissionModeAt: s.permissionModeAt, permissionModeRevision: s.permissionModeRevision, lastActivityAt: s.lastActivityAt, lastAssistant: s.lastAssistant, aiTitle: s.aiTitle, customTitle: s.customTitle, customTitleRevision: s.customTitleRevision, subAgents: subAgentViews(s, nowMs), bgShells: bgShellViews(s, nowMs), pendingAsk: s.pendingAsk, pendingQuestion, lastUserAt: s.lastUserAt, lastUserText: s.lastUserText, lastFence: s.lastFence, noTranscript: s.noTranscript }
     },
     // The CURRENT fresh foreign session ids (mtime within FOREIGN_FRESH_MS, capped), mtime-desc. Kept
     // as the last scan's result — recomputed at most every FOREIGN_SCAN_EVERY ticks.
@@ -1364,6 +1688,14 @@ export function createTailer(deps: TailerDeps): Tailer {
     forget(slug) {
       states.delete(slug)
       foreignStates.delete(slug)
+    },
+    notePermissionMode(slug, permissionMode) {
+      const state = states.get(slug)
+      if (state) {
+        state.permissionMode = permissionMode
+        state.unconfirmedPermissionMode = undefined
+        state.unconfirmedPermissionPolls = undefined
+      }
     },
     start() {
       if (timer) return

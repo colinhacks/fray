@@ -10,6 +10,9 @@
   --color-border: #26282d;
   --color-border-strong: #33363c;
   --color-fg: #e6e7e9;
+  /* User chat bubble fill — a tick less white than --color-fg so the human's words read as a warm
+     off-white card rather than a stark white block, while text (text-bg) stays high-contrast. */
+  --color-user-bubble: #d5d7da;
   --color-muted: #8b8f96;
   --color-accent: #e8b923;
   --color-live: #4ac97e;
@@ -74,6 +77,7 @@ html[data-font="sans"] body {
   font-family: var(--font-sans);
 }
 html[data-font="sans"] .md-body code,
+html[data-font="sans"] .md-inline code,
 html[data-font="sans"] .md-body pre,
 html[data-font="sans"] .font-mono-keep {
   font-family: var(--font-mono);
@@ -89,10 +93,93 @@ html[data-font="sans"] .fray-bash .md-body {
   font-family: var(--font-sans);
 }
 
+/* The expanded body of a codex model-reasoning block. The summary is a QUIET secondary aside, so it
+   reads one step down from real answer prose: 12px (matching the block's collapsed header) on a tighter
+   block step, in the muted color — never the 14px fg body that would compete with the actual answer. */
+.fray-reasoning .md-body {
+  font-size: 12px;
+  --md-step: 8px;
+  color: var(--color-muted);
+}
+/* Codex emits each reasoning step as a bare `**bold header**` (default summary = header-only, no body),
+   so a turn is often a stack of 5-10 such fragments. Rendered at markdown's 700 weight that reads as a
+   wall of loud headers — the opposite of the quiet metadata aside this block wants. Drop the emphasis to
+   the body weight so the steps read as a soft train-of-thought list; a detailed-mode header still leads
+   its paragraph by position, not by shouting. */
+.fray-reasoning .md-body strong {
+  font-weight: inherit;
+}
+
 /* Petite caps for the inline dispatch readouts — subtle small-capital glyphs, a touch of tracking. */
 .petite-caps {
   font-variant-caps: all-petite-caps;
   letter-spacing: 0.045em;
+}
+
+/* Inline code that resolves to a real on-disk file (see localFileCode.ts): a quiet affordance that it
+   opens on click. A dotted accent underline + pointer read as "actionable" without shouting; hover
+   firms the underline and tints the text. Only added to <code> the server confirmed is a real file. */
+.local-file-code {
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+  text-decoration-color: color-mix(in srgb, var(--color-accent) 55%, transparent);
+}
+.local-file-code:hover {
+  text-decoration-style: solid;
+  color: var(--color-accent);
+}
+
+/* Inline prompt controls are peers even when their compact layout differs. Keep their selected
+   values on one explicit, non-responsive scale instead of relying on Tailwind utility ordering
+   between a selector and caller-supplied classes. */
+.prompt-control-type {
+  font-size: 12px;
+  line-height: 16px;
+}
+
+/* Live work is a color-plus-motion cue: the bright dot remains readable in high contrast, while
+   reduced-motion users retain the same static ring. CSS-only animation avoids transcript rerenders
+   and therefore cannot disturb scroll anchoring. */
+.fray-live-dot {
+  display: block;
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 9999px;
+  background: var(--color-accent);
+  /* Keep the motion cue close to the mark. At high browser zoom the former 4px pulse read as a
+     second, much larger circle rather than a quiet live-state halo. */
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-accent) 28%, transparent);
+  animation: fray-live-pulse 1.25s ease-in-out infinite;
+}
+@keyframes fray-live-pulse {
+  50% { opacity: 0.62; box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-accent) 14%, transparent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .fray-live-dot { animation: none; background: transparent; border: 2px solid var(--color-accent); box-shadow: none; }
+}
+
+/* QUIET-LIVE dot: a background subshell / Monitor that is still a live process but has not touched its
+   output in a while (a dev server waiting, a Monitor with no output file at all). It is ALIVE, not
+   idle — a flat gray dot mislabels it. So it BREATHES: a slow, soft in/out that reads as a calm,
+   resting pulse (distinct from the brighter, faster accent pulse that signals fresh output). Muted
+   tone keeps the accent reserved for active work; the motion alone carries "still alive". */
+.fray-live-dot-quiet {
+  display: block;
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 9999px;
+  background: color-mix(in srgb, var(--color-accent) 55%, var(--color-muted));
+  animation: fray-live-breathe 2.6s ease-in-out infinite;
+}
+@keyframes fray-live-breathe {
+  0%, 100% { opacity: 0.4; transform: scale(0.82); }
+  50% { opacity: 0.9; transform: scale(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .fray-live-dot-quiet { animation: none; opacity: 1; transform: none; background: transparent; border: 1.5px solid color-mix(in srgb, var(--color-accent) 55%, var(--color-muted)); }
 }
 @supports not (font-variant-caps: all-petite-caps) {
   .petite-caps {
@@ -121,9 +208,40 @@ a[href] {
   cursor: pointer;
 }
 
+/* Reserve the owner/repo measure before the first board keyframe. This is deliberately static: a
+   loading shimmer adds motion to persistent corner chrome, and should not be required to convey
+   state (the parent has an accessible loading label). */
+.identity-slot {
+  display: block;
+  min-width: 0;
+}
+.identity-slot--resolved {
+  flex: 1 1 auto;
+}
+.identity-slot--placeholder {
+  /* A modest, static cold reservation prevents a false name and avoids a large first-keyframe jump.
+     It applies only before an identity exists; resolved owner/repo is content-sized. */
+  width: 9rem;
+  max-width: calc(100vw - 9rem);
+  flex: 0 1 auto;
+}
+.identity-placeholder {
+  display: block;
+  width: 100%;
+  height: 0.75rem;
+  border-radius: 9999px;
+  background: color-mix(in srgb, var(--color-muted) 18%, transparent);
+}
+
+/* The inner-surface scrollbar width, as a CSS var so the ONE place that must match it — the sticky
+   user bubble's reserved gutter (UserBubble in ChatView.tsx: `calc(0.875rem + var(--sbw))`) — can't
+   silently drift out of sync and resurrect the reflow it was added to prevent. */
+:root {
+  --sbw: 7px;
+}
 ::-webkit-scrollbar {
-  width: 7px;
-  height: 7px;
+  width: var(--sbw);
+  height: var(--sbw);
 }
 ::-webkit-scrollbar-thumb {
   background: #2c2f35;
@@ -140,6 +258,21 @@ a[href] {
 }
 .scrollbar-none::-webkit-scrollbar {
   display: none; /* WebKit/Blink */
+}
+
+/* Scrollbars NEVER cause reflow. The page scrollbar is zero-width (above), but inner surfaces keep a
+   visible 7px scrollbar — so its gutter would otherwise steal 7px of content width the INSTANT a
+   scrollbar appears (and give it back when it goes), reflowing text every time. `scrollbar-gutter:
+   stable` reserves that gutter PERMANENTLY on every vertical scroll container, so a scrollbar shows or
+   hides without ever shifting content. Scoped to the vertical-overflow utilities (Tailwind's classes,
+   which every scroll surface in the app uses) rather than `*` so that horizontal code/diff blocks
+   (`overflow-x-auto`) don't grow a permanent bottom gutter, and `.scrollbar-none` surfaces — which
+   have no scrollbar — reserve nothing. */
+.overflow-y-auto,
+.overflow-y-scroll,
+.overflow-auto,
+.overflow-scroll {
+  scrollbar-gutter: stable;
 }
 
 ::selection {
@@ -166,10 +299,16 @@ a[href] {
     opacity: 1;
   }
 }
-.pop-in {
+/* Presence-managed Radix layers expose data-state="closed" while they wait to unmount. Keep the
+   enter animation off that state: if the same animation remains applied after selecting an item,
+   Radix waits for an animationend that already fired and can leave the invisible layer mounted
+   with body pointer-events disabled. Non-Radix callers have no data-state and still animate. */
+.pop-in:not([data-state]),
+.pop-in[data-state="open"] {
   animation: pop-in 0.11s cubic-bezier(0.16, 1, 0.3, 1);
 }
-.overlay-in {
+.overlay-in:not([data-state]),
+.overlay-in[data-state="open"] {
   animation: overlay-in 0.12s ease-out;
 }
 
@@ -265,15 +404,46 @@ a[href] {
   text-decoration: underline;
   text-underline-offset: 2px;
 }
+.md-body .local-file-action {
+  color: var(--color-accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+.md-body img[data-local-path] {
+  cursor: pointer;
+}
 /* Inline code is MONO inside a sans (or mono) prose run. Mono has a smaller x-height, so at the old
    0.9em it read visibly smaller than the surrounding copy. 0.95em optically matches the sans body:
    the mono glyphs land at the same apparent size as the prose around them. (Applies in both the
    default mono-prose mode and html[data-font="sans"] — code stays mono in both.) */
-.md-body code {
+/* Inline code chip — shared by block prose (.md-body) and inline-only runs (.md-inline: answer chips,
+   the recommendation caption). Same font pinning as everything else: inherits mono from the body by
+   default, re-pinned to mono under the sans experiment (see html[data-font="sans"] .md-*inline* code). */
+.md-body code,
+.md-inline code {
   font-size: 0.95em;
   background: var(--color-panel-2);
   border-radius: 4px;
   padding: 0.05em 0.3em;
+}
+/* Inline-only markdown (answer chips, the recommendation caption): honor inline emphasis/strong/del/
+   links without md-body's block chrome. Code shares the prose chip above; emphasis maps to weight/style. */
+.md-inline strong {
+  font-weight: 600;
+}
+.md-inline em {
+  font-style: italic;
+}
+.md-inline del {
+  text-decoration: line-through;
+}
+.md-inline a {
+  text-decoration: underline;
 }
 .md-body pre {
   background: var(--color-bg);
@@ -287,6 +457,64 @@ a[href] {
   border: none;
   padding: 0;
   font-size: 0.88em;
+}
+/* Fenced code highlighting: a deliberately restrained dark palette, expressed only through the
+   allowlisted classes emitted by our explicit highlight.js core grammars. Block typography,
+   line-height, padding, selection, and overflow continue to belong to the existing pre/code rules
+   above; inline code never receives .hljs and is therefore unaffected. */
+.md-body .hljs {
+  color: #d5d8dc;
+}
+.md-body .hljs-comment,
+.md-body .hljs-quote {
+  color: #747b85;
+  font-style: italic;
+}
+.md-body .hljs-keyword,
+.md-body .hljs-selector-tag,
+.md-body .hljs-doctag {
+  color: #c5a3d8;
+}
+.md-body .hljs-string,
+.md-body .hljs-regexp,
+.md-body .hljs-addition,
+.md-body .hljs-attribute {
+  color: #a9c48c;
+}
+.md-body .hljs-number,
+.md-body .hljs-literal,
+.md-body .hljs-symbol,
+.md-body .hljs-bullet {
+  color: #d5a66f;
+}
+.md-body .hljs-title,
+.md-body .hljs-section,
+.md-body .hljs-property,
+.md-body .hljs-selector-id,
+.md-body .hljs-selector-class {
+  color: #87b6d4;
+}
+.md-body .hljs-type,
+.md-body .hljs-built_in,
+.md-body .hljs-name,
+.md-body .hljs-tag {
+  color: #d1bd7d;
+}
+.md-body .hljs-meta,
+.md-body .hljs-meta .hljs-keyword {
+  color: #a8a0c7;
+}
+.md-body .hljs-variable,
+.md-body .hljs-template-variable,
+.md-body .hljs-params {
+  color: #c9a5ae;
+}
+.md-body .hljs-deletion {
+  color: #d98d8d;
+}
+.md-body .hljs-addition,
+.md-body .hljs-deletion {
+  background: color-mix(in srgb, currentColor 9%, transparent);
 }
 .md-body blockquote {
   border-left: 2px solid var(--color-border-strong);
@@ -377,3 +605,30 @@ a[href] {
   100% { box-shadow: 0 0 0 0 transparent inset; border-radius: 12px; }
 }
 @media (prefers-reduced-motion: reduce) { .queue-flash { animation: none; } }
+
+/* Queue card EXIT — the CardSlot exit (TodosView). The card FADES to transparent while it recedes
+   (uniform scale from its centre, so it "sinks backwards") and blurs, AT FULL HEIGHT. Then TodosView
+   UNMOUNTS it and, in the same layout frame, pins a currently-visible neighbour card so nothing on
+   screen shifts (the one-shot pin in TodosView.tsx).
+   There is deliberately NO height-collapse phase (removed 2026-07-15). A gradual grid 1fr→0fr collapse
+   unavoidably DRIFTS the neighbouring card by the collapsed height — native scroll anchoring does not
+   compensate a grid collapse, and any programmatic scroll run alongside it fights the collapse and
+   bounces the card the reader is watching. Instant removal + the explicit neighbour pin is the classic,
+   deterministic answer. Duration MUST stay in sync with QUEUE_EXIT_MS in TodosView.tsx (it keeps the
+   card mounted through the fade before unmounting). */
+.fray-card-slot { opacity: 1; }
+.fray-card-slot[data-queue-leaving="true"] { opacity: 0; }
+.fray-card-slot > .fray-card-clip > .fray-card-body { transform-origin: center center; }
+.fray-card-slot[data-queue-leaving="true"] > .fray-card-clip > .fray-card-body { transform: scale(0.94); filter: blur(6px); }
+/* Promote to a compositing layer ONLY while dissolving — a permanent will-change on every mounted card
+   would pin a GPU layer per queue row for its whole lifetime. */
+.fray-card-slot[data-queue-leaving="true"] > .fray-card-clip > .fray-card-body { will-change: transform, filter; }
+@media (prefers-reduced-motion: no-preference) {
+  .fray-card-slot[data-queue-leaving="true"] {
+    transition: opacity 200ms cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .fray-card-slot > .fray-card-clip > .fray-card-body {
+    transition: transform 200ms cubic-bezier(0.4, 0, 0.2, 1),
+                filter 200ms cubic-bezier(0.4, 0, 0.2, 1);
+  }
+}

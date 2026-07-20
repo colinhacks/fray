@@ -16,6 +16,10 @@ export const defaultSettings = (): Settings => ({
   effort: undefined,
   notifications: true,
   font: "sans",
+  localFileOpener: "system",
+  // Runtime release gate ON by default (opt-out) — the browser-QA + screenshot-in-handoff loop is
+  // fray's differentiator. A project that doesn't want it flips this off in Settings.
+  runtimeGate: true,
 })
 
 // Settings persist as one JSON blob under settings['settings']. Read merges over defaults

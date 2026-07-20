@@ -1,9 +1,15 @@
 import * as RadixMenu from "@radix-ui/react-dropdown-menu"
-import type { ReactNode } from "react"
+import type { ComponentProps, ReactNode } from "react"
+import { OPAQUE_PORTAL_SURFACE_CLASS } from "../../lib/overlaySurface.ts"
 
 // Thin styled wrappers over Radix DropdownMenu so call sites read declaratively. The popover
-// matches the Select: elevated bg, soft shadow, padded rounded items.
-export const Menu = RadixMenu.Root
+// matches the Select: elevated bg, soft shadow, padded rounded items. These are anchored popovers,
+// not modal dialogs: keep the surrounding app visible to assistive technology and pointer-capable
+// while the menu is open. Radix defaults DropdownMenu to modal, which otherwise aria-hides #root and
+// disables body pointer events even though no visual overlay is rendered.
+export function Menu({ modal = false, ...props }: ComponentProps<typeof RadixMenu.Root>) {
+  return <RadixMenu.Root modal={modal} {...props} />
+}
 export const MenuTrigger = RadixMenu.Trigger
 
 export function MenuContent({
@@ -20,7 +26,7 @@ export function MenuContent({
       <RadixMenu.Content
         align={align}
         sideOffset={sideOffset}
-        className="pop-in z-[70] min-w-[184px] overflow-hidden rounded-lg border border-border bg-elevated p-1 shadow-2xl shadow-black/40"
+        className={`${OPAQUE_PORTAL_SURFACE_CLASS} min-w-[184px] overflow-hidden rounded-lg p-1`}
       >
         {children}
       </RadixMenu.Content>

@@ -15,7 +15,7 @@ function transcript(dir: string, fileId: string, ownerId: string, mtimeSec?: num
   const first = JSON.stringify({
     type: "user",
     timestamp: "2026-07-01T00:00:00.000Z",
-    message: { role: "user", content: `Your scratchpad is \`.fray/scratch/${ownerId}.md\` — keep state there.` },
+    message: { role: "user", content: `Your scratchpad is \`.fray/threads/${ownerId}/scratch.md\` — keep state there.` },
   })
   const path = join(dir, `${fileId}.jsonl`)
   writeFileSync(path, first + "\n")
@@ -24,7 +24,7 @@ function transcript(dir: string, fileId: string, ownerId: string, mtimeSec?: num
 }
 
 test("sentinelFor: the scratchpad path tail embeds the pinned id", () => {
-  assert.equal(sentinelFor("abc-123"), "scratch/abc-123.md")
+  assert.equal(sentinelFor("abc-123"), "threads/abc-123/scratch.md")
 })
 
 test("discoverTranscriptId: finds a drifted transcript by its scratchpad sentinel", () => {
@@ -73,7 +73,7 @@ test("discoverTranscriptId: a missing/unreadable dir degrades to undefined (neve
 
 test("discoverTranscriptId: non-.jsonl and dotfiles are skipped", () => {
   const dir = tmp()
-  writeFileSync(join(dir, "pinned-id.txt"), `.fray/scratch/pinned-id.md`)
-  writeFileSync(join(dir, ".hidden.jsonl"), `.fray/scratch/pinned-id.md`)
+  writeFileSync(join(dir, "pinned-id.txt"), `.fray/threads/pinned-id/scratch.md`)
+  writeFileSync(join(dir, ".hidden.jsonl"), `.fray/threads/pinned-id/scratch.md`)
   assert.equal(discoverTranscriptId(dir, "pinned-id"), undefined)
 })

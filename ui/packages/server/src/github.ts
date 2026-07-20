@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
-import type { GithubItem } from "@fray-ui/shared"
+import { GITHUB_DISPATCH_UI_BOUNDARY, type GithubItem } from "@fray-ui/shared"
 
 // gh-CLI wrapper. Design principles (matching project.ts / open-external.ts): every call is
 // execFile with an ARGS ARRAY, NEVER a shell string, so a repo/number can never be reinterpreted
@@ -253,16 +253,16 @@ function labelsLine(labels: string[]): string {
 // --- Default templates (exported; the batch handler prefers the user's Settings override) ---
 //
 // These are TEMPLATE STRINGS with {token} placeholders that renderGithubPrompt substitutes:
-// {repo} {n} {title} {url} {labels} {body}. They deliberately do NOT carry the leading
-// `THREAD: <slug>` tag — renderGithubPrompt prepends it (see there) so a user's custom template can
-// never omit/mangle it and orphan the thread's .fray file. Edit these to change the shipped defaults;
-// a user override (Settings.githubIssuePrompt / githubPrPrompt) supersedes at dispatch time.
+// {repo} {n} {title} {url} {labels} {body}. They deliberately do NOT carry the leading generated
+// envelope (`THREAD`, compact UI lead, presentation boundary) — renderGithubPrompt prepends that so a
+// user's custom template can never omit/mangle the thread binding or flood the first bubble. Edit
+// these to change the shipped defaults; a user override supersedes at dispatch time.
 
 // The ISSUE default. Branches on report type: the worker first classifies bug-vs-feature, then a
 // BUG gets reproduce → trace → recommend, and a FEATURE gets clarify → impact → plan. Research only.
 // The body is deliberately NOT inlined ({body} is unused here) — the worker fetches it via
-// `gh issue view`, keeping the dispatched first-message bubble small (a giant body dump used to fill
-// the whole thread UI). A user's custom Settings template MAY still use {body} if they prefer inlining.
+// `gh issue view`, keeping prompt transport small. The UI boundary below independently keeps the first
+// bubble compact, including when a user's custom Settings template chooses to inline {body}.
 export const DEFAULT_ISSUE_PROMPT = `You are triaging a GitHub issue in {repo}. This is a RESEARCH thread: the deliverable is FINDINGS and
 a recommendation — not a landed fix.
 
@@ -293,9 +293,10 @@ IF FEATURE:
 
 Post NOTHING to GitHub (no comments, no labels, no close) unless the human explicitly asks — read-only.
 
-Handback: put your findings + recommendation in your FINAL MESSAGE (bare rest = "your move"), or a
-\`\`\`question\`\`\` block if a human call is needed. If the next step is obvious, small, and you have high
-confidence, you MAY end with a \`\`\`question approval\`\`\` proposing to implement it.`
+Handback: put your findings + recommendation in your FINAL MESSAGE and close with a \`\`\`done\`\`\`
+fence listing the completed research/evidence. If a human call is needed, use a \`\`\`question\`\`\`
+block instead. If the next step is obvious, small, and you have high confidence, you MAY end with a
+\`\`\`question approval\`\`\` proposing to implement it.`
 
 // The PR default: an adversarial review/audit before recommending merge. Read-only.
 export const DEFAULT_PR_PROMPT = `You are reviewing an open pull request in {repo}. This is an AUDIT thread: adversarially verify the
@@ -310,15 +311,18 @@ Read the PR FIRST — \`gh pr view {n} -R {repo} --comments\` (description + dis
    in context, not just the hunks.
 2. VERIFY. For each substantive change, ask: is it correct? does it handle edges? does it break
    existing behavior or the public API? are there tests, and do they actually cover the change?
-   Check CI: \`gh pr checks {n} -R {repo}\`.
+   Check CI: \`gh pr checks {n} -R {repo}\`. Pending automation is evidence to report, not a reason
+   to park this audit; if later scope explicitly includes shepherding the PR, keep CI/bot/merge
+   progression active with the backend wait primitive from the worker contract.
 3. RECOMMEND. Approve / request-changes / needs-discussion, with a concise findings list — each
    concern citing exact file:line in the diff. Distinguish blocking issues from nits.
 
 Post NOTHING to GitHub (no review, no comment, no approve/merge) unless the human explicitly asks —
 read-only; produce the review as your final message.
 
-Handback: your review in your FINAL MESSAGE (bare rest), or a \`\`\`question approval\`\`\` if you want a
-go/no-go on posting the review to GitHub.`
+Handback: put your review in your FINAL MESSAGE and close with a \`\`\`done\`\`\` fence listing the
+completed audit/evidence, or use a \`\`\`question approval\`\`\` if you want a go/no-go on posting the
+review to GitHub.`
 
 // --- Pure templater (unit-tested seam) ---
 
@@ -342,8 +346,9 @@ export const PROMPT_TOKENS = ["repo", "n", "title", "url", "labels", "body"] as 
 //    there is no injection-via-item-content and no order-dependence between tokens.
 //  • {body} is truncated defensively (kind-aware pointer) so a giant issue/PR body can't blow tmux's
 //    arg-length limit (the task prompt is a CLI arg, not the system-prompt file — see dispatch.ts).
-//  • Prepends the `THREAD: <slug>` tag itself: it is NOT part of the editable template, so a custom
-//    prompt can never drop/mangle it and orphan the thread's .fray file.
+//  • Prepends a generated envelope: the `THREAD: <slug>` binding, a compact human-facing GitHub lead,
+//    then an exact UI boundary. The FULL substituted template remains below the boundary for the
+//    worker; transcript presentation alone hides that machine-facing tail.
 //  • An unknown {placeholder} in the template is left verbatim (only the 6 known tokens are replaced).
 export function renderGithubPrompt(template: string, repo: string, it: PromptItem, slug: string, kind: "issue" | "pr"): string {
   const subs: Record<(typeof PROMPT_TOKENS)[number], string> = {
@@ -355,7 +360,9 @@ export function renderGithubPrompt(template: string, repo: string, it: PromptIte
     body: truncateBody(it.body, it.number, kind),
   }
   const filled = template.replace(/\{(repo|n|title|url|labels|body)\}/g, (_m, k: (typeof PROMPT_TOKENS)[number]) => subs[k])
-  return `THREAD: ${slug}\n\n${filled}`
+  const item = kind === "issue" ? "Issue" : "PR"
+  const lead = `Investigate this issue and make recommendations\n\n${item} #${it.number}: ${it.title}\nRepository: ${repo}\nURL: ${it.url}`
+  return `THREAD: ${slug}\n\n${lead}\n\n${GITHUB_DISPATCH_UI_BOUNDARY}\n\n${filled}`
 }
 
 // Pick the EFFECTIVE template: the user's Settings override when it is present and non-blank, else the

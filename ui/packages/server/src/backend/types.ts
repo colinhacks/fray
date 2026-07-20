@@ -9,6 +9,16 @@ import type { FenceView, SubAgentView, BgShellView, PendingAskData, TurnState } 
 
 export type BackendKind = "claude" | "codex"
 
+// A verified native TUI modal that blocks the backend before it can append another transcript
+// record. This is intentionally tiny and presentation-safe: pane contents/options never cross the
+// server boundary (they can contain commands, repository data, or secrets). Backends emit only a
+// coarse family plus a fixed, sanitized title after matching their own version-grounded modal chrome.
+export type NativeInputKind = "tool-approval" | "permission" | "confirmation" | "selection"
+export interface NativeInputRequiredData {
+  kind: NativeInputKind
+  title: string
+}
+
 // A backend-neutral transcript record: the vocabulary a backend's parser emits, and — for a backend
 // whose turn model maps cleanly onto it (codex's explicit task_started/task_complete brackets) — the
 // unit the tailer's generic fold would consume. Each backend maps its raw transcript lines onto this
@@ -27,6 +37,7 @@ export type NormalizedEvent =
   | { kind: "user-message"; at?: string; text?: string; synthetic: boolean } // human turn (synthetic=peer/notification/tool-result echo — never bumps lastUserAt)
   | { kind: "tool-call"; at?: string; id: string; name: string; input: unknown }
   | { kind: "tool-result"; at?: string; id: string; text: string }
+  | { kind: "reasoning"; at?: string; text: string } // model-reasoning SUMMARY (Codex plaintext summary[]; Claude thinking is redacted → never emitted)
   | { kind: "title"; title: string } // backend's own session auto-title (ai-title / codex thread title)
 
 // The shape a backend's fold produces per session — the SAME shape board.ts already consumes as
@@ -35,10 +46,24 @@ export type NormalizedEvent =
 // SessionTelemetry directly (see tailer.get()).
 export interface NormalizedTail {
   turn: TurnState
+  // Backend-observed session profile when its transcript records it. Claude assistant records expose
+  // the actual model but not effort; codex turn_context exposes both. Optional by design.
+  model?: string
+  effort?: string
+  profileAt?: string
+  profileRevision?: number
+  // Backend-observed permission/sandbox state. Codex emits this in turn_context and
+  // thread_settings_applied; Claude emits permission-mode sidecars.
+  permissionMode?: PermissionMode
+  // Timestamp of the Codex profile event. Claude's permission-mode sidecar has no timestamp, so it
+  // remains undefined there. Used to distinguish a pre-reattach Codex turn_context from a later
+  // manual /permissions change.
+  permissionModeAt?: string
   lastActivityAt?: string
   lastAssistant?: string
   aiTitle?: string
   lastUserAt?: string
+  lastUserText?: string // latest genuine human message (used to confirm durable Codex input delivery)
   lastFence?: FenceView // parsed by the shared fence grammar from the final message
   pendingQuestion: boolean
   subAgents: SubAgentView[] // codex: always []
@@ -56,10 +81,31 @@ export interface NormalizedTail {
 export interface FoldState {
   turn: TurnState // in-flight while a turn runs; idle once it brackets closed
   sawRecords: boolean // any substantive record folded yet (a fresh/booting session guard)
+  model?: string // latest concrete backend-observed model
+  effort?: string // latest concrete backend-observed reasoning effort
+  profileAt?: string // timestamp of latest model/effort record
+  profileRevision?: number // increments even when a profile record repeats
+  permissionMode?: PermissionMode // latest concrete backend-observed permission/sandbox mode
+  permissionModeAt?: string // timestamp of the latest timestamped permission profile event
+  permissionModeRevision?: number // increments for every profile record, even when the value repeats
   lastActivityAt?: string // ISO8601 of the latest timestamped event
   lastAssistant?: string // ~200-char preview of the latest assistant text
   aiTitle?: string // the backend's own session auto-title (latest non-empty wins)
+  // A backend may carry one in-band auto-title candidate on its first finalized response. Recording
+  // that first final lets a backend distinguish a later recovery signal from an initial title; only a
+  // replaceable automatic fallback may accept that later signal.
+  titleCandidateFinalSeen?: boolean
+  // Raw text of that first finalized response. Codex repeats the answer on task_complete; remembering
+  // it lets the fold strip the same hidden marker from the echo without treating a later turn as a
+  // second title candidate.
+  titleCandidateFinalText?: string
+  // Provenance for Codex's auto title. A bounded dispatch fallback exists only so an omitted in-band
+  // signal never leaves the board on an internal slug; a later valid Fray signal may replace it.
+  // A generated signal or provider-native title is final for automatic naming (manual titles are
+  // guarded separately by storage's title_auto CAS).
+  autoTitleSource?: "fallback" | "fray" | "native"
   lastUserAt?: string // ISO8601 of the newest GENUINE (non-synthetic) human turn — the listing sort key
+  lastUserText?: string // exact text of that genuine human turn when the backend records it
   lastFence?: FenceView // done/awaiting excusal fence on the final message (cleared by any user turn)
   lastAssistantHasQuestion: boolean // the final message carries an unanswered ```question fence
 }
@@ -70,6 +116,9 @@ export interface FoldState {
 export interface PrewriteFile {
   path: string
   contents: string
+  // Sensitive prompt transports should be owner-only while the spawned CLI is consuming them.
+  // Optional so existing backend prewrites retain their current platform default.
+  mode?: number
 }
 
 export interface BuiltCommand {
@@ -89,7 +138,9 @@ export interface SpawnOpts {
   effort?: string
 }
 export interface ResumeOpts extends Omit<SpawnOpts, "prompt"> {
-  message: string
+  // Omitted when fray is only re-attaching an idle saved conversation to apply a per-thread
+  // permission change. Present for an ordinary dead-session follow-up.
+  message?: string
 }
 
 export interface AgentBackend {
@@ -99,7 +150,8 @@ export interface AgentBackend {
   // Build the detached-spawn argv + any files that must exist on disk first. The caller runs
   // `tmux.spawn(slug, argv, cwd, env)` after writing the prewrite files.
   buildSpawn(opts: SpawnOpts): BuiltCommand
-  // Dead-session resume: argv to re-attach the pinned session with a follow-up message.
+  // Resume/reattach the pinned session; `message` starts a turn when present, otherwise the CLI opens
+  // idle at its prompt (used for a controlled permission-profile restart).
   buildResume(opts: ResumeOpts): BuiltCommand
 
   // ---- transcript location ----
@@ -121,6 +173,9 @@ export interface AgentBackend {
   // implement this as `for (const ev of this.parseLine(line)) applyEvent(state, ev)`.
   foldLine(state: FoldState, line: string): void
 
-  // ---- optional pane-sniff (interactive permission prompt; no jsonl signal) ----
+  // ---- optional pane-sniff (native interactive prompt; no jsonl signal) ----
   matchesPermPrompt?(pane: string): boolean // claude: the empirical markers; codex: its own or omitted
+  // Structured, backend-specific native-modal detection. Implementations MUST match verified terminal
+  // chrome rather than arbitrary model output and MUST NOT return pane-derived option/detail text.
+  detectNativeInput?(pane: string): NativeInputRequiredData | undefined
 }

@@ -1,6 +1,6 @@
 {
   "name": "fray-codex",
-  "version": "0.5.0",
+  "version": "0.5.0+codex.20260714224845",
   "description": "Explicit, prompt-first orchestration with model-routed Codex subagents.",
   "author": {
     "name": "Colin McDonnell",
@@ -8,19 +8,31 @@
   },
   "homepage": "https://github.com/colinhacks/fray/tree/main/codex",
   "repository": "https://github.com/colinhacks/fray",
-  "keywords": ["codex", "subagents", "orchestration", "multi-agent", "model-routing"],
+  "keywords": [
+    "codex",
+    "subagents",
+    "orchestration",
+    "multi-agent",
+    "model-routing"
+  ],
   "skills": "./skills/",
   "interface": {
     "displayName": "Fray for Codex",
     "shortDescription": "Explicitly orchestrate concurrent Codex workstreams.",
-    "longDescription": "Adds explicit-only Fray orchestration with native per-dispatch model and effort routing, scoped delegation, worker-owned scratchpads when useful, return reconciliation, and outcome-oriented reporting.",
+    "longDescription": "Adds explicit-only Fray orchestration with a visible plan plus concise session-specific scratch notes, native blocking input for material choices, native per-dispatch model and effort routing, scoped delegation, return reconciliation, and outcome-oriented reporting.",
     "developerName": "Colin McDonnell",
     "category": "Productivity",
-    "capabilities": ["Subagents", "Orchestration", "Model Routing", "Review"],
+    "capabilities": [
+      "Subagents",
+      "Orchestration",
+      "Model Routing",
+      "Review"
+    ],
     "defaultPrompt": [
       "Use $fray-codex:fray-orchestrator to delegate these workstreams.",
       "Use $fray-codex:fray-orchestrator to run this audit as a campaign.",
-      "Use $fray-codex:fray-orchestrator and add this ask without dropping active work."
+      "Use $fray-codex:fray-orchestrator and add this ask without dropping active work.",
+      "Use $fray-codex:fray-orchestrator to keep a concise session-specific checklist, summarize it in the visible plan, and ask me natively about material choices."
     ]
   }
 }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react"
 import { useMutation, useQuery } from "@tanstack/react-query"
 import { useSnapshot } from "valtio"
 import { Check, Copy, HelpCircle, X } from "lucide-react"
@@ -8,9 +8,10 @@ import { store } from "../store.ts"
 import { prefs } from "../lib/prefs.ts"
 import { registerSettingsClose } from "../lib/overlays.ts"
 import { queryClient } from "../main.tsx"
-import { Field } from "./NewThreadModal.tsx"
 import { Select } from "./ui/Select.tsx"
+import { Popover, PopoverContent, PopoverTrigger } from "./ui/Popover.tsx"
 import { Tooltip } from "./Tooltip.tsx"
+import { draftKey, useDraft, useProjectDir } from "../lib/drafts.ts"
 import {
   modelGroups,
   EFFORT_OPTIONS_SETTINGS,
@@ -23,6 +24,20 @@ import {
 } from "../lib/options.ts"
 
 type NotifPerm = "default" | "granted" | "denied" | "unsupported"
+export const SETTINGS_HELP = {
+  model: "Choose the default model used when you create or dispatch work from this project.",
+  permission: "Sets how Claude asks before it performs actions in new work.",
+  sandbox: "Sets the Codex sandbox level for new work.",
+  effort: "Controls the default reasoning effort for new work. Available options depend on the selected model.",
+  font: "Changes the interface reading font for this browser.",
+  localFileOpener: "Chooses how vetted local artifact links open. Image clicks always use the OS default viewer.",
+  compact: "Collapses long diffs by default in this browser. This takes effect immediately.",
+  stickyUserMessage: "Keeps your most recent message stuck to the top of a thread while the reply scrolls underneath. It stays collapsed to a small card (hover to expand it) so a long message never blocks much of the view. Applies immediately in this browser.",
+  queueOrder: "Orders the Needs-you queue and the sidebar's rested threads by when each was last active. Oldest first (FIFO, default) surfaces the longest-waiting item first so you cycle through everything; Newest first (LIFO) keeps the most recently active on top. Applies immediately in this browser.",
+  notifications: "Shows a desktop notification when work needs attention while this window is hidden.",
+  runtimeGate: "When on, dispatched workers must verify UI/runtime changes in a real browser, screenshot the result into their handoff, and get an independent review before finishing. Turn off to drop that requirement from the worker prompt.",
+  subagentInstructions: "Your custom per-project instructions, appended to every dispatched agent's prompt after the built-in worker contract.",
+} as const
 function currentPerm(): NotifPerm {
   if (typeof Notification === "undefined") return "unsupported"
   return Notification.permission as NotifPerm
@@ -41,6 +56,10 @@ export function SettingsDrawer() {
   // hand-maintained list). [] until it loads; the option builders fall back to a compiled-in mirror.
   const codexModels = useQuery({ queryKey: ["codexModels"], queryFn: () => rpc.codexModels() })
   const codexList = codexModels.data ?? []
+  const projectDir = useProjectDir()
+  const [preambleDraft, setPreambleDraft, clearPreambleDraft] = useDraft(draftKey.settings(projectDir, "dispatchPreamble"))
+  const [issueDraft, setIssueDraft, clearIssueDraft] = useDraft(draftKey.settings(projectDir, "githubIssuePrompt"))
+  const [prDraft, setPrDraft, clearPrDraft] = useDraft(draftKey.settings(projectDir, "githubPrPrompt"))
   const [draft, setDraft] = useState<Settings | null>(null)
   const [perm, setPerm] = useState<NotifPerm>(currentPerm())
 
@@ -63,8 +82,20 @@ export function SettingsDrawer() {
   }, [])
 
   useEffect(() => {
-    if (settings.data && !draft) setDraft(settings.data)
-  }, [settings.data, draft])
+    if (settings.data && !draft) setDraft({
+      ...settings.data,
+      ...(preambleDraft ? { dispatchPreamble: preambleDraft } : {}),
+      ...(issueDraft ? { githubIssuePrompt: issueDraft } : {}),
+      ...(prDraft ? { githubPrPrompt: prDraft } : {}),
+    })
+  }, [settings.data, draft, preambleDraft, issueDraft, prDraft])
+
+  const setTrackedDraft = useCallback((next: Settings) => {
+    if (next.dispatchPreamble !== draft?.dispatchPreamble) setPreambleDraft(next.dispatchPreamble)
+    if (next.githubIssuePrompt !== draft?.githubIssuePrompt) setIssueDraft(next.githubIssuePrompt ?? "")
+    if (next.githubPrPrompt !== draft?.githubPrPrompt) setPrDraft(next.githubPrPrompt ?? "")
+    setDraft(next)
+  }, [draft, setIssueDraft, setPreambleDraft, setPrDraft])
 
   function close() {
     if (closing) return
@@ -76,6 +107,9 @@ export function SettingsDrawer() {
   const save = useMutation({
     mutationFn: (s: Settings) => rpc.settingsSet(s),
     onSuccess: () => {
+      clearPreambleDraft()
+      clearIssueDraft()
+      clearPrDraft()
       queryClient.invalidateQueries({ queryKey: ["settingsGet"] })
       close()
     },
@@ -89,7 +123,7 @@ export function SettingsDrawer() {
       const result = (await Notification.requestPermission()) as NotifPerm
       setPerm(result)
     }
-    setDraft({ ...draft, notifications: on })
+    setTrackedDraft({ ...draft, notifications: on })
   }
 
   const dirty = !!(draft && settings.data && JSON.stringify(draft) !== JSON.stringify(settings.data))
@@ -126,58 +160,95 @@ export function SettingsDrawer() {
             {/* Model is the FIRST control: it drives the backend, and the permission/effort controls
                 below present the chosen backend's axis (Claude permission-mode vs Codex sandbox; the
                 codex effort set). Picking a model stamps the derived backend into the draft. */}
-            <Field label="Model">
+            <SettingsField label="Model" help={SETTINGS_HELP.model}>
               <Select
                 variant="bordered"
                 value={draft.model ?? ""}
-                onValueChange={(v) => setDraft({ ...draft, model: v || undefined, backend: backendForModel(v || undefined, codexList) })}
+                onValueChange={(v) => setTrackedDraft({ ...draft, model: v || undefined, backend: backendForModel(v || undefined, codexList) })}
                 groups={modelGroups(codexList, { withDefault: true })}
                 indicatorPosition="right"
                 ariaLabel="Model"
               />
-            </Field>
+            </SettingsField>
 
             {/* Permission mode (Claude) / Sandbox (Codex) — same stored `permissionMode` field; for
                 codex the options are a VIEW that the server's codexSandbox() maps to `-s`. */}
-            <Field label={backend === "codex" ? "Sandbox" : "Permission mode"}>
+            <SettingsField
+              label={backend === "codex" ? "Sandbox" : "Permission mode"}
+              help={backend === "codex" ? SETTINGS_HELP.sandbox : SETTINGS_HELP.permission}
+            >
               <Select
                 variant="bordered"
                 value={permValueFor(backend, draft.permissionMode)}
-                onValueChange={(v) => setDraft({ ...draft, permissionMode: v as Settings["permissionMode"] })}
+                onValueChange={(v) => setTrackedDraft({ ...draft, permissionMode: v as Settings["permissionMode"] })}
                 options={permOptionsFor(backend)}
+                indicatorPosition="right"
                 ariaLabel={backend === "codex" ? "Sandbox" : "Permission mode"}
               />
-            </Field>
+            </SettingsField>
 
-            <Field label="Effort">
+            <SettingsField label="Effort" help={SETTINGS_HELP.effort}>
               <Select
                 variant="bordered"
                 value={backend === "codex" ? codexEffortForModel(codexModel, draft.effort ?? "") : (draft.effort ?? "")}
-                onValueChange={(v) => setDraft({ ...draft, effort: (v || undefined) as Settings["effort"] })}
+                onValueChange={(v) => setTrackedDraft({ ...draft, effort: (v || undefined) as Settings["effort"] })}
                 options={backend === "codex" ? codexEffortOptions(codexModel, { withDefault: true }) : EFFORT_OPTIONS_SETTINGS}
                 indicatorPosition="right"
                 ariaLabel="Effort"
               />
-            </Field>
+            </SettingsField>
 
-            <Field label="Font">
-              <FontToggle value={draft.font ?? "mono"} onChange={(font) => setDraft({ ...draft, font })} />
-            </Field>
+            <SettingsField label="Font" help={SETTINGS_HELP.font}>
+              <FontToggle value={draft.font ?? "mono"} onChange={(font) => setTrackedDraft({ ...draft, font })} />
+            </SettingsField>
+
+            <SettingsField label="Local file links" help={SETTINGS_HELP.localFileOpener}>
+              <Select
+                variant="bordered"
+                value={draft.localFileOpener ?? "system"}
+                onValueChange={(v) => setTrackedDraft({ ...draft, localFileOpener: v as Settings["localFileOpener"] })}
+                options={[
+                  { value: "system", label: "System default" },
+                  { value: "cursor", label: "Cursor" },
+                  { value: "vscode", label: "VS Code" },
+                  { value: "finder", label: "Reveal in Finder" },
+                  { value: "copy", label: "Copy path" },
+                ]}
+                indicatorPosition="right"
+                ariaLabel="Local file link opener"
+              />
+            </SettingsField>
 
             {/* A client-only VIEW preference (localStorage, not server Settings): applies IMMEDIATELY,
                 not on Save, so it's wired straight to the prefs proxy rather than the draft. */}
-            <Field label="Compact mode">
+            <SettingsField label="Compact mode" help={SETTINGS_HELP.compact}>
               <CompactToggle />
-            </Field>
+            </SettingsField>
+
+            {/* Also a client-only VIEW preference (localStorage): applies immediately, wired to prefs. */}
+            <SettingsField label="Sticky message" help={SETTINGS_HELP.stickyUserMessage}>
+              <StickyMessageControl />
+            </SettingsField>
+
+            {/* Client-only VIEW preference (localStorage): applies immediately, wired to prefs. */}
+            <SettingsField label="Queue order" help={SETTINGS_HELP.queueOrder}>
+              <QueueOrderControl />
+            </SettingsField>
 
             {/* Same segmented Off/On control as every other row (the old bare checkbox matched
                 nothing else in the form). Off left, On right — switch convention. */}
-            <Field label="Desktop notifications">
+            <SettingsField label="Desktop notifications" help={SETTINGS_HELP.notifications}>
               <OnOffToggle value={draft.notifications} onChange={toggleNotifications} />
               {draft.notifications && <PermHint perm={perm} />}
-            </Field>
+            </SettingsField>
 
-            <PromptsSection draft={draft} setDraft={setDraft} />
+            {/* Server setting (part of the dispatched worker's system prompt) — saved on Save, not live.
+                Absent ⇒ on, so a checkbox always reflects the effective state. */}
+            <SettingsField label="Runtime QA gate" help={SETTINGS_HELP.runtimeGate}>
+              <OnOffToggle value={draft.runtimeGate !== false} onChange={(on) => setTrackedDraft({ ...draft, runtimeGate: on })} />
+            </SettingsField>
+
+            <PromptsSection draft={draft} setDraft={setTrackedDraft} />
           </div>
         )}
 
@@ -204,12 +275,21 @@ function LabelWithHelp({ label, help }: { label: string; help: string }) {
   return (
     <span className="flex items-center gap-1.5 text-[11px] uppercase tracking-wide text-muted">
       {label}
-      <Tooltip label={help} side="right">
-        <button type="button" aria-label={`About ${label}`} className="text-muted/60 hover:text-fg transition-colors">
+      <Tooltip label={help} side="right" clickable>
+        <button type="button" aria-label={`About ${label}`} className="inline-flex size-4 items-center justify-center text-muted/60 hover:text-fg transition-colors">
           <HelpCircle size={12} />
         </button>
       </Tooltip>
     </span>
+  )
+}
+
+function SettingsField({ label, help, children }: { label: string; help: string; children: ReactNode }) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <LabelWithHelp label={label} help={help} />
+      {children}
+    </div>
   )
 }
 
@@ -232,7 +312,7 @@ const GH_PROMPT_TOKENS: { token: string; gloss: string }[] = [
 function PromptsSection({ draft, setDraft }: { draft: Settings; setDraft: (s: Settings) => void }) {
   const defaults = useQuery({ queryKey: ["githubPromptDefaults"], queryFn: () => rpc.githubPromptDefaults() })
   return (
-    <div className="flex flex-col gap-6 border-t border-border pt-6">
+    <div className="flex flex-col gap-6">
       <DividerLabel label="Prompts" />
 
       {/* Subagent instructions — the old "Dispatch preamble", now grouped with the picker prompts since
@@ -240,7 +320,7 @@ function PromptsSection({ draft, setDraft }: { draft: Settings; setDraft: (s: Se
       <div className="flex flex-col gap-2">
         <LabelWithHelp
           label="Subagent instructions"
-          help="Your custom per-project instructions, appended to every dispatched agent's prompt after the built-in worker contract."
+          help={SETTINGS_HELP.subagentInstructions}
         />
         <textarea
           value={draft.dispatchPreamble}
@@ -252,17 +332,14 @@ function PromptsSection({ draft, setDraft }: { draft: Settings; setDraft: (s: Se
         />
       </div>
 
-      {/* The two GitHub-picker investigation templates. Tokens apply to BOTH, so the "?" popover lives
-          once in this group's intro row rather than being repeated per field. */}
+      {/* The two GitHub-picker investigation templates. Each field carries its own label, so no group
+          label is needed; tokens apply to BOTH, so the "?" popover lives once, right-aligned above them,
+          rather than being repeated per field. */}
       {!defaults.data ? (
         <div className="text-[12px] text-muted">Loading defaults…</div>
       ) : (
         <div className="flex flex-col gap-5">
-          <div className="flex items-start justify-between gap-3">
-            <span className="text-[11px] leading-relaxed text-muted/70">
-              The worker prompt used for each item you dispatch from the GitHub picker. Leave an editor empty to use the
-              built-in default.
-            </span>
+          <div className="flex justify-end">
             <TokenHelpPopover />
           </div>
           <GithubPromptField
@@ -298,64 +375,39 @@ function DividerLabel({ label }: { label: string }) {
   )
 }
 
-// A real click-popover (NOT a hover tooltip) listing the substitution tokens. Opens on click, stays
-// open, and dismisses on outside-click or Esc. There is no @radix-ui/react-popover dep, so this is a
-// hand-rolled panel: an open flag + an absolutely-positioned panel + document listeners. The Esc
-// handler stopPropagation()s so it closes the popover WITHOUT bubbling up to App's window-level Esc
-// (which would otherwise close the whole Settings drawer).
+// A real click-popover (NOT a hover tooltip) listing the substitution tokens, built on the shared
+// Radix Popover: opaque from the first frame, portaled above the drawer, and it flips/shifts to stay
+// on-screen. Opens on click; dismisses on outside-click or Esc (Radix handles both, and — being a
+// non-modal Popover portaled to <body> — its Esc does not bubble to App's window-level Esc, so it
+// closes only the panel, never the whole Settings drawer). Prefers opening UPWARD: the "?" lives low
+// in the scroll body, and the roomy Subagent editor sits above it.
 function TokenHelpPopover() {
   const [open, setOpen] = useState(false)
-  const ref = useRef<HTMLDivElement>(null)
-  useEffect(() => {
-    if (!open) return
-    function onDown(e: MouseEvent) {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
-    }
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") {
-        e.stopPropagation()
-        setOpen(false)
-      }
-    }
-    document.addEventListener("mousedown", onDown)
-    document.addEventListener("keydown", onKey)
-    return () => {
-      document.removeEventListener("mousedown", onDown)
-      document.removeEventListener("keydown", onKey)
-    }
-  }, [open])
   return (
-    <div ref={ref} className="relative shrink-0">
-      <button
-        type="button"
-        aria-label="Available tokens"
-        aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
-        className={`transition-colors ${open ? "text-accent" : "text-muted/60 hover:text-fg"}`}
-      >
-        <HelpCircle size={14} />
-      </button>
-      {open && (
-        <div
-          role="dialog"
-          // Opens UPWARD (bottom-full): the "?" lives low in the scroll body, so a downward panel would
-          // clip against the drawer footer / viewport edge. Upward has the roomy Subagent editor above it.
-          className="absolute right-0 bottom-full mb-2 z-10 w-56 rounded-md border border-border bg-elevated p-3 shadow-lg shadow-black/40"
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          aria-label="Available tokens"
+          className={`shrink-0 transition-colors ${open ? "text-accent" : "text-muted/60 hover:text-fg"}`}
         >
-          <div className="mb-2 text-[11px] font-medium text-fg">Substitution tokens</div>
-          <ul className="flex flex-col gap-1.5">
-            {GH_PROMPT_TOKENS.map(({ token, gloss }) => (
-              <li key={token} className="flex items-center justify-between gap-3 text-[11px]">
-                <code className="font-mono-keep rounded border border-border bg-bg px-1 py-0.5 text-[10px] text-fg/80">
-                  {`{${token}}`}
-                </code>
-                <span className="text-muted/80">{gloss}</span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-    </div>
+          <HelpCircle size={14} />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent side="top" align="end" className="w-56 p-3">
+        <div className="mb-2 text-[11px] font-medium text-fg">Substitution tokens</div>
+        <ul className="flex flex-col gap-1.5">
+          {GH_PROMPT_TOKENS.map(({ token, gloss }) => (
+            <li key={token} className="flex items-center justify-between gap-3 text-[11px]">
+              <code className="font-mono-keep rounded border border-border bg-bg px-1 py-0.5 text-[10px] text-fg/80">
+                {`{${token}}`}
+              </code>
+              <span className="text-muted/80">{gloss}</span>
+            </li>
+          ))}
+        </ul>
+      </PopoverContent>
+    </Popover>
   )
 }
 
@@ -460,6 +512,38 @@ function CompactToggle() {
   return <OnOffToggle value={compactDiffs} onChange={(v) => (prefs.compactDiffs = v)} />
 }
 
+// Sticky most-recent-message preference: client-only (localStorage prefs proxy), applies live to every
+// thread/queue-card the instant it flips. On by default — a collapsed, hover-to-expand bubble.
+function StickyMessageControl() {
+  const { stickyUserMessage } = useSnapshot(prefs)
+  return <OnOffToggle value={stickyUserMessage} onChange={(v) => (prefs.stickyUserMessage = v)} />
+}
+
+// Queue/rested-band direction: client-only (localStorage prefs proxy), applies live to the Needs-you
+// queue and the sidebar's rested rows the instant it flips. FIFO by default (oldest-active first).
+function QueueOrderControl() {
+  const { queueOrder } = useSnapshot(prefs)
+  const opts: { v: "fifo" | "lifo"; label: string }[] = [
+    { v: "fifo", label: "Oldest first" },
+    { v: "lifo", label: "Newest first" },
+  ]
+  return (
+    <div className="inline-flex w-fit rounded-md border border-border bg-bg p-0.5">
+      {opts.map((o) => (
+        <button
+          key={o.v}
+          onClick={() => (prefs.queueOrder = o.v)}
+          className={`rounded px-3 py-1 text-[12px] transition-colors ${
+            queueOrder === o.v ? "bg-fg text-bg" : "text-muted hover:text-fg"
+          }`}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
 // Quiet, small permission-state line under the notifications toggle. Everything is muted (the old
 // loud-red denied line read as an error); the denied state additionally offers a recovery assist,
 // since a page can't re-prompt once denied.
@@ -470,7 +554,7 @@ function PermHint({ perm }: { perm: NotifPerm }) {
     default: "Browser permission not yet granted — notifications won't fire until you allow them.",
     unsupported: "This browser does not support desktop notifications.",
   }
-  return <span className="pl-6 text-[11px] text-muted/70">{text[perm]}</span>
+  return <span className="text-[11px] text-muted/70">{text[perm]}</span>
 }
 
 type Browser = "chrome" | "edge" | "safari" | "firefox" | "other"
@@ -494,7 +578,7 @@ function NotifDeniedHelp() {
   const chromiumUrl = `${browser === "edge" ? "edge" : "chrome"}://settings/content/siteDetails?site=${encodeURIComponent(origin)}`
 
   return (
-    <div className="pl-6 flex flex-col gap-1 text-[11px] text-muted/70">
+    <div className="flex flex-col gap-1 text-[11px] text-muted/70">
       <span>Notifications are blocked for this site. Re-enable them in your browser, then reload.</span>
       {browser === "chrome" || browser === "edge" ? (
         <CopyableAddress url={chromiumUrl} hint="Paste this into a new tab, set Notifications → Allow:" />
@@ -529,17 +613,16 @@ function CopyableAddress({ url, hint }: { url: string; hint: string }) {
     }
   }
   return (
-    <span className="flex flex-col gap-1">
+    <span className="flex w-full flex-col gap-1">
       <span>{hint}</span>
-      <span className="flex items-center gap-1.5">
-        <code className="font-mono-keep select-all rounded border border-border bg-bg px-1.5 py-0.5 text-[10.5px] text-fg/90 break-all">
+      <span className="flex min-w-0 items-center gap-1.5">
+        <code className="min-w-0 flex-1 font-mono-keep select-all rounded border border-border bg-bg px-1.5 py-0.5 text-[10.5px] text-fg/90 break-all">
           {url}
         </code>
         <button
           type="button"
           onClick={copy}
           aria-label="Copy address"
-          title="Copy address"
           className="shrink-0 rounded border border-border p-1 text-muted hover:bg-panel-2 hover:text-fg transition-colors"
         >
           {copied ? <Check size={11} className="text-live" /> : <Copy size={11} />}

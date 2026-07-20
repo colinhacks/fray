@@ -1,6 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, realpathSync } from "node:fs"
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, realpathSync, statSync, utimesSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createStorage } from "./storage.ts"
@@ -21,19 +21,23 @@ import {
 import { createClaudeBackend } from "./backend/claude.ts"
 import { createCodexBackend } from "./backend/codex.ts"
 import type { AgentBackend } from "./backend/types.ts"
+import type { PaneIdentity, TmuxSpawnOptions } from "./tmux.ts"
 
 function tmp(prefix: string) {
   return mkdtempSync(join(tmpdir(), prefix))
 }
 
-// A dispatcher wired to a tmp project + real storage + a stub board + an INJECTED spawn that captures
-// argv (no real `claude`, no real tmux session). dispatch()/adopt() still call tmux.ensureServer() and
-// killSession(), which are session-free / no-op on the unique fixture slugs here (both swallow errors).
-function dispatcherHarness() {
+function fakePaneIdentity(n = 1): PaneIdentity {
+  return { paneId: `%${n}`, panePid: 10_000 + n, sessionCreated: 20_000 + n }
+}
+
+// A dispatcher wired to a tmp project + real storage + a stub board + injected tmux seams. No test in
+// this harness contacts the live project socket or starts a real worker.
+function dispatcherHarness(settings = defaultSettings()) {
   const dir = tmp("fray-dispatch-")
   const storage = createStorage(join(dir, "ui.db"))
   const project: Project = { dir, id: "id", name: "test", label: "o/test", stateDir: dir, cwdSlug: cwdSlug(dir) }
-  const spawned: { slug: string; cmd: string[]; cwd: string; env?: Record<string, string> }[] = []
+  const spawned: { slug: string; cmd: string[]; cwd: string; env?: Record<string, string>; promptText?: string; promptMode?: number }[] = []
   const board: BoardManager = {
     snapshot: async () => ({}) as never,
     currentSeq: () => 0,
@@ -46,8 +50,34 @@ function dispatcherHarness() {
     project,
     storage,
     board,
-    getSettings: () => defaultSettings(),
-    spawn: (slug, cmd, cwd, env) => void spawned.push({ slug, cmd, cwd, env }),
+    readBoard: async () => ({
+      config: {},
+      threads: existsSync(join(dir, ".fray"))
+        ? readdirSync(join(dir, ".fray"), { withFileTypes: true })
+            .filter((entry) => entry.isFile() && entry.name.endsWith(".md"))
+            .map((entry) => ({
+              id: entry.name.slice(0, -3),
+              title: entry.name.slice(0, -3),
+              status: "active",
+              owner: null,
+              agents: [],
+              errors: [],
+              warnings: [],
+            }))
+        : [],
+      errors: [],
+      warnings: [],
+      errorItems: [],
+    }),
+    getSettings: () => settings,
+    spawn: (slug, cmd, cwd, env, options: TmuxSpawnOptions = {}) => {
+      spawned.push({ slug, cmd, cwd, env })
+      const identity = fakePaneIdentity(spawned.length)
+      options.onCreated?.(identity)
+      return identity
+    },
+    ensureServer: () => {},
+    hasSession: () => false,
   })
   return { dir, storage, project, spawned, dispatcher }
 }
@@ -224,7 +254,7 @@ test("composePrompt: scratchpad orientation + custom instructions + task (no thr
   const out = composePrompt("sid-123", "Do the thing.", "PREAMBLE_TEXT")
   // Session-first: the visible first message points at the scratchpad, NOT a .fray file to own. The
   // fixed worker prompt still rides --append-system-prompt (buildClaudeCommand), not this message.
-  assert.ok(out.includes(".fray/scratch/sid-123.md"))
+  assert.ok(out.includes(".fray/threads/sid-123/scratch.md"))
   assert.ok(!out.includes("You are a dispatched worker agent"))
   assert.ok(!out.includes("You own")) // the old ownership contract is gone
   assert.ok(!out.includes("status: blocked"))
@@ -235,10 +265,10 @@ test("composePrompt: scratchpad orientation + custom instructions + task (no thr
 
 test("scratchpadOrientation: scratchpad line always; PLAN line only when a plan is associated", () => {
   const bare = scratchpadOrientation("sid-1")
-  assert.ok(bare.includes("SCRATCHPAD: .fray/scratch/sid-1.md"))
+  assert.ok(bare.includes("SCRATCHPAD: .fray/threads/sid-1/scratch.md"))
   assert.ok(!bare.includes("PLAN:"))
   const withPlan = scratchpadOrientation("sid-1", ".fray/plans/p.md")
-  assert.ok(withPlan.includes("SCRATCHPAD: .fray/scratch/sid-1.md"))
+  assert.ok(withPlan.includes("SCRATCHPAD: .fray/threads/sid-1/scratch.md"))
   assert.ok(withPlan.includes("PLAN: .fray/plans/p.md"))
 })
 
@@ -308,11 +338,17 @@ test("buildClaudeResumeCommand: -r <sessionId> with the follow-up + worker syste
   // Resume re-carries the worker norms (system prompt is rebuilt per invocation) via the file flag.
   const dflt = buildClaudeResumeCommand({ sessionId: "sid", permissionMode: "auto", message: "m" })
   assert.ok(dflt.includes("--append-system-prompt-file"))
-  assert.ok(systemPromptOf(dflt).startsWith("You are a dispatched worker agent"))
+  const system = systemPromptOf(dflt)
+  assert.ok(system.startsWith("You are a dispatched worker agent"))
+  // A dead-session follow-up rebuilds the system prompt, so the awaiting re-entry invariant must ride
+  // the ACTUAL `claude -r` invocation—not live only in a companion skill the worker may not reload.
+  assert.match(system, /back to awaiting/)
+  assert.match(system, /NEVER say it is "already parked"/)
+  assert.match(system, /MUST re-emit a fresh terminal/)
 })
 
 test("build*Command: extraSystemPrompt is appended AFTER the worker norms in the system prompt", () => {
-  const scratch = "SCRATCHPAD: .fray/scratch/u.md — memory"
+  const scratch = "SCRATCHPAD: .fray/threads/u/scratch.md — memory"
   const disp = buildClaudeCommand({ sessionId: "u", permissionMode: "auto", prompt: "p", workerPrompt: "WORKER", extraSystemPrompt: scratch })
   const dSys = systemPromptOf(disp)
   assert.ok(dSys.startsWith("WORKER"))
@@ -326,13 +362,13 @@ test("build*Command: extraSystemPrompt is appended AFTER the worker norms in the
 
 test("dispatch: writes a scratchpad (not a thread file), argv carries the scratchpad, stores an open row", async () => {
   const h = dispatcherHarness()
-  const { slug, sessionId } = await h.dispatcher.dispatch({ prompt: "Do the thing." })
+  const { slug, sessionId } = await h.dispatcher.dispatch({ prompt: "Do the thing.", model: "opus", effort: "high" })
 
   // Session-first: NO .fray/<slug>.md thread file is written on dispatch.
   assert.ok(!existsSync(join(h.dir, ".fray", `${slug}.md`)), "no thread file written")
 
   // The scratchpad is provisioned with the conventional skeleton.
-  const scratch = join(h.dir, ".fray", "scratch", `${sessionId}.md`)
+  const scratch = join(h.dir, ".fray", "threads", sessionId, "scratch.md")
   assert.ok(existsSync(scratch), "scratchpad file created")
   const body = readFileSync(scratch, "utf8")
   assert.ok(body.startsWith("# Scratchpad — "))
@@ -343,9 +379,9 @@ test("dispatch: writes a scratchpad (not a thread file), argv carries the scratc
   // argv: the SCRATCHPAD orientation rides the system prompt; the user message carries the path + TASK
   // and NONE of the retired thread-ownership contract.
   const cmd = h.spawned[0].cmd
-  assert.ok(systemPromptOf(cmd).includes(`SCRATCHPAD: .fray/scratch/${sessionId}.md`))
+  assert.ok(systemPromptOf(cmd).includes(`SCRATCHPAD: .fray/threads/${sessionId}/scratch.md`))
   const userPrompt = cmd[cmd.length - 1]
-  assert.ok(userPrompt.includes(`.fray/scratch/${sessionId}.md`))
+  assert.ok(userPrompt.includes(`.fray/threads/${sessionId}/scratch.md`))
   assert.ok(userPrompt.includes("TASK:\nDo the thing."))
   assert.ok(!userPrompt.includes("You own"))
   assert.equal(h.spawned[0].env?.FRAY_UI_THREAD, slug)
@@ -355,6 +391,9 @@ test("dispatch: writes a scratchpad (not a thread file), argv carries the scratc
   assert.equal(row?.session_id, sessionId)
   assert.equal(row?.state, "open")
   assert.equal(row?.plan_path, null)
+  assert.equal(row?.model, "opus", "the dispatch model is pinned on the session row")
+  assert.equal(row?.effort, "high", "the dispatch effort is pinned on the session row")
+  assert.equal(row?.permission_mode, "auto", "the concrete launch permission is pinned on the session row")
 })
 
 test("dispatch: a valid planPath is stored + named in the system prompt; invalid ones are ignored", async () => {
@@ -374,9 +413,9 @@ test("dispatch: a valid planPath is stored + named in the system prompt; invalid
 })
 
 test("adopt: requires the legacy file, provisions a scratchpad, orientation is context-not-contract", async () => {
-  const h = dispatcherHarness()
+  const h = dispatcherHarness({ ...defaultSettings(), model: "sonnet", effort: "xhigh" })
   // No file → clean rejection.
-  await assert.rejects(h.dispatcher.adopt("adopt-fixture"), /no thread file/)
+  await assert.rejects(h.dispatcher.adopt("adopt-fixture"), /thread is not available for adoption/)
 
   mkdirSync(join(h.dir, ".fray"), { recursive: true })
   writeFileSync(join(h.dir, ".fray", "adopt-fixture.md"), "---\ntitle: x\nstatus: active\n---\n\n## Goal\n\ng\n")
@@ -384,13 +423,17 @@ test("adopt: requires the legacy file, provisions a scratchpad, orientation is c
   assert.equal(slug, "adopt-fixture")
 
   // Scratchpad provisioned even for an adopted thread.
-  assert.ok(existsSync(join(h.dir, ".fray", "scratch", `${sessionId}.md`)))
+  assert.ok(existsSync(join(h.dir, ".fray", "threads", sessionId, "scratch.md")))
 
   // System prompt: scratchpad orientation + the adoption note framing the file as CONTEXT, not a contract.
   const sys = systemPromptOf(h.spawned[0].cmd)
-  assert.ok(sys.includes(`SCRATCHPAD: .fray/scratch/${sessionId}.md`))
+  assert.ok(sys.includes(`SCRATCHPAD: .fray/threads/${sessionId}/scratch.md`))
   assert.ok(sys.includes("CONTEXT, not a contract"))
   assert.ok(sys.includes("adopt-fixture.md"))
+  const row = h.storage.getSession(slug)
+  assert.equal(row?.model, "sonnet", "adoption pins the model default used for its new session")
+  assert.equal(row?.effort, "xhigh", "adoption pins the effort default used for its new session")
+  assert.equal(row?.permission_mode, "auto", "adoption pins the concrete launch permission")
 })
 
 test("cwdSlug: replaces / and . with - (Claude Code project-log convention)", () => {
@@ -408,23 +451,32 @@ function codexDispatcherHarness() {
   const codexHome = tmp("fray-codexhome-")
   const storage = createStorage(join(dir, "ui.db"))
   const project: Project = { dir, id: "id", name: "test", label: "o/test", stateDir: dir, cwdSlug: cwdSlug(dir) }
-  const spawned: { slug: string; cmd: string[]; cwd: string; env?: Record<string, string> }[] = []
+  const spawned: {
+    slug: string
+    cmd: string[]
+    cwd: string
+    env?: Record<string, string>
+    promptText?: string
+    promptMode?: number
+  }[] = []
   const CODEX_ID = "019f4e0a-cafe-7891-9cbf-00000000abcd"
   // A spawn that SIMULATES codex: extract the per-dispatch sentinel from the prompt (codex spawns via an
   // `sh -c` wrapper that reads the prompt from a temp FILE — the last argv element — so read it) and write
   // a fresh rollout carrying it (+ a session_meta id/cwd) so the dispatcher's sentinel discovery resolves
   // it. A claude spawn (no `fray-session:` sentinel) writes nothing — the resolver stayed off codex.
   const spawn = (slug: string, cmd: string[], cwd: string, env?: Record<string, string>) => {
-    spawned.push({ slug, cmd, cwd, env })
     const last = cmd[cmd.length - 1] ?? ""
     const promptText = cmd[0] === "sh" ? readFileSync(last, "utf8") : last
+    const promptMode = cmd[0] === "sh" ? statSync(last).mode & 0o777 : undefined
+    spawned.push({ slug, cmd, cwd, env, promptText, promptMode })
     const sentinel = promptText.match(/fray-session:[0-9a-f-]+/)?.[0]
-    if (!sentinel) return
+    if (!sentinel) return fakePaneIdentity(spawned.length)
     const sdir = join(codexHome, "sessions", "2026", "07", "10")
     mkdirSync(sdir, { recursive: true })
     const meta = JSON.stringify({ timestamp: "2026-07-10T22:00:00.000Z", type: "session_meta", payload: { session_id: CODEX_ID, cwd } })
     const um = JSON.stringify({ timestamp: "2026-07-10T22:00:01.000Z", type: "event_msg", payload: { type: "user_message", message: `do the task <!-- ${sentinel} -->` } })
     writeFileSync(join(sdir, `rollout-2026-07-10T22-00-00-${CODEX_ID}.jsonl`), meta + "\n" + um + "\n")
+    return fakePaneIdentity(spawned.length)
   }
   const codexBackend = createCodexBackend({ codexHome })
   const claudeBackend = createClaudeBackend({ logDir: join(dir, "logs") })
@@ -437,7 +489,16 @@ function codexDispatcherHarness() {
     start: async () => {},
     stop: async () => {},
   }
-  const dispatcher = createDispatcher({ project, storage, board, getSettings: () => defaultSettings(), spawn, backendFor, codexHome })
+  const dispatcher = createDispatcher({
+    project,
+    storage,
+    board,
+    getSettings: () => defaultSettings(),
+    spawn,
+    ensureServer: () => {},
+    backendFor,
+    codexHome,
+  })
   return { dir, codexHome, storage, project, spawned, dispatcher, CODEX_ID }
 }
 
@@ -460,16 +521,22 @@ test("dispatch(codex): pre-arms cwd trust, spawns the codex argv, and pins the d
   assert.ok(script.includes(`exec 'codex' '--cd' '${h.project.dir}'`), "the wrapper execs the real codex argv")
   assert.ok(script.includes("'-a' 'never'"), "approvals never (unattended)")
   const promptFile = cmd[cmd.length - 1]
-  const promptText = readFileSync(promptFile, "utf8")
+  const promptText = h.spawned[0].promptText!
   assert.ok(promptText.includes(`fray-session:${sessionId}`), "the discovery sentinel rides the prompt file")
   assert.ok(promptText.length > 10_000, "the ~18KB worker contract rides the prompt file")
+  assert.equal(h.spawned[0].promptMode, 0o600, "the full task/contract is owner-readable only while Codex consumes it")
+  assert.equal(existsSync(promptFile), false, "verified discovery removes the successful dispatch's prompt transport")
   assert.ok(cmd.join(" ").length < 2_000, "the tmux command line stays well under the length limit")
 
   // 2b. the contract a codex worker receives is the CODEX variant — codex's own session/wake +
   //     model/effort/sandbox framing, and NONE of the Claude-Code-only guidance it can't act on
   //     (the Agent tool + fray:<model>-<effort> profiles, "claude session"/`claude -r`).
   assert.ok(promptText.includes("a top-level `codex` session"), "codex worker gets the codex session framing")
-  assert.ok(promptText.includes("## Working solo"), "codex worker gets the solo section")
+  assert.ok(promptText.includes("## Own one task"), "codex worker gets the one-task leaf section")
+  assert.ok(promptText.includes("## Bounded native delegation"), "codex worker retains explicitly authorized delegation")
+  assert.ok(promptText.includes("FRAY TITLE TRANSPORT (required)"), "the final-answer title transport survives the prompt-file wrapper")
+  assert.ok(promptText.indexOf("TASK:\nWire codex.") < promptText.indexOf("FRAY TITLE TRANSPORT"), "the title reminder stays after the human task, where an exact-output task cannot eclipse it")
+  assert.ok(promptText.indexOf("FRAY TITLE TRANSPORT") < promptText.indexOf(`<!-- fray-session:${sessionId} -->`), "the sentinel remains the final transport segment")
   assert.ok(!promptText.includes("## Sub-agents"), "codex worker never gets the Claude Sub-agents section")
   assert.ok(!promptText.includes("fray:<model>-<effort>"), "codex worker never gets the fray profile ladder")
   assert.ok(!promptText.includes("claude -r"), "codex worker never gets the `claude -r` wake")
@@ -480,7 +547,171 @@ test("dispatch(codex): pre-arms cwd trust, spawns the codex argv, and pins the d
   assert.equal(rowdb.backend, "codex")
   assert.equal(rowdb.agent_session_id, h.CODEX_ID, "the discovered codex rollout id is pinned")
   assert.equal(rowdb.session_id, sessionId, "session_id stays the fray-minted key")
-  assert.ok(existsSync(join(h.dir, ".fray", "scratch", `${sessionId}.md`)), "scratchpad keyed on the fray session_id")
+  assert.equal(rowdb.permission_mode, "default", "Codex workspace-write is stored in its canonical shared value")
+  assert.ok(existsSync(join(h.dir, ".fray", "threads", sessionId, "scratch.md")), "scratchpad keyed on the fray session_id")
+})
+
+test("dispatch(codex): concurrent same-cwd starts wait for their own delayed sentinel and survive storage restart", async () => {
+  const dir = tmp("fray-dispatch-codex-race-")
+  const codexHome = tmp("fray-codexhome-race-")
+  const dbPath = join(dir, "ui.db")
+  const storage = createStorage(dbPath)
+  const project: Project = { dir, id: "race-id", name: "race", label: "o/race", stateDir: dir, cwdSlug: cwdSlug(dir) }
+  const board = {
+    snapshot: async () => ({}),
+    currentSeq: () => 0,
+    rebuild: async () => ({}),
+    refresh: () => ({}),
+    start: async () => {},
+    stop: async () => {},
+  } as unknown as BoardManager
+  const codexBackend = createCodexBackend({ codexHome })
+  const claudeBackend = createClaudeBackend({ logDir: join(dir, "logs") })
+  const backendFor = (kind?: string): AgentBackend => (kind === "codex" ? codexBackend : claudeBackend)
+  const ids = {
+    "race-a": "019f-race-a-native",
+    "race-b": "019f-race-b-native",
+  } as const
+  const launches = new Map<string, { sentinel: string; path: string }>()
+  const tied = new Date()
+
+  const spawn = (slug: string, cmd: string[], cwd: string) => {
+    const prompt = readFileSync(cmd.at(-1)!, "utf8")
+    const sentinel = prompt.match(/fray-session:[0-9a-f-]+/)?.[0]
+    assert.ok(sentinel)
+    const shard = slug === "race-a" ? ["2026", "07", "11"] : ["2026", "07", "12"]
+    const rolloutDir = join(codexHome, "sessions", ...shard)
+    const nativeId = ids[slug as keyof typeof ids]
+    const path = join(rolloutDir, `rollout-${slug}-${nativeId}.jsonl`)
+    mkdirSync(rolloutDir, { recursive: true })
+    launches.set(slug, { sentinel, path })
+
+    // B materializes completely while A is in its first poll sleep. With the old cwd fallback, A's
+    // next poll immediately stole B. A deliberately has no file until the second sleep below.
+    if (slug === "race-b") {
+      writeFileSync(
+        path,
+        [
+          JSON.stringify({ type: "session_meta", payload: { session_id: nativeId, cwd } }),
+          JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: `B <!-- ${sentinel} -->` } }),
+        ].join("\n") + "\n",
+      )
+      utimesSync(path, tied, tied)
+    }
+    return fakePaneIdentity(slug === "race-a" ? 41 : 42)
+  }
+
+  let sleeps = 0
+  const dispatcher = createDispatcher({
+    project,
+    storage,
+    board,
+    getSettings: () => defaultSettings(),
+    spawn,
+    ensureServer: () => {},
+    backendFor,
+    codexHome,
+    codexDiscoveryTimeoutMs: 20,
+    codexDiscoveryIntervalMs: 1,
+    codexDiscoverySleep: async () => {
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      sleeps++
+      if (sleeps !== 2) return
+      const launch = launches.get("race-a")!
+      writeFileSync(
+        launch.path,
+        [
+          JSON.stringify({ type: "session_meta", payload: { session_id: ids["race-a"], cwd: project.dir } }),
+          JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: `A <!-- ${launch.sentinel} -->` } }),
+        ].join("\n") + "\n",
+      )
+      utimesSync(launch.path, tied, tied)
+    },
+  })
+
+  const [a, b] = await Promise.all([
+    dispatcher.dispatch({ slug: "race-a", prompt: "First concurrent Codex." }, { backend: "codex" }),
+    dispatcher.dispatch({ slug: "race-b", prompt: "Second concurrent Codex." }, { backend: "codex" }),
+  ])
+  assert.equal(a.slug, "race-a")
+  assert.equal(b.slug, "race-b")
+  assert.equal(storage.getSession("race-a")?.agent_session_id, ids["race-a"])
+  assert.equal(storage.getSession("race-b")?.agent_session_id, ids["race-b"])
+  assert.notEqual(storage.getSession("race-a")?.agent_session_id, storage.getSession("race-b")?.agent_session_id)
+
+  storage.close()
+  const reopened = createStorage(dbPath)
+  assert.equal(reopened.getSession("race-a")?.agent_session_id, ids["race-a"], "A remains pinned after control-plane restart")
+  assert.equal(reopened.getSession("race-b")?.agent_session_id, ids["race-b"], "B remains pinned after control-plane restart")
+  reopened.close()
+})
+
+test("dispatch(codex): sentinel timeout stops only its unregistered worker and leaves no resumable lie", async () => {
+  const dir = tmp("fray-dispatch-codex-timeout-")
+  const codexHome = tmp("fray-codexhome-timeout-")
+  const storage = createStorage(join(dir, "ui.db"))
+  const project: Project = { dir, id: "timeout-id", name: "timeout", label: "o/timeout", stateDir: dir, cwdSlug: cwdSlug(dir) }
+  let rebuilds = 0
+  const board = {
+    snapshot: async () => ({}),
+    currentSeq: () => 0,
+    rebuild: async () => void rebuilds++,
+    refresh: () => ({}),
+    start: async () => {},
+    stop: async () => {},
+  } as unknown as BoardManager
+  const codexBackend = createCodexBackend({ codexHome })
+  const claudeBackend = createClaudeBackend({ logDir: join(dir, "logs") })
+  const backendFor = (kind?: string): AgentBackend => (kind === "codex" ? codexBackend : claudeBackend)
+  const killed: string[] = []
+  let promptFile = ""
+  let fraySessionId = ""
+  const spawn = (slug: string, cmd: string[], cwd: string) => {
+    promptFile = cmd.at(-1)!
+    const prompt = readFileSync(promptFile, "utf8")
+    fraySessionId = prompt.match(/fray-session:([0-9a-f-]+)/)?.[1] ?? ""
+    assert.ok(fraySessionId)
+    const rolloutDir = join(codexHome, "sessions", "2026", "07", "12")
+    mkdirSync(rolloutDir, { recursive: true })
+    // A complete same-cwd neighbor plus this launch's metadata-without-sentinel must never be accepted.
+    writeFileSync(
+      join(rolloutDir, "rollout-neighbor.jsonl"),
+      [
+        JSON.stringify({ type: "session_meta", payload: { session_id: "unrelated-native", cwd } }),
+        JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "neighbor <!-- fray-session:someone-else -->" } }),
+      ].join("\n") + "\n",
+    )
+    writeFileSync(
+      join(rolloutDir, `rollout-${slug}.jsonl`),
+      JSON.stringify({ type: "session_meta", payload: { session_id: "own-native-without-proof", cwd } }) + "\n",
+    )
+    return fakePaneIdentity(51)
+  }
+  const dispatcher = createDispatcher({
+    project,
+    storage,
+    board,
+    getSettings: () => defaultSettings(),
+    spawn,
+    ensureServer: () => {},
+    backendFor,
+    codexHome,
+    killSession: (slug) => void killed.push(slug),
+    codexDiscoveryTimeoutMs: 2,
+    codexDiscoveryIntervalMs: 1,
+    codexDiscoverySleep: async () => {},
+  })
+
+  await assert.rejects(
+    dispatcher.dispatch({ slug: "timeout-owner", prompt: "This rollout never records its sentinel." }, { backend: "codex" }),
+    /could not verify its rollout within 2ms.*stopped; please retry/i,
+  )
+  assert.deepEqual(killed, ["timeout-owner"], "cleanup targets only the uniquely spawned slug")
+  assert.equal(storage.getSession("timeout-owner"), undefined, "no row can later resume with a false/null native id")
+  assert.equal(storage.allSessions().length, 0)
+  assert.equal(rebuilds, 0, "a failed dispatch never publishes a phantom row")
+  assert.equal(existsSync(join(dir, ".fray", "threads", fraySessionId, "scratch.md")), false, "scratch artifact is rolled back")
+  assert.equal(existsSync(promptFile), false, "prompt transport artifact is rolled back")
 })
 
 test("dispatch(claude) through the same resolver is UNCHANGED — no trust write, backend stays claude", async () => {

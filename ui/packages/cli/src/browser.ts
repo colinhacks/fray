@@ -1,5 +1,5 @@
 /**
- * Browser detection and app-mode launcher.
+ * Default-browser tab and opt-in app-mode launchers.
  * Vendored from @gluon-framework/gluon (MIT), adapted for gent.
  * Supports Chromium-based and Firefox-based browsers on macOS, Linux, and Windows.
  */
@@ -8,6 +8,58 @@ import { spawn, execFile } from "node:child_process"
 import { access, readdir, mkdir, writeFile, readFile, rm } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join, delimiter, sep, basename } from "node:path"
+
+export interface BrowserOpenCommand {
+  command: string
+  args: string[]
+}
+
+export type BrowserCommandRunner = (command: string, args: string[]) => Promise<string>
+
+export interface BrowserTabLaunchOptions {
+  platform?: NodeJS.Platform
+  runCommand?: BrowserCommandRunner
+}
+
+/**
+ * Build the shell-free platform command that asks the OS default browser to open a normal tab.
+ * Keeping this separate from app-mode browser discovery is deliberate: the user's configured
+ * browser owns ordinary Fray launches, while `launchApp` remains an explicit compatibility mode.
+ */
+export function defaultBrowserOpenCommand(
+  rawUrl: string,
+  platform: NodeJS.Platform = process.platform,
+): BrowserOpenCommand {
+  let url: URL
+  try {
+    url = new URL(rawUrl)
+  } catch {
+    throw new Error(`Cannot open invalid browser URL: ${rawUrl}`)
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`Cannot open unsupported browser URL scheme: ${url.protocol}`)
+  }
+
+  if (platform === "darwin") return { command: "/usr/bin/open", args: [url.toString()] }
+  if (platform === "win32") {
+    return { command: "rundll32.exe", args: ["url.dll,FileProtocolHandler", url.toString()] }
+  }
+  if (platform === "linux" || platform === "freebsd" || platform === "openbsd") {
+    return { command: "xdg-open", args: [url.toString()] }
+  }
+  throw new Error(`Opening the default browser is not supported on ${platform}`)
+}
+
+/** Ask the OS default URL handler to open Fray, and await acceptance of that request. */
+export async function launchBrowserTab(
+  rawUrl: string,
+  options: BrowserTabLaunchOptions = {},
+): Promise<void> {
+  const platform = options.platform ?? process.platform
+  const runCommand = options.runCommand ?? execFileP
+  const launch = defaultBrowserOpenCommand(rawUrl, platform)
+  await runCommand(launch.command, launch.args)
+}
 
 // ---- Browser path registry ----
 

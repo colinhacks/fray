@@ -1,14 +1,16 @@
-import { useEffect } from "react"
+import { useEffect, useRef } from "react"
 import { useSnapshot } from "valtio"
 import { useQuery } from "@tanstack/react-query"
 import { Settings as SettingsIcon } from "lucide-react"
-import { store, seedBoard, threadBySlug, pushDrawer, topDrawer, topThreadSlug, openNewThread, showToast } from "./store.ts"
+import { closeGithubPicker, store, seedBoard, threadBySlug, pushDrawer, topDrawer, topThreadSlug, openNewThread, showToast } from "./store.ts"
 import { useBoard } from "./hooks.ts"
 import { displayTitle } from "./groups.ts"
 import { closeSettingsAnimated, closeDrawerAnimated } from "./lib/overlays.ts"
 import { startRouter } from "./lib/router.ts"
+import { dismissOpenSelect } from "./lib/selectOverlay.ts"
+import { nextSidebarPresence, type SidebarPresence } from "./lib/sidebarPresence.ts"
 import { rpc } from "./api/rpc.ts"
-import { Sidebar, IdentityMark } from "./components/Sidebar.tsx"
+import { Sidebar, IdentityMark, projectIdentity } from "./components/Sidebar.tsx"
 import { TooltipProvider } from "./components/Tooltip.tsx"
 import { ThreadSheet } from "./components/ThreadSheet.tsx"
 import { SubAgentSheet } from "./components/SubAgentSheet.tsx"
@@ -21,7 +23,12 @@ import { SettingsDrawer } from "./components/SettingsDrawer.tsx"
 import { CommandPalette } from "./components/CommandPalette.tsx"
 import { StatusListView } from "./components/StatusListView.tsx"
 import { NoFray } from "./components/EmptyState.tsx"
+import { RestartFrayButton } from "./components/RestartFrayButton.tsx"
+import { RestartOverlay } from "./components/RestartOverlay.tsx"
 import { Toaster } from "./components/Toaster.tsx"
+import { FRAY_SUPERVISOR_STATUS_WAKE_EVENT, getFraySupervisorStatus } from "./api/restart.ts"
+
+const RELOAD_AFTER_UPDATE_RESTART = "fray:reload-after-update-restart"
 
 // The not-signed-in hint fires at most once per page load. A module-scoped flag (not React state)
 // keeps it from re-firing across re-renders, effect re-runs, or a StrictMode double-invoke.
@@ -34,6 +41,7 @@ function maybeShowSignInHint() {
 
 export function App() {
   const snap = useSnapshot(store)
+  const sidebarPresence = useRef<SidebarPresence>({ projectDir: null, hasBeenVisible: false })
 
   // Seed the board once at startup so the first paint doesn't wait on the SSE connect; SSE keeps it
   // fresh afterward. seedBoard (not setBoard) so a late-resolving seed can't clobber a board the SSE
@@ -44,6 +52,67 @@ export function App() {
 
   // URL ⇄ view sync (deep links, reload restore, shareable paths).
   useEffect(() => startRouter(), [])
+
+  // The public supervisor survives replacement of the app child. It is consequently the only
+  // trustworthy transition signal: an old child can still say ready while the next artifact builds.
+  // Poll gently at rest and promptly during a handoff; writes are gated in rpc.ts but drafts remain
+  // session-backed and editable throughout.
+  useEffect(() => {
+    let active = true
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let announcedFailure: string | null = null
+    let polling = false
+    const poll = async () => {
+      if (polling) return
+      polling = true
+      const status = await getFraySupervisorStatus()
+      if (!active) { polling = false; return }
+      if (status) {
+        // An optimistic, user-initiated restart raised the overlay before the supervisor confirmed the
+        // transition. HOLD it until a poll actually OBSERVES a server-confirmed non-"ready" status: a
+        // "ready" read while pending is either the pre-flip state or a stale in-flight response, and
+        // applying it would drop the overlay and (with a destination armed) reload onto the old child.
+        // The moment a poll sees "restarting"/"failed", the optimism is server-backed — clear the hold.
+        if (store.controlPlaneRestartPending) {
+          if (status.state !== "ready") {
+            store.controlPlaneRestartPending = false
+            store.controlPlaneState = status.state
+            store.controlPlaneMessage = status.message ?? null
+          }
+        } else {
+          store.controlPlaneState = status.state
+          store.controlPlaneMessage = status.message ?? null
+        }
+        const destination = sessionStorage.getItem(RELOAD_AFTER_UPDATE_RESTART)
+        if (status.state === "ready" && destination && !store.controlPlaneRestartPending) {
+          sessionStorage.removeItem(RELOAD_AFTER_UPDATE_RESTART)
+          window.location.replace(destination)
+          polling = false
+          return
+        }
+        if (status.state === "failed" && destination) {
+          sessionStorage.removeItem(RELOAD_AFTER_UPDATE_RESTART)
+          if (announcedFailure !== status.message) {
+            announcedFailure = status.message ?? "Update & Restart failed"
+            showToast(`Update & Restart failed: ${announcedFailure}`, { duration: 7000 })
+          }
+        }
+      }
+      polling = false
+      timer = setTimeout(poll, store.controlPlaneState === "restarting" ? 500 : 8_000)
+    }
+    const wake = () => {
+      if (timer) clearTimeout(timer)
+      void poll()
+    }
+    window.addEventListener(FRAY_SUPERVISOR_STATUS_WAKE_EVENT, wake)
+    void poll()
+    return () => {
+      active = false
+      window.removeEventListener(FRAY_SUPERVISOR_STATUS_WAKE_EVENT, wake)
+      if (timer) clearTimeout(timer)
+    }
+  }, [])
 
   // While ANY overlay is open (thread sheet, doc drawer, settings, new-thread modal, palette), the
   // PAGE must not scroll — only the overlay's own pane does.
@@ -98,6 +167,9 @@ export function App() {
   // drawer, and a composer's Esc simply blurs it. No virtual focus, no zombie states.)
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
+      // The terminal is a native TUI surface. Its Escape/arrows/control keys and slash-menu input
+      // belong to xterm, never to Fray's drawer/global shortcut layer.
+      if (e.target instanceof Element && e.target.closest(".xterm")) return
       const meta = e.metaKey || e.ctrlKey
       if (meta) {
         const key = e.key.toLowerCase()
@@ -123,13 +195,21 @@ export function App() {
       }
 
       if (e.key === "Escape") {
+        // Portaled selectors are not descendants of their owning dialog/drawer. Give the topmost
+        // model/effort matrix or Select this physical Escape before unwinding the app overlay stack.
+        if (dismissOpenSelect()) {
+          e.preventDefault()
+          e.stopPropagation()
+          e.stopImmediatePropagation()
+          return
+        }
         // Overlays soak up Esc first (outermost wins). A focused composer handles its own Esc (blur)
         // and stops propagation, so reaching here means the page is at rest. Settings + the
         // open-thread sheet route through their OWN animated close (fall back to the store write if
         // nothing registered) so Esc slides them out instead of unmounting instantly.
         if (store.showPalette) store.showPalette = false
         else if (store.showNewThread) store.showNewThread = false
-        else if (store.showGithubPicker) store.showGithubPicker = false
+        else if (store.showGithubPicker) closeGithubPicker()
         else if (store.showSettings) { if (!closeSettingsAnimated()) store.showSettings = false }
         // The drawer STACK unwinds topmost-first, one layer per Esc.
         else if (store.drawers.length > 0) {
@@ -143,6 +223,11 @@ export function App() {
   }, [])
 
   const board = useBoard()
+  sidebarPresence.current = nextSidebarPresence(sidebarPresence.current, board)
+  const showSidebar = board !== null && sidebarPresence.current.hasBeenVisible
+  // A missing board is not evidence that this project is named "fray". Keep the header neutral until
+  // a board keyframe supplies an actual owner/repo identity; reconnects retain their adopted board.
+  const identity = projectIdentity(board)
 
   // Window title carries the project identity. In the INSTALLED APP window (display-mode:
   // standalone) Chrome prefixes the title bar with the app name itself ("Fray - <title>"), so the
@@ -154,26 +239,47 @@ export function App() {
     document.title = standalone ? (projectLabel ?? "fray") : projectLabel ? `fray · ${projectLabel}` : "fray"
   }, [projectLabel])
 
-  if (board && !board.frayActive) return <NoFray dir={board.projectDir} />
+  if (board && !board.frayActive) return (
+    <TooltipProvider>
+      <RestartOverlay open={snap.controlPlaneState === "restarting"} message={snap.controlPlaneMessage} />
+      {/* While restarting, the whole app subtree goes inert so nothing behind the scrim is focusable
+          or clickable; the overlay is rendered as a sibling OUTSIDE it so it stays interactive. */}
+      <div inert={snap.controlPlaneState === "restarting"}>
+        <div className="fixed top-3 right-3 z-20"><RestartFrayButton /></div>
+        <NoFray dir={board.projectDir} />
+        <Toaster />
+      </div>
+    </TooltipProvider>
+  )
 
   return (
     <TooltipProvider>
-    <div className="relative min-h-screen bg-bg text-fg text-sm">
+    <RestartOverlay open={snap.controlPlaneState === "restarting"} message={snap.controlPlaneMessage} />
+    {/* While restarting, the whole app subtree goes inert so nothing behind the scrim is focusable or
+        clickable; the overlay above is a sibling OUTSIDE it so it stays interactive. */}
+    <div inert={snap.controlPlaneState === "restarting"} className="relative min-h-screen bg-bg text-fg text-sm">
       {/* Fixed corner chrome, as it always was: workspace identity + the New-thread pill top-left,
           the Settings gear top-right. Everything else flows; the PAGE is the one and only scroll
           container — a tall card simply runs off both edges. */}
       <div className="fixed top-3 left-4 z-20 max-w-[40vw]">
-        <IdentityMark label={board?.projectLabel ?? board?.projectName ?? "fray"} state={snap.connection} />
+        <IdentityMark
+          identity={identity}
+          state={snap.connection}
+          boardFallback={snap.socketBoardFallback}
+        />
       </div>
       {/* (The old fixed "New thread" pill moved INTO the sidebar's top — one entry point, same modal
           flow; ⌘N and the always-visible dispatch box remain the other doors.) */}
-      <button
-        title="Settings"
-        className="fixed top-3 right-3 z-20 p-1.5 rounded text-muted hover:bg-panel hover:text-fg"
-        onClick={() => (store.showSettings = true)}
-      >
-        <SettingsIcon size={16} />
-      </button>
+      <div className="fixed top-3 right-3 z-20 flex items-center gap-0.5">
+        <RestartFrayButton />
+        <button
+          title="Settings"
+          className="p-1.5 rounded text-fg hover:bg-panel"
+          onClick={() => (store.showSettings = true)}
+        >
+          <SettingsIcon size={16} />
+        </button>
+      </div>
 
       {/* CENTERED PAIR with a FIXED GUTTER: the floating sidebar column and the workpane sit side by
           side with one constant 52px gap (gap-13 — "space-around looked weird"; a fixed gutter reads
@@ -182,20 +288,17 @@ export function App() {
           (sticky, set in Sidebar.tsx) and scales clamp(240px → 30vw → 600px) so titles get real room
           on large screens; the workpane keeps its readable 720px measure (shrinking first when space
           runs out) and scrolls as normal top-anchored page flow. */}
-      <div className="flex min-h-screen justify-center gap-13">
-        {/* BRAND-NEW-USER fallback: with ZERO threads of any status the sidebar doesn't render at all
-            (no empty-sections skeleton) — the centered prompt box (TodosView keys on the SAME
-            zero-threads predicate) is the whole screen, chrome-free beyond the corner marks. The
-            first dispatched thread brings the full layout in. Also hidden pre-board (the loader). */}
-        {/* Foreign (terminal) sessions don't count toward "has a board": a project whose only activity
-            is the maintainer's own terminal still gets the brand-new-user centered dispatch screen. */}
-        {board && (board.threads.some((t) => t.foreign !== true) || (board.plans?.length ?? 0) > 0) && <Sidebar />}
+      <div className="flex min-h-screen justify-center gap-13 max-[800px]:flex-col max-[800px]:justify-start max-[800px]:gap-0 max-[800px]:px-3">
+        {/* A genuinely fresh project keeps its centered first-task view. Once this project has had a
+            Fray-owned thread or plan, the sidebar remains mounted through transient empty keyframes;
+            navigation must not vanish while the live board stream reconnects or catches up. */}
+        {showSidebar && <Sidebar />}
         <main
           id="workpane"
           // min-h-screen where content is vertically CENTERED: the boot loader and the empty queue's
           // prompt box (TodosView's flex-1 centering needs a full-height parent); populated queues just
           // top-align and grow past. Threads render in DRAWERS, never here.
-          className={`w-[720px] max-w-[62vw] min-w-0 flex flex-col py-5 ${
+          className={`w-[720px] max-w-[62vw] min-w-0 flex flex-col py-5 max-[800px]:w-full max-[800px]:max-w-none ${
             snap.view === "todos" || !board ? "min-h-screen" : ""
           } ${
             // Queue recedes: the CARD carries its own chrome (a sticky header), so the bordered panel
@@ -219,36 +322,55 @@ export function App() {
         </main>
       </div>
 
-      {/* The side-drawer STACK: each layer above the last, arbitrary depth. */}
-      {snap.drawers.map((d, i) =>
-        d.kind === "thread" ? (
-          <ThreadSheet key={d.id} id={d.id} slug={d.slug} depth={i} initialTerminal={d.terminal} />
-        ) : d.kind === "subagent" ? (
-          <SubAgentSheet
-            key={d.id}
-            id={d.id}
-            slug={d.slug}
-            subId={d.subId ?? ""}
-            label={d.label ?? d.slug}
-            subagentType={d.subagentType}
-            startedAt={d.startedAt}
-            depth={i}
-          />
-        ) : d.kind === "plan" ? (
-          <PlanDrawer key={d.id} id={d.id} path={d.path ?? d.slug} title={d.label ?? d.slug} depth={i} />
-        ) : (
-          <ThreadDrawer
-            key={d.id}
-            id={d.id}
-            slug={d.slug}
-            depth={i}
-            title={(() => { const t = threadBySlug(board, d.slug); return t ? displayTitle(t) : d.slug })()}
-          />
-        ),
-      )}
+      {/* The side-drawer STACK: each layer above the last, arbitrary depth. Two DIFFERENT depths:
+          `depth` = the layer's true stack position (array index) drives z-index — it must stay strictly
+          monotonic so a layer always paints above everything below it, including the ~210ms window while
+          a lower layer slides OUT. `widthDepth` = the count of layers below that are STAYING (non-closing)
+          drives the width/inset (each step 28px narrower). A closing layer keeps its array slot for its
+          slide-out, so counting it toward WIDTH made the layer above open one step too narrow, then JUMP
+          wider (content reflow) the instant the closer was removed; excluding it lets the new layer render
+          at its FINAL width and slide in from off-screen with no end-of-animation reflow. z and width are
+          decoupled because ThreadSheet alone is portaled + split-z (overlay/content) while the others are
+          single-z inline — tying z to the non-closing count let a closing ThreadSheet outrank a drawer
+          opened above it. */}
+      {(() => {
+        let below = 0
+        return snap.drawers.map((d, i) => {
+          const widthDepth = below
+          if (!d.closing) below++
+          return d.kind === "thread" ? (
+            <ThreadSheet key={d.id} id={d.id} slug={d.slug} depth={i} widthDepth={widthDepth} initiallyOpen={d.routed} />
+          ) : d.kind === "subagent" ? (
+            <SubAgentSheet
+              key={d.id}
+              id={d.id}
+              slug={d.slug}
+              subId={d.subId ?? ""}
+              label={d.label ?? d.slug}
+              subagentType={d.subagentType}
+              startedAt={d.startedAt}
+              depth={i}
+              widthDepth={widthDepth}
+            />
+          ) : d.kind === "plan" ? (
+            <PlanDrawer key={d.id} id={d.id} path={d.path ?? d.slug} title={d.label ?? d.slug} depth={i} widthDepth={widthDepth} />
+          ) : (
+            <ThreadDrawer
+              key={d.id}
+              id={d.id}
+              slug={d.slug}
+              depth={i}
+              widthDepth={widthDepth}
+              title={(() => { const t = threadBySlug(board, d.slug); return t ? displayTitle(t) : d.slug })()}
+            />
+          )
+        })
+      })()}
       {snap.showSettings && <SettingsDrawer />}
       {snap.showNewThread && <NewThreadDialog onClose={() => { store.showNewThread = false; store.newThreadPlanPath = null }} />}
-      {snap.showGithubPicker && <GithubPickerModal onClose={() => (store.showGithubPicker = false)} />}
+      {snap.showGithubPicker && snap.githubDispatchProfile && (
+        <GithubPickerModal profile={{ ...snap.githubDispatchProfile }} onClose={closeGithubPicker} />
+      )}
       <CommandPalette />
       <Toaster />
     </div>

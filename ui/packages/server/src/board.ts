@@ -1,20 +1,29 @@
-import { watch as fsWatch, existsSync, readdirSync, readFileSync, statSync, type FSWatcher } from "node:fs"
+import {
+  existsSync,
+  watch as fsWatch,
+  type FSWatcher,
+} from "node:fs"
 import { join } from "node:path"
 import watcher from "@parcel/watcher"
-import type { BoardSnapshot, ThreadView, FrayStatus, BlockMechanism, RuntimeState, PlanView } from "@fray-ui/shared"
-import { BoardDiffer } from "@fray-ui/shared"
+import type { BoardSnapshot, ThreadView, RuntimeState, PlanView } from "@fray-ui/shared"
+import { BoardDiffer, CODEX_INPUT_CONFIRMATION_TIMEOUT_MS, PermissionMode, SnoozeUntil, ThreadSlug, isValidAwaitingTimer, type PermissionMode as PermissionModeValue } from "@fray-ui/shared"
 import type { Bus } from "./bus.ts"
 import type { Project } from "./project.ts"
 import type { Storage, SessionRow } from "./storage.ts"
+import { normalizeObservedThreadModel } from "./backend/thread-profiles.ts"
 import type { Tailer, SessionTelemetry } from "./tailer.ts"
-import { readBoard, frayDirExists, runThreadUpdate, type FrayThread, type FrayErrorItem } from "./fray.ts"
+import type { InteractionChange } from "./interaction-store.ts"
+import { frayDirExists } from "./fray.ts"
 import * as tmux from "./tmux.ts"
+import { effectivePermissionMode, resolveLegacyThreadFile } from "./dispatch.ts"
+import { ProducerStoppedError } from "./shutdown.ts"
+import { adoptionRuntimeBinding } from "./adoption-recovery.ts"
+import { listPlanFiles } from "./plan-files.ts"
 
-// The read model: merges the fray board (source of truth for STATUS, via readBoard) with the
-// session registry (runtime overlay — which tmux session backs a thread + unread) and the JSONL
-// tailer (turn state + last-activity + assistant preview). Rebuilt on any .fray change (debounced)
-// or any tailer state change. Changes fan out on the bus as KEYED PER-THREAD DELTAS (a BoardDiffer
-// emits only the threads that changed); the full snapshot is the connect keyframe + the resync frame.
+// The read model is provenance-bound to the durable session registry. A session row exists only after
+// Fray UI dispatches or explicitly adopts a thread, so unrelated legacy `.fray/*.md` files and raw
+// terminal transcripts never enter this board (or its queue/error surface). The tailer contributes
+// telemetry only for registered rows. Plan documents remain project artifacts and are read separately.
 
 const DEBOUNCE_MS = 150
 // Level-triggered reconcile period: a periodic full rebuild that re-publishes if anything drifted.
@@ -30,14 +39,19 @@ const RECONCILE_MS = 15_000
 // turn-idle once it ends).
 function deriveRuntime(
   slug: string,
-  hasRow: boolean,
+  row: SessionRow | undefined,
+  storage: Storage,
   turn: "in-flight" | "idle" | undefined,
   permPrompt: boolean,
 ): RuntimeState {
-  if (!hasRow) return "none"
+  if (!row) return "none"
+  const adoption = adoptionRuntimeBinding(storage, row)
+  if (adoption.kind === "conflict") return "exited"
+  if (adoption.kind === "bound") {
+    if (!tmux.isExpectedAdoptionPaneLiveAnywhereCached(adoption.claim)) return "exited"
+  } else if (!tmux.isLiveCached(slug)) return "exited"
   // Cached (batched list-panes) — this runs per-thread on EVERY overlay refresh; the uncached
   // two-subprocess isLive here starved the event loop whenever an agent was streaming.
-  if (!tmux.isLiveCached(slug)) return "exited"
   if (permPrompt) return "perm-prompt"
   return turn === "idle" ? "turn-idle" : "running"
 }
@@ -57,112 +71,14 @@ export function degradeIfNoTranscript(runtime: RuntimeState, noTranscript: boole
 // thread whose agent wrote an essay into status_text can't fatten every snapshot push (on a large
 // board these two fields alone were half a megabyte).
 const LINE_CAP = 240
-// `activity` is contractually a single ≤100-char gerund label; cap it defensively (tighter than the
-// generic LINE_CAP) so a worker that over-writes it can't fatten every snapshot push.
-const ACTIVITY_CAP = 100
 function capLine(s: string | undefined | null, cap = LINE_CAP): string | undefined {
   if (!s) return undefined
   return s.length > cap ? `${s.slice(0, cap - 1)}…` : s
 }
 
-function toThreadView(t: FrayThread, storage: Storage, tailer: Tailer): ThreadView {
-  const row = storage.getSession(t.id)
-  const tele = tailer.get(t.id)
-  const runtime = deriveRuntime(t.id, row !== undefined, tele?.turn, tele?.permPrompt ?? false)
-  // TERMINAL threads (done/dismissed/archived, not unread, no live session) render as one slim
-  // listing row — id/title/status is ALL the client shows, so it's all that ships. On a mature
-  // board this is nearly every thread.
-  const terminal =
-    (row?.archived === 1 || t.status === "done" || t.status === "dismissed") &&
-    (row ? row.unread !== 1 : true) &&
-    (runtime === "none" || runtime === "exited")
-  if (terminal) {
-    return {
-      id: t.id,
-      title: t.title ?? "",
-      status: (t.status ?? "done") as FrayStatus,
-      hasPlan: Boolean(t.hasPlan), // derived plan-doc marker — cheap boolean, ships even on the slim row
-      mechanism: null,
-      humanBlocked: false,
-      ready: false,
-      dependsOn: [],
-      externalDeps: [],
-      agents: [],
-      errors: [],
-      warnings: [],
-      runtime,
-      unread: false,
-      archived: row ? row.archived === 1 : false,
-      spawnedAt: row?.spawned_at,
-      aiTitle: tele?.aiTitle,
-      titleAuto: row?.title_auto === 1,
-      // Terminal (done/dismissed/archived, no live session): no live sub-agents/shells by definition,
-      // and the slim row deliberately ships nothing rich — always empty here (pendingAsk stays absent).
-      subAgents: [],
-      bgShells: [],
-      pendingQuestion: false,
-      // lastUserAt is an ORDERING key (not rich display) — the listing sorts every row incl.
-      // terminals by it, so ship it even on the slim row (falls back to spawnedAt in groups.ts).
-      lastUserAt: tele?.lastUserAt,
-      kind: "legacy", // a .fray-file row — the collapsed Legacy shelf's read-only material
-    }
-  }
-  return {
-    id: t.id,
-    title: t.title ?? "",
-    // Board statuses are canonical; an invalid-status thread passes through as-is and carries
-    // an entry in `errors`, so we surface the raw value rather than silently remapping it.
-    status: (t.status ?? "active") as FrayStatus,
-    statusText: capLine(t.status_text),
-    activity: capLine(t.activity, ACTIVITY_CAP),
-    next: capLine(t.next),
-    hasPlan: Boolean(t.hasPlan), // derived: body has a `## Plan` section → quiet PLAN badge
-
-    mechanism: t.status === "blocked" ? ((t.mechanism ?? "human") as BlockMechanism) : null,
-    // `needs-human` is the declared awaiting-you state and THE queue definition. humanBlocked is now
-    // re-derived from status alone (the field name is kept — it's read widely by the client's
-    // needsAction / indicator logic); the board parser aliases legacy `blocked`+no-machine-field →
-    // `needs-human`, so old threads map correctly once the parser change lands. `blocked` is now a pure
-    // machine-wait (its mechanism above still drives the timer/threads glyphs) and never humanBlocked.
-    humanBlocked: t.status === "needs-human",
-    ready: Boolean(t.ready),
-    dependsOn: t.threadDeps ?? [],
-    externalDeps: (t.externalDeps ?? []).map((d) => d.label),
-    owner: t.owner || undefined,
-    revalidate: t.revalidate ? new Date(t.revalidate.atMs).toISOString() : undefined,
-    agents: (t.agents ?? []).map((a) => ({ id: a.id, label: a.label, state: a.state })),
-    errors: t.errors ?? [],
-    warnings: t.warnings ?? [],
-    runtime,
-    sessionId: row?.session_id,
-    tmuxName: row?.tmux_name,
-    unread: row ? row.unread === 1 : false,
-    archived: row ? row.archived === 1 : false,
-    lastAssistant: tele?.lastAssistant,
-    spawnedAt: row?.spawned_at,
-    lastActivityAt: tele?.lastActivityAt,
-    aiTitle: tele?.aiTitle,
-    titleAuto: row?.title_auto === 1,
-    // Live background sub-agents this worker dispatched (empty when none / no session yet).
-    subAgents: tele?.subAgents ?? [],
-    // Live background shells this worker launched (the anchored ops strip; empty when none).
-    bgShells: tele?.bgShells ?? [],
-    // A pending native AskUserQuestion the session is frozen on (the safety net; else undefined).
-    pendingAsk: tele?.pendingAsk ? { questions: tele.pendingAsk.questions } : undefined,
-    // Derived safety net: at rest with a chat-only ```question the worker never encoded as blocked.
-    pendingQuestion: tele?.pendingQuestion ?? false,
-    // Newest user-role record — the listing's chronological sort key (user answer/steer/dispatch
-    // bumps the row to the top). Falls back to spawnedAt in groups.ts when absent.
-    lastUserAt: tele?.lastUserAt,
-    kind: "legacy", // a .fray-file row — the collapsed Legacy shelf's read-only material
-  }
-}
-
-// ---- Session threads (2026-07-09): the working rail's unit — one ThreadView per registry row
-// (storage.allSessions()) plus one per foreign session (tailer.foreignIds()). The fray board's
-// status vocabulary does NOT apply: `status` is synthesized "active" (the field is required but
-// UNUSED for session rows — display keys on kind/state/needsYou, not status), and the block/dep
-// fields are inert. State + queue membership are derived below.
+// ---- Session threads (2026-07-09): the working rail's unit — exactly one ThreadView per durable
+// registry row. The legacy fray status vocabulary does not apply: `status` is synthesized "active"
+// (the field is required but display keys on kind/state/needsYou), and block/dep fields are inert.
 
 // Parse an ISO time to epoch-ms, or -Infinity when absent/unparseable (a missing clearance never
 // beats a real activity time in the needsYou compare below).
@@ -172,24 +88,78 @@ function timeOrNegInf(s: string | null | undefined): number {
   return Number.isFinite(t) ? t : -Infinity
 }
 
-// EFFECTIVE lifecycle state for a session row (open|archived). An explicit state write wins; else the
-// legacy archived flag; else a paired legacy .fray thread at terminal status (a pre-migration session
-// must not flood the working rail); else open. Foreign threads are always open (handled at the call site).
-function effectiveSessionState(row: SessionRow, legacyTerminal: boolean): "open" | "archived" {
+// EFFECTIVE lifecycle state for a registered session row (open|archived). An explicit state write wins;
+// otherwise the historical archived bit migrates older rows without consulting unrelated files.
+function effectiveSessionState(row: SessionRow, registeredLegacyTerminal: boolean): "open" | "archived" {
   if (row.state === "open" || row.state === "archived") return row.state
   if (row.archived === 1) return "archived"
-  if (legacyTerminal) return "archived"
+  if (registeredLegacyTerminal) return "archived"
   return "open"
 }
 
+// Pre-session-first Fray UI rows may have state=NULL and derive their archived state from a paired
+// terminal thread document. Preserve that migration behavior without scanning the directory: open
+// only the canonical filename selected by a durable session row, reject symlinks at open time, and
+// read only whether status is `done`/`dismissed`. Malformed or missing files fail open as an active session and never
+// contribute a board parser error.
+function registeredLegacyFileIsTerminal(projectDir: string, slug: string): boolean {
+  const file = resolveLegacyThreadFile(projectDir, slug)
+  if (!file) return false
+  const frontmatter = file.contents.toString("utf8").match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1]
+  const raw = frontmatter?.match(/^status:\s*(.*?)\s*$/m)?.[1]
+  const status = raw?.replace(/^(?:"(.*)"|'(.*)')$/, "$1$2").trim()
+  return status === "done" || status === "dismissed"
+}
+
+function futureSnooze(row: Pick<SessionRow, "snoozed_until">, nowMs: number): string | undefined {
+  const parsed = SnoozeUntil.safeParse(row.snoozed_until)
+  return parsed.success && Date.parse(parsed.data) > nowMs ? parsed.data : undefined
+}
+
+function hasLiveBackgroundWork(tele: SessionTelemetry | undefined): boolean {
+  return Boolean(
+    tele?.subAgents?.some((agent) => agent.state === "running") ||
+    tele?.bgShells?.some((shell) => shell.state === "running"),
+  )
+}
+
+// A declared wait excuses an idle thread only for a specific external-human/review gate or a valid
+// future scheduler instant. Legacy PR/CI/session hints, malformed/elapsed timers, and hintless fences
+// are agent-owned work; if the worker nevertheless comes to rest, the queue must surface that rest.
+function hasParkedExternalWait(tele: SessionTelemetry | undefined, nowMs: number): boolean {
+  if (tele?.lastFence?.kind !== "awaiting") return false
+  return tele.lastFence.hints.some((hint) =>
+    hint.kind === "human" ||
+    hint.kind === "github-review" ||
+    (hint.kind === "timer" && isValidAwaitingTimer(hint.value) && Date.parse(hint.value) > nowMs),
+  )
+}
+
 // SERVER-DERIVED queue membership for a REGISTERED session thread (foreign/archived → false at the
-// call site). perm-prompt and a pending native ask are PROCESS-level blocks a view can't clear, so they
-// force needsYou. Otherwise the thread must be AT REST (turn-idle / exited) and UNEXCUSED (no done/awaiting
-// fence), with its last activity strictly newer than the last interaction clearance (max of seen_at,
-// last_read_at). No valid lastActivityAt → never in the queue.
-export function deriveNeedsYou(row: SessionRow, tele: SessionTelemetry | undefined, runtime: RuntimeState): boolean {
+// call site). Every otherwise-unexcused owned/open thread enters Queue when its top-level worker comes
+// to rest. A user-owned snooze temporarily suppresses every queue reason—including a concrete ask,
+// permission prompt, or crash—then the exact deadline restores the still-current reason. Truthful
+// external waits place ordinary rest in Held without writing lifecycle state.
+export function deriveNeedsYou(
+  row: SessionRow,
+  tele: SessionTelemetry | undefined,
+  runtime: RuntimeState,
+  hasActionableInteraction = false,
+  nowMs = Date.now(),
+): boolean {
+  // Snooze is explicit operator lifecycle state. It must be checked before provider/question/crash
+  // gates so choosing Snooze from any queue card actually parks that card until its exact deadline.
+  // The underlying telemetry remains intact and is re-derived when the scheduler clears the instant.
+  if (futureSnooze(row, nowMs)) return false
+  // A typed request is already scoped to this exact registered session by the interaction journal.
+  // It is a hard human gate even when the provider is mid-turn: the turn cannot advance until the
+  // advertised response is delivered, so at-rest transcript heuristics do not apply.
+  if (hasActionableInteraction) return true
   if (runtime === "perm-prompt") return true
   if (tele?.pendingAsk) return true
+  // Codex connector/tool approvals and verified native selectors leave the rollout in-flight. They
+  // are nevertheless hard human gates, so queue them independently of runtime/at-rest semantics.
+  if (tele?.nativeInputRequired) return true
   const atRest = runtime === "turn-idle" || runtime === "exited"
   if (!atRest) return false
   // CRASH/STALL net: the pane EXITED while the turn was still in flight (last record a tool_use, never
@@ -204,35 +174,139 @@ export function deriveNeedsYou(row: SessionRow, tele: SessionTelemetry | undefin
   // needing input surface automatically and STAY until resolved). The tailer clears pendingQuestion the
   // moment a newer user message lands (an answer/steer supersedes the fence), which is what dequeues it.
   if (tele?.pendingQuestion) return true
-  // EXPLICIT ASKS ONLY (maintainer 2026-07-10): the queue is a thread that ASKED something — a native
-  // ask, a ```question, a permission prompt, or a crash mid-work. A BARE rest (the agent hit end_turn
-  // without asking anything — it finished, or it's waiting on machine work it described only in prose)
-  // does NOT card. Reason: the earlier "at rest = your move, cards until seen" inversion was noisy in
-  // practice — a classic worker that rested with "I'll verify CI when the fixer reports back" (no fence,
-  // no live child) showed a loud awaiting-you dot with nothing for the human to do. A thread that truly
-  // needs you ASKS (a question fence) or the worker EXCUSES it (a done/awaiting fence); an un-asked rest
-  // is idle, shown quietly in the sidebar, never queued. (This makes seen_at/interaction-clearance moot
-  // for the queue — a real ask stays until answered, not until glanced at.)
-  return false
+  // A top-level turn that is resting only while its own child/Monitor still runs is still in flight,
+  // not a human handoff. Once that operation clears, the next board refresh queues the bare rest.
+  if (hasLiveBackgroundWork(tele)) return false
+  if (hasParkedExternalWait(tele, nowMs)) return false
+  // A final ```done fence is a CHECKED completion handoff: show its success card in the queue until the
+  // human explicitly Archives the thread. Like a question, merely viewing it does not resolve it. The
+  // at-rest gate above prevents a stale fence from carding while a follow-up turn is still running.
+  if (tele?.lastFence?.kind === "done") return true
+  // Bare rest is itself the handoff. It remains queued until the human explicitly sends more work,
+  // snoozes it, or archives it; merely opening/seeing the thread cannot silently clear the card.
+  return true
 }
 
 // The scratchpad path for a session, iff the file exists under the project dir (else undefined so the
-// client offers no doc tab). Convention: .fray/scratch/<session_id>.md.
+// client offers no doc tab). Convention: .fray/threads/<session_id>/scratch.md.
 function scratchpadPathIfExists(projectDir: string, sessionId: string): string | undefined {
-  const rel = `.fray/scratch/${sessionId}.md`
+  const rel = `.fray/threads/${sessionId}/scratch.md`
   return existsSync(join(projectDir, rel)) ? rel : undefined
 }
 
 // A REGISTERED session thread's view (id = row.slug). Runtime via the shared deriveRuntime (tmux-aware);
-// telemetry fields mirror the legacy path exactly. Display prefers aiTitle client-side over row.title.
-function sessionThreadView(projectDir: string, row: SessionRow, tele: SessionTelemetry | undefined, legacyTerminal: boolean): ThreadView {
-  const runtime = degradeIfNoTranscript(deriveRuntime(row.slug, true, tele?.turn, tele?.permPrompt ?? false), tele?.noTranscript)
-  const state = effectiveSessionState(row, legacyTerminal)
+// telemetry fields mirror the legacy path; title provenance is resolved before the snapshot is emitted.
+export function resolveSessionProfile(
+  row: Pick<SessionRow, "backend" | "model" | "effort" | "spawned_at">,
+  tele: Pick<SessionTelemetry, "model" | "effort" | "profileAt"> | undefined,
+): { model?: string; effort?: string } {
+  const persistedModel = row.model?.trim() || undefined
+  const persistedEffort = row.effort?.trim() || undefined
+  const observedAt = tele?.profileAt ? Date.parse(tele.profileAt) : NaN
+  const spawnedAt = Date.parse(row.spawned_at)
+  // A transcript is replayed from byte zero whenever a runtime generation changes. A persisted launch
+  // target therefore remains authoritative until a genuinely post-spawn profile record arrives; old
+  // turn_context/assistant records must not snap the controls back after reattach or server restart.
+  const observedIsCurrent = Number.isFinite(observedAt) && Number.isFinite(spawnedAt) && observedAt >= spawnedAt
+  const observedModel = tele?.model
+    ? normalizeObservedThreadModel(row.backend ?? "claude", tele.model) ?? tele.model.trim()
+    : undefined
+  const model = (!persistedModel || observedIsCurrent ? observedModel : undefined) || persistedModel
+  const effort = (!persistedEffort || observedIsCurrent ? tele?.effort?.trim() : undefined) || persistedEffort
+  return { model, effort }
+}
+
+export function resolveSessionPermission(
+  row: Pick<SessionRow, "backend" | "spawned_at" | "permission_mode" | "permission_pending">,
+  tele?: Pick<SessionTelemetry, "permissionMode" | "permissionModeAt">,
+): ThreadView["permissionMode"] {
+  const saved = PermissionMode.safeParse(row.permission_mode)
+  const pending = PermissionMode.safeParse(row.permission_pending)
+  const normalize = (mode: PermissionModeValue) => effectivePermissionMode(row.backend === "codex" ? "codex" : "claude", mode)
+  // A successful controlled reattach stamps the exact argv mode before its transcript sidecar is
+  // tailed. During that short reconciliation window the launched value is already authoritative.
+  if (saved.success && pending.success && normalize(saved.data) === normalize(pending.data)) return normalize(saved.data)
+  if (row.backend === "codex" && saved.success) {
+    // Codex does not append a profile record merely by reopening an idle rollout. Ignore an older
+    // turn_context from before this process generation, but accept a later /permissions or turn event.
+    const observedAt = tele?.permissionModeAt ? Date.parse(tele.permissionModeAt) : NaN
+    const spawnedAt = Date.parse(row.spawned_at)
+    if (tele?.permissionMode && Number.isFinite(observedAt) && Number.isFinite(spawnedAt) && observedAt >= spawnedAt) {
+      return normalize(tele.permissionMode)
+    }
+    return normalize(saved.data)
+  }
+  // The tailer writes every observed Claude permission-mode transition back to this row. Prefer the
+  // durable value so a just-reattached process cannot be relabeled by the previous in-memory fold.
+  if (saved.success) return normalize(saved.data)
+  return tele?.permissionMode ? normalize(tele.permissionMode) : undefined
+}
+
+export function resolvePendingPermission(row: Pick<SessionRow, "permission_pending">): ThreadView["permissionPending"] {
+  const parsed = PermissionMode.safeParse(row.permission_pending)
+  return parsed.success ? parsed.data : undefined
+}
+
+export function queuedInputCount(value: string | null | undefined): number {
+  if (!value) return 0
+  try {
+    const parsed = JSON.parse(value)
+    return Array.isArray(parsed) ? parsed.length : 0
+  } catch {
+    return 0
+  }
+}
+
+export function codexInputIsAmbiguous(value: string | null | undefined, now = Date.now()): boolean {
+  if (!value) return false
+  try {
+    const first = JSON.parse(value)?.[0]
+    if (!first || first.state !== "submitted" || typeof first.submittedAt !== "string") return false
+    const submittedAt = Date.parse(first.submittedAt)
+    return Number.isFinite(submittedAt) && now - submittedAt >= CODEX_INPUT_CONFIRMATION_TIMEOUT_MS
+  } catch {
+    return false
+  }
+}
+
+// Title provenance is resolved server-side as well as in the web display helper. A transcript title
+// is eligible only while the registry says the stored fallback was machine-generated; once a human
+// commits a title (setTitle atomically clears title_auto), no later tail tick can put aiTitle back on
+// the wire as a competing display value.
+export function resolveSessionTitle(
+  row: Pick<SessionRow, "title" | "title_auto">,
+  tele: Pick<SessionTelemetry, "aiTitle"> | undefined,
+): Pick<ThreadView, "title" | "titleAuto" | "aiTitle"> {
+  const titleAuto = row.title_auto === 1
+  return {
+    title: row.title ?? "",
+    titleAuto,
+    aiTitle: titleAuto ? tele?.aiTitle : undefined,
+  }
+}
+
+function sessionThreadView(
+  projectDir: string,
+  storage: Storage,
+  row: SessionRow,
+  tele: SessionTelemetry | undefined,
+  registeredLegacyTerminal: boolean,
+  interactionPresence: { pending: boolean; needsUser: boolean },
+  nowMs: number,
+): ThreadView {
+  const runtime = degradeIfNoTranscript(deriveRuntime(row.slug, row, storage, tele?.turn, tele?.permPrompt ?? false), tele?.noTranscript)
+  const state = effectiveSessionState(row, registeredLegacyTerminal)
   const archived = state === "archived"
-  const needsYou = archived ? false : deriveNeedsYou(row, tele, runtime)
+  const needsYou = archived ? false : deriveNeedsYou(row, tele, runtime, interactionPresence.needsUser, nowMs)
+  const crashed = runtime === "exited" && tele?.turn === "in-flight"
+  const snoozedUntil = futureSnooze(row, nowMs)
+  const profile = resolveSessionProfile(row, tele)
+  const permissionMode = resolveSessionPermission(row, tele)
+  const permissionPending = resolvePendingPermission(row)
+  const title = resolveSessionTitle(row, tele)
   return {
     id: row.slug,
-    title: row.title ?? "",
+    ...title,
     status: "active", // synthesized: the field is required but UNUSED for session rows (see note above)
     hasPlan: false,
     mechanism: null,
@@ -251,11 +325,10 @@ function sessionThreadView(projectDir: string, row: SessionRow, tele: SessionTel
     lastAssistant: tele?.lastAssistant,
     spawnedAt: row.spawned_at,
     lastActivityAt: tele?.lastActivityAt,
-    aiTitle: tele?.aiTitle,
-    titleAuto: row.title_auto === 1,
     subAgents: tele?.subAgents ?? [],
     bgShells: tele?.bgShells ?? [],
     pendingAsk: tele?.pendingAsk ? { questions: tele.pendingAsk.questions } : undefined,
+    nativeInputRequired: tele?.nativeInputRequired,
     pendingQuestion: tele?.pendingQuestion ?? false,
     lastUserAt: tele?.lastUserAt,
     kind: "session",
@@ -264,86 +337,57 @@ function sessionThreadView(projectDir: string, row: SessionRow, tele: SessionTel
     seenAt: row.seen_at ?? undefined,
     planPath: row.plan_path ?? undefined,
     state,
+    snoozedUntil,
     needsYou,
+    crashed,
+    pendingInteraction: interactionPresence.pending,
+    actionableInteraction: interactionPresence.needsUser,
     scratchpadPath: scratchpadPathIfExists(projectDir, row.session_id),
-    // The rail's backend badge (Codex-support epic, Phase 3). Only a codex row carries a badge; a
-    // claude row (backend NULL/'claude' — the column default) leaves it undefined so the default
-    // backend renders unmarked.
-    backend: row.backend === "codex" ? "codex" : undefined,
+    // Preserve only a durable, canonical backend identity. In particular, Claude is not inferred
+    // from today's dispatch preference: unknown/migrated rows remain unmarked, while rows whose
+    // database default was explicitly normalized to "claude" get the same per-thread identity as
+    // Codex rows.
+    backend: row.backend === "claude" || row.backend === "codex" ? row.backend : undefined,
+    // Only a persisted, validated per-session value is exposed. A migrated row stays visibly unknown;
+    // never label it with today's global defaults (which may not match its running process).
+    permissionMode,
+    permissionPending,
+    permissionChangePending: row.permission_pending !== null && row.permission_pending !== undefined,
+    profilePendingModel: row.profile_pending_model?.trim() || undefined,
+    profilePendingEffort: row.profile_pending_effort?.trim() || undefined,
+    profileChangePending:
+      row.profile_pending_model !== null && row.profile_pending_model !== undefined ||
+      row.profile_pending_effort !== null && row.profile_pending_effort !== undefined,
+    runtimeControlPending: row.runtime_control !== null && row.runtime_control !== undefined,
+    // A queued Codex follow-up deliberately retains the `codex-input` owner until transcript
+    // confirmation. The controller accepts another follow-up under that same owner, so expose this
+    // exact capability rather than making every runtime control look sendable to the browser.
+    followUpQueueAvailable: row.backend === "codex" && row.runtime_control === "codex-input",
+    queuedInputCount: queuedInputCount(row.codex_input_queue),
+    codexInputAmbiguous: codexInputIsAmbiguous(row.codex_input_queue),
+    controlError: row.control_error?.trim() || undefined,
+    // Session profile resolved from backend-observed transcript truth first, then pinned launch
+    // metadata (which supplies immediate/pre-response values and Claude's unrecorded effort). Never
+    // fall back to current Settings; when both durable sources are silent the readout is omitted.
+    model: profile.model,
+    effort: profile.effort,
   }
 }
 
-// A FOREIGN session thread's view (a maintainer terminal — id = session id, no registry row). Read-only:
-// runtime is derived WITHOUT tmux (never call tmux for a session we don't own), no queue membership, no
-// archive/seen/unread state, no tmux-verb fields.
-function foreignThreadView(sessionId: string, tele: SessionTelemetry | undefined): ThreadView {
-  const runtime: RuntimeState = tele?.turn === "idle" ? "turn-idle" : "running"
-  return {
-    id: sessionId,
-    title: "",
-    status: "active", // synthesized (unused for session rows)
-    hasPlan: false,
-    mechanism: null,
-    humanBlocked: false,
-    ready: false,
-    dependsOn: [],
-    externalDeps: [],
-    agents: [],
-    errors: [],
-    warnings: [],
-    runtime,
-    sessionId,
-    unread: false,
-    archived: false,
-    lastAssistant: tele?.lastAssistant,
-    lastActivityAt: tele?.lastActivityAt,
-    aiTitle: tele?.aiTitle,
-    subAgents: tele?.subAgents ?? [],
-    bgShells: tele?.bgShells ?? [],
-    pendingAsk: tele?.pendingAsk ? { questions: tele.pendingAsk.questions } : undefined,
-    pendingQuestion: tele?.pendingQuestion ?? false,
-    lastUserAt: tele?.lastUserAt,
-    kind: "session",
-    foreign: true,
-    lastFence: tele?.lastFence,
-    state: "open",
-    needsYou: false,
-    // Deliberately never set for foreign threads: the scratchpad READ RPC resolves through a registry
-    // row (rowless → ""), so advertising a path here would offer a doc tab that can't load. Foreign
-    // sessions aren't fray-provisioned anyway — no pad exists.
-    scratchpadPath: undefined,
-  }
-}
-
-// Plan artifacts (.fray/plans/*.md): title from the first markdown heading in the head of the file (else
-// the filename stem), mtime, and the slugs of any session rows dispatched from it. All fs errors → skip /
-// []. Recomputed on rebuild (the recursive .fray watcher fires on .fray/plans changes).
+// Plan artifacts (.fray/plans/*.md): title from the first markdown heading in the securely resolved
+// bytes (else the filename stem), mtime, and registered session slugs dispatched from it. Discovery and
+// reading share one stable no-follow resolver; indirect or raced files are omitted.
 function readPlans(projectDir: string, rows: SessionRow[]): PlanView[] {
-  const plansDir = join(projectDir, ".fray", "plans")
-  let files: string[]
-  try {
-    files = readdirSync(plansDir).filter((f) => f.endsWith(".md") && !f.startsWith("."))
-  } catch {
-    return [] // no plans dir (or unreadable) — no Plans section data
-  }
-  const out: PlanView[] = []
-  for (const file of files) {
-    const rel = `.fray/plans/${file}`
-    let title = file.replace(/\.md$/, "")
-    let updatedAt: string | undefined
-    try {
-      const full = join(plansDir, file)
-      updatedAt = statSync(full).mtime.toISOString()
-      const head = readFileSync(full, "utf8").split("\n").slice(0, 50)
-      const h = head.find((l) => /^#{1,6}\s+\S/.test(l))
-      if (h) title = h.replace(/^#{1,6}\s+/, "").trim() || title
-    } catch {
-      // unreadable file — keep the filename stem, no mtime
-    }
-    const threadIds = rows.filter((r) => r.plan_path === rel).map((r) => r.slug)
-    out.push({ path: rel, title, updatedAt, threadIds })
-  }
-  return out
+  return listPlanFiles(projectDir).map((file) => {
+    let title = file.filename.replace(/\.md$/, "")
+    const head = file.contents.toString("utf8").split("\n").slice(0, 50)
+    const heading = head.find((line) => /^#{1,6}\s+\S/.test(line))
+    if (heading) title = heading.replace(/^#{1,6}\s+/, "").trim() || title
+    const threadIds = rows
+      .filter((row) => row.plan_path === file.relativePath && ThreadSlug.safeParse(row.slug).success)
+      .map((row) => row.slug)
+    return { path: file.relativePath, title, updatedAt: new Date(file.mtimeMs).toISOString(), threadIds }
+  })
 }
 
 export interface BoardManager {
@@ -352,21 +396,50 @@ export interface BoardManager {
   // client can adopt it and then apply deltas seq+1, seq+2 … (see the /events handler). Read
   // synchronously right after snapshot() so the two are consistent.
   currentSeq(): number
-  // Full: re-runs the fray shell-out. Use when .fray/ content changed.
+  // Full: revalidates registered-file migration state and secure plan discovery.
   rebuild(): Promise<BoardSnapshot>
-  // Overlay-only: reuses the cached fray board; cheap + sync. Use for tailer/session changes.
+  // Overlay-only: reuses file-backed caches; cheap + sync. Use for tailer/session changes.
   refresh(): BoardSnapshot
+  // A durable typed-interaction transition changes queue membership independently of transcript or
+  // .fray files. The board caches per-session presence and refreshes on the journal's post-commit edge.
+  interactionChanged?(change: InteractionChange): void
   start(): Promise<void>
   stop(): Promise<void>
 }
 
-export function createBoard(project: Project, storage: Storage, bus: Bus, tailer: Tailer, bootId: string): BoardManager {
+export interface BoardManagerDeps {
+  subscribe?: typeof watcher.subscribe
+  now?: () => number
+}
+
+export function createBoard(
+  project: Project,
+  storage: Storage,
+  bus: Bus,
+  tailer: Tailer,
+  bootId: string,
+  deps: BoardManagerDeps = {},
+): BoardManager {
+  const subscribe = deps.subscribe ?? watcher.subscribe
+  const now = deps.now ?? Date.now
   let cached: BoardSnapshot | null = null
   let parcelSub: watcher.AsyncSubscription | null = null
+  let watchSetup: Promise<void> | null = null
   let bootstrapWatch: FSWatcher | null = null
   let debounce: NodeJS.Timeout | null = null
   let reconcileTimer: NodeJS.Timeout | null = null
-  const frayDir = join(project.dir, ".fray")
+  let snoozeTimer: NodeJS.Timeout | null = null
+  let interactionRefreshQueued = false
+  let snoozeRefreshQueued = false
+  let stopped = false
+  let stopPromise: Promise<void> | null = null
+  const activeRebuilds = new Set<Promise<BoardSnapshot>>()
+  // Pending presence and human actionability, keyed by BOTH slug and current session id. Provider
+  // responses remain journal-pending until acknowledgement, but QUEUED/SENT is no longer a human ask:
+  // keep its thread card readable while dropping it from Needs You. A replacement session therefore
+  // cannot inherit either signal from the prior rollout.
+  const pendingInteractionCache = new Map<string, { pending: boolean; needsUser: boolean }>()
+  const interactionKey = (slug: string, sessionId: string) => `${slug}\u0000${sessionId}`
   // Per-slug "was this SESSION thread in the needs-you queue last build?" — drives the needs-decision
   // notify dedupe: we fire only on a false→true edge, and a thread leaving the queue re-arms it.
   const needsYouPrev = new Map<string, boolean>()
@@ -374,8 +447,8 @@ export function createBoard(project: Project, storage: Storage, bus: Bus, tailer
   // server doesn't fire a storm for every historical resting thread already in the queue.
   let notifyPrimed = false
 
-  // Fire a needs-decision notify for every SESSION thread that has NEWLY entered the needs-you queue
-  // (legacy rows are shelved vestiges — no notifies). Edge-triggered + deduped; primed on the first build.
+  // Fire a needs-decision notify for every registered session that newly enters the queue.
+  // Edge-triggered + deduped; primed on the first build.
   function notifyNeedsYou(sessionThreads: ThreadView[]): void {
     const seen = new Set<string>()
     for (const t of sessionThreads) {
@@ -392,125 +465,139 @@ export function createBoard(project: Project, storage: Storage, bus: Bus, tailer
     notifyPrimed = true
   }
 
-  // Sync Claude's evolving ai-title into the thread FILE for auto-titled dispatches ("rename
-  // periodically"): the display already prefers aiTitle live; this makes it durable in fray.
-  // Guarded per-slug so each new ai-title writes exactly once (the write itself retriggers the
-  // watcher, which would otherwise loop).
-  const syncedTitles = new Map<string, string>()
-  function syncAutoTitles(threads: ThreadView[]): void {
-    for (const t of threads) {
-      const ai = t.aiTitle?.trim()
-      if (!ai || ai === t.title) continue
-      // Only sync into a thread FILE that exists: new session dispatches have no .fray/<slug>.md, and
-      // shelling out to fray-update against a missing file just fails and retry-loops. The row title
-      // (row.title) plus client-side aiTitle preference already cover fileless session threads.
-      if (!existsSync(join(frayDir, `${t.id}.md`))) continue
-      const row = storage.getSession(t.id)
-      if (!row || row.title_auto !== 1) continue
-      if (syncedTitles.get(t.id) === ai) continue
-      syncedTitles.set(t.id, ai)
-      runThreadUpdate(project.dir, t.id, ["--set", `title=${ai}`]).catch(() => {
-        syncedTitles.delete(t.id) // retry on the next build
-      })
-    }
-  }
-
-  // The parsed fray board (from the shell-out) is CACHED: the expensive `readBoard` subprocess
-  // runs only when .fray/ actually changes; tailer/session-registry changes reuse the cache and
-  // re-run only the cheap in-memory overlay. Before this split, every overlay-ish change (a 1s
-  // tailer tick, a markRead) paid the full subprocess — rebuilds queued up and RPC handlers that
-  // awaited them stalled for many seconds.
-  let frayCache: Awaited<ReturnType<typeof readBoard>> | null = null
-  let frayErr: string | null = null
-  // Plan artifacts cache — recomputed on rebuild alongside frayCache (the recursive .fray watcher fires
-  // on .fray/plans changes). assemble() reads it so an overlay-only refresh doesn't re-stat the dir.
+  // File-backed migration/plan caches are recomputed only on a full rebuild (the recursive .fray
+  // watcher catches changes). Overlay-only refreshes remain filesystem-free.
+  let legacyTerminalCache = new Set<string>()
   let plansCache: PlanView[] = []
-  let reading: Promise<void> | null = null
-  // Self-healing: a failed read is NEVER terminal — it schedules its own retry with backoff, so the
-  // board converges without waiting for the next external event. (A truncated shell-out once left a
-  // permanently empty board with the error buried in an unrendered field.)
-  let retryTimer: NodeJS.Timeout | null = null
-  let retryDelay = 1000
 
-  async function refreshFrayCache(): Promise<void> {
-    // Coalesce concurrent full reads — one subprocess at a time, everyone awaits the same one.
-    if (!reading) {
-      reading = readBoard(project.dir)
-        .then((b) => {
-          frayCache = b
-          frayErr = null
-          retryDelay = 1000
-        })
-        .catch((err) => {
-          frayErr = `board read failed: ${err instanceof Error ? err.message : String(err)}`
-          if (retryTimer) clearTimeout(retryTimer)
-          retryTimer = setTimeout(() => void rebuild(), retryDelay)
-          retryDelay = Math.min(retryDelay * 2, 15_000)
-        })
-        .finally(() => {
-          reading = null
-        })
-    }
-    await reading
-  }
-
-  // Assemble a snapshot from the cached fray data + live overlay (storage/tailer). Cheap and sync.
-  // A board-read failure (frayErr) has no single file to name — surface it as a non-repairable
-  // structured item so the banner can render one uniform list off `errorItems` alone.
-  const readErrItem = (): FrayErrorItem[] => (frayErr ? [{ file: "", kind: "other" as const, message: frayErr }] : [])
-
-  // Build the session-backed threads: one per registry row + one per foreign session. Legacy status (for
-  // the effective-state derivation — a pre-migration session paired with a terminal .fray file archives)
-  // comes from the cached fray board when present.
-  function buildSessionThreads(): ThreadView[] {
-    const rows = storage.allSessions()
-    const legacyTerminal = new Set<string>()
-    if (frayCache) for (const t of frayCache.threads) if (t.status === "done" || t.status === "dismissed") legacyTerminal.add(t.id)
-    const registered = new Set<string>()
+  // Build exactly the session-backed threads recorded by Fray UI. The registry is the provenance
+  // boundary: historical rows remain valid after migration/restart, and both Claude and Codex use the
+  // same durable shape. Raw tailer discoveries never confer ownership.
+  function buildSessionThreads(nowMs: number): ThreadView[] {
+    // Old/corrupt databases predate the canonical storage guard. Keep such rows inert instead of
+    // emitting an invalid board id or allowing it to reach tailer/tmux consumers.
+    const rows = storage.allSessions().filter((row) => ThreadSlug.safeParse(row.slug).success)
+    const currentInteractionKeys = new Set<string>()
     const out: ThreadView[] = []
     for (const row of rows) {
-      registered.add(row.session_id)
-      out.push(sessionThreadView(project.dir, row, tailer.get(row.slug), legacyTerminal.has(row.slug)))
+      const key = interactionKey(row.slug, row.session_id)
+      currentInteractionKeys.add(key)
+      let interactionPresence = pendingInteractionCache.get(key)
+      if (interactionPresence === undefined) {
+        try {
+          const scope = {
+            projectId: project.id,
+            threadSlug: row.slug,
+            sessionId: row.session_id,
+          }
+          const pending = storage.interactions.listPending(scope)
+          interactionPresence = {
+            pending: pending.length > 0,
+            needsUser: pending.some((interaction) => {
+              const delivery = storage.interactions.providerDelivery(scope, interaction.id)
+              return !delivery || (delivery.state !== "queued" && delivery.state !== "sent")
+            }),
+          }
+        } catch {
+          // Fail visible. A corrupt/unreadable journal must not silently hide a request that may hold
+          // provider authority; the queue card will surface the scoped RPC error instead.
+          interactionPresence = { pending: true, needsUser: true }
+        }
+        pendingInteractionCache.set(key, interactionPresence)
+      }
+      out.push(sessionThreadView(
+        project.dir,
+        storage,
+        row,
+        tailer.get(row.slug),
+        legacyTerminalCache.has(row.slug),
+        interactionPresence,
+        nowMs,
+      ))
     }
-    // Foreign sessions (id = session id). Skip any that already back a registry row (defensive — a
-    // registered session's jsonl should never surface in foreignIds, but never render it twice).
-    for (const sid of tailer.foreignIds()) {
-      if (registered.has(sid)) continue
-      out.push(foreignThreadView(sid, tailer.get(sid)))
+    for (const key of pendingInteractionCache.keys()) {
+      if (!currentInteractionKeys.has(key)) pendingInteractionCache.delete(key)
     }
     return out
   }
 
-  // Assemble a snapshot from the cached fray data + live overlay (storage/tailer) + plans cache. Cheap and
-  // sync. Session threads and plans emit REGARDLESS of .fray/ existence; legacy (.fray-file) rows only
-  // when the board read has landed. frayActive tracks .fray/ presence (the legacy source of truth).
-  //
-  // ONE ROW PER ID: a slug with both a registry row and a .fray file emits ONLY the session row.
-  // (The earlier "render both by design" call was unsound: registered session threads use the slug
-  // as their id, so the legacy twin COLLIDED in the id-keyed BoardDiffer — each rebuild flip-flopped
-  // which representation won and the first delta after page load replaced every session row with its
-  // legacy twin, emptying the sidebar's working sections. Found live 2026-07-09. The paired file
-  // stays reachable through the session thread's doc drawer.)
+  // Assemble a snapshot from registered sessions + plan artifacts. Unregistered legacy files and
+  // foreign transcripts are excluded before any legacy parser is invoked, so they cannot contribute a
+  // row, queue card, warning, or error. `frayActive` remains a capability bit for plan/scratch storage.
   function assemble(): BoardSnapshot {
+    // One clock sample owns every snooze decision in this snapshot: expiry clearing, visibility,
+    // needs-you derivation, and timer selection cannot disagree at a deadline boundary.
+    const assembledAtMs = now()
+    // Canonical UTC strings sort chronologically, so one indexed write clears every elapsed snooze.
+    // This runs on every edge-triggered refresh as well as the level-triggered reconcile.
+    storage.clearExpiredSnoozes(new Date(assembledAtMs).toISOString())
     const base = { projectDir: project.dir, projectName: project.name, projectLabel: project.label }
     const frayActive = frayDirExists(project.dir)
-    const sessionThreads = buildSessionThreads()
-    const sessionIds = new Set(sessionThreads.map((t) => t.id))
-    const legacyThreads =
-      frayActive && frayCache
-        ? frayCache.threads.map((t) => toThreadView(t, storage, tailer)).filter((t) => !sessionIds.has(t.id))
-        : []
+    const sessionThreads = buildSessionThreads(assembledAtMs)
+    armSnoozeWake(sessionThreads, assembledAtMs)
     notifyNeedsYou(sessionThreads)
-    syncAutoTitles(sessionThreads)
-    const errors = frayActive ? [...(frayCache?.errors ?? []), ...(frayErr ? [frayErr] : [])] : []
-    const warnings = frayActive ? (frayCache?.warnings ?? []) : []
-    const errorItems = frayActive ? [...(frayCache?.errorItems ?? []), ...readErrItem()] : []
-    return { ...base, frayActive, threads: [...legacyThreads, ...sessionThreads], errors, warnings, errorItems, plans: plansCache }
+    return {
+      ...base,
+      frayActive,
+      threads: sessionThreads,
+      errors: [],
+      warnings: [],
+      errorItems: [],
+      plans: plansCache,
+    }
+  }
+
+  // Schedule the exact next user-snooze deadline instead of relying on the 15s reconciliation ceiling.
+  // Long waits are chunked at Node's safe timeout limit; restart re-arms from the durable DB value.
+  function queueSnoozeRefresh(): void {
+    if (snoozeRefreshQueued) return
+    snoozeRefreshQueued = true
+    queueMicrotask(() => {
+      snoozeRefreshQueued = false
+      if (stopped) return
+      refresh()
+    })
+  }
+
+  function armSnoozeWake(threads: readonly ThreadView[], assembledAtMs: number): void {
+    if (snoozeTimer) clearTimeout(snoozeTimer)
+    snoozeTimer = null
+    if (stopped) return
+    let next = Infinity
+    for (const thread of threads) {
+      const at = Date.parse(thread.snoozedUntil ?? "")
+      if (Number.isFinite(at) && at > assembledAtMs) next = Math.min(next, at)
+    }
+    if (!Number.isFinite(next)) return
+    // Assembly can take long enough to cross the selected deadline. Rebuild immediately in that case
+    // instead of dropping the now-due deadline and waiting for the 15s reconcile sweep.
+    const schedulingNowMs = now()
+    if (next <= schedulingNowMs) {
+      queueSnoozeRefresh()
+      return
+    }
+    const delay = Math.max(1, Math.min(next - schedulingNowMs + 1, 2_147_000_000))
+    snoozeTimer = setTimeout(() => {
+      snoozeTimer = null
+      if (!stopped) queueSnoozeRefresh()
+    }, delay)
+    snoozeTimer.unref?.()
   }
 
   // Recompute the plans cache (full-read grade). Called on rebuild; empty when .fray/ is absent.
   function recomputePlans(): void {
     plansCache = frayDirExists(project.dir) ? readPlans(project.dir, storage.allSessions()) : []
+  }
+
+  function recomputeLegacyTerminalState(): void {
+    legacyTerminalCache = new Set(
+      storage.allSessions()
+        // Auto-titled UI rows are session-first authority: a matching legacy filename is untrusted and
+        // must not even be opened. Only a non-auto historical row can use the narrow terminal-status
+        // migration bridge while its explicit lifecycle state is still absent.
+        .filter((row) => row.state == null && row.archived !== 1 && row.title_auto !== 1 && registeredLegacyFileIsTerminal(project.dir, row.slug))
+        .map((row) => row.slug),
+    )
   }
 
   // Publish only what CHANGED. The differ holds the last-broadcast per-thread JSON; on each snapshot it
@@ -525,43 +612,98 @@ export function createBoard(project: Project, storage: Storage, bus: Bus, tailer
     bus.publish({ type: "board-delta", seq: d.seq, bootId, upserts: d.upserts, removed: d.removed, ...(d.meta ? { meta: d.meta } : {}) })
   }
 
-  // FULL rebuild: re-read the fray board (subprocess) then assemble. For .fray changes.
-  async function rebuild(): Promise<BoardSnapshot> {
-    await refreshFrayCache()
+  // FULL rebuild: recompute registered-file migration metadata + plans, then assemble.
+  async function rebuildOnce(): Promise<BoardSnapshot> {
+    if (stopped) throw new ProducerStoppedError("board")
+    // One indexed expiry sweep per level-triggered reconcile keeps queue membership truthful even
+    // with no browser mounted. Any transitions publish normal journal invalidations.
+    storage.interactions.expireDue()
+    recomputeLegacyTerminalState()
     recomputePlans()
     cached = assemble()
     publish(cached)
     return cached
   }
 
+  function rebuild(): Promise<BoardSnapshot> {
+    if (stopped) return Promise.reject(new ProducerStoppedError("board"))
+    const task = rebuildOnce()
+    activeRebuilds.add(task)
+    task.then(
+      () => activeRebuilds.delete(task),
+      () => activeRebuilds.delete(task),
+    )
+    return task
+  }
+
   // OVERLAY-ONLY rebuild: reuse the cached fray data. For tailer/session-registry changes.
   function refresh(): BoardSnapshot {
+    if (stopped) throw new ProducerStoppedError("board")
     cached = assemble()
     publish(cached)
     return cached
   }
 
-  function scheduleRebuild() {
-    if (debounce) clearTimeout(debounce)
-    debounce = setTimeout(() => void rebuild(), DEBOUNCE_MS)
+  function interactionChanged(change: InteractionChange): void {
+    if (stopped) return
+    const key = interactionKey(change.threadSlug, change.sessionId)
+    // Delivery-only transitions keep lifecycle/revision unchanged, so always evict and re-read the
+    // durable join. This prevents awaiting→queued→sent→acknowledged from oscillating the queue based on
+    // whichever layer happened to notify last.
+    pendingInteractionCache.delete(key)
+    // Store observers may fire from within a surrounding SQLite transaction or while listPending is
+    // expiring records during assembly. Defer and coalesce the refresh to avoid re-entrant builds.
+    if (interactionRefreshQueued) return
+    interactionRefreshQueued = true
+    queueMicrotask(() => {
+      interactionRefreshQueued = false
+      if (stopped) return
+      refresh()
+    })
   }
 
-  async function watchFrayDir() {
-    if (parcelSub) return
-    parcelSub = await watcher.subscribe(join(project.dir, ".fray"), () => scheduleRebuild())
+  function scheduleRebuild() {
+    if (stopped) return
+    if (debounce) clearTimeout(debounce)
+    debounce = setTimeout(() => void rebuild().catch(() => {}), DEBOUNCE_MS)
+  }
+
+  function watchFrayDir(): Promise<void> {
+    if (parcelSub || stopped) return Promise.resolve()
+    if (watchSetup) return watchSetup
+    const setup = (async () => {
+      const next = await subscribe(join(project.dir, ".fray"), () => scheduleRebuild())
+      if (stopped) {
+        await next.unsubscribe()
+        return
+      }
+      parcelSub = next
+    })()
+    watchSetup = setup
+    void setup.then(
+      () => { if (watchSetup === setup) watchSetup = null },
+      () => { if (watchSetup === setup) watchSetup = null },
+    )
+    return setup
   }
 
   return {
-    snapshot: async () => cached ?? (await rebuild()),
+    snapshot: async () => {
+      if (stopped) throw new ProducerStoppedError("board")
+      return cached ?? (await rebuild())
+    },
     currentSeq: () => differ.currentSeq(),
     rebuild,
     refresh,
+    interactionChanged,
     async start() {
+      if (stopped) throw new ProducerStoppedError("board")
       await rebuild()
+      if (stopped) return
       // LEVEL-TRIGGERED reconciliation: a periodic full rebuild guarantees convergence even if every
       // edge (watcher event, SSE push, mutation hook) is missed or fails — the UI can lag one period,
       // never forever. Edge-triggered paths above make it feel instant; this makes it CORRECT.
-      reconcileTimer = setInterval(() => void rebuild(), RECONCILE_MS)
+      reconcileTimer = setInterval(() => void rebuild().catch(() => {}), RECONCILE_MS)
       if (frayDirExists(project.dir)) {
         await watchFrayDir()
       } else {
@@ -572,7 +714,7 @@ export function createBoard(project: Project, storage: Storage, bus: Bus, tailer
             if (name === ".fray" && frayDirExists(project.dir)) {
               bootstrapWatch?.close()
               bootstrapWatch = null
-              void watchFrayDir()
+              void watchFrayDir().catch(() => {})
               scheduleRebuild()
             }
           })
@@ -581,13 +723,30 @@ export function createBoard(project: Project, storage: Storage, bus: Bus, tailer
         }
       }
     },
-    async stop() {
-      if (debounce) clearTimeout(debounce)
-      if (retryTimer) clearTimeout(retryTimer)
-      if (reconcileTimer) clearInterval(reconcileTimer)
-      bootstrapWatch?.close()
-      await parcelSub?.unsubscribe()
-      parcelSub = null
+    stop() {
+      if (stopPromise) return stopPromise
+      stopped = true
+      stopPromise = (async () => {
+        if (debounce) clearTimeout(debounce)
+        debounce = null
+        if (reconcileTimer) clearInterval(reconcileTimer)
+        reconcileTimer = null
+        if (snoozeTimer) clearTimeout(snoozeTimer)
+        snoozeTimer = null
+        bootstrapWatch?.close()
+        bootstrapWatch = null
+        const subscription = parcelSub
+        parcelSub = null
+        const pendingWatchSetup = watchSetup
+        await Promise.all([
+          pendingWatchSetup ?? Promise.resolve(),
+          subscription?.unsubscribe() ?? Promise.resolve(),
+        ])
+        // Rebuilds are registry/plan reads only, but still drain them so a replacement generation never
+        // publishes a stale delta after shutdown begins.
+        await Promise.allSettled([...activeRebuilds])
+      })()
+      return stopPromise
     },
   }
 }

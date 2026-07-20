@@ -1,6 +1,8 @@
 import type { ServerEvent } from "@fray-ui/shared"
+import type { QueryClient } from "@tanstack/react-query"
 import { store } from "../store.ts"
 import { BoardStream } from "./board-stream.ts"
+import { invalidateInteractionQueries } from "./interaction-cache.ts"
 
 // The SSE transport — the FALLBACK path once the /ws multiplex exists (socket.ts calls connectSSE() when
 // a pre-restart server has no /ws route). It carries the board channel (keyframe + deltas + notify) through
@@ -12,10 +14,16 @@ let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 let lastMsg = 0
 let health: ReturnType<typeof setInterval> | null = null
 let failures = 0
+let qc: QueryClient | null = null
 
 // Board seq-gap resync = reconnect the EventSource: the connect handshake re-sends the full board as a
 // fresh keyframe with the current seq. NOT a failure (the connection is healthy) so it skips backoff.
-const stream = new BoardStream(() => resync())
+const stream = new BoardStream(
+  () => resync(),
+  (event) => {
+    if (qc) void invalidateInteractionQueries(qc, event)
+  },
+)
 
 // Server pushes full board snapshots (+ optional heartbeats). If we go quiet for
 // this long we assume the connection is dead and reconnect. Reattach is cheap.
@@ -108,7 +116,8 @@ function resync() {
 
 // Connect after load so the SSE socket doesn't consume one of Chrome's 6 per-host
 // connection slots while Vite is still streaming modules in dev.
-export function connectSSE() {
+export function connectSSE(queryClient?: QueryClient) {
+  if (queryClient) qc = queryClient
   if (document.readyState === "complete") connect()
   else window.addEventListener("load", connect, { once: true })
 }

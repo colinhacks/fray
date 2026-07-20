@@ -5,10 +5,13 @@ cross-workstream decisions, dispatch, reconciliation, and the human-facing synth
 research, implementation, verification, planning, and review run in bounded native Codex agents.
 
 This is deliberately lighter than the classic Claude Code implementation. It uses Codex's native
-agent threads and completion state instead of requiring a `.fray/` board, dispatch ledger, lifecycle
-hooks, or a Cartesian matrix of custom-agent profiles. A worker may keep a task-local scratchpad when
-compaction or a large evidence set makes one useful; the orchestrator does not mirror every worker's
-notes.
+agent threads and completion state instead of lifecycle hooks or a Cartesian matrix of custom-agent
+profiles. For an explicit multi-workstream orchestration it does create a concise, durable
+`.fray/threads/<CODEX_THREAD_ID>/scratch.md`: the root uses this universal thread scratch document as
+concise, human-readable notes for open work, owners, constraints, and verification. A worker may keep a task-local scratchpad when
+compaction or a large evidence set makes one useful at
+`.fray/threads/<child-CODEX_THREAD_ID>/scratch.md`; the orchestrator does not mirror every worker's
+notes. `.fray/plans/*.md` remains exclusively for user plans.
 
 ## Install from GitHub
 
@@ -73,30 +76,77 @@ stops and reports the limitation instead of silently spawning inherited-compute 
 Every Fray dispatch passes an exact model slug, an explicit effort, and `fork_context: false` so the
 child starts from its self-contained task prompt rather than a parent-history fork:
 
-- `gpt-5.6-luna` + `low` for fully specified mechanical collection or edits.
-- `gpt-5.6-terra` + `medium` for ordinary research, probes, tests, verification, and bounded work.
-- `gpt-5.6-sol` + `high` or `xhigh` for substantive implementation, subtle diagnosis, architecture,
-  security-sensitive work, and load-bearing review.
-- `gpt-5.6-sol` + `max` only for the hardest leaf problems.
-- `gpt-5.6-sol` + `ultra` only for an intentionally delegated lead that should orchestrate a nested
-  campaign—not an ordinary worker.
+- `gpt-5.6-terra` + `medium` is the default for most work, including ordinary research, bounded
+  implementation, verification, review, and planning.
+- `gpt-5.6-luna` + `medium` or `gpt-5.6-terra` + `medium` for fully specified mechanical QA,
+  documentation, straightforward tests, and exact collection or edits. Luna is only for work whose
+  decisions are already made.
+- `gpt-5.6-terra` + `high` only when observed evidence demonstrates cross-layer or concurrency
+  ambiguity that a medium worker cannot safely resolve.
+- `gpt-5.6-sol` + `high` or `xhigh` only for genuinely high-risk runtime, persistence,
+  process-control, provider-protocol, or complex-concurrency work. Use xhigh only when the evidence
+  shows that high effort is inadequate for the coupled risk.
 
-Intent and compute are separate. A research task may warrant Sol; a mechanical implementation may
-warrant Luna. The account's active model catalog and effort support always win over this default
-matrix.
+Before any Sol or xhigh spawn, the orchestrator records a concrete routing rationale in the dispatch:
+the observed evidence, the specific risk or ambiguity, and why Terra + medium is inadequate. Broad
+labels such as “architecture,” “substantive,” “security-sensitive,” or “review” are not sufficient.
+Fray does not use Sol, xhigh, max, or ultra merely because work is important, broad, or difficult.
+Intent and compute remain separate, and the account's active model catalog and effort support always
+win over this policy.
 
 ## What orchestrator mode changes
 
 After explicit invocation, the root chat stays out of substantive worker execution. It:
 
 - preserves every unfinished user outcome unless the user supersedes it;
+- creates and continuously maintains Codex's built-in visible plan plus concise scratch notes;
 - assigns bounded ownership and non-overlapping write scopes;
 - routes model and effort per dispatch;
 - accepts new input while children are active without dropping earlier work;
 - reconciles every return before reporting an outcome complete; and
 - synthesizes results by user outcome rather than pasting agent transcripts.
 
-Native thread state is the primary execution record. Fray does not create a mandatory on-disk board.
+Before multi-thread dispatch, Fray creates or refreshes the thread-isolated
+`.fray/threads/<CODEX_THREAD_ID>/scratch.md` with ordinary Markdown and creates or refreshes the short
+visible plan with every known outcome. At every user-message boundary, it refreshes native agents,
+updates the notes with reports, corrections, or constraints, and immediately updates the visible-plan
+summary before materially acting. It preserves unfinished outcomes unless explicitly superseded or
+deferred, and never marks one complete merely because an agent returned or another became more urgent.
+The notes record only the useful context: owner, evidence, material constraints, and verification still
+needed. Native agent state is the execution source of truth. The scratch path uses exact
+`CODEX_THREAD_ID`; if it is unavailable, Fray keeps continuity in the native thread rather than scanning
+for or borrowing another thread's notes. Before final handoff, Fray re-reads the scratch notes and runs
+a zero-drop audit across conversation requests, plan entries, and live/completed agents.
+
+When an unresolved choice would materially change scope, deliverable, authority, cost, risk, or the
+user's preferred outcome, Fray stops that lane and uses Codex's native blocking `request_user_input`
+card when available. The card gives concrete options, puts the recommended option first, and explains
+the tradeoff; Fray does not substitute a prose question. It proceeds autonomously for facts that safe
+inspection can discover and for bounded, reversible, or nonmaterial defaults, while independent work
+continues.
+
+## Agent completion invariant
+
+Once Fray spawns an agent, it lets that agent run to a terminal return. A changed requirement travels
+through the agent's message or queued-follow-up path; the root reconciles obsolete or conflicting
+results after return. It never interrupts active agents to reduce churn, reclaim slots or quota,
+redirect work, respond to a steer, contain live-server instability, or hurry completion. An
+interruption can leave partially applied edits, tests, and owned processes behind, which is an unsound
+state. Isolate or restart only the affected unstable service, never an agent that may be writing. If an
+agent appears hung or continuing would be dangerous, Fray asks the user through the interactive
+question path. The only exception is an explicit user instruction naming the interruption.
+
+## Browser QA and helper-process hygiene
+
+For any delegated task that launches a browser, agent-browser session, Chrome DevTools MCP, or helper
+process, Fray requires a minimum, uniquely named owned session/server—normally one reused for desktop
+and narrow/mobile checks. The worker must close its exact session/server through a `finally`, trap, or
+equivalent path on success, failure, or interruption; it must never global-close another agent's
+session. Before returning, it verifies its owned session/server and helper-process tree are gone, and
+reports that cleanup confirmation with screenshot and console evidence. Chrome DevTools MCP is preferred
+when available to the current Codex provider; `agent-browser` or the repository Puppeteer harness is an
+explicit fallback. The root does not reconcile a browser-QA outcome as complete without screenshot and
+console/page-error evidence, optical-review results, and cleanup confirmation.
 
 ## Fray UI workers are intentionally different
 
@@ -113,6 +163,28 @@ process and injects a smaller worker contract:
 
 This keeps nested delegation available without turning every Fray UI card into another full Fray
 portfolio.
+
+## GitHub CI and review monitors
+
+Fray's canonical portable sources live at repository `monitors/`; byte-identical packaged copies of
+`ci-watch.mjs` and `review-watch.mjs` sit beside this skill. Agents first inspect project-local
+`AGENTS.md`, skills, docs, package scripts, and declared tooling. An explicit local monitor wins only
+after its absolute command and terminal event/exit semantics are validated; invalid declared tooling is
+a visible configuration error, never silently shadowed by Fray. Agents never choose a monitor merely
+by filename. The bundled copies are the fallback and use active, owned `gh` CLI monitoring rather than treating `awaiting ci:` or a partial
+`gh pr checks` rollup as a wake mechanism. The CI monitor combines PR checks with workflow runs for
+the exact head SHA: `ACTION_REQUIRED` fork gates are pending, not green. The review monitor wakes only
+on new non-bot activity after its baseline. Neither script exposes GitHub credentials or detaches a
+process; cancelling the worker cancels its monitor, and restarting launches a new owned monitor.
+
+Fray UI's server scheduler remains the durable fallback for wall-clock `timer:` and external-human
+`human:` + `github-review:` gates. It is not a substitute for an active CI monitor or evidence that
+the full CI matrix passed.
+
+Codex keeps the selected monitor in one persistent `exec_command` / `write_stdin` session. A routed
+Luna child is an optional concurrency choice only when the parent genuinely has independent work to do;
+it is never the default or the monitor abstraction. It only runs the validated monitor to its terminal
+NDJSON verdict and cannot edit, mutate GitHub, delegate, detach, or emit a timer/legacy CI fence.
 
 ## Limitations
 

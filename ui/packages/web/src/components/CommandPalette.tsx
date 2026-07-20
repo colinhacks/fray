@@ -47,7 +47,7 @@ export function CommandPalette() {
         label="Command palette"
         className="w-[560px] max-w-[92vw] rounded-lg border border-border bg-panel shadow-2xl overflow-hidden"
         // cmdk defaults to matching the DOM text; we drive matching via each item's `value` instead.
-        filter={(value, query) => (value.toLowerCase().includes(query.toLowerCase()) ? 1 : 0)}
+        filter={(value: string, query: string, _keywords?: string[]) => (value.toLowerCase().includes(query.toLowerCase()) ? 1 : 0)}
       >
         <Command.Input
           autoFocus

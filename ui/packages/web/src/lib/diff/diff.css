@@ -24,9 +24,9 @@
   font-size: 11.5px;
   color: var(--color-muted);
 }
-/* The header/body divider exists only when a body FOLLOWS — on a collapsed block the header is the
-   last child, and this rule would otherwise stack on the container's own border (a 2px bottom). */
-.fray-diff-header:not(:last-child) {
+/* The body stays mounted (hidden when collapsed) so aria-controls always resolves; key the divider
+   to disclosure state instead of DOM adjacency so a collapsed card keeps its single bottom border. */
+.fray-diff-header[data-expanded="true"] {
   border-bottom: 1px solid var(--color-border);
 }
 /* Lighter than assistant prose — bright white is reserved for actual agent messages. */
@@ -99,6 +99,18 @@
 }
 /* The "Bash" label sits in the same near-white the tool NAMES use (not the dimmer detail gray). */
 .fray-bash-label { color: rgb(from var(--color-fg) r g b / 0.85); font-size: 11.5px; }
+/* The tool-name label (READ / EDIT / AGENT …) is petite-caps at the SAME 11.5px as the detail path
+   beside it. Its small-caps ride optically LOW in the line-box, so lift the label a pixel and drop
+   the detail beside it a pixel — the two then meet on a shared optical baseline instead of the raw
+   flex center. Covers both the Bash/Read/Agent header and the Edit diff header (sibling metrics). */
+.fray-bash-header .fray-bash-label,
+.fray-diff-header .fray-bash-label { position: relative; top: 0.8px; }
+.fray-bash-header > span:first-child > :not(.fray-bash-label),
+.fray-diff-header > span:first-child > :not(.fray-bash-label) { position: relative; top: 1px; }
+/* The status meta (done · 2m) shares the header's 11.5px so it doesn't read as an afterthought; its
+   small-caps sit low in that box, so drop it a pixel onto the row's optical baseline. */
+.fray-tool-header-caps { position: relative; top: 1px; }
+.fray-tool-failed { color: #e5534b; }
 .fray-bash-expand {
   color: var(--color-muted);
   font-size: 11px;

@@ -1,18 +1,20 @@
 import { useEffect } from "react"
 import { useSnapshot } from "valtio"
 import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query"
-import type { BoardSnapshot, ThreadView, TranscriptMessage } from "@fray-ui/shared"
+import type { BoardSnapshot, InteractionRecord, ThreadView, TranscriptMessage } from "@fray-ui/shared"
 import { store, threadBySlug } from "./store.ts"
 import { rpc } from "./api/rpc.ts"
-import { subscribeTranscript, unsubscribeTranscript } from "./api/socket.ts"
+import { retryTranscriptSocket, subscribeTranscript, unsubscribeTranscript } from "./api/socket.ts"
 import { mergeOptimistic, isTranscriptStale, newestRenderedAt } from "./lib/transcript-sync.ts"
+import { pendingInteractionsKey } from "./api/interaction-cache.ts"
+import { reconcileLatestPage, type PaginatedTranscriptData } from "./lib/transcriptPagination.ts"
 
 // A transcript message carrying a transient client-only flag: a follow-up we optimistically appended
 // on send that hasn't yet appeared in a server refetch. The flag drives the "queued" affordance and
 // is naturally dropped when server truth overwrites the cache — EXCEPT that a blunt overwrite would drop
 // it too early (before the server's own copy lands), so overwrites now route through mergeOptimistic.
-export type ChatMessage = TranscriptMessage & { queued?: boolean }
-type TranscriptData = { messages: ChatMessage[] }
+export type ChatMessage = TranscriptMessage & { queued?: boolean; deliveryId?: string }
+export type TranscriptData = Partial<Omit<PaginatedTranscriptData, "messages">> & { messages: ChatMessage[] }
 
 // (mergeToolRuns was DELETED with the ordered-parts fidelity fix. Its whole job was to fold
 // consecutive tool-only turns into one band so adjacent collapsed "5 tool calls"/"3 tool calls"
@@ -44,6 +46,47 @@ export function useSocketTranscripts(): boolean {
   return useSnapshot(store).socketTranscripts
 }
 
+export function ownedInteractionScope(thread: ThreadView | undefined): { slug: string; sessionId: string } | undefined {
+  if (!thread || thread.kind !== "session" || thread.foreign || !thread.sessionId) return undefined
+  return { slug: thread.id, sessionId: thread.sessionId }
+}
+
+// A current server emits an exact board-level presence bit, so unrelated needs-you rows (questions,
+// done handoffs, native prompts) do not each fan out another list RPC. During a rolling update an older
+// board omits the optional field; preserve the prior query behavior until the server catches up so a
+// real typed request is never hidden merely because client and server bundles changed out of order.
+export function pendingInteractionScope(thread: ThreadView | undefined): { slug: string; sessionId: string } | undefined {
+  const scope = ownedInteractionScope(thread)
+  if (!scope || thread?.pendingInteraction === false) return undefined
+  return scope
+}
+
+// Keep an expiring card accurate even if the provider edge or push transport is lost. The server's
+// scoped list call performs the authoritative expiry transition; otherwise SSE/WS invalidations keep
+// this query pull-free.
+export function nextInteractionExpiryDelay(interactions: readonly InteractionRecord[], now = Date.now()): number | false {
+  let earliest = Infinity
+  for (const interaction of interactions) {
+    if (!interaction.expiresAt) continue
+    const expires = Date.parse(interaction.expiresAt)
+    if (Number.isFinite(expires)) earliest = Math.min(earliest, expires)
+  }
+  if (!Number.isFinite(earliest)) return false
+  return Math.max(250, earliest - now + 50)
+}
+
+export function usePendingInteractions(thread: ThreadView | undefined) {
+  const scope = pendingInteractionScope(thread)
+  return useQuery({
+    queryKey: scope ? pendingInteractionsKey(scope.slug, scope.sessionId) : ["interactions", "pending", "unowned"],
+    queryFn: () => rpc.pendingInteractions(scope!),
+    enabled: scope !== undefined,
+    refetchInterval: (query) => nextInteractionExpiryDelay(query.state.data?.interactions ?? []),
+    refetchOnReconnect: true,
+    refetchOnWindowFocus: true,
+  })
+}
+
 // Shared transcript query. `poll` controls whether the transcript stays LIVE (chat while the agent is
 // running) or is left to refetch only on explicit triggers (the To-dos pager).
 //
@@ -61,7 +104,9 @@ const MAX_HEAL_ATTEMPTS = 3
 
 export function useTranscript(slug: string, opts: { poll: boolean }) {
   const qc = useQueryClient()
-  const socket = useSnapshot(store).socketTranscripts
+  const snap = useSnapshot(store)
+  const socket = snap.socketTranscripts
+  const transportFallback = snap.socketTranscriptFallbacks[slug]
 
   // Subscribe the live surface to server transcript push (ref-counted in socket.ts, so a drawer + the main
   // view on one slug share a single server subscription; unmount / poll→false / socket-flip unsubscribes).
@@ -80,10 +125,17 @@ export function useTranscript(slug: string, opts: { poll: boolean }) {
     queryFn: async () => {
       const res = await rpc.threadTranscript({ slug })
       const prev = qc.getQueryData<TranscriptData>(["transcript", slug])
-      return { messages: mergeOptimistic(prev?.messages, res.messages as ChatMessage[]) }
+      const reconciled = reconcileLatestPage(prev as PaginatedTranscriptData | undefined, res)
+      return {
+        ...reconciled,
+        messages: mergeOptimistic(prev?.messages, reconciled.messages as ChatMessage[]),
+      }
     },
-    // Poll only when the socket ISN'T the transcript source; in socket mode pushes keep the cache fresh.
-    refetchInterval: opts.poll && !socket ? 1500 : false,
+    // A typed per-subscription transport rejection (logical overflow or aggregate read budget) is
+    // deliberately NON-retrying: keep the last complete copy visible and let the banner offer explicit
+    // one-shot refresh/retry actions. Ordinary SSE fallback still polls exactly as before.
+    refetchInterval: opts.poll && !socket && !transportFallback ? 1500 : false,
+    refetchOnWindowFocus: !transportFallback,
   })
 
   // LEVEL-TRIGGERED freshness watchdog — the self-healing complement to the edge-triggered push/poll. A
@@ -96,7 +148,7 @@ export function useTranscript(slug: string, opts: { poll: boolean }) {
   // FUTURE pushes), and warn a structured breadcrumb so the underlying delivery bug stays diagnosable. Lives
   // in the hook so every consumer (main ChatView + the drawer's) inherits the invariant.
   useEffect(() => {
-    if (!opts.poll) return // only LIVE views self-heal; a settled thread's transcript is intentionally static
+    if (!opts.poll || transportFallback) return // typed pause stays manual; never turn the watchdog into a full-read loop
     let inFlight = false
     let attempts = 0
     let lastHealNewest: string | undefined
@@ -130,9 +182,25 @@ export function useTranscript(slug: string, opts: { poll: boolean }) {
     return () => clearInterval(iv)
     // query.refetch is stable across renders (react-query); slug/poll/socket cover the meaningful deps.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [slug, opts.poll, socket])
+  }, [slug, opts.poll, socket, transportFallback])
 
-  return query
+  return {
+    ...query,
+    transportFallback: transportFallback
+      ? transportFallback.kind === "payload-too-large"
+        ? {
+            kind: "payload-too-large" as const,
+            actualBytes: transportFallback.actualBytes,
+            maxBytes: transportFallback.maxBytes,
+          }
+        : {
+            kind: "read-budget" as const,
+            scope: transportFallback.scope,
+            retryAfterMs: transportFallback.retryAfterMs,
+          }
+      : null,
+    retryLiveUpdates: () => retryTranscriptSocket(slug),
+  }
 }
 
 // A live/stale sub-agent's OWN transcript, for the drill-in drawer. Keyed by (slug, id) so distinct
@@ -151,19 +219,21 @@ export function useSubAgentTranscript(slug: string, id: string) {
 // agent's next turn picks them up — so the message would otherwise vanish on send. Optimistically
 // append it to the ["transcript", slug] cache as a user bubble tagged `queued`; the next real refetch
 // (which never sets `queued`) overwrites the cache and dedupes it against the server's own copy.
-export function appendQueuedMessage(qc: QueryClient, slug: string, text: string) {
+export function appendQueuedMessage(
+  qc: QueryClient,
+  slug: string,
+  text: string,
+  opts: { scrollToBottom?: boolean; deliveryId?: string } = {},
+) {
   qc.setQueryData<TranscriptData>(["transcript", slug], (prev) => {
     const messages = prev?.messages ?? []
-    return { messages: [...messages, { role: "user", text, tools: [], parts: [], queued: true }] }
+    return { ...prev, messages: [...messages, { role: "user", text, tools: [], parts: [], queued: true, deliveryId: opts.deliveryId }] }
   })
-  // Sending commits the user to the conversation tail, so force the page to the bottom REGARDLESS of
-  // current scroll position. ChatView's auto-stick only fires when you're already near the bottom
-  // (so reading history is never yanked), which means a reply sent from up-thread would otherwise
-  // leave the new bubble off-screen. This is the single send-path hook shared by the thread composer
-  // (ThreadActionBar) and the answering controller (queue card + thread-view answers). The main
-  // workpane and queue scroll the WINDOW; the side drawer runs its own bottom-pin. rAF so the new
-  // bubble is laid out before we read scrollHeight.
-  if (typeof window !== "undefined") {
+  // Chat replies commit to the conversation tail, so they normally force the page to the bottom even
+  // when the reader sent from up-thread. Queue cards opt out: their post-answer destination is the
+  // recorded next queue card, and a global bottom-pin would race it. rAF lets the optimistic bubble
+  // lay out before the document height is read.
+  if (opts.scrollToBottom !== false && typeof window !== "undefined") {
     requestAnimationFrame(() => window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "smooth" }))
   }
 }
@@ -172,11 +242,12 @@ export function appendQueuedMessage(qc: QueryClient, slug: string, text: string)
 // the LAST still-queued message whose text matches (only optimistic entries carry `queued`, so a
 // server-confirmed copy is never touched). Keeps the optimistic UX honest: a failed follow-up no
 // longer leaves a phantom "sent" bubble the reload silently erases.
-export function removeQueuedMessage(qc: QueryClient, slug: string, text: string) {
+export function removeQueuedMessage(qc: QueryClient, slug: string, text: string, deliveryId?: string) {
   qc.setQueryData<TranscriptData>(["transcript", slug], (prev) => {
     if (!prev?.messages?.length) return prev
-    const i = prev.messages.findLastIndex((m) => m.queued && m.role === "user" && m.text === text)
+    const i = prev.messages.findLastIndex((m) => m.queued && m.role === "user" && m.text === text &&
+      (deliveryId === undefined || m.deliveryId === deliveryId))
     if (i === -1) return prev
-    return { messages: prev.messages.filter((_, j) => j !== i) }
+    return { ...prev, messages: prev.messages.filter((_, j) => j !== i) }
   })
 }

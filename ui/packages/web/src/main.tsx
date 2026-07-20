@@ -6,6 +6,16 @@ import { App } from "./App.tsx"
 import { connectSync } from "./api/socket.ts"
 import { initFont } from "./lib/font.ts"
 import { installExternalLinkInterceptor } from "./lib/external-links.ts"
+import { installLocalFileLinkInterceptor } from "./lib/local-file-links.ts"
+import { primeRoute } from "./lib/router.ts"
+
+const settingsFixture = typeof window !== "undefined" && window.location.pathname.endsWith("/settings-formatting-fixture.html")
+
+if (!settingsFixture) {
+  // Adopt a cold/deep URL before React takes its first store snapshot. startRouter installs the ongoing
+  // store/history listeners from App; this synchronous seed is what makes the initial drawer real.
+  primeRoute()
+}
 
 export const queryClient = new QueryClient({
   defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
@@ -13,14 +23,19 @@ export const queryClient = new QueryClient({
 
 // One multiplexed /ws (board + transcript push + notify); falls back to SSE + polling if /ws is
 // unavailable (a pre-restart server). The socket writes transcript pushes into this queryClient's cache.
-connectSync(queryClient)
-initFont(queryClient)
-installExternalLinkInterceptor()
+if (!settingsFixture) {
+  connectSync(queryClient)
+  initFont(queryClient)
+  installExternalLinkInterceptor()
+  installLocalFileLinkInterceptor()
+}
 
 // No StrictMode: it double-mounts effects, which would open the terminal
 // WebSocket (and xterm instance) twice per selection in dev.
-createRoot(document.getElementById("root")!).render(
-  <QueryClientProvider client={queryClient}>
-    <App />
-  </QueryClientProvider>,
-)
+if (!settingsFixture) {
+  createRoot(document.getElementById("root")!).render(
+    <QueryClientProvider client={queryClient}>
+      <App />
+    </QueryClientProvider>,
+  )
+}

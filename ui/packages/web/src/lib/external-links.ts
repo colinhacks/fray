@@ -1,57 +1,81 @@
-import { rpc } from "../api/rpc.ts"
+// Fray normally runs in an ordinary browser tab. External http(s) anchors should therefore stay in
+// the browser's native click path: target=_blank opens a normal tab synchronously from the user
+// gesture, preserves modifier-key behavior, and cannot be stranded behind an async RPC. Internal
+// links and non-http schemes are left untouched so local navigation remains local.
 
-// The fray UI runs inside a chromeless Chrome --app window with a DEDICATED user-data-dir. Any
-// http(s) link clicked inside therefore navigates within that isolated profile — the
-// "anonymous Chrome window" the user reported — instead of their real, default browser. This
-// installs ONE document-level, capture-phase click listener that catches every external link
-// (including anchors inside transcript markdown rendered via dangerouslySetInnerHTML, which is why
-// it must be global rather than per-component) and hands it to the OS default browser via the
-// `openExternal` RPC.
-//
-// Only http(s) links to a DIFFERENT origin are intercepted. Internal/relative links (same origin)
-// and non-http schemes (cursor://, file:, mailto:, …) pass through untouched. Modifier keys are
-// intentionally ignored — routing every external link to the default browser is the whole point.
-export function installExternalLinkInterceptor(): void {
-  document.addEventListener(
-    "click",
-    (e) => {
-      if (e.defaultPrevented) return
-      if (e.button !== 0) return // left-click only; let middle/right do their thing
+type AnchorLike = Pick<HTMLAnchorElement, "getAttribute" | "setAttribute" | "hasAttribute">
 
-      const anchor = findAnchor(e)
-      if (!anchor) return
-      const href = anchor.getAttribute("href")
-      if (!href) return
+/** Resolve an untrusted href, accepting only http(s). Useful for explicit link-like controls too. */
+export function safeHttpUrl(raw: string, baseHref: string): string | null {
+  try {
+    const url = new URL(raw, baseHref)
+    return url.protocol === "http:" || url.protocol === "https:" ? url.toString() : null
+  } catch {
+    return null
+  }
+}
 
-      let url: URL
-      try {
-        url = new URL(href, location.href) // resolve relative hrefs against the current document
-      } catch {
-        return
-      }
-      if (url.protocol !== "http:" && url.protocol !== "https:") return // cursor://, file:, mailto: → pass through
-      if (url.origin === location.origin) return // internal/relative → let the SPA handle it
+/**
+ * Give an external http(s) anchor safe native new-tab attributes. Returns true only when the anchor
+ * is external. No navigation is prevented or synthesized here; the browser completes the click.
+ */
+export function prepareExternalAnchor(anchor: AnchorLike, currentHref: string): boolean {
+  const href = anchor.getAttribute("href")
+  if (!href) return false
+  const targetUrl = safeHttpUrl(href, currentHref)
+  if (!targetUrl) return false
 
-      // External link: keep it out of our app-profile window.
-      e.preventDefault()
-      const target = url.toString()
-      rpc.openExternal({ url: target }).catch(() => {
-        // The running server may predate this mutation (its half activates on the next restart), or
-        // the OS open failed. Degrade gracefully so the link still works in the pre-restart window.
-        window.open(target, "_blank", "noopener,noreferrer")
-      })
-    },
-    true, // capture: run before React's synthetic handlers / any SPA nav
-  )
+  let currentUrl: URL
+  try {
+    currentUrl = new URL(currentHref)
+  } catch {
+    return false
+  }
+  if (new URL(targetUrl).origin === currentUrl.origin) return false
+
+  anchor.setAttribute("target", "_blank")
+  const rel = new Set((anchor.getAttribute("rel") ?? "").split(/\s+/u).filter(Boolean))
+  rel.add("noopener")
+  rel.add("noreferrer")
+  anchor.setAttribute("rel", [...rel].join(" "))
+  return true
+}
+
+/** Exported for focused node tests; the installed listener delegates to this exact handler. */
+export function createExternalLinkClickHandler(
+  currentHref: () => string = () => location.href,
+): (event: MouseEvent) => void {
+  return (event) => {
+    if (event.defaultPrevented || event.button !== 0) return
+    const anchor = findAnchor(event)
+    if (anchor) prepareExternalAnchor(anchor, currentHref())
+  }
+}
+
+export function installExternalLinkInterceptor(): () => void {
+  const handler = createExternalLinkClickHandler()
+  document.addEventListener("click", handler, true)
+  return () => document.removeEventListener("click", handler, true)
 }
 
 // Nearest enclosing anchor with an href — via composedPath (crosses shadow boundaries) with a
-// closest() fallback.
-function findAnchor(e: MouseEvent): HTMLAnchorElement | null {
-  const path = typeof e.composedPath === "function" ? e.composedPath() : []
-  for (const el of path) {
-    if (el instanceof HTMLAnchorElement && el.hasAttribute("href")) return el
+// closest() fallback. Structural detection keeps this helper testable without a synthetic DOM.
+function findAnchor(event: MouseEvent): HTMLAnchorElement | null {
+  const path = typeof event.composedPath === "function" ? event.composedPath() : []
+  for (const value of path) {
+    if (isAnchor(value)) return value
   }
-  const target = e.target as Element | null
-  return (target?.closest?.("a[href]") as HTMLAnchorElement | null) ?? null
+  const target = event.target as { closest?: (selector: string) => unknown } | null
+  const closest = target?.closest?.("a[href]")
+  return isAnchor(closest) ? closest : null
+}
+
+function isAnchor(value: unknown): value is HTMLAnchorElement {
+  if (!value || typeof value !== "object") return false
+  const candidate = value as Partial<HTMLAnchorElement>
+  return candidate.tagName?.toLowerCase() === "a"
+    && typeof candidate.getAttribute === "function"
+    && typeof candidate.setAttribute === "function"
+    && typeof candidate.hasAttribute === "function"
+    && candidate.hasAttribute("href")
 }

@@ -4,8 +4,8 @@
 // worker writes and the server's lastFence parser: an opening line exactly ```done or ```awaiting, the
 // body, then a closing ``` line. Pure string logic, no DOM — unit-testable.
 //
-// The signal fence LANGUAGE is the state: `done` = a success card (+ an Archive button on the final
-// message of a non-archived session thread), `awaiting` = a machine-wait card with hint chips. Distinct
+// The signal fence LANGUAGE is the state: `done` = a presentation-only success card (thread lifecycle
+// actions live in a stable footer), `awaiting` = a parked human/timer card with hint chips. Distinct
 // from ```question blocks (their own machinery in questionBlocks.ts) — those never match here.
 
 import type { AwaitingHint } from "@fray-ui/shared"
@@ -23,9 +23,9 @@ export type FenceSegment =
 // can't match the (done|awaiting) alternation, so question blocks are left entirely to questionBlocks.ts.
 const FENCE_BLOCK = /^```(done|awaiting)[ \t]*\r?\n([\s\S]*?)\r?\n```[ \t]*$/gm
 
-// A machine-wait hint line inside an ```awaiting body: `<kind>: <value>` where kind ∈ pr|ci|timer|session
-// (case-insensitive). Everything else is prose. Matches the ThreadFence hint grammar in shared.
-const HINT_RE = /^(pr|ci|timer|session):\s*(.+)$/i
+// A parked-wait hint line inside an ```awaiting body. `human`/`github-review`/`timer` are current; the
+// other three remain parseable for legacy transcripts. Case-insensitive; everything else is prose.
+const HINT_RE = /^(human|github-review|timer|pr|ci|session):\s*(\S.*)$/i
 
 // Split the body of a fence into its prose (hint lines removed) and its parsed hints. `done` fences
 // carry no hints — the whole body is prose.

@@ -1,28 +1,59 @@
-import type { ThreadView } from "@fray-ui/shared"
+import { isValidAwaitingTimer, type AwaitingHint, type ThreadView } from "@fray-ui/shared"
 
 // Shared listing logic: the queue definition (needsAction), the sidebar's status-keyed sections
 // (sectionThreads), and the interaction-recency ordering both surfaces use.
 
-// The title to SHOW for a thread: prefer Claude's own auto-generated session name (aiTitle) once it
-// exists, else the dispatch title. One place so every render site (sidebar, palette, header) agrees.
-// Typed to just the two fields it reads so it accepts a valtio readonly snapshot as readily as a
-// plain ThreadView.
-export function displayTitle(t: Pick<ThreadView, "title" | "aiTitle" | "id" | "titleAuto" | "spawnedAt">): string {
+// The title to SHOW for a thread: prefer trustworthy backend title telemetry once it exists, else the
+// provenance-aware stored title. One place so every render site (sidebar, palette, header) agrees.
+// The narrow Pick accepts a valtio readonly snapshot as readily as a plain ThreadView.
+export function displayTitle(t: Pick<ThreadView, "title" | "aiTitle" | "id" | "titleAuto" | "spawnedAt" | "backend" | "runtime">): string {
   // A machine-guessed dispatch title (titleAuto) with no aiTitle yet is NOT a real name — show the
   // "Spinning up…" placeholder while the session is genuinely just spinning up (maintainer 2026-07-10:
   // "do not try to guess at the thread title"). But that's BOUNDED (see titleIsProvisional): a session
-  // that never yields an aiTitle must fall back to the dispatch title, not stick on "Spinning up…".
+  // Claude that never yields an aiTitle falls back after its bounded window; Codex uses live runtime
+  // state and the neutral fallback below.
   if (titleIsProvisional(t)) return SPINNING_UP_TITLE
-  // aiTitle first, then the dispatch title; a session row can carry title "" with no aiTitle yet, so
-  // fall back to the slug/id (a bare thread never renders as an empty row).
-  return t.aiTitle || t.title || t.id
+  // Codex's TUI has no native automatic naming event. Fray asks the first finalized response for a
+  // hidden title signal; omission or malformed syntax must stay neutral rather than exposing either
+  // the stored legacy prompt heuristic or a provider-recorded raw initial prompt.
+  if (t.backend === "codex" && t.titleAuto === true && !t.aiTitle?.trim()) return UNTITLED_THREAD_TITLE
+  // `titleAuto === false` means the stored title came from a human (dispatch title or explicit rename),
+  // so it wins even if a later/stale transcript record carries an aiTitle equal to the slug. Unknown
+  // legacy rows retain the historical aiTitle-first fallback because their provenance is unavailable.
+  if (t.titleAuto === false && t.title.trim()) return t.title
+  // For machine-titled rows, an internal slug is not a display title. This is especially important
+  // around native `/rename`: if Claude fails to emit a custom title, the header must keep a neutral
+  // name rather than presenting the session identifier as though rename succeeded. Legacy rows
+  // (unknown titleAuto) retain the historical id fallback.
+  if (t.aiTitle?.trim()) return readableMachineTitle(t.aiTitle)
+  if (t.title.trim() && !(t.titleAuto === true && t.title.trim() === t.id)) {
+    return t.titleAuto === true ? readableMachineTitle(t.title) : t.title.trim()
+  }
+  return t.titleAuto === true ? UNTITLED_THREAD_TITLE : t.id
+}
+
+// Backend-generated titles are not human metadata. Claude's native auto-rename currently reports a
+// semantic kebab slug; humanize that immediately so even the short generate→confirm interval can
+// never paint an internal identifier. Explicit/manual titles bypass this helper above and stay exact.
+// SENTENCE case (capitalize only the first word) — thread titles follow the repo copy rule (see
+// AGENTS.md), never Title Case; mirrors the server's humanizeClaudeTitle so the generate→confirm
+// interval and the persisted rename read identically.
+export function readableMachineTitle(raw: string): string {
+  const title = raw.trim()
+  if (!/^[a-z0-9]+(?:[-_][a-z0-9]+)*$/i.test(title)) return title
+  const words = title.split(/[-_]+/).filter(Boolean)
+  if (words.length === 0) return title
+  const joined = words.join(" ").toLowerCase()
+  return joined.charAt(0).toUpperCase() + joined.slice(1)
 }
 
 // The placeholder shown (dimmed) while a freshly-dispatched thread has only a machine-guessed title.
 export const SPINNING_UP_TITLE = "Spinning up a thread…"
+export const UNTITLED_THREAD_TITLE = "Untitled thread"
 
-// "Spinning up…" is a BRIEF placeholder for the window between dispatch and Claude naming the session.
+// Claude uses a brief time window; Codex uses its concrete spawning runtime state.
 const SPIN_UP_MS = 60_000
+const CODEX_TITLE_SIGNAL_GRACE_MS = 15_000
 
 // A title is PROVISIONAL when it's the auto-guessed dispatch slug, Claude hasn't named the session yet
 // (titleAuto && no aiTitle), AND the dispatch is still WITHIN the spin-up window. The time bound is
@@ -30,8 +61,17 @@ const SPIN_UP_MS = 60_000
 // pinned id) loses the transcript and never sees an aiTitle — without the bound the row would stick on
 // "Spinning up…" forever (maintainer 2026-07-10). After the window it falls back to the dispatch title.
 // Root cause of the lost transcript is tracked separately ([[session-transcript-drift]]).
-export function titleIsProvisional(t: Pick<ThreadView, "aiTitle" | "titleAuto" | "spawnedAt">): boolean {
+export function titleIsProvisional(t: Pick<ThreadView, "aiTitle" | "titleAuto" | "spawnedAt" | "backend" | "runtime">): boolean {
   if (!t.titleAuto || t.aiTitle) return false
+  // Codex now emits its title in the first assistant commentary, normally a couple seconds after the
+  // rollout starts. Keep the neutral startup label through that short, bounded title-signal grace so
+  // the row never flashes "Untitled thread" between task_started and the comment. A noncompliant or
+  // failed worker still degrades to the neutral fallback after the grace; it can never stick here.
+  if (t.backend === "codex") {
+    if (t.runtime === "spawning") return true
+    const spawned = Date.parse(t.spawnedAt ?? "")
+    return Number.isFinite(spawned) && Date.now() - spawned < CODEX_TITLE_SIGNAL_GRACE_MS
+  }
   const spawned = Date.parse(t.spawnedAt ?? "")
   return Number.isFinite(spawned) && Date.now() - spawned < SPIN_UP_MS
 }
@@ -96,12 +136,11 @@ export function needsAction(t: ThreadView): boolean {
   return false
 }
 
-// Chronological listing key (ms): the newest REAL USER INTERACTION on the thread — an answer, a
-// steer, or the dispatch itself — falling back to spawn time when there's been no later interaction (a
-// dispatch IS an interaction). This is the ONLY thing that reorders a row: the user's own actions bump
-// it to the top, predictably. Crucially it does NOT key off `lastActivityAt` (which includes AGENT
-// tool churn) — `lastUserAt` is server-derived to EXCLUDE tool_results, so a row never jumps from
-// motion the user didn't cause. Neither timestamp present → 0 (sinks to the bottom, id-tiebroken).
+// USER-INTERACTION key (ms): the newest REAL USER INTERACTION on the thread — an answer, a steer, or
+// the dispatch itself — falling back to spawn time when there's been no later interaction (a dispatch
+// IS an interaction). `lastUserAt` is server-derived to EXCLUDE tool_results, so it never moves from
+// AGENT motion. This is the stable base folded into `lastActiveAt` below (and the churn-free fallback
+// a still-running row uses). Neither timestamp present → 0 (sinks to the bottom, id-tiebroken).
 function interactionAt(t: ThreadView): number {
   const u = Date.parse(t.lastUserAt ?? "")
   const s = Date.parse(t.spawnedAt ?? "")
@@ -109,36 +148,98 @@ function interactionAt(t: ThreadView): number {
   return Number.isFinite(max) ? max : 0
 }
 
-// Attention first (needsAction), then most-recent USER-INTERACTION first within each band (see
-// interactionAt). id-tiebroken so equal-time rows hold a stable order. New array; input untouched.
+// THE listing sort key: "last active" = the newest activity ON THE THREAD, matching the row's visible
+// "Last active" label (which renders `lastActivityAt`). For a thread AT REST, `lastActivityAt` is
+// exactly when it last came to rest (its final assistant/system record) — a stable, meaningful moment
+// — so the order and the label finally agree (maintainer 2026-07-15: "last active just means the last
+// time the thread was active … it should also be looking at the rest timestamp"). A RUNNING thread's
+// `lastActivityAt` churns on every tool_result, which would reshuffle live rows the user never
+// touched, so a running row falls back to `interactionAt` — preserving the no-mid-turn-reshuffle
+// guarantee. Missing `lastActivityAt` → `interactionAt` (spawn/last-user), which is ALSO the label's
+// own fallback (activityTimestamp), so the two clocks never diverge. `isActivelyRunning` is hoisted.
+function lastActiveAt(t: ThreadView): number {
+  const base = interactionAt(t)
+  if (isActivelyRunning(t)) return base
+  const a = Date.parse(t.lastActivityAt ?? "")
+  return Number.isFinite(a) ? Math.max(a, base) : base
+}
+
+// The listing DIRECTION the queue/rested band orders by (a per-browser view preference — see
+// lib/prefs.ts). FIFO (default) surfaces the longest-waiting item first so the human cycles through
+// all work; LIFO surfaces the most-recently-active first.
+export type QueueDirection = "fifo" | "lifo"
+
+// Attention first (needsAction), then most-recent LAST-ACTIVE first within each band (see
+// lastActiveAt). id-tiebroken so equal-time rows hold a stable order. New array; input untouched.
 export function sortThreads(threads: readonly ThreadView[]): ThreadView[] {
   return [...threads].sort((a, b) => {
     const aa = needsAction(a)
     const bb = needsAction(b)
     if (aa !== bb) return aa ? -1 : 1
-    const d = interactionAt(b) - interactionAt(a)
+    const d = lastActiveAt(b) - lastActiveAt(a)
     return d !== 0 ? d : a.id.localeCompare(b.id)
   })
 }
 
-// Order a thread set by most-recent USER-INTERACTION first (interactionAt), id-tiebroken. HISTORY:
-// the listing was once STABLE SPAWN-ORDER, to stop it reshuffling under the (since-deleted) arrow-walk
-// — but the reshuffle it guarded against was AGENT activity (lastActivityAt moving from tool churn the
-// user didn't cause). This key keeps that guarantee (lastUserAt excludes tool_results, so agent motion
-// never reorders) while ADDING the motion the maintainer wants: a row the user just acted on —
-// answered, steered, dispatched — bumps to the top. Predictable, self-caused motion only. New array;
-// input untouched.
+// Order a thread set by most-recent LAST-ACTIVE first (lastActiveAt), id-tiebroken. Used for the
+// running band and the Held/Inactive sections — surfaces where newest-on-top is always wanted (the
+// FIFO/LIFO preference governs only the queue/rested band via orderQueue). A running row keys off its
+// stable user-interaction time (lastActiveAt's churn guard), so live agent motion never reshuffles it;
+// an at-rest row keys off when it came to rest, matching its "Last active" label. New array; input
+// untouched.
 export function orderByInteraction(threads: readonly ThreadView[]): ThreadView[] {
   return [...threads].sort((a, b) => {
-    const d = interactionAt(b) - interactionAt(a)
+    const d = lastActiveAt(b) - lastActiveAt(a)
     return d !== 0 ? d : a.id.localeCompare(b.id)
+  })
+}
+
+// Queue cards have two deliberately small priority bands. A concrete unresolved request or failure
+// comes before an ordinary bare-rest/done handoff, even when that passive handoff was touched more
+// recently. Within a band, the queue orders FIFO (see orderQueue) so the human cycles through all
+// waiting work instead of re-triaging whatever rested most recently.
+// `pendingInteraction` is intentionally absent: a response still awaiting provider acknowledgement
+// remains readable, but only `actionableInteraction` means the human still owes a decision.
+export type QueuePriority = 0 | 1
+
+export function queuePriority(t: ThreadView): QueuePriority {
+  const hardAttention = Boolean(
+    t.actionableInteraction ||
+      t.pendingAsk ||
+      t.nativeInputRequired ||
+      t.pendingQuestion ||
+      t.runtime === "perm-prompt" ||
+      t.crashed ||
+      t.humanBlocked ||
+      t.status === "needs-human",
+  )
+  return hardAttention ? 0 : 1
+}
+
+// Within each priority band, order by DIRECTION (a per-browser view preference — see lib/prefs.ts):
+//   • FIFO (default): the thread gone LONGEST without activity surfaces first (oldest lastActiveAt =
+//     ascending), so answering it sends it to the BACK of the line and the next-oldest rises — the
+//     human cycles through every waiting item instead of endlessly re-triaging whatever rested most
+//     recently (maintainer 2026-07-15: "first in first out is a better system… you are not constantly
+//     cycling through all of the tasks").
+//   • LIFO: the most-recently-active first (descending) — the older last-in-first-out feel.
+// The hard-attention band always leads regardless. lastActiveAt keys off when an AT-REST thread came
+// to rest (matching its "Last active" label) and off the stable user-interaction time for a running
+// row, so agent tool churn never reorders a card. id-tiebroken for a stable order among equal-age rows.
+export function orderQueue(threads: readonly ThreadView[], direction: QueueDirection = "fifo"): ThreadView[] {
+  const dir = direction === "lifo" ? -1 : 1
+  return [...threads].sort((a, b) => {
+    const priority = queuePriority(a) - queuePriority(b)
+    if (priority !== 0) return priority
+    const age = (lastActiveAt(a) - lastActiveAt(b)) * dir
+    return age !== 0 ? age : a.id.localeCompare(b.id)
   })
 }
 
 // ── SESSION-FIRST QUEUE ──────────────────────────────────────────────────────────────────────────
 // The Needs-you queue (the cards surface) is EXACTLY the session threads the SERVER derived as needing
-// the human (t.needsYou — at rest + unexcused + activity newer than seen_at, plus the process-level
-// blocks a view can't clear). Do NOT re-derive it client-side for session rows. Legacy .fray-file rows
+// the human (t.needsYou — explicit questions, checked/done handoffs, and process-level blocks a view
+// can't clear). Do NOT re-derive it client-side for session rows. Legacy .fray-file rows
 // never card anymore. An archived thread is out of the queue regardless (belt-and-suspenders — the
 // server already drops needsYou when archived). Pre-restart snapshots carry no kind/needsYou → false →
 // an empty queue, the accepted degrade.
@@ -159,19 +260,20 @@ export function foreignThreads(threads: readonly ThreadView[]): ThreadView[] {
 // ── SIDEBAR SECTIONS (session-first) ───────────────────────────────────────────────────────────────
 // The rail's THREAD-derived sections, keyed on the session-first model (NOT fray status). Every thread
 // row lands in exactly one of these; the Plans section is separate (from board.plans, not threads).
-//   • active           — open session work: running, needs-you, bare rest, done-fenced, OR awaiting its
-//                        OWN sub-agents (internal work) / another session. Never dimmed as a band.
-//   • awaitingExternal — open, AT REST behind an ```awaiting fence whose primary hint is pr/ci/timer AND
-//                        no live sub-agents: genuinely blocked on an EXTERNAL event. Its own DIMMED band
-//                        between Active and Inactive (maintainer 2026-07-10).
+//   • active           — open session work: running, needs-you, bare rest, done-fenced, OR owning a
+//                        live sub-agent/background shell/Monitor. Never dimmed as a band.
+//   • held             — open, AT REST behind ANY declared ```awaiting fence (or the canonical
+//                        blocked+timer status) AND no live background op. Its own DIMMED band between
+//                        Active and Inactive. The glyph and section share isHeld(), so a row can never
+//                        show a clock/hourglass while remaining in Active.
 //   • inactive         — state === "archived" (the only archiver is an explicit Archive / done-card button).
 //   • legacy           — kind !== "session": vestigial .fray-file rows, hidden entirely (null).
 // A FOREIGN session row (a maintainer terminal — no registry row, so no state/needsYou) is dropped
 // entirely (never rows). Order within a section is interaction recency.
-export type SectionKey = "active" | "awaitingExternal" | "inactive"
+export type SectionKey = "active" | "held" | "inactive"
 // Thread-derived buckets, in render order. The Plans section (board.plans) is interleaved by the
 // Sidebar after the thread buckets; it has no thread bucket here.
-export const SECTION_ORDER: readonly SectionKey[] = ["active", "awaitingExternal", "inactive"]
+export const SECTION_ORDER: readonly SectionKey[] = ["active", "held", "inactive"]
 
 // A session process is "at rest" (off-turn) when the pane is idle or the session has exited — the gate
 // an awaiting excusal needs (a mid-turn worker is still working, never awaiting).
@@ -179,8 +281,8 @@ function atRest(t: ThreadView): boolean {
   return t.runtime === "turn-idle" || t.runtime === "exited"
 }
 
-// DECLARED MACHINE-WAIT: at rest behind an ```awaiting fence — the thread ITSELF declared it is parked
-// on a machine (CI, a PR review/merge, a timer, another session), not on you and not still working. The
+// DECLARED PARK: at rest behind an ```awaiting fence — the thread ITSELF declared it is parked, not
+// still working. The current contract reserves this for a human gate/timer; legacy hints remain readable. The
 // RAW signal; the banding below refines it into external-vs-internal. NB: this requires the worker to
 // actually emit the fence — a thread that rests bare (prose only) reads as idle/waiting, not declared.
 function isDeclaredAwaiting(t: ThreadView): boolean {
@@ -194,17 +296,62 @@ function hasLiveSubAgents(t: ThreadView): boolean {
   return (t.subAgents ?? []).some((s) => s.state === "running")
 }
 
-// AWAITING-EXTERNAL: the thread is genuinely blocked on an EXTERNAL, scheduler-actionable gate — a
-// declared ```awaiting fence at rest whose PRIMARY hint is pr / ci / timer — AND it has no live
-// sub-agents. This is the ONLY set that earns the dedicated DIMMED band between Active and Inactive
-// (maintainer 2026-07-10: give the truly-external waiters their own band). Excluded on purpose, all
-// staying in Active undimmed: a bare rest (no fence), a `session` hint (waiting on another fray session
-// reads as internal/ambiguous → treat as Active), and anything with a live sub-agent (internal work —
-// hasLiveSubAgents keeps it Active even with a stale awaiting fence).
-export function isAwaitingExternal(t: ThreadView): boolean {
-  if (!isDeclaredAwaiting(t) || hasLiveSubAgents(t)) return false
-  const hk = t.lastFence?.hints[0]?.kind
-  return hk === "pr" || hk === "ci" || hk === "timer"
+// A background Bash/Monitor is work the top-level worker still OWNS. It is surfaced separately from
+// drill-in sub-agents, but has the same section consequence: keep the parent Active and spinning.
+function hasLiveBackgroundOps(t: ThreadView): boolean {
+  return (t.bgShells ?? []).some((s) => s.state === "running")
+}
+
+function hasLiveOps(t: ThreadView): boolean {
+  return hasLiveSubAgents(t) || hasLiveBackgroundOps(t)
+}
+
+// The wait kinds that truthfully earn the parked/hourglass presentation. A timer is only a park while
+// its valid scheduler instant is still in the future; malformed or elapsed timer prose must not
+// advertise a durable future wake. github-review is an external HUMAN gate with a durable GitHub
+// activity cursor. Legacy machine waits (pr/ci/session) intentionally do not qualify.
+export function parkedAwaitingHint(hints: readonly AwaitingHint[], nowMs = Date.now()): AwaitingHint | undefined {
+  return (
+    hints.find((h) => h.kind === "human") ??
+    hints.find((h) => h.kind === "github-review") ??
+    hints.find((h) => h.kind === "timer" && isValidAwaitingTimer(h.value) && Date.parse(h.value) > nowMs)
+  )
+}
+
+export function futureSnoozedUntil(
+  t: Pick<ThreadView, "snoozedUntil">,
+  nowMs = Date.now(),
+): string | undefined {
+  const at = Date.parse(t.snoozedUntil ?? "")
+  return Number.isFinite(at) && at > nowMs ? t.snoozedUntil : undefined
+}
+
+// HELD: one semantic predicate owns both classification and presentation. Only a specific external
+// human/review gate or a valid FUTURE timestamp belongs in the dimmed Held band. Legacy automated
+// waits (pr/ci/session), malformed/elapsed timers, and hintless fences stay Active so they cannot hide
+// work an agent should own through an in-band watcher. A canonical blocked+timer status remains a
+// compatibility path only when it carries the same explicit future ISO instant. A live child/Monitor
+// wins, and archived rows remain Inactive/done.
+export function isHeld(t: ThreadView, nowMs = Date.now()): boolean {
+  const userSnooze = futureSnoozedUntil(t, nowMs) !== undefined
+  if (t.state === "archived" || hasLiveOps(t)) return false
+  // A user-owned snooze deliberately wins over a concrete ask, permission prompt, or crash. Those
+  // states still exist in the transcript/runtime and re-enter Queue at the exact wake deadline; the
+  // snooze merely parks their presentation until then. Mid-turn work keeps running in Active, while
+  // a provider permission prompt is itself parked and may therefore move to Held.
+  if (userSnooze) return t.runtime !== "running" && t.runtime !== "spawning"
+  // Without an explicit user snooze, higher-priority attention states render ?, !, or a native
+  // prompt—not a wait glyph—so a stale awaiting fence cannot demote them out of Queue.
+  if (t.needsYou || t.pendingAsk || t.runtime === "perm-prompt") return false
+  if (!atRest(t)) return false
+  const declaredWait = t.lastFence?.kind === "awaiting" && parkedAwaitingHint(t.lastFence.hints, nowMs) !== undefined
+  const timedStatus =
+    t.status === "blocked" &&
+    t.mechanism === "timer" &&
+    typeof t.revalidate === "string" &&
+    isValidAwaitingTimer(t.revalidate) &&
+    Date.parse(t.revalidate) > nowMs
+  return userSnooze || declaredWait || timedStatus
 }
 
 // ACTIVELY RUNNING: a live session with work in flight — exactly the states the sidebar renders with a
@@ -213,7 +360,39 @@ export function isAwaitingExternal(t: ThreadView): boolean {
 // bumped-then-resumed archived thread showed a spinner under Inactive).
 export function isActivelyRunning(t: ThreadView): boolean {
   if (t.runtime === "running" || t.runtime === "spawning") return true
-  return t.runtime === "turn-idle" && hasLiveSubAgents(t)
+  return t.runtime === "turn-idle" && hasLiveOps(t)
+}
+
+// One status-priority decision shared by the sidebar renderer and its tests. The order is important:
+// an archived row at rest stays archived even if stale attention metadata lingers; a real human ask
+// stays a question after the worker exits; live work stays working; and a completed handoff stays a
+// check instead of being mislabelled as a crash merely because `needsYou` also puts it in the queue.
+export type SessionIndicatorKind = "archived" | "needs-input" | "working" | "done" | "stalled" | "held" | "rest"
+
+export function sessionIndicatorKind(t: ThreadView): SessionIndicatorKind {
+  const activelyRunning = isActivelyRunning(t)
+  if (t.state === "archived" && !activelyRunning) return "archived"
+
+  const explicitlyNeedsInput = Boolean(
+    t.actionableInteraction ||
+      t.pendingAsk ||
+      t.pendingQuestion ||
+      t.nativeInputRequired ||
+      t.runtime === "perm-prompt" ||
+      t.humanBlocked ||
+      t.status === "needs-human",
+  )
+  if (explicitlyNeedsInput) return "needs-input"
+  if (activelyRunning) return "working"
+
+  if (isHeld(t)) return "held"
+  if (t.lastFence?.kind === "done" && atRest(t)) return "done"
+  // `crashed` is explicit on current snapshots. During a rolling client/server reload an older
+  // snapshot may omit it; retain the old exited+needsYou crash rendering only for that undefined
+  // compatibility case. Crucially, Queue membership alone says only "this turn came to rest"—a
+  // clean bare rest keeps the ordinary ellipsis instead of falsely advertising a question.
+  if (t.crashed === true || (t.crashed === undefined && t.needsYou && t.runtime === "exited")) return "stalled"
+  return "rest"
 }
 
 export function sectionOf(t: ThreadView): SectionKey | null {
@@ -228,41 +407,56 @@ export function sectionOf(t: ThreadView): SectionKey | null {
   // to Inactive only once it comes to rest still-archived. (A user BUMP un-archives it for good via
   // resume; this is the display safety net for a running-yet-archived session.)
   if (t.state === "archived" && !isActivelyRunning(t)) return "inactive"
-  // The EXTERNAL waiters (pr/ci/timer awaiting, no live subs) split out into their own dimmed band.
+  // Only truthful human/future-timer waiters split into the labeled, dimmed Held band.
   // Everything else open — running, needs-you, bare rest, done-fenced, awaiting-its-own-subs, or an
   // awaiting `session`/hintless wait — is Active.
-  if (isAwaitingExternal(t)) return "awaitingExternal"
+  if (isHeld(t)) return "held"
   return "active"
 }
 
-// The ACTIVE section's order: interaction-recency, EXCEPT a DECLARED machine-wait that stayed in Active
-// (a `session`/hintless ```awaiting fence — the external pr/ci/timer waits live in their own band now)
-// sinks to the bottom as a group (maintainer 2026-07-10: "waiting/blocked should always show up at the
-// bottom of the active list"). Live work and live-sub-agent threads float on top; interaction recency
-// holds within each group. New array; input untouched.
-export function orderActive(threads: readonly ThreadView[]): ThreadView[] {
-  return [...threads].sort((a, b) => {
-    const aw = isDeclaredAwaiting(a) && !hasLiveSubAgents(a) ? 1 : 0
-    const bw = isDeclaredAwaiting(b) && !hasLiveSubAgents(b) ? 1 : 0
-    if (aw !== bw) return aw - bw // declared-waiting sinks below everything still in play
-    const d = interactionAt(b) - interactionAt(a)
-    return d !== 0 ? d : a.id.localeCompare(b.id)
-  })
+// The Active section is TWO rule-separated bands (the Sidebar draws the rule): actively-running work
+// on top, then everything at rest BELOW — and the rested band is ordered by the EXACT queue comparator
+// (orderQueue), so the sidebar's rested rows and the Needs-you queue cards share ONE order. That shared
+// order is what makes the scroll-position marker monotonic: scrolling the queue down walks the marker
+// straight down the rail instead of hopping around (maintainer 2026-07-15: the queue/sidebar mismatch
+// "totally defeats the purpose of the scroll position indicator"; running agents "should not render in
+// the queue at all"). Running threads have no queue card, so their interaction-recency order never
+// affects the marker — grouping them on top just keeps live work glanceable and out of the rested run.
+export function orderActive(threads: readonly ThreadView[], direction: QueueDirection = "fifo"): ThreadView[] {
+  const running = threads.filter(inActiveRunningBand)
+  const rested = threads.filter((t) => !inActiveRunningBand(t))
+  return [...orderByInteraction(running), ...orderQueue(rested, direction)]
+}
+
+// The running band is strictly live work that ISN'T waiting on the human: a queued thread ALWAYS
+// belongs to the rested band so its queue card maps to a rested-band row and the marker stays
+// monotonic even in the rare spinning-yet-needs-you state. (Its rail indicator may still be a spinner
+// via sessionIndicatorKind — cosmetic; what matters here is that it never leaves the rested band.)
+function inActiveRunningBand(t: ThreadView): boolean {
+  return isActivelyRunning(t) && t.needsYou !== true
+}
+
+// Split an ALREADY-ordered Active list (see orderActive) into its running/rested bands WITHOUT
+// re-sorting — filter() preserves orderActive's order — so the Sidebar can render the separating rule.
+export function partitionActive(active: readonly ThreadView[]): { running: ThreadView[]; rested: ThreadView[] } {
+  return {
+    running: active.filter(inActiveRunningBand),
+    rested: active.filter((t) => !inActiveRunningBand(t)),
+  }
 }
 
 // Partition threads into the thread-derived sidebar sections. Active sinks its leftover declared-waiting
-// rows to the bottom (orderActive); awaitingExternal (the dimmed band) and inactive/archived are plain
-// interaction recency.
+// Held and inactive/archived are plain interaction recency.
 export type SectionedThreads = Record<SectionKey, ThreadView[]>
-export function sectionThreads(threads: readonly ThreadView[]): SectionedThreads {
-  const out: SectionedThreads = { active: [], awaitingExternal: [], inactive: [] }
+export function sectionThreads(threads: readonly ThreadView[], direction: QueueDirection = "fifo"): SectionedThreads {
+  const out: SectionedThreads = { active: [], held: [], inactive: [] }
   for (const t of threads) {
     if (t.kind === "session" && t.foreign === true) continue // foreign sessions never row (nor strip — dropped)
     const k = sectionOf(t)
     if (k) out[k].push(t)
   }
-  out.active = orderActive(out.active)
-  out.awaitingExternal = orderByInteraction(out.awaitingExternal)
+  out.active = orderActive(out.active, direction)
+  out.held = orderByInteraction(out.held)
   out.inactive = orderByInteraction(out.inactive)
   return out
 }

@@ -91,7 +91,7 @@ export function pairAnswersMessage(messages: readonly MsgLike[], index: number):
 
   for (let i = index - 1; i >= 0; i--) {
     const m = messages[i]
-    if (m.kind === "event") continue // punctuation, not a conversation turn
+    if (m.kind === "event" || m.kind === "reasoning") continue // punctuation, not a conversation turn
     if (!m.text.trim()) continue // tool-only turn — no narrative to pair with
     if (m.role === "user") break // an earlier human turn — don't pair across it
     const blocks = splitQuestionBlocks(m.text).filter((s) => s.kind === "question")

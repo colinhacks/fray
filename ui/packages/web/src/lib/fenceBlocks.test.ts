@@ -24,27 +24,29 @@ test("a done fence with surrounding prose", () => {
   ])
 })
 
-test("an awaiting fence: hint lines parse to hints, the rest is prose", () => {
-  const text = "```awaiting\nWaiting on CI to go green before merging.\npr: owner/repo#12\nci: build #4821\n```"
+test("an awaiting fence: current human/github-review/timer hint lines parse with the prose", () => {
+  const text = "```awaiting\nWaiting on a named maintainer at a scheduled checkpoint.\nhuman: Alice must approve fork CI\ngithub-review: owner/repo#12\ntimer: 2026-07-15T17:00:00Z\n```"
   assert.deepEqual(splitFenceBlocks(text), [
     {
       kind: "fence",
       fenceKind: "awaiting",
-      body: "Waiting on CI to go green before merging.",
+      body: "Waiting on a named maintainer at a scheduled checkpoint.",
       hints: [
-        { kind: "pr", value: "owner/repo#12" },
-        { kind: "ci", value: "build #4821" },
+        { kind: "human", value: "Alice must approve fork CI" },
+        { kind: "github-review", value: "owner/repo#12" },
+        { kind: "timer", value: "2026-07-15T17:00:00Z" },
       ],
     },
   ])
 })
 
-test("awaiting hint kinds are case-insensitive and all four are recognized", () => {
-  const { hints, body } = parseFenceBody("PR: p\nCI: c\nTimer: 5m\nSession: sub-123\nprose tail", "awaiting")
+test("awaiting hint kinds are case-insensitive; current and legacy kinds remain readable", () => {
+  const { hints, body } = parseFenceBody("Human: Alice approves\nTimer: 2026-07-15T17:00:00Z\nPR: p\nCI: c\nSession: sub-123\nprose tail", "awaiting")
   assert.deepEqual(hints, [
+    { kind: "human", value: "Alice approves" },
+    { kind: "timer", value: "2026-07-15T17:00:00Z" },
     { kind: "pr", value: "p" },
     { kind: "ci", value: "c" },
-    { kind: "timer", value: "5m" },
     { kind: "session", value: "sub-123" },
   ])
   assert.equal(body, "prose tail")

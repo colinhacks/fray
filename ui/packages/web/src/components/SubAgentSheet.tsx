@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react"
+import { useSnapshot } from "valtio"
 import { X } from "lucide-react"
-import { store, markDrawerClosing } from "../store.ts"
+import { store, markDrawerClosing, removeDrawerAfterExit } from "../store.ts"
 import { registerDrawerClose } from "../lib/overlays.ts"
 import { useSubAgentTranscript } from "../hooks.ts"
 import { Message } from "./ChatView.tsx"
+import { formatElapsedMinutes } from "../lib/durationLabels.ts"
 
 // One SUB-AGENT layer of the side-drawer stack: a right sheet (same slide/backdrop family as the
 // thread sheet) showing a live/stale sub-agent's OWN transcript, READ-ONLY — no composer, no answering,
@@ -24,9 +26,7 @@ function elapsed(startedAt: string | undefined): string {
   const t = Date.parse(startedAt)
   if (!Number.isFinite(t)) return ""
   const mins = Math.floor((Date.now() - t) / 60_000)
-  if (mins < 1) return "just now"
-  if (mins < 60) return `${mins}m`
-  return `${Math.floor(mins / 60)}h ${mins % 60}m`
+  return formatElapsedMinutes(mins)
 }
 
 export function SubAgentSheet({
@@ -37,6 +37,7 @@ export function SubAgentSheet({
   subagentType,
   startedAt,
   depth,
+  widthDepth,
 }: {
   id: number
   slug: string
@@ -45,12 +46,14 @@ export function SubAgentSheet({
   subagentType?: string
   startedAt?: string
   depth: number
+  widthDepth: number
 }) {
   const [shown, setShown] = useState(false)
-  const [closing, setClosing] = useState(false)
+  const closingRef = useRef(false)
   // Deferred heavy body — mount the shell first, render the transcript one frame later (see header).
   const [bodyReady, setBodyReady] = useState(false)
   const scrollerRef = useRef<HTMLDivElement>(null)
+  const snap = useSnapshot(store)
 
   const q = useSubAgentTranscript(slug, subId)
   const messages = useMemo(() => q.data?.messages ?? [], [q.data])
@@ -96,12 +99,12 @@ export function SubAgentSheet({
   }, [bodyReady])
 
   function close() {
-    if (closing) return
-    setClosing(true)
+    if (closingRef.current) return
+    closingRef.current = true
     markDrawerClosing(id) // stop URL/topThreadSlug counting this layer the instant it slides out
     setShown(false)
     window.setTimeout(() => {
-      store.drawers = store.drawers.filter((d) => d.id !== id)
+      removeDrawerAfterExit(id)
     }, prefersReducedMotion() ? 0 : CLOSE_MS)
   }
 
@@ -110,6 +113,12 @@ export function SubAgentSheet({
     return () => registerDrawerClose(id, null)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id])
+
+  useEffect(() => {
+    if (snap.drawers.find((drawer) => drawer.id === id)?.closing || !closingRef.current) return
+    closingRef.current = false
+    setShown(true)
+  }, [snap.drawers, id])
 
   const stateLabel =
     state === "stale"
@@ -130,7 +139,7 @@ export function SubAgentSheet({
     >
       <div
         className={`h-full flex flex-col border-l border-border bg-panel shadow-2xl shadow-black/50 transition-transform duration-200 ease-out motion-reduce:transition-none ${shown ? "translate-x-0" : "translate-x-full"}`}
-        style={{ width: `min(${720 - depth * 28}px, ${80 - depth * 4}vw)` }}
+        style={{ width: `min(${720 - widthDepth * 28}px, ${80 - widthDepth * 4}vw)` }}
         onMouseDown={(e) => e.stopPropagation()}
       >
         {/* Header shell paints immediately (part of the instant-open shell). */}

@@ -1,48 +1,35 @@
-import { useState } from "react"
+import type { ReactNode } from "react"
 import { useSnapshot } from "valtio"
-import { useMutation, useQueryClient } from "@tanstack/react-query"
-import { rpc } from "../api/rpc.ts"
-import { store, showToast } from "../store.ts"
-import { appendQueuedMessage, removeQueuedMessage } from "../hooks.ts"
+import { store } from "../store.ts"
+import { useThreadComposerControls } from "../hooks/useThreadComposerControls.tsx"
 import { Composer } from "./Composer.tsx"
+import { draftKey, draftStore, useDraft, useProjectDir } from "../lib/drafts.ts"
+import { useEagerFollowUp } from "../lib/eagerComposerSubmission.ts"
 
 // The bar under the chat/terminal is now JUST the follow-up composer — the Done button and the
-// ⋯ menu live in the workpane header (ThreadHeaderActions) next to the tabs.
-export function ThreadActionBar({ slug }: { slug: string }) {
+// ⋯ menu live in the workpane header (ThreadHeaderActions) next to the tabs. `ops` (the live
+// background-operations strip) renders INSIDE this padded box rather than beside it, so those rows
+// hang tight off the prompt and the box's own pb becomes their gap to the lifecycle footer.
+export function ThreadActionBar({ slug, ops }: { slug: string; onTerminal?: () => void; ops?: ReactNode }) {
   const snap = useSnapshot(store)
   const thread = snap.board?.threads.find((t) => t.id === slug)
-  const [message, setMessage] = useState("")
-  const qc = useQueryClient()
-
-  const followUp = useMutation({ mutationFn: (m: string) => rpc.followUp({ slug, message: m }) })
+  const projectDir = useProjectDir()
+  const key = draftKey.followUp(projectDir, slug, thread?.sessionId)
+  const [message, setMessage, clearMessage] = useDraft(key)
+  const controls = useThreadComposerControls(slug)
+  const followUp = useEagerFollowUp(slug)
 
   function send() {
     const m = message.trim()
     if (!m) return
-    // INSTANT + OPTIMISTIC (send-latency): clear the box and paint the queued bubble SYNCHRONOUSLY on
-    // Enter — the felt response must NEVER wait on the followUp round-trip. Both the input clear and
-    // the optimistic bubble used to sit inside onSuccess, so nothing painted until the RPC returned
-    // (a full server round-trip the maintainer perceived as lag — profiled at ~420ms behind a 400ms
-    // stub, with the queued bubble not appearing until the reply landed). This is ONE eager render:
-    // appendQueuedMessage adds ONLY the new bubble (the memoized transcript bails on the other
-    // messages — measured 2 Message re-renders regardless of length) and scrolls to the tail. The
-    // TRUTH stays the mutation: a failed send rolls the optimistic bubble back, RESTORES the draft
-    // (only if the box is still empty, so a new draft typed meanwhile isn't clobbered), and explains —
-    // so a dead session no longer leaves a phantom "sent" bubble. Mirrors the queue's optimistic
-    // sendMessage (useLiveAnswering) so the two send paths can't drift.
-    setMessage("")
-    appendQueuedMessage(qc, slug, m)
-    followUp.mutate(m, {
-      onError: (e) => {
-        removeQueuedMessage(qc, slug, m)
-        setMessage((cur) => (cur ? cur : m))
-        showToast(`Send failed: ${(e as Error).message.slice(0, 80)}`)
-      },
+    followUp.submit(m, {
+      onOptimistic: clearMessage,
+      // Never clobber a newer draft typed while the request was in flight.
+      onRollback: () => { if (!draftStore.get(key)) setMessage(message) },
     })
   }
 
   if (!thread) return null
-
   // A FOREIGN session (a maintainer terminal — no registry row) is a read-only transcript view: no
   // composer, no verbs. Say so plainly instead of the follow-up box (there's no tmux stdin to steer).
   if (thread.foreign) {
@@ -54,7 +41,7 @@ export function ThreadActionBar({ slug }: { slug: string }) {
   }
 
   return (
-    <div className="shrink-0 border-t border-border bg-panel px-3 py-3">
+    <div data-thread-action-bar className="shrink-0 border-t border-border bg-panel px-3 py-3">
       <Composer
         id="followup-input"
         surface="chatComposer"
@@ -62,7 +49,11 @@ export function ThreadActionBar({ slug }: { slug: string }) {
         onChange={setMessage}
         onSubmit={send}
         placeholder="Follow up…"
+        busy={controls.busy || followUp.pending}
+        footer={controls.footer}
       />
+      {controls.status}
+      {ops}
     </div>
   )
 }

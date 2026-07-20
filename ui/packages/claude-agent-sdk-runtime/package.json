@@ -1,0 +1,13 @@
+{
+  "name": "@fray-ui/claude-agent-sdk-runtime",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.207",
+    "zod": "4.4.3"
+  }
+}

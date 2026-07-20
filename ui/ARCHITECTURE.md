@@ -51,8 +51,10 @@ plugin (`../cc-worker/`). The full plan: `../plans/standalone-ui.md`.
   `tailer.ts` (JSONL), `dispatch.ts` (thread file create + prompt compose + spawn),
   `settings.ts`.
 - `web` — React 19 + Vite 8 + Tailwind v4 + valtio + TanStack Query + xterm.js.
-- `cli` — `fray-ui` bin: ensure server (respect `~/.fray/projects/<id>/server.lock`), then open
-  the chromeless window (`src/browser.ts`, vendored from Gluon via gent — do not rewrite it).
+- `cli` — canonical source-backed `fray` bin (`fray-ui` compatibility alias): canonicalize cwd's Git
+  root, health-check/reuse its detached dev supervisor, atomically allocate/persist an isolated port,
+  then open or focus the chromeless window. Locks and logs live under
+  `~/.fray/projects/<id>/`; `src/browser.ts` is vendored from Gluon via gent.
 
 ## Conventions
 
@@ -63,8 +65,10 @@ plugin (`../cc-worker/`). The full plan: `../plans/standalone-ui.md`.
 - Known gotcha: node-pty prebuilds lose the exec bit on `spawn-helper` (npm/pnpm strip it) —
   the server package postinstall re-chmods it. PTY code cannot run inside a sandboxed shell.
 - UI state (unread, lastReadAt, session registry, settings) lives in
-  `~/.fray/projects/<projectId>/ui.db` (SQLite). `projectId` = UUID stored in the repo's
-  `.git/config` key `fray.id` (create on first run). NEVER store UI state in `.fray/`.
+  `~/.fray/projects/<projectId>/ui.db` (SQLite). An ordinary/main worktree's UUID remains the repo's
+  `.git/config` key `fray.id`; a linked worktree stores its own UUID at
+  `<worktree-gitdir>/fray.config`, preserving ordinary state while isolating sibling DB/lock/tmux
+  namespaces. NEVER store UI state in the checkout's `.fray/`.
 - **Sidebar design philosophy (2026-07-09, maintainer-directed — don't regress it).** A FLOATING
   left column: NO background, NO border, NO clipping on the column itself (the New-thread pill's
   hover-scale must never clip; only the section LIST is a scroll container). Vertically centered in
@@ -84,3 +88,44 @@ plugin (`../cc-worker/`). The full plan: `../plans/standalone-ui.md`.
   never-spawned thread — `store.openThread`), and the remaining keyboard is ⌘K/⌘N/⌘I + Esc
   unwinding overlays then drawers. A ZERO-thread board (brand-new user) hides the sidebar entirely
   and centers the dispatch prompt as the whole screen.
+
+## Experimental Codex app-server bridge foundation
+
+- Disabled by default. `FRAY_CODEX_APP_SERVER_BRIDGE=1` constructs a lazy internal bridge; it does
+  not change dispatch defaults, `backendFor`, or tmux/TUI control. The generic scoped interaction
+  cards can reflect bridge-owned journal rows, but no default user flow creates those rows.
+- The bridge can start new sessions and resume only native thread ids in its own SQLite ownership
+  table. Existing/default/TUI Codex sessions are never imported or migrated.
+- The protocol gate accepts exactly installed Codex `0.144.1`, audited from generated protocol plus
+  immutable source tag `rust-v0.144.1` (`44918ea10c0f99151c6710411b4322c2f5c96bea`), over child stdio
+  JSONL after `initialize` / `initialized`. Upgrades require a new exact source/protocol audit,
+  fingerprint, fixtures, and diagnostic expectation; semver ranges are never accepted. It rejects
+  versioned `jsonrpc` envelopes, bounds and serializes inbound records, and never retains stderr text.
+  No PTY or terminal scraping.
+- The child receives an explicit minimal environment, not `process.env`: executable/runtime/home,
+  locale/temp, OS credential-store plumbing, proxy/custom-CA settings, and only the audited built-in
+  Codex/OpenAI auth/provider variables. Fray, GitHub, Anthropic, AWS, Node injection, and arbitrary
+  `CODEX_*`/`OPENAI_*` values are excluded. Arbitrary custom-provider `env_key` support remains out of
+  scope until it can be derived and approved without forwarding unrelated secrets.
+- Provider responses are durably claimed once, but the interaction journal remains pending until
+  Codex emits `serverRequest/resolved`. A disconnect never blindly replays an unknown send; a newly
+  witnessed matching server request is required. Session/turn ownership, provider RPC ids, and
+  response acknowledgements remain connection-epoch and project-session scoped. Secret user-input
+  delivery fails closed until a secure transient escrow exists.
+- Exact response semantics are intentionally narrow: additional permissions expose turn/session
+  grants plus deny (the server treats an empty granted profile as no grant), while
+  `request_user_input` exposes only answer. That protocol has no decline/cancel response; cancelling
+  work belongs to a separate future `turn/interrupt` control, not a fabricated interaction choice.
+- Registry replacement/deletion atomically cancels old delivery rows and detaches the exact native
+  binding before a lifecycle hook removes it and terminates the child. Bridge disconnect/close
+  detaches active bindings, and action authority requires a live connection plus the exact active
+  binding/epoch. Ordinary TUI sessions have no matching binding and are untouched.
+- Scoped interaction reads expose only a provider-neutral delivery effect. `awaiting-user` is the
+  sole provider-backed state that enables controls; durable `queued`/`sent` projects as noninteractive
+  “Sending to runtime…” across remounts and restarts, and a missing bridge projects as
+  `reconnect-required`. Transport ids, provider context/responses, and secret values never cross this
+  RPC boundary. The board retains pending thread visibility but removes queued/sent work from Needs
+  You until a genuinely actionable request exists.
+- Dispatch selection remains intentionally deferred. Do not enable this flag as a user-facing default
+  until dedicated turn-interrupt UX, secure secret-answer delivery, custom-provider environment
+  policy, independent review, and real end-to-end live-thread validation are complete.

@@ -1,6 +1,6 @@
 ---
 name: gh
-description: The gh-CLI playbook for a fray-ui worker signed into GitHub (invoke as fray:gh). Load this whenever your effort touches GitHub — reading or triaging an issue or PR, reviewing a diff, checking CI/release status, or searching issues/PRs — to use `gh` eagerly and correctly: the read-vs-write boundary (never comment/label/close/merge unless the human asks), the toon absolute-path shim for large JSON, concrete read recipes, and active Monitor/background-Bash CI/PR watches. Only meaningful when you are signed in (`gh auth status --active` exit 0); the session-seed hook injects a pointer here when you are.
+description: The gh-CLI playbook for a fray-ui worker signed into GitHub (invoke as fray:gh). Load this whenever your effort touches GitHub — reading or triaging an issue or PR, reviewing a diff, checking CI/release status, or searching issues/PRs — to use `gh` eagerly and correctly: the read-vs-write boundary (never comment/label/close/merge unless the human asks), optional toon use for large JSON, concrete read recipes, and active Monitor/background-Bash CI/PR watches. Only meaningful when you are signed in (`gh auth status --active` exit 0); the session-seed hook injects a pointer here when you are.
 version: 0.1.1
 metadata:
   internal: true
@@ -10,7 +10,7 @@ metadata:
 
 You are a **fray-ui worker** and you are **signed into the `gh` CLI in a GitHub repo** (the session-seed hook confirmed `gh auth status --active` before pointing you here). `gh` is the fastest path to issue / PR / CI / release context — reach for it before guessing, and prefer it over scraping the web UI or reasoning from memory.
 
-This skill is the full playbook the injected `⟦gh available⟧` block summarizes: the **read-vs-write boundary**, the **toon shim** for large JSON, concrete **read recipes**, and how to keep a **CI/PR watch** active until the next actionable event.
+This skill is the full playbook the injected `⟦gh available⟧` block summarizes: the **read-vs-write boundary**, optional **toon** use for large JSON, concrete **read recipes**, and how to keep a **CI/PR watch** active until the next actionable event.
 
 ## The one hard rule — READ freely, WRITE only when asked
 
@@ -25,15 +25,14 @@ There is no server-side enforcement of this; the boundary is yours to hold.
 
 ## toon — pipe LARGE, FLAT gh JSON through the shim
 
-`toon` (Token-Oriented Object Notation) losslessly re-encodes JSON ~30–40% smaller for LLM context. Use it when a `gh … --json` result you're reading into YOUR context is **large and flat** (a list page: `gh issue list`, `gh pr list`, `gh search`, `gh api` list endpoints).
-
-**toon is NOT on PATH.** Use the absolute path, or export it once:
+`toon` (Token-Oriented Object Notation) losslessly re-encodes JSON ~30–40% smaller for LLM context. Use it only when a `gh … --json` result you're reading into YOUR context is **large and flat** (a list page: `gh issue list`, `gh pr list`, `gh search`, `gh api` list endpoints) and `command -v toon` succeeds. It is optional: do not install it or assume a home-directory-specific location.
 
 ```bash
-gh issue list -R OWNER/REPO --json number,title,url,updatedAt --limit 50 | "$HOME/.nvm/versions/node/v24.14.0/bin/toon"
-# or, once per shell:
-export PATH="$HOME/.nvm/versions/node/v24.14.0/bin:$PATH"
-gh pr list -R OWNER/REPO --json number,title,url --limit 50 | toon
+if command -v toon >/dev/null 2>&1; then
+  gh issue list -R OWNER/REPO --json number,title,url,updatedAt --limit 50 | toon
+else
+  gh issue list -R OWNER/REPO --json number,title,url,updatedAt --limit 50
+fi
 ```
 
 **Skip toon** for tiny payloads (a handful of fields, one item) and for **deeply-nested** JSON (`reactionGroups`, review threads, nested files) — nesting defeats tabularization, so the savings collapse to noise and you add a parse tax for yourself. A single `gh pr view N --json …` is small — read it raw.
@@ -76,7 +75,7 @@ Use search to find duplicates, related work, and prior art before you conclude s
 **Raw API** for anything the porcelain doesn't cover:
 ```bash
 gh api repos/OWNER/REPO/commits/SHA/check-runs --jq '.check_runs[] | {name, conclusion}'
-gh api "repos/OWNER/REPO/issues?state=open&labels=bug&per_page=50" | "$HOME/.nvm/versions/node/v24.14.0/bin/toon"
+gh api "repos/OWNER/REPO/issues?state=open&labels=bug&per_page=50" | { command -v toon >/dev/null 2>&1 && toon || cat; }
 ```
 
 ## Keep GitHub automation active
@@ -85,11 +84,32 @@ CI, automated review, releases, merge queues, and already-authorized merge progr
 can observe with `gh`; they do not earn an `awaiting` fence. Keep a live operation attached to the
 thread and continue when it reports.
 
+### Select monitor tooling explicitly
+
+Before launching any CI/review monitor, inspect project-local `AGENTS.md`, active skills, repository
+docs, `package.json` scripts, and declared monitor tooling. Prefer an explicit project-local monitor
+only if it documents terminal semantics for this gate. Validate its absolute command and terminal
+event/exit contract before launch. If declared tooling is missing, invalid, or has no terminal
+semantics, stop and report that configuration error; never silently shadow it with a Fray script, and
+never execute a monitor merely because its filename looks plausible.
+
+When no project monitor is declared, the bundled fallback scripts are
+`<this-skill-dir>/scripts/ci-watch.mjs` and `review-watch.mjs`. They are generated byte-for-byte from
+Fray's canonical `monitors/` source and require only Node plus logged-in `gh`. Their stdout is
+`fray.github-monitor/v1` NDJSON: `status` means keep waiting; `terminal` is a verdict. They join
+exact-head workflow runs with PR checks, keeping `ACTION_REQUIRED` pending, and baseline only new
+non-bot review activity. A GitHub/auth error is terminal exit 3; SIGINT/SIGTERM produces terminal
+`cancelled` and exit 130. A `--once` pending/baseline snapshot is deliberately non-terminal exit 0.
+For CI, retries are collapsed only within the same workflow name and event; distinct exact-head events
+such as `push` and `pull_request` both contribute to the aggregate verdict.
+
 - One-shot completion: launch `Bash` with `run_in_background: true`, for example
   `gh run watch RUN_ID -R OWNER/REPO --exit-status` or a repo watcher that exits when all PR checks
   settle. The completion task-notification re-invokes you. Diagnose/fix on red; continue the authorized
   release/merge path on green.
-- State transitions: use `Monitor` with a quiet loop that prints only changes or the terminal event.
+- State transitions: use native `Monitor` with a quiet loop that prints only changes or the terminal
+  event. It is the Claude adapter for the selected script; do not make a sub-agent the monitor
+  abstraction.
   Finite monitors run up to one hour; `persistent: true` runs until `TaskStop` or the Claude session
   ends. Stop a watch once its gate is obsolete.
 - A background Bash launch exposes an output-file path. Use `Read` on that path only for diagnostics;

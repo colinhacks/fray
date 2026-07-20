@@ -1,22 +1,41 @@
-import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react"
+import { createContext, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react"
+import { useSnapshot } from "valtio"
+import * as RadixTabs from "@radix-ui/react-tabs"
 import { useMutation, useQuery } from "@tanstack/react-query"
-import { AlertTriangle, Archive, ArrowUpRight, Check, ChevronRight, Clock, HelpCircle, KeyRound, ListChecks, RefreshCw, ShieldCheck, X } from "lucide-react"
-import type { AwaitingHint, PendingAsk, TranscriptEdit, TranscriptMessage } from "@fray-ui/shared"
+import { AlertTriangle, ArrowUpRight, Check, ChevronRight, Clock, FileText, HelpCircle, KeyRound, ListChecks, Loader2, ShieldCheck, Sparkles, X } from "lucide-react"
+import type { AwaitingHint, NativeInputRequired as NativeInputRequiredData, PendingAsk, ThreadView as ThreadViewData, TranscriptEdit, TranscriptMessage, TranscriptToolCall } from "@fray-ui/shared"
+import { isValidAwaitingTimer } from "@fray-ui/shared"
 import { store, threadBySlug, pushDrawer, pushSubAgentDrawer, showToast } from "../store.ts"
 import { useBoard, useTranscript, useSocketTranscripts, type ChatMessage } from "../hooks.ts"
 import { rpc } from "../api/rpc.ts"
 import { displayTitle } from "../groups.ts"
-import { mdToHtml, stripFrontmatter } from "../lib/markdown.ts"
-import { splitProseImages } from "../lib/imagePaths.ts"
+import { mdToHtml, mdInlineToHtml, stripFrontmatter } from "../lib/markdown.ts"
+import { splitProseAttachments } from "../lib/imagePaths.ts"
 import { DiffBlock, PathLink } from "./DiffBlock.tsx"
 import { splitQuestionBlocks, parseQuestionBlock, type QuestionKind, type BlockAnswer, type MessageAnswering } from "../lib/questionBlocks.ts"
 import { splitFenceBlocks, type FenceKind } from "../lib/fenceBlocks.ts"
 import { parseAnswersMessage, pairAllAnswers, type PairedAnswer } from "../lib/answersMessage.ts"
 import { useLiveAnswering } from "../lib/answering.ts"
-import { TerminalPane } from "./TerminalPane.tsx"
+import { useLocalFileCodeLinks } from "../lib/localFileCode.ts"
+import { shouldSubmitComposerEnter } from "../lib/composerKeyboard.ts"
+import { messagePresentationText } from "../lib/messagePresentation.ts"
+import { formatSnoozedUntil, snoozePresetInstant, formatSnoozeWake } from "../lib/snooze.ts"
+import { prefs } from "../lib/prefs.ts"
+import { canAdoptThread } from "../lib/adoption.ts"
+import { THREAD_TITLE_MAX_LENGTH, aiRenameAvailability, manualThreadTitleSeed, threadTitleToCommit } from "../lib/threadTitle.ts"
+import { THREAD_HEADER_CLASS, THREAD_HEADER_CONTROLS_CLASS, THREAD_HEADER_TITLE_CLASS } from "../lib/threadHeaderLayout.ts"
 import { ThreadActionBar } from "./ThreadActionBar.tsx"
 import { HeaderActions } from "./HeaderActions.tsx"
+import { ThreadLifecycleFooter, StateButton } from "./ThreadLifecycleFooter.tsx"
+import { threadLifecycleAvailability } from "../lib/threadLifecycle.ts"
 import { Tooltip } from "./Tooltip.tsx"
+import { ToolDisclosureHeader } from "./ToolDisclosureHeader.ts"
+import { hasRunningToolIndicator, isRunningOperation, liveBackgroundOperationState } from "../lib/operationIndicators.ts"
+import { formatCountdownSeconds, formatElapsedMinutes, formatFixedDuration, formatToolDuration } from "../lib/durationLabels.ts"
+import { TRANSCRIPT_META_LABEL_CLASS } from "../lib/transcriptMetaLabels.ts"
+import { InteractionStack } from "./InteractionCards.tsx"
+import { LastActive } from "./LastActive.tsx"
+import { CopyTerminalCommandButton, useCopyTerminalCommand } from "./ExternalTerminalCommand.tsx"
 
 // Answer types moved to lib/questionBlocks.ts (shared by the queue card, the thread view, and the
 // answering controller). Re-exported here so existing importers keep working.
@@ -25,22 +44,10 @@ export type { BlockAnswer, MessageAnswering }
 // The thread slug the current message tree belongs to — set by ChatView so a nested AgentBlock can
 // resolve its live tracked sub-agent (for the "running Nm" header + drill-in drawer) without threading
 // the slug through every intermediate. Null in surfaces that don't provide it (the queue card, a
-// sub-agent's own transcript) → AgentBlocks there render as plain (non-live) prompt cards.
-const ThreadSlugContext = createContext<string | null>(null)
-
-// The nearest scrollable ANCESTOR of `start`, or null when the page itself is the scroller. Used to
-// scope auto-scroll to the ACTUAL container: in the main workpane there is no overflow ancestor (the
-// PAGE scrolls → null → window), but inside the ThreadSheet drawer the sheet's own overflow-y-auto
-// scroller is found first — so ChatView never yanks the whole page when it lives in a drawer.
-function nearestScroller(start: HTMLElement | null): HTMLElement | null {
-  let node = start?.parentElement ?? null
-  while (node && node !== document.body && node !== document.documentElement) {
-    const oy = getComputedStyle(node).overflowY
-    if (oy === "auto" || oy === "scroll") return node
-    node = node.parentElement
-  }
-  return null // page-level scroll (window / documentElement)
-}
+// sub-agent's own transcript) → AgentBlocks there render as plain (non-live) prompt cards. The QUEUE
+// card also provides this now (maintainer 2026-07-15): its sub-agent blocks go live (spinner +
+// drill-in) AND its done/awaiting fence cards resolve their thread to show the confirm button.
+export const ThreadSlugContext = createContext<string | null>(null)
 
 // The default thread surface: the session transcript (parsed server-side from the JSONL) rendered
 // as a conversation — assistant prose as markdown, tool calls as compact one-liners, a spinner
@@ -55,33 +62,43 @@ function nearestScroller(start: HTMLElement | null): HTMLElement | null {
 // state). Chat is a single scroll column (sticky header + composer); terminal is a fixed-box pane.
 // The thread's active surface tab: the conversation, the raw terminal (⌘T power-user), or the
 // scratchpad doc (a session thread's compaction-proof working memory — read-only).
-export type ThreadTab = "chat" | "terminal" | "scratch"
+export type ThreadTab = "chat" | "scratch"
 
 export function ThreadView({ slug, tab, onTab, onStatusApplied, onClose }: { slug: string; tab: ThreadTab; onTab: (t: ThreadTab) => void; onStatusApplied?: () => void; onClose?: () => void }) {
-  if (tab === "terminal") {
-    return (
-      <div className="flex-1 min-h-0 flex flex-col">
-        <ThreadHeader slug={slug} tab={tab} onTab={onTab} onStatusApplied={onStatusApplied} onClose={onClose} />
-        <TerminalPane slug={slug} />
-        <ThreadActionBar slug={slug} />
-      </div>
-    )
-  }
-  if (tab === "scratch") {
-    return (
-      <div className="flex-1 min-h-0 flex flex-col">
-        <ThreadHeader slug={slug} tab={tab} onTab={onTab} onStatusApplied={onStatusApplied} onClose={onClose} />
+  const board = useBoard()
+  const thread = threadBySlug(board, slug)
+  return (
+    <RadixTabs.Root
+      value={tab}
+      onValueChange={(value) => onTab(value as ThreadTab)}
+      activationMode="automatic"
+      className="flex-1 min-h-0 flex flex-col"
+    >
+      <ThreadHeader slug={slug} tab={tab} onStatusApplied={onStatusApplied} onClose={onClose} />
+      {tab === "scratch" ? (
+        <RadixTabs.Content value="scratch" className="flex-1 min-h-0 flex flex-col outline-none">
+        <InteractionStack
+          thread={thread}
+          className="mx-4 mt-3 max-h-[45vh] shrink-0 overflow-y-auto"
+        />
         <ScratchpadPane slug={slug} />
-      </div>
-    )
-  }
-  return <ChatView slug={slug} tab={tab} onTab={onTab} onStatusApplied={onStatusApplied} onClose={onClose} />
+        </RadixTabs.Content>
+      ) : (
+        <ChatView slug={slug} onTab={onTab} />
+      )}
+      {thread && <ThreadLifecycleFooter thread={thread} sticky safeArea onArchived={onStatusApplied} />}
+    </RadixTabs.Root>
+  )
 }
 
-function ChatView({ slug, tab, onTab, onStatusApplied, onClose }: { slug: string; tab: ThreadTab; onTab: (t: ThreadTab) => void; onStatusApplied?: () => void; onClose?: () => void }) {
+function ChatView({ slug, onTab }: { slug: string; onTab: (t: ThreadTab) => void }) {
   const board = useBoard()
   const thread = threadBySlug(board, slug)
   const running = thread?.runtime === "running" || thread?.runtime === "spawning"
+  // Foreign terminals are transcript-only: even if a stale/malformed snapshot happened to carry a
+  // native modal field, never offer a terminal control Fray does not own.
+  const nativeInputRequired = thread?.foreign ? undefined : thread?.nativeInputRequired
+  const copyTerminalCommand = useCopyTerminalCommand(slug)
 
   const q = useTranscript(slug, { poll: running })
   // Raw server order — each message renders its `parts` in block order (fidelity). Memoized so
@@ -91,29 +108,20 @@ function ChatView({ slug, tab, onTab, onStatusApplied, onClose }: { slug: string
   // needs the whole list; Message renders per-message). null — a stable primitive — at every ordinary
   // index, so the memoized Message only sees a `paired` prop change on actual answers-messages.
   const paired = useMemo(() => pairAllAnswers(messages), [messages])
-  // LIVE question-block interactivity in the thread view (parity with the queue card): the last blocked
-  // message gets clickable chips + per-block inputs + a composed reply; historical blocks stay read-only.
-  const { liveMsg, answering, answerable, anyAnswered, sendAnswers } = useLiveAnswering(slug, messages)
-
-  // The done-fence Archive button lands on the FINAL message of a NON-archived, registered (non-foreign)
-  // session thread. On success it CLOSES the drawer (via onStatusApplied — the thread just left the
-  // state you were looking at it for) and toasts, instead of leaving the drawer open on an archived
-  // thread while the button silently vanishes (the bug the maintainer hit 2026-07-10). Historical fences
-  // render the same cards but without this button.
-  const archivable = thread?.kind === "session" && thread.state !== "archived" && !thread.foreign
-  const archive = useMutation({ mutationFn: () => rpc.setThreadState({ slug, state: "archived" }) })
-  const archiveMutate = archive.mutate
-  const onArchive = useCallback(
-    () =>
-      archiveMutate(undefined, {
-        onSuccess: () => {
-          showToast("Archived")
-          onStatusApplied?.()
-        },
-        onError: (e) => showToast(`Archive failed: ${(e as Error).message.slice(0, 80)}`),
-      }),
-    [archiveMutate, onStatusApplied],
-  )
+  // The most recent LANDED user message (queued/optimistic follow-ups pin to the bottom and aren't the
+  // "current ask") — pinned to the top of the pane via StickyUserBand so it stays visible while the
+  // agent's reply scrolls under it. -1 when the transcript has no user message yet.
+  const lastUserIdx = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) if (messages[i].role === "user" && !messages[i].queued) return i
+    return -1
+  }, [messages])
+  // Client view pref: how (or whether) to pin the current ask to the pane top. `off` → no pin.
+  const { stickyUserMessage } = useSnapshot(prefs)
+  // Question-block interactivity in the thread view. `multiMessage`: unlike the queue card (live ask
+  // only), the drawer keeps EVERY still-open ask answerable — scroll back to a question a sub-agent
+  // return / the agent's own continuation buried and answer it in place. answeringForMessage wires each
+  // open message's chips AND its own bottom Send button (scoped to just that message's blocks).
+  const { answeringForMessage } = useLiveAnswering(slug, messages, undefined, { multiMessage: true })
 
   // Board pushes are a cheap signal that the transcript may have grown, but pushing on EVERY board push
   // over-fetches (the board changes for reasons unrelated to this thread). Only refetch when this thread's
@@ -123,49 +131,77 @@ function ChatView({ slug, tab, onTab, onStatusApplied, onClose }: { slug: string
   const socketPush = useSocketTranscripts()
   const lastActivityRef = useRef(thread?.lastActivityAt)
   useEffect(() => {
-    if (socketPush) return
+    if (socketPush || q.transportFallback) return
     if (thread?.lastActivityAt !== lastActivityRef.current) {
       lastActivityRef.current = thread?.lastActivityAt
       q.refetch()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [thread?.lastActivityAt, socketPush])
+  }, [thread?.lastActivityAt, socketPush, q.transportFallback])
 
-  // Stick to the bottom like a terminal, but only when the user is already near it.
-  const rootRef = useRef<HTMLDivElement>(null)
+  // The drawer transcript is the only scrolling region. The composer, selectors, and running
+  // operation rows are siblings, so a long draft cannot push any footer control under a boundary.
+  const transcriptRef = useRef<HTMLDivElement>(null)
   const count = q.data?.messages.length ?? 0
   useEffect(() => {
-    // Scope auto-scroll to the ACTUAL scroll container. In the main workpane the PAGE scrolls
-    // (nearestScroller → null → window). Inside a drawer this ChatView lives in the sheet's OWN
-    // overflow-y-auto scroller — scroll THAT, never the page (scrolling window here is what yanked the
-    // whole queue on drawer-open). Gated on near-bottom so reading history is never fought.
-    const scroller = nearestScroller(rootRef.current)
-    if (scroller) {
-      if (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 240) scroller.scrollTop = scroller.scrollHeight
-    } else {
-      const doc = document.documentElement
-      if (doc.scrollHeight - window.scrollY - window.innerHeight < 240) window.scrollTo({ top: doc.scrollHeight })
-    }
+    const scroller = transcriptRef.current
+    if (scroller && scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 240) scroller.scrollTop = scroller.scrollHeight
   }, [count, running])
 
   return (
     <ThreadSlugContext.Provider value={slug}>
-    <div ref={rootRef} className="flex-1 flex flex-col">
-      <ThreadHeader slug={slug} tab={tab} onTab={onTab} onStatusApplied={onStatusApplied} onClose={onClose} />
-      {/* flex-1 so short conversations still push the composer to the bottom; a long transcript just
-          grows the card past the viewport and the page scrolls (sticky header pins to the viewport).
-          gap-3.5 = 14px = STEP (the in-message VSpace unit): inter-message spacing MUST equal the
-          between-block spacing or the rhythm looks uneven. Tailwind can't reference the JS STEP const —
-          keep this in sync with STEP by hand (same value mirrored on the queue card's list in TodosView). */}
+    <RadixTabs.Content
+      value="chat"
+      data-drawer-scroll-ready={q.isPending ? "false" : "true"}
+      className="flex-1 min-h-0 flex flex-col overflow-hidden outline-none"
+    >
+      <div ref={transcriptRef} data-drawer-transcript-scroll className="min-h-0 flex-1 overflow-y-auto">
+      <InteractionStack
+        thread={thread}
+        className="px-6 pt-5"
+        autoFocusFirst
+      />
+      {q.transportFallback && (
+        <div
+          data-transcript-sync-fallback
+          className="mx-6 mt-3 flex flex-wrap items-center gap-2.5 rounded-md border border-border-strong bg-panel-2 px-3 py-2 text-[12px]"
+          title={q.transportFallback.kind === "payload-too-large"
+            ? `Live payload ${q.transportFallback.actualBytes} bytes; socket limit ${q.transportFallback.maxBytes} bytes`
+            : `Transcript read budget reached (${q.transportFallback.scope}); retry after about ${q.transportFallback.retryAfterMs}ms`}
+        >
+          <AlertTriangle size={13} className="shrink-0 text-muted" />
+          <div className="min-w-[180px] flex-1 leading-snug text-fg/85">
+            <span className="font-medium">Live transcript updates paused.</span>{" "}
+            {q.transportFallback.kind === "payload-too-large"
+              ? "The transcript is too large for push; the last complete HTTP-loaded copy remains visible."
+              : "The live read budget was reached; the last complete copy remains visible. Retry in a moment."}
+          </div>
+          <button
+            type="button"
+            disabled={q.isFetching}
+            onClick={() => void q.refetch()}
+            className="shrink-0 rounded-md border border-border px-2 py-1 text-[11px] text-fg/90 transition-colors hover:bg-panel disabled:opacity-40"
+          >
+            {q.isFetching ? "Refreshing…" : "Refresh once"}
+          </button>
+          <button
+            type="button"
+            onClick={q.retryLiveUpdates}
+            className="shrink-0 rounded-md border border-border px-2 py-1 text-[11px] text-fg/90 transition-colors hover:bg-panel"
+          >
+            Retry live
+          </button>
+        </div>
+      )}
       {/* No flex GAP: between-message spacing is adjacency-based explicit spacers (two tool-only
           messages → the tight 6px run; anything involving prose/a bubble/an event → STEP 14px), so a
           tool-card column reads uniformly no matter how the turns were chunked. */}
-      <div className="flex-1 flex flex-col px-6 py-5">
+      <div className="flex min-h-full flex-col px-6 py-5">
         {count === 0 ? (
           <div className="flex-1 flex items-center justify-center text-sm text-muted">
             {running ? (
               <span className="flex items-center gap-2"><Dots /> Session starting…</span>
-            ) : thread && thread.runtime === "none" ? (
+            ) : canAdoptThread(thread) ? (
               // A thread fray-ui never originated (pre-existing .fray board): no session, no
               // transcript. Cold-adopt it — a fresh worker reads the thread FILE and continues;
               // per the fray contract the doc, not the conversation, is the durable context.
@@ -191,54 +227,50 @@ function ChatView({ slug, tab, onTab, onStatusApplied, onClose }: { slug: string
               // that render nothing (so no orphan/double gap), 6px between two tool-only messages, STEP
               // otherwise. `prevToolOnly === null` marks "no rendered message yet" → no leading spacer.
               const out: ReactNode[] = []
-              let prevTailIsTool: boolean | null = null
+              let prevTailIsMeta: boolean | null = null
               messages.forEach((m, i) => {
                 // QUEUED (optimistic, not-yet-in-the-log) messages are pinned to the very BOTTOM
                 // (rendered after the working/pending indicators, below) — not interleaved here.
                 if (m.queued) return
                 if (messageRendersNothing(m)) return
-                // 6px when a tool band ABUTS a tool band across the boundary (see messageTailIsTool).
-                if (prevTailIsTool !== null) out.push(<VSpace key={`s${i}`} h={prevTailIsTool && messageHeadIsTool(m) ? 6 : STEP} />)
-                out.push(
+                // 6px when two META rows abut across the boundary — a tool band OR a "Thought for Ns" /
+                // reasoning label (see messageTailIsMeta), so the meta-label column reads as one rhythm.
+                if (prevTailIsMeta !== null) out.push(<VSpace key={`s${i}`} h={prevTailIsMeta && messageHeadIsMeta(m) ? 6 : STEP} />)
+                // The current ask sticks to the pane top (unless the pref is off) as a collapsed,
+                // hover-to-expand bubble; every other message flows normally.
+                const isSticky = i === lastUserIdx && stickyUserMessage
+                const msg = (
                   <Message
                     key={i}
                     m={m}
-                    answering={m === liveMsg ? answering : undefined}
+                    answering={answeringForMessage(m)}
+                    showSendButton
                     paired={paired[i]}
-                    onArchive={archivable && i === messages.length - 1 ? onArchive : undefined}
-                  />,
+                    sticky={isSticky}
+                  />
                 )
-                prevTailIsTool = messageTailIsTool(m)
+                out.push(isSticky ? <StickyUserBand key={i}>{msg}</StickyUserBand> : msg)
+                prevTailIsMeta = messageTailIsMeta(m)
               })
               return out
             })()}
-            {(thread?.pendingAsk || thread?.runtime === "perm-prompt" || running) && <VSpace />}
+            {(thread?.pendingAsk || nativeInputRequired || thread?.runtime === "perm-prompt" || running) && <VSpace />}
             {/* A frozen native AskUserQuestion takes precedence over the generic perm banner and the
                 Working… spinner — it's the salient state (the safety net). Background sub-agents/shells
                 are NOT surfaced here anymore: they live in the anchored ops strip (below), which is
                 visible even mid-turn. */}
             {thread?.pendingAsk ? (
-              <PendingAskCard ask={thread.pendingAsk} onTerminal={() => onTab("terminal")} />
+              <PendingAskCard ask={thread.pendingAsk} onTerminal={copyTerminalCommand} />
+            ) : nativeInputRequired ? (
+              <NativeInputRequiredCard input={nativeInputRequired} onTerminal={copyTerminalCommand} />
             ) : thread?.runtime === "perm-prompt" ? (
-              <PermPromptBanner onTerminal={() => onTab("terminal")} />
+              <PermPromptBanner onTerminal={copyTerminalCommand} />
             ) : running ? (
               <WorkingIndicator since={thread?.lastUserAt} />
             ) : null}
-            {/* Parity with the queue card: when the live message is answerable, a composed-reply button
-                (the block inputs' ⌘-Enter also submits). Historical blocks aren't answerable. */}
-            {answerable && <VSpace />}
-            {answerable && (
-              <div className="flex justify-end">
-                <button
-                  disabled={!anyAnswered}
-                  onClick={sendAnswers}
-                  onMouseDown={(e) => e.preventDefault()}
-                  className="rounded-md bg-fg px-3 py-1.5 text-[12px] font-medium text-bg outline-none transition-all hover:opacity-90 active:scale-95 disabled:opacity-30 disabled:hover:opacity-30"
-                >
-                  Send answers
-                </button>
-              </div>
-            )}
+            {/* No thread-level Send button anymore: each question-bearing message renders its OWN bottom
+                Send button (Message's showSendButton), scoped to just that message's blocks (each block's
+                ⌘-Enter also submits that message). Answering is now one message at a time by design. */}
             {/* QUEUED (optimistic) messages pinned to the VERY BOTTOM — below the working/pending
                 indicators — until the server echoes them into the transcript (maintainer 2026-07-09:
                 "queued messages render underneath everything until they become un-queued and show up
@@ -246,43 +278,68 @@ function ChatView({ slug, tab, onTab, onStatusApplied, onClose }: { slug: string
                 as a group after everything. Once confirmed, the optimistic copy is consumed and the
                 real message renders in its natural place above. */}
             {messages.some((m) => m.queued) && <VSpace />}
-            {messages.map((m, i) =>
-              m.queued ? (
-                // flex flex-col MIRRORS the parent scroll container (line ~162) so the Message root's
-                // `self-end` engages here exactly as it does for a landed message. Without it this
-                // wrapper is a plain block, self-end is inert, and a multi-line bubble stretches to 85%
-                // and floats center-right — the center-then-snap-right jump on materialize.
-                <div key={`q${i}`} className={`flex flex-col ${i > 0 && messages[i - 1]?.queued ? "mt-3.5" : ""}`}>
-                  <Message m={m} paired={paired[i]} />
-                </div>
-              ) : null,
-            )}
+            {/* flex flex-col MIRRORS the parent scroll container (line ~162) so each Message root's
+                `self-end` engages here exactly as it does for a landed message. Without it this group
+                is a plain block, self-end is inert, and a multi-line bubble stretches to 85% and floats
+                center-right — the center-then-snap-right jump on materialize.
+                gap-3.5 = 14px = STEP (Tailwind can't reference the JS const — keep it in sync by hand):
+                successive queued sends carry the same rhythm as any other pair. The gap is STRUCTURAL
+                rather than an `mt` keyed off `messages[i-1].queued` — that adjacency test failed
+                whenever a message this pass SKIPS (an event, anything messageRendersNothing) sat
+                between two queued sends, butting the two bubbles together. */}
+            <div className="flex flex-col gap-3.5">
+              {messages.map((m, i) => (m.queued ? <Message key={`q${i}`} m={m} paired={paired[i]} /> : null))}
+            </div>
           </>
         )}
       </div>
-      {/* Sticky bottom: the persistent BACKGROUND-OPS strip rides directly above the composer (both
-          opaque, so the tail scrolls under them). The strip is visible whenever ops are live — even
-          mid-turn, unlike the old at-rest banner. */}
+      </div>
+      {/* This entire footer is deliberately non-scrolling: transcript history alone overflows. */}
       {/* Prompt box FIRST, then the background-ops strip UNDERNEATH it at the very bottom (maintainer
           2026-07-09): running sub-agents / shells / monitors sit below the composer, not above it. */}
-      <div className="sticky bottom-0 z-10">
-        <ThreadActionBar slug={slug} />
-        <BackgroundOpsStrip slug={slug} />
+      <div data-thread-chat-footer className="z-10 shrink-0 border-t border-border bg-panel">
+        <ThreadActionBar
+          slug={slug}
+          onTerminal={copyTerminalCommand}
+          ops={<BackgroundOpsStrip slug={slug} className="px-1 pb-2 pt-1.5" />}
+        />
       </div>
-    </div>
+    </RadixTabs.Content>
     </ThreadSlugContext.Provider>
   )
 }
 
-// The thread's top bar: title, the Chat/Terminal/Doc tab toggle, and — at the far right — the SHARED
-// HeaderActions (the kind-split verbs: session Archive/Kill or legacy Mark-as). The tab is CONTROLLED
-// (tab/onTab) so the drawer drives its own copy. A FOREIGN session hides the Terminal tab (no tmux to
-// attach). The Doc tab appears only when the thread has a provisioned scratchpad. STICKY top-0 so it
-// pins to the top of the chat scroll; above the fixed terminal pane it behaves as a normal top bar.
-export function ThreadHeader({ slug, tab, onTab, onStatusApplied, onClose }: { slug: string; tab: ThreadTab; onTab: (t: ThreadTab) => void; onStatusApplied?: () => void; onClose?: () => void }) {
+// The thread's top bar: title, the Chat/Doc tab toggle, and — at the far right — the shared actions.
+// non-lifecycle HeaderActions. Snooze and Archive stay in the persistent thread footer. The tab is CONTROLLED
+// (tab/onTab) so the drawer drives its own copy. Owned sessions expose a command-copy icon; foreign
+// rows do not. The Doc tab appears only when the thread has a provisioned scratchpad.
+export function ThreadHeader({ slug, tab, onStatusApplied, onClose }: { slug: string; tab: ThreadTab; onStatusApplied?: () => void; onClose?: () => void }) {
   const board = useBoard()
   const thread = threadBySlug(board, slug)
   const markComplete = useMutation({ mutationFn: () => rpc.markComplete({ slug }) })
+  const renameTitle = useMutation({ mutationFn: (title: string) => rpc.renameThread({ slug, title }) })
+  const aiRenameTitle = useMutation({
+    mutationFn: () => rpc.aiRenameThread({ slug }),
+    onSuccess: ({ title }) => showToast(`Renamed to “${title}”`),
+    onError: (error) => showToast(error instanceof Error ? error.message : "Could not rename with Claude", { duration: 7000 }),
+  })
+  const [editingTitle, setEditingTitle] = useState(false)
+  const [titleDraft, setTitleDraft] = useState("")
+  const titleInputRef = useRef<HTMLInputElement>(null)
+  useEffect(() => {
+    if (!editingTitle) return
+    const frame = requestAnimationFrame(() => {
+      titleInputRef.current?.focus()
+      titleInputRef.current?.select()
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [editingTitle])
+  // A drawer can switch slugs without remounting this header. Never carry a half-entered title into
+  // another thread; changing selection has the same semantics as cancelling with Escape.
+  useEffect(() => {
+    setEditingTitle(false)
+    setTitleDraft("")
+  }, [slug])
   // The "Fray document" header affordance opens .fray/<slug>.md (threadBody). Many session threads have
   // no such file — their working doc is the scratchpad (the Doc tab) — so the button would dead-end on
   // "No thread file found". Gate it on the doc actually having body content (same stripFrontmatter the
@@ -291,90 +348,169 @@ export function ThreadHeader({ slug, tab, onTab, onStatusApplied, onClose }: { s
   const docQ = useQuery({ queryKey: ["threadBody", slug], queryFn: () => rpc.threadBody({ slug }) })
   const hasDoc = stripFrontmatter(docQ.data?.markdown ?? "").trim().length > 0
   if (!thread) return null
-  const showTerminal = thread.foreign !== true // no tmux session we own to attach for a foreign thread
+  const showTerminalCommand = thread.kind === "session" && thread.foreign !== true
   const showScratch = !!thread.scratchpadPath
-  // Rename is a SESSION-only verb (a foreign session has no session we own to rename), and only safe to
-  // fire when the agent is AT THE PROMPT (turn-idle) — see the identical gating note this button used to
-  // carry in HeaderActions before it moved next to the title.
+  // Manual rename is registry metadata for either backend. Claude additionally owns a native AI
+  // rename; Codex has no equivalent and must never be shown a fake slash-command affordance.
   const isForeign = thread.foreign === true
-  const renameReady = thread.runtime === "turn-idle"
+  const canRename = thread.kind === "session" && !isForeign
+  const shownTitle = displayTitle(thread)
+  const aiRename = aiRenameAvailability(thread)
+  const aiRenameUnavailable = !aiRename.enabled || aiRenameTitle.isPending
+  const aiRenameLabel = aiRenameTitle.isPending
+    ? "Claude is generating a title…"
+    : aiRename.enabled && aiRenameTitle.error instanceof Error
+      ? aiRenameTitle.error.message
+      : aiRename.label
+  function cancelRename(): void {
+    setEditingTitle(false)
+    setTitleDraft("")
+  }
+  function commitRename(): void {
+    const title = threadTitleToCommit(titleDraft, shownTitle)
+    setEditingTitle(false)
+    if (!title) {
+      setTitleDraft("")
+      return
+    }
+    renameTitle.mutate(title, {
+      onSuccess: () => {
+        setTitleDraft("")
+        showToast("Thread renamed")
+      },
+      onError: (error) => {
+        setTitleDraft(title)
+        setEditingTitle(true)
+        showToast(error instanceof Error ? error.message : "Could not rename thread")
+      },
+    })
+  }
   return (
-    <header className="sticky top-0 z-10 shrink-0 flex items-center gap-2.5 px-3 h-12 border-b border-border bg-panel">
-      <div className="min-w-0 pl-1 flex-1 flex items-center gap-1">
-        <button
-          type="button"
-          title={displayTitle(thread)}
-          onClick={() => {
-            navigator.clipboard.writeText(displayTitle(thread))
-            showToast("Copied title")
-          }}
-          className="min-w-0 truncate rounded px-0.5 -mx-0.5 font-semibold text-[15px] text-left cursor-pointer transition-colors hover:bg-panel-2"
-        >
-          {displayTitle(thread)}
-        </button>
-        {!isForeign && (
-          <Tooltip label={renameReady ? "Regenerate name" : "Regenerate name (agent must be idle)"}>
-            <button
-              type="button"
-              aria-label="Regenerate name"
-              disabled={!renameReady}
-              onClick={() =>
-                rpc
-                  .renameThread({ slug: thread.id })
-                  .then(() => showToast("Renaming…"))
-                  .catch(() => {})
-              }
-              className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted outline-none transition-colors hover:bg-panel-2 hover:text-fg disabled:hover:bg-transparent disabled:hover:text-muted disabled:opacity-40"
-            >
-              <RefreshCw size={13} strokeWidth={2} />
-            </button>
-          </Tooltip>
+    <header
+      data-thread-header
+      className={THREAD_HEADER_CLASS}
+    >
+      <div className={THREAD_HEADER_TITLE_CLASS}>
+        <div className="min-w-0 leading-tight">
+          {/* Keep the title's display wrapper content-sized. Long names still truncate inside the
+              remaining header width, but short names do not claim the whole row as a click target. */}
+          <div className="flex min-w-0 items-center gap-1">
+            {editingTitle ? (
+              <input
+                ref={titleInputRef}
+                aria-label="Thread title"
+                value={titleDraft}
+                maxLength={THREAD_TITLE_MAX_LENGTH}
+                onChange={(event) => setTitleDraft(event.target.value)}
+                onBlur={commitRename}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault()
+                    commitRename()
+                  } else if (event.key === "Escape") {
+                    event.preventDefault()
+                    cancelRename()
+                  }
+                }}
+                className="min-w-0 flex-1 rounded-md border border-border bg-elevated px-1.5 py-1 font-semibold text-[15px] text-fg outline-none focus:border-accent"
+              />
+            ) : canRename ? (
+              <button
+                type="button"
+                title="Edit title"
+                aria-label={`Edit thread title: ${shownTitle}`}
+                disabled={renameTitle.isPending || aiRenameTitle.isPending}
+                onClick={() => {
+                  setTitleDraft(manualThreadTitleSeed(shownTitle, thread.id))
+                  setEditingTitle(true)
+                }}
+                className="min-w-0 max-w-full shrink truncate rounded px-0.5 -mx-0.5 font-semibold text-[15px] text-left outline-none transition-colors hover:bg-panel-2 focus-visible:ring-1 focus-visible:ring-fg/60 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {shownTitle}
+              </button>
+            ) : (
+              <div className="min-w-0 max-w-full shrink truncate px-0.5 -mx-0.5 font-semibold text-[15px]" title={shownTitle}>
+                {shownTitle}
+              </div>
+            )}
+            {aiRename.show && !editingTitle && (
+              <Tooltip label={aiRenameLabel}>
+                {/* aria-disabled (not native disabled) keeps the reason keyboard-focusable; the guarded
+                    click remains a no-op until the runtime is safe. */}
+                <button
+                  type="button"
+                  aria-label={aiRenameTitle.isPending ? "Renaming with Claude" : aiRename.enabled ? "Rename with Claude" : aiRename.label}
+                  title={aiRenameLabel}
+                  aria-busy={aiRenameTitle.isPending}
+                  aria-disabled={aiRenameUnavailable}
+                  onClick={() => {
+                    if (aiRenameUnavailable) return
+                    aiRenameTitle.reset()
+                    aiRenameTitle.mutate()
+                  }}
+                  className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-md outline-none transition-colors ${
+                    aiRenameUnavailable ? "cursor-not-allowed opacity-40" : ""
+                  } ${aiRenameTitle.error ? "text-red-400 hover:bg-red-500/10" : "text-accent hover:bg-accent/10"}`}
+                >
+                  <Sparkles size={13} strokeWidth={2} className={aiRenameTitle.isPending ? "animate-pulse" : ""} />
+                </button>
+              </Tooltip>
+            )}
+          </div>
+          <LastActive at={thread.lastActivityAt} fallbackAt={thread.spawnedAt} className="mt-0.5 block truncate text-[11px] leading-tight text-muted/75" />
+        </div>
+      </div>
+      {/* At constrained drawer widths, controls get their own deliberate row. This keeps the
+          clickable title and its activity stamp readable instead of competing with fixed-width
+          tabs/actions, while the control row itself remains a single unbroken cluster. */}
+      <div className={THREAD_HEADER_CONTROLS_CLASS}>
+        <RadixTabs.List aria-label="Thread view" className="flex shrink-0 items-center gap-1 rounded-lg bg-panel-2 p-0.5 text-[11px]">
+          <Tab value="chat" label="Chat" />
+          {showScratch && <Tab value="scratch" label="Doc" />}
+        </RadixTabs.List>
+        <div className="flex shrink-0 items-center">
+          {showTerminalCommand && <CopyTerminalCommandButton slug={slug} />}
+          <HeaderActions
+            thread={thread}
+            onDoc={hasDoc ? () => pushDrawer("doc", thread.id) : undefined}
+            onDone={() => markComplete.mutate(undefined, { onSuccess: onStatusApplied })}
+            doneBusy={markComplete.isPending}
+            onStatusApplied={onStatusApplied}
+          />
+        </div>
+        {/* Close-X for the DRAWER context (onClose passed by ThreadSheet) — parity with the Settings,
+            sub-agent, and Doc drawers, all of which carry a corner "Close". Wired to the SAME animated
+            close() as the backdrop/Esc path (markDrawerClosing + the 210ms slide-out), never an instant
+            unmount. Absent in the main workpane (no onClose → no drawer to close). */}
+        {onClose && (
+          <button
+            type="button"
+            aria-label="Close"
+            data-dialog-initial-focus
+            onClick={onClose}
+            className="ml-0.5 shrink-0 rounded-md p-1.5 text-muted outline-none transition-colors hover:bg-panel-2 hover:text-fg"
+          >
+            <X size={15} />
+          </button>
         )}
       </div>
-      <div className="flex items-center gap-1 rounded-lg bg-panel-2 p-0.5 text-[11px]">
-        <Tab active={tab === "chat"} onClick={() => onTab("chat")} label="Chat" />
-        {showTerminal && <Tab active={tab === "terminal"} onClick={() => onTab("terminal")} label="Terminal" />}
-        {showScratch && <Tab active={tab === "scratch"} onClick={() => onTab("scratch")} label="Doc" />}
-      </div>
-      <HeaderActions
-        thread={thread}
-        onDoc={hasDoc ? () => pushDrawer("doc", thread.id) : undefined}
-        onDone={() => markComplete.mutate(undefined, { onSuccess: onStatusApplied })}
-        doneBusy={markComplete.isPending}
-        onStatusApplied={onStatusApplied}
-      />
-      {/* Close-X for the DRAWER context (onClose passed by ThreadSheet) — parity with the Settings,
-          sub-agent, and Doc drawers, all of which carry a corner "Close". Wired to the SAME animated
-          close() as the backdrop/Esc path (markDrawerClosing + the 210ms slide-out), never an instant
-          unmount. Absent in the main workpane (no onClose → no drawer to close). */}
-      {onClose && (
-        <button
-          aria-label="Close"
-          onClick={onClose}
-          className="ml-0.5 shrink-0 rounded-md p-1.5 text-muted outline-none transition-colors hover:bg-panel-2 hover:text-fg"
-        >
-          <X size={15} />
-        </button>
-      )}
     </header>
   )
 }
 
-// Chat | Terminal | Doc — the segmented toggle in the thread header.
-function Tab({ active, onClick, label }: { active: boolean; onClick: () => void; label: string }) {
+// Chat | Doc — the segmented toggle in the thread header.
+function Tab({ value, label }: { value: ThreadTab; label: string }) {
   return (
-    <button
-      onClick={onClick}
-      className={`rounded-md px-2.5 py-1 transition-colors ${
-        active ? "bg-elevated text-fg shadow-sm shadow-black/20" : "text-muted hover:text-fg"
-      }`}
+    <RadixTabs.Trigger
+      value={value}
+      className="rounded-md px-2.5 py-1 text-muted outline-none transition-colors hover:text-fg focus-visible:ring-1 focus-visible:ring-fg/60 data-[state=active]:bg-elevated data-[state=active]:text-fg data-[state=active]:shadow-sm data-[state=active]:shadow-black/20"
     >
       {label}
-    </button>
+    </RadixTabs.Trigger>
   )
 }
 
-// The scratchpad doc tab: a session thread's compaction-proof working memory (.fray/scratch/<id>.md),
+// The scratchpad doc tab: a session thread's compaction-proof working memory (.fray/threads/<id>/scratch.md),
 // rendered read-only as markdown. Refetched on open (a simple query); the worker rewrites the file as
 // it works, so a re-open picks up the latest. Empty when never provisioned.
 function ScratchpadPane({ slug }: { slug: string }) {
@@ -406,7 +542,7 @@ export const STEP = 14
 // / messageHeadIsTool inspect the LAST / FIRST rendered block; the legacy (no-parts) path renders the
 // tool band FIRST then prose, so its head is tools-if-any and its tail is tools-only-if-no-prose.
 export function messageTailIsTool(m: ChatMessage): boolean {
-  if (m.kind === "event" || m.role === "user") return false
+  if (m.kind === "event" || m.kind === "reasoning" || m.role === "user") return false
   if (m.parts && m.parts.length > 0) {
     for (let i = m.parts.length - 1; i >= 0; i--) {
       const p = m.parts[i]
@@ -417,7 +553,7 @@ export function messageTailIsTool(m: ChatMessage): boolean {
   return (m.tools?.length ?? 0) > 0 && !m.text.trim()
 }
 export function messageHeadIsTool(m: ChatMessage): boolean {
-  if (m.kind === "event" || m.role === "user") return false
+  if (m.kind === "event" || m.kind === "reasoning" || m.role === "user") return false
   if (m.parts && m.parts.length > 0) {
     for (const p of m.parts) {
       if (p.kind === "tools" ? p.tools.length > 0 : p.text.trim()) return p.kind === "tools"
@@ -426,12 +562,36 @@ export function messageHeadIsTool(m: ChatMessage): boolean {
   }
   return (m.tools?.length ?? 0) > 0
 }
+// A lightweight single-line META label — a collapsed "Thought for Ns"/"Agent … finished" event or a
+// collapsed Codex reasoning row. These share the SAME petite-caps line box as a "N tool calls" batch
+// header (TRANSCRIPT_META_LABEL_CLASS), so per the "one rhythm" intent (transcriptMetaLabels.ts) they
+// join the tight 6px tool run instead of forcing a 14px break on both sides. A BOUNDARY event is a
+// section-break divider, not a quiet label — it keeps STEP.
+function isMetaLabelMessage(m: ChatMessage): boolean {
+  return (m.kind === "event" && !m.boundary) || m.kind === "reasoning"
+}
+// Tail/head predicates for the tight-run spacer: a tool band OR a meta label. An event/reasoning
+// message is a single row, so its head and tail are the same meta label.
+export function messageTailIsMeta(m: ChatMessage): boolean {
+  return isMetaLabelMessage(m) || messageTailIsTool(m)
+}
+export function messageHeadIsMeta(m: ChatMessage): boolean {
+  return isMetaLabelMessage(m) || messageHeadIsTool(m)
+}
 // Matches exactly when Message returns null (an empty/thinking-only assistant turn) — such a message
 // takes no slot, so the adjacency-spacer walk must SKIP it (else two spacers stack into a double gap).
 export function messageRendersNothing(m: ChatMessage): boolean {
-  if (m.kind === "event" || m.role === "user") return false
+  if (m.kind === "event" || m.kind === "reasoning" || m.role === "user") return false
   if (m.parts && m.parts.length > 0) return m.parts.every((p) => (p.kind === "tools" ? p.tools.length === 0 : !p.text.trim()))
   return (m.tools?.length ?? 0) === 0 && !m.text.trim()
+}
+// Would this message render anything under `textOnly` (tool bands dropped)? Mirrors messageRendersNothing
+// but counts ONLY text parts — the queue card uses it to decide whether a first/last agent message that
+// is pure batched tool calls (no prose) contributes a visible row, or folds entirely into the bar.
+export function messageHasRenderableText(m: ChatMessage): boolean {
+  if (m.kind === "event" || m.kind === "reasoning" || m.role === "user") return false
+  if (m.parts && m.parts.length > 0) return m.parts.some((p) => p.kind === "text" && p.text.trim() !== "")
+  return typeof m.text === "string" && m.text.trim() !== ""
 }
 export function VSpace({ h = STEP }: { h?: number }) {
   return <div aria-hidden className="shrink-0" style={{ height: h }} />
@@ -465,6 +625,19 @@ interface CollapsedTool {
   // rollout; Claude Bash results aren't recorded). Rendered as a second pane below the command in the
   // BashBlock. Absent for Claude Bash calls → the command shows alone (the prior behavior).
   output?: string
+  // Set for a tool whose result carried an image (e.g. chrome-devtools `take_screenshot`): the absolute
+  // path to the decoded screenshot, rendered inline via /local-image inside a ToolImageCard. Like the
+  // read/command entries it stands alone — never folds into a ×N repeat count.
+  outputImage?: string
+  // Generic tool input/source plus terminal result metadata. These fields also retain failure context
+  // for specialized cards such as Edit, which normally renders only its diff.
+  input?: string
+  status?: TranscriptToolCall["status"]
+  backgroundState?: TranscriptToolCall["backgroundState"]
+  exitCode?: number
+  cwd?: string
+  sessionId?: string | number
+  durationMs?: number
   // Set for a Read call whose result shipped an excerpt: the (capped) file content, rendered as its
   // own collapsed card. Like edits/command, a read entry stands alone (never folds into a repeat
   // count). Absent pre-restart / for older transcripts → the Read renders as a header-only card.
@@ -482,6 +655,12 @@ interface CollapsedTool {
   sendSummary?: string
   sendBody?: string
   sendType?: string
+  // Set for a SendUserFile (file delivery) call: the SentFilesCard renders the delivered files inline —
+  // `sentImages` are servable cache paths shown as pictures, `sentFiles` non-image basenames as openable
+  // chips, `caption` the label. Stands alone — never folds into a ×N count.
+  sentImages?: string[]
+  sentFiles?: string[]
+  caption?: string
   count: number
 }
 
@@ -495,23 +674,41 @@ function collapseTools(tools: TranscriptMessage["tools"]): CollapsedTool[] {
   for (const t of tools) {
     const last = out[out.length - 1]
     if (t.edit) {
-      if (last && last.edits && last.edits[0].file === t.edit.file) last.edits.push(t.edit)
-      else out.push({ name: t.name, detail: t.detail, edits: [t.edit], count: 1 })
+      const hasResultContext = Boolean(t.input || t.output || t.status || t.exitCode !== undefined)
+      if (last && last.edits && !hasResultContext && !last.input && !last.output && !last.status && last.edits[0].file === t.edit.file) last.edits.push(t.edit)
+      else out.push({ name: t.name, detail: t.detail, edits: [t.edit], input: t.input, output: t.output, status: t.status, backgroundState: t.backgroundState, exitCode: t.exitCode, cwd: t.cwd, sessionId: t.sessionId, durationMs: t.durationMs, count: 1 })
     } else if (t.command) {
-      out.push({ name: t.name, detail: t.detail, command: t.command, desc: t.desc, output: t.output, count: 1 })
+      out.push({ name: t.name, detail: t.detail, command: t.command, desc: t.desc, input: t.input, output: t.output, status: t.status, backgroundState: t.backgroundState, exitCode: t.exitCode, cwd: t.cwd, sessionId: t.sessionId, durationMs: t.durationMs, count: 1 })
     } else if (t.read) {
       // A Read that shipped an excerpt renders as its own expandable card — never folds into a ×N run.
-      out.push({ name: t.name, detail: t.detail, read: t.read, count: 1 })
+      out.push({ name: t.name, detail: t.detail, read: t.read, status: t.status, durationMs: t.durationMs, count: 1 })
     } else if (t.prompt) {
       // An Agent dispatch renders as its own expandable card — never folds into a ×N run.
-      out.push({ name: t.name, detail: t.detail, prompt: t.prompt, subagentType: t.subagentType, agentId: t.agentId, agentStatus: t.agentStatus, agentElapsedMs: t.agentElapsedMs, count: 1 })
+      out.push({ name: t.name, detail: t.detail, prompt: t.prompt, subagentType: t.subagentType, agentId: t.agentId, agentStatus: t.agentStatus, agentElapsedMs: t.agentElapsedMs, output: t.output, status: t.status, durationMs: t.durationMs, count: 1 })
     } else if (t.sendTo !== undefined || t.sendBody !== undefined) {
       // A SendMessage (peer message) renders as its own SendMessageCard — never folds into a ×N run.
-      out.push({ name: t.name, detail: t.detail, sendTo: t.sendTo, sendSummary: t.sendSummary, sendBody: t.sendBody, sendType: t.sendType, count: 1 })
-    } else if (last && !last.edits && !last.command && !last.read && !last.prompt && last.sendTo === undefined && last.sendBody === undefined && last.name === t.name && last.detail === t.detail) {
+      out.push({ name: t.name, detail: t.detail, sendTo: t.sendTo, sendSummary: t.sendSummary, sendBody: t.sendBody, sendType: t.sendType, status: t.status, durationMs: t.durationMs, count: 1 })
+    } else if (t.outputImage) {
+      // A screenshot / image tool result (chrome-devtools `take_screenshot`, an image Read) renders as its
+      // own ToolImageCard showing the picture inline — never folds into a ×N run.
+      out.push({ name: t.name, detail: t.detail, outputImage: t.outputImage, output: t.output, status: t.status, durationMs: t.durationMs, count: 1 })
+    } else if (t.sentImages || t.sentFiles) {
+      // A SendUserFile delivery renders as its own SentFilesCard (images inline + caption) — never folds.
+      out.push({ name: t.name, detail: t.detail, sentImages: t.sentImages, sentFiles: t.sentFiles, caption: t.caption, status: t.status, durationMs: t.durationMs, count: 1 })
+    } else if (t.input || t.output) {
+      out.push({ name: t.name, detail: t.detail, input: t.input, output: t.output, status: t.status, backgroundState: t.backgroundState, exitCode: t.exitCode, cwd: t.cwd, sessionId: t.sessionId, durationMs: t.durationMs, count: 1 })
+    } else if (
+      last &&
+      !last.edits && !last.command && !last.input && !last.output && !last.read && !last.prompt &&
+      !last.outputImage && !last.sentImages && !last.sentFiles &&
+      last.sendTo === undefined && last.sendBody === undefined &&
+      last.name === t.name && last.detail === t.detail &&
+      last.status === t.status && last.backgroundState === t.backgroundState && last.exitCode === t.exitCode && last.cwd === t.cwd &&
+      last.sessionId === t.sessionId && last.durationMs === t.durationMs
+    ) {
       last.count++
     } else {
-      out.push({ name: t.name, detail: t.detail, count: 1 })
+      out.push({ name: t.name, detail: t.detail, status: t.status, backgroundState: t.backgroundState, exitCode: t.exitCode, cwd: t.cwd, sessionId: t.sessionId, durationMs: t.durationMs, count: 1 })
     }
   }
   return out
@@ -546,6 +743,7 @@ const COLLAPSE_AT = 4
 
 function ToolCalls({ tools, dense }: { tools: CollapsedTool[]; dense?: boolean }) {
   const [expanded, setExpanded] = useState(false)
+  const cardsId = useId()
   const total = tools.reduce((n, t) => n + t.count, 0)
   // Dense surfaces (queue cards) condense ANY run of more than one call behind the summary toggle;
   // the full thread view keeps the higher threshold.
@@ -562,13 +760,17 @@ function ToolCalls({ tools, dense }: { tools: CollapsedTool[]; dense?: boolean }
       // RIGHT, flush-left with the tool lines it reveals.
       <button
         key="toggle"
+        type="button"
         onClick={() => setExpanded((v) => !v)}
         onMouseDown={(e) => e.preventDefault()}
-        className="petite-caps flex items-center gap-1 self-start text-[12.5px] leading-6 text-muted/70 outline-none transition-colors hover:text-fg"
+        aria-controls={cardsId}
+        aria-expanded={expanded}
+        aria-label={`${expanded ? "Collapse" : "Expand"} ${total} tool calls`}
+        className={`${TRANSCRIPT_META_LABEL_CLASS} flex items-center gap-1 self-start rounded outline-none transition-colors hover:text-fg focus-visible:ring-1 focus-visible:ring-fg/60`}
       >
         {/* Label stays "N tool calls" in BOTH states — the rotating chevron alone signals open/closed. */}
         <span className="tabular-nums">{total} tool calls</span>
-        <ChevronRight size={12} className={`transition-transform ${expanded ? "rotate-90" : ""}`} />
+        <ChevronRight aria-hidden="true" size={12} className={`relative -top-px shrink-0 transition-transform ${expanded ? "rotate-90" : ""}`} />
       </button>,
     )
   }
@@ -579,25 +781,82 @@ function ToolCalls({ tools, dense }: { tools: CollapsedTool[]; dense?: boolean }
     // full STEP (14px) from surrounding prose. No other spacing values exist inside a tool band.
     const cards = tools.map((t, i) => <ToolCardRouter key={i} t={t} />)
     blocks.push(
-      <div key="cards" className="flex flex-col">
+      <div key="cards" id={collapsible ? cardsId : undefined} className="flex flex-col">
         {withSpacers(cards, 6)}
       </div>,
     )
   }
 
-  return <div className="flex flex-col">{withSpacers(blocks)}</div>
+  return (
+    <div className="flex flex-col">
+      {withSpacers(blocks)}
+      {/* Keep aria-controls resolvable while the expensive card run is not mounted. */}
+      {collapsible && !showItems && <div id={cardsId} hidden />}
+    </div>
+  )
 }
 
 // Route a collapsed tool entry to its card. Edit/Bash/Read/Agent get expandable bodies (chevron);
 // everything else (Grep, Glob, Read-without-excerpt, MCP, Monitor, a pre-restart Bash with no command)
 // is a header-only card. All share the same bordered card family so no call ever reads as bare text.
 function ToolCardRouter({ t }: { t: CollapsedTool }) {
-  if (t.edits) return <DiffBlock edits={t.edits} />
-  if (t.command) return <BashBlock command={t.command} desc={t.desc ?? t.detail} output={t.output} />
-  if (t.read) return <ReadBlock detail={t.detail} read={t.read} />
-  if (t.prompt) return <AgentBlock detail={t.detail} prompt={t.prompt} subagentType={t.subagentType} agentId={t.agentId} agentStatus={t.agentStatus} agentElapsedMs={t.agentElapsedMs} />
-  if (t.sendTo !== undefined || t.sendBody !== undefined) return <SendMessageCard to={t.sendTo} summary={t.sendSummary} body={t.sendBody ?? ""} type={t.sendType} />
-  return <ToolCard name={t.name} detail={t.detail} count={t.count} />
+  const slug = useContext(ThreadSlugContext)
+  const board = useBoard()
+  const thread = slug ? threadBySlug(board, slug) : undefined
+  const liveBackgroundState = liveBackgroundOperationState(t, thread?.bgShells ?? [])
+  if (t.edits && t.status !== "failed" && t.status !== "cancelled") {
+    return <DiffBlock edits={t.edits} meta={<ToolStatusMeta status={t.status} backgroundState={t.backgroundState} liveBackgroundState={liveBackgroundState} exitCode={t.exitCode} durationMs={t.durationMs} />} />
+  }
+  if (t.command) {
+    return <BashBlock command={t.command} desc={t.desc ?? t.detail} output={t.output} status={t.status} backgroundState={t.backgroundState} liveBackgroundState={liveBackgroundState} exitCode={t.exitCode} cwd={t.cwd} sessionId={t.sessionId} durationMs={t.durationMs} />
+  }
+  if (t.read) return <ReadBlock detail={t.detail} read={t.read} status={t.status} durationMs={t.durationMs} />
+  if (t.prompt) return <AgentBlock detail={t.detail} prompt={t.prompt} subagentType={t.subagentType} agentId={t.agentId} agentStatus={t.agentStatus} agentElapsedMs={t.agentElapsedMs} status={t.status} durationMs={t.durationMs} output={t.output} />
+  if (t.sendTo !== undefined || t.sendBody !== undefined) return <SendMessageCard to={t.sendTo} summary={t.sendSummary} body={t.sendBody ?? ""} type={t.sendType} status={t.status} durationMs={t.durationMs} />
+  if (t.outputImage) return <ToolImageCard name={t.name} detail={t.detail} outputImage={t.outputImage} output={t.output} status={t.status} durationMs={t.durationMs} />
+  if (t.sentImages || t.sentFiles) return <SentFilesCard images={t.sentImages ?? []} files={t.sentFiles ?? []} caption={t.caption} status={t.status} durationMs={t.durationMs} />
+  if (t.input || t.output) {
+    return <BashBlock name={t.name} command={t.input ?? ""} desc={t.detail} output={t.output} status={t.status} backgroundState={t.backgroundState} liveBackgroundState={liveBackgroundState} exitCode={t.exitCode} cwd={t.cwd} sessionId={t.sessionId} durationMs={t.durationMs} inputLabel="input" />
+  }
+  return <ToolCard name={t.name} detail={t.detail} count={t.count} status={t.status} backgroundState={t.backgroundState} liveBackgroundState={liveBackgroundState} exitCode={t.exitCode} cwd={t.cwd} sessionId={t.sessionId} durationMs={t.durationMs} />
+}
+
+type ToolStatus = NonNullable<TranscriptToolCall["status"]>
+
+export function ToolStatusMeta({ status, backgroundState, liveBackgroundState, exitCode, durationMs }: { status?: ToolStatus; backgroundState?: TranscriptToolCall["backgroundState"]; liveBackgroundState?: "running" | "stale"; exitCode?: number; durationMs?: number }) {
+  if (!status && durationMs === undefined) return null
+  const label =
+    liveBackgroundState === "running"
+      ? "background running"
+      : liveBackgroundState === "stale"
+        ? "background stale"
+        : status === "pending"
+      ? backgroundState === "unknown"
+        ? "background / unknown"
+        : "running"
+      : status === "failed"
+        ? exitCode !== undefined
+          ? `exit ${exitCode}`
+          : "failed"
+        : status === "cancelled"
+          ? "cancelled"
+          : status === "completed"
+            ? "done"
+            : undefined
+  const duration = durationMs !== undefined ? formatToolDuration(durationMs) : undefined
+  const title = [label, duration].filter(Boolean).join(" · ")
+  const tone = status === "failed" ? "fray-tool-failed" : status === "cancelled" ? "text-amber-400" : "text-muted/55"
+  return (
+    <span className={`petite-caps fray-tool-header-caps flex shrink-0 items-center gap-1 text-[11.5px] leading-none ${tone}`} title={title} aria-label={title}>
+      {(liveBackgroundState === "running" || hasRunningToolIndicator(status, backgroundState)) && <span aria-hidden className="fray-live-dot" data-running-indicator="tool-disclosure" />}
+      <span>{[label, duration].filter(Boolean).join(" · ")}</span>
+    </span>
+  )
+}
+
+function contextualDetail(detail?: string, cwd?: string, sessionId?: string | number): string | undefined {
+  const context = cwd ? `in ${shortenTarget(cwd)}` : sessionId !== undefined && !detail?.includes(String(sessionId)) ? `session ${sessionId}` : undefined
+  return [detail, context].filter(Boolean).join(" · ") || undefined
 }
 
 // A tool detail reads as a file path we can open in the editor when it's a single absolute-path
@@ -614,11 +873,12 @@ function isFilePath(detail: string): boolean {
 // COMMON case pre-restart, so it must be indistinguishable from a real card header. petite-caps label
 // left, repo-relative detail middle (an editor deep-link for a plain absolute path), ×N fold right. No
 // call ever reads as bare `Name(detail)` text again.
-function ToolCard({ name, detail, count }: { name: string; detail?: string; count: number }) {
-  const short = detail ? shortenTarget(detail) : undefined
+function ToolCard({ name, detail, count, status, backgroundState, liveBackgroundState, exitCode, cwd, sessionId, durationMs }: { name: string; detail?: string; count: number; status?: ToolStatus; backgroundState?: TranscriptToolCall["backgroundState"]; liveBackgroundState?: "running" | "stale"; exitCode?: number; cwd?: string; sessionId?: string | number; durationMs?: number }) {
+  const shownDetail = contextualDetail(detail, cwd, sessionId)
+  const short = shownDetail ? shortenTarget(shownDetail) : undefined
   const linkPath = detail && isFilePath(detail) ? detail : undefined
   return (
-    <div className="fray-bash" title={detail}>
+    <div className="fray-bash" title={shownDetail}>
       <div className="fray-bash-header">
         <span className="flex min-w-0 items-center gap-2">
           <span className="petite-caps fray-bash-label shrink-0">{prettyToolName(name)}</span>
@@ -634,7 +894,100 @@ function ToolCard({ name, detail, count }: { name: string; detail?: string; coun
               <span className="min-w-0 truncate text-[11.5px] text-muted">{short}</span>
             ))}
         </span>
-        {count > 1 && <span className="shrink-0 tabular-nums text-[11px] text-muted/45">×{count}</span>}
+        <span className="flex shrink-0 items-center gap-2">
+          <ToolStatusMeta status={status} backgroundState={backgroundState} liveBackgroundState={liveBackgroundState} exitCode={exitCode} durationMs={durationMs} />
+          {count > 1 && <span className="tabular-nums text-[11px] text-muted/45">×{count}</span>}
+        </span>
+      </div>
+    </div>
+  )
+}
+
+// A tool whose result carried an image (chrome-devtools `take_screenshot`, an image Read) rendered as
+// its own card in the Bash/Read family — but OPEN by default, because seeing the screenshot IS the point.
+// The header is the petite-caps tool name + detail + status; the body renders the decoded picture inline
+// via BlockImage (the same gated /local-image treatment as an agent-authored screenshot path in prose),
+// plus any accompanying text result below it. Clicking the header collapses/expands the picture.
+function ToolImageCard({ name, detail, outputImage, output, status, durationMs }: { name: string; detail?: string; outputImage: string; output?: string; status?: ToolStatus; durationMs?: number }) {
+  const [open, setOpen] = useState(true)
+  const bodyId = useId()
+  const short = detail ? shortenTarget(detail) : undefined
+  return (
+    <div className="fray-bash">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        onMouseDown={(e) => e.preventDefault()}
+        aria-controls={bodyId}
+        aria-expanded={open}
+        aria-label={`${open ? "Collapse" : "Expand"} ${prettyToolName(name)} screenshot${short ? `: ${short}` : ""}`}
+        className="fray-bash-header w-full text-left outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-fg/60"
+      >
+        <span className="flex min-w-0 items-center gap-2">
+          <span className="petite-caps fray-bash-label shrink-0">{prettyToolName(name)}</span>
+          {short && <span className="min-w-0 truncate text-[11.5px] text-muted" title={detail}>{short}</span>}
+        </span>
+        <span className="flex shrink-0 items-center gap-2">
+          <ToolStatusMeta status={status} durationMs={durationMs} />
+          <ChevronRight aria-hidden="true" size={12} className={`shrink-0 text-muted transition-transform ${open ? "rotate-90" : ""}`} />
+        </span>
+      </button>
+      <div id={bodyId} hidden={!open}>
+        {open && (
+          <div className="px-2.5 pb-2.5 pt-1.5">
+            <BlockImage path={outputImage} />
+            {output && <pre className="fray-bash-body fray-bash-output-body mt-1.5">{output}</pre>}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// A SendUserFile delivery — the worker surfacing files to the human. Same card family (`fray-bash`) and
+// header as ToolImageCard so it reads as one of the tool cards, but OPEN by default: seeing the delivered
+// images IS the point. Body: images inline (stacked, via the gated /local-image route), non-image files as
+// openable chips (BlockFile → the gated opener), and the `caption` below in muted prose (capped ~65% wide
+// so long captions stay readable against the wide card, not one edge-to-edge line).
+function SentFilesCard({ images, files, caption, status, durationMs }: { images: string[]; files: string[]; caption?: string; status?: ToolStatus; durationMs?: number }) {
+  const [open, setOpen] = useState(true)
+  const bodyId = useId()
+  const summary = [
+    images.length ? `${images.length} image${images.length === 1 ? "" : "s"}` : "",
+    files.length ? `${files.length} file${files.length === 1 ? "" : "s"}` : "",
+  ].filter(Boolean).join(" · ")
+  return (
+    <div className="fray-bash">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        onMouseDown={(e) => e.preventDefault()}
+        aria-controls={bodyId}
+        aria-expanded={open}
+        aria-label={`${open ? "Collapse" : "Expand"} files sent to you${summary ? `: ${summary}` : ""}`}
+        className="fray-bash-header w-full text-left outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-fg/60"
+      >
+        <span className="flex min-w-0 items-center gap-2">
+          <span className="petite-caps fray-bash-label shrink-0">Sent to you</span>
+          {summary && <span className="min-w-0 truncate text-[11.5px] text-muted">{summary}</span>}
+        </span>
+        <span className="flex shrink-0 items-center gap-2">
+          <ToolStatusMeta status={status} durationMs={durationMs} />
+          <ChevronRight aria-hidden="true" size={12} className={`shrink-0 text-muted transition-transform ${open ? "rotate-90" : ""}`} />
+        </span>
+      </button>
+      <div id={bodyId} hidden={!open}>
+        {open && (
+          <div className="flex flex-col gap-1.5 px-2.5 pb-2.5 pt-1.5">
+            {images.map((path, i) => <BlockImage key={`i${i}`} path={path} hideCaption altText={caption ?? "delivered image"} />)}
+            {files.length > 0 && (
+              <div className="flex flex-wrap gap-1.5">
+                {files.map((f, i) => <BlockFile key={`f${i}`} path={f} />)}
+              </div>
+            )}
+            {caption && <div className="max-w-[65%] text-[12px] leading-snug text-muted">{caption}</div>}
+          </div>
+        )}
       </div>
     </div>
   )
@@ -645,44 +998,84 @@ function ToolCard({ name, detail, count }: { name: string; detail?: string; coun
 // the header reveals the raw command in mono — pre-wrapped so long lines wrap (wide unbreakable
 // content scrolls INSIDE the block, never the page). Past ~16 lines the open body clamps too.
 const BASH_MAX_LINES = 16
-function BashBlock({ command, desc, output }: { command: string; desc?: string; output?: string }) {
+function BashBlock({
+  command,
+  desc,
+  output,
+  name = "Bash",
+  status,
+  backgroundState,
+  liveBackgroundState,
+  exitCode,
+  cwd,
+  sessionId,
+  durationMs,
+  inputLabel,
+}: {
+  command: string
+  desc?: string
+  output?: string
+  name?: string
+  status?: ToolStatus
+  backgroundState?: TranscriptToolCall["backgroundState"]
+  liveBackgroundState?: "running" | "stale"
+  exitCode?: number
+  cwd?: string
+  sessionId?: string | number
+  durationMs?: number
+  inputLabel?: string
+}) {
   const [open, setOpen] = useState(false)
   const [expanded, setExpanded] = useState(false)
   const [outExpanded, setOutExpanded] = useState(false)
+  const bodyId = useId()
   const lineCount = useMemo(() => command.split("\n").length, [command])
   const long = lineCount > BASH_MAX_LINES
   // Codex ships the command's stdout/stderr in the same rollout (Claude doesn't), so a codex Bash card
   // carries an `output` pane below the command — clamped + independently expandable like the command.
   const outLineCount = useMemo(() => (output ? output.split("\n").length : 0), [output])
   const outLong = outLineCount > BASH_MAX_LINES
+  const shownDesc = contextualDetail(desc, cwd, sessionId)
+  const expandable = Boolean(command || output)
   return (
     <div className="fray-bash">
       <button
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => expandable && setOpen((v) => !v)}
         onMouseDown={(e) => e.preventDefault()}
-        className="fray-bash-header w-full text-left"
+        aria-controls={expandable ? bodyId : undefined}
+        aria-expanded={expandable ? open : undefined}
+        aria-label={`${expandable ? `${open ? "Collapse" : "Expand"} ` : ""}${prettyToolName(name)}${shownDesc ? `: ${shownDesc}` : ""}`}
+        className="fray-bash-header w-full text-left outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-fg/60"
       >
         <span className="flex min-w-0 items-center gap-2">
-          <span className="petite-caps fray-bash-label shrink-0">Bash</span>
-          <span className="min-w-0 truncate text-[11.5px] text-muted">{desc ?? ""}</span>
+          <span className="petite-caps fray-bash-label shrink-0">{prettyToolName(name)}</span>
+          <span className="min-w-0 truncate text-[11.5px] text-muted" title={shownDesc}>{shownDesc ?? ""}</span>
         </span>
-        <ChevronRight size={12} className={`shrink-0 text-muted transition-transform ${open ? "rotate-90" : ""}`} />
+        <span className="flex shrink-0 items-center gap-2">
+          <ToolStatusMeta status={status} backgroundState={backgroundState} liveBackgroundState={liveBackgroundState} exitCode={exitCode} durationMs={durationMs} />
+          {expandable && <ChevronRight aria-hidden="true" size={12} className={`shrink-0 text-muted transition-transform ${open ? "rotate-90" : ""}`} />}
+        </span>
       </button>
-      {open && (
-        <>
-          <pre className={`fray-bash-body${long && !expanded ? " fray-bash-clamp" : ""}`}>{command}</pre>
-          {long && (
-            <button
-              type="button"
-              onClick={() => setExpanded((v) => !v)}
-              onMouseDown={(e) => e.preventDefault()}
-              className="fray-bash-expand petite-caps px-2.5 pb-1.5"
-            >
-              {expanded ? "Collapse" : `Show all ${lineCount} lines`}
-            </button>
+      {expandable && (
+        <div id={bodyId} hidden={!open}>
+          {open && command && (
+            <>
+              {inputLabel && <div className="fray-bash-output-label petite-caps">{inputLabel}</div>}
+              <pre className={`fray-bash-body${inputLabel ? " fray-bash-output-body" : ""}${long && !expanded ? " fray-bash-clamp" : ""}`}>{command}</pre>
+              {long && (
+                <button
+                  type="button"
+                  onClick={() => setExpanded((v) => !v)}
+                  onMouseDown={(e) => e.preventDefault()}
+                  className="fray-bash-expand petite-caps px-2.5 pb-1.5"
+                >
+                  {expanded ? "Collapse" : `Show all ${lineCount} lines`}
+                </button>
+              )}
+            </>
           )}
-          {output && (
+          {open && output && (
             <>
               <div className="fray-bash-output-label petite-caps">output</div>
               <pre className={`fray-bash-body fray-bash-output-body${outLong && !outExpanded ? " fray-bash-clamp" : ""}`}>{output}</pre>
@@ -698,7 +1091,7 @@ function BashBlock({ command, desc, output }: { command: string; desc?: string; 
               )}
             </>
           )}
-        </>
+        </div>
       )}
     </div>
   )
@@ -710,52 +1103,53 @@ function BashBlock({ command, desc, output }: { command: string; desc?: string; 
 // in mono, with the same clamp + "Show all N lines" affordance as a long Bash body. Reuses the
 // fray-bash card classes so Bash / Edit / Read read as one system.
 const READ_MAX_LINES = 16
-function ReadBlock({ detail, read }: { detail?: string; read: string }) {
+function ReadBlock({ detail, read, status, durationMs }: { detail?: string; read: string; status?: ToolStatus; durationMs?: number }) {
   const [open, setOpen] = useState(false)
   const [expanded, setExpanded] = useState(false)
+  const bodyId = useId()
   const lineCount = useMemo(() => read.split("\n").length, [read])
   const long = lineCount > READ_MAX_LINES
   const short = detail ? shortenTarget(detail) : undefined
   const linkPath = detail && isFilePath(detail) ? detail : undefined
   return (
     <div className="fray-bash">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        onMouseDown={(e) => e.preventDefault()}
-        className="fray-bash-header w-full text-left"
+      <ToolDisclosureHeader
+        className="fray-bash-header"
+        controls={bodyId}
+        expanded={open}
+        label={`${open ? "Collapse" : "Expand"} Read${detail ? `: ${detail}` : ""}`}
+        onToggle={() => setOpen((v) => !v)}
+        meta={<ToolStatusMeta status={status} durationMs={durationMs} />}
       >
-        <span className="flex min-w-0 items-center gap-2">
-          <span className="petite-caps fray-bash-label shrink-0">Read</span>
-          {short &&
-            (linkPath ? (
-              // The path link swallows its own click so opening the file doesn't also toggle the card.
-              <span className="min-w-0 truncate" onClick={(e) => e.stopPropagation()}>
-                <PathLink path={linkPath} className="text-[11.5px] text-muted">
-                  {short}
-                </PathLink>
-              </span>
-            ) : (
-              <span className="min-w-0 truncate text-[11.5px] text-muted">{short}</span>
-            ))}
-        </span>
-        <ChevronRight size={12} className={`shrink-0 text-muted transition-transform ${open ? "rotate-90" : ""}`} />
-      </button>
-      {open && (
-        <>
-          <pre className={`fray-bash-body${long && !expanded ? " fray-bash-clamp" : ""}`}>{read}</pre>
-          {long && (
-            <button
-              type="button"
-              onClick={() => setExpanded((v) => !v)}
-              onMouseDown={(e) => e.preventDefault()}
-              className="fray-bash-expand petite-caps px-2.5 pb-1.5"
-            >
-              {expanded ? "Collapse" : `Show all ${lineCount} lines`}
-            </button>
-          )}
-        </>
-      )}
+        <span className="petite-caps fray-bash-label shrink-0">Read</span>
+        {short &&
+          (linkPath ? (
+            <span className="min-w-0 truncate">
+              <PathLink path={linkPath} className="text-[11.5px] text-muted">
+                {short}
+              </PathLink>
+            </span>
+          ) : (
+            <span className="min-w-0 truncate text-[11.5px] text-muted">{short}</span>
+          ))}
+      </ToolDisclosureHeader>
+      <div id={bodyId} hidden={!open}>
+        {open && (
+          <>
+            <pre className={`fray-bash-body${long && !expanded ? " fray-bash-clamp" : ""}`}>{read}</pre>
+            {long && (
+              <button
+                type="button"
+                onClick={() => setExpanded((v) => !v)}
+                onMouseDown={(e) => e.preventDefault()}
+                className="fray-bash-expand petite-caps px-2.5 pb-1.5"
+              >
+                {expanded ? "Collapse" : `Show all ${lineCount} lines`}
+              </button>
+            )}
+          </>
+        )}
+      </div>
     </div>
   )
 }
@@ -767,14 +1161,20 @@ function ReadBlock({ detail, read }: { detail?: string; read: string }) {
 // sub-agent's own transcript in a new drawer — for LIVE and COMPLETED children alike (the drawer
 // resolves both; an aged-out one degrades to "unavailable"). The header also carries the child's state
 // — "running Nm" (+ a spinner) while live, or "finished 35m" / "failed 12m" once completed.
+// Exported for operation-indicators-fixture.tsx: the agent row is the one card family with TWO
+// independent status sources (its own stateLabel + the shared meta slot), so it needs live fixture
+// coverage — the double-indicator bug shipped precisely because the fixture skipped it.
 const AGENT_MAX_LINES = 16
-function AgentBlock({
+export function AgentBlock({
   detail,
   prompt,
   subagentType,
   agentId,
   agentStatus,
   agentElapsedMs,
+  status,
+  durationMs,
+  output,
 }: {
   detail?: string
   prompt: string
@@ -782,9 +1182,13 @@ function AgentBlock({
   agentId?: string
   agentStatus?: "completed" | "failed" | "killed"
   agentElapsedMs?: number
+  status?: ToolStatus
+  durationMs?: number
+  output?: string
 }) {
   const [open, setOpen] = useState(false)
   const [expanded, setExpanded] = useState(false)
+  const bodyId = useId()
   const lineCount = useMemo(() => prompt.split("\n").length, [prompt])
   const long = lineCount > AGENT_MAX_LINES
   const slug = useContext(ThreadSlugContext)
@@ -809,6 +1213,13 @@ function AgentBlock({
     stateLabel = live.state === "stale" ? "stale" : `running${e ? ` ${e}` : ""}`
   }
 
+  // ONE running indicator per row (maintainer 2026-07-18). Whenever a live/completed child resolves,
+  // stateLabel above already IS this row's status and carries its own dot — and "running 3 min" is
+  // strictly richer than ToolStatusMeta's generic "running", so the meta badge would be a second,
+  // duller copy of the same fact. The meta slot stays the ONLY status surface for the remaining case:
+  // a dispatch with no child record at all, where a terminal status/duration must still render.
+  const showStatusMeta = !live && !agentStatus
+
   function openDrawer() {
     if (!slug || !agentId) return
     pushSubAgentDrawer(slug, agentId, { label: title, subagentType, startedAt: live?.startedAt })
@@ -816,51 +1227,55 @@ function AgentBlock({
 
   return (
     <div className="fray-bash">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        onMouseDown={(e) => e.preventDefault()}
-        className="fray-bash-header w-full text-left"
+      <ToolDisclosureHeader
+        className="fray-bash-header"
+        controls={bodyId}
+        expanded={open}
+        label={`${open ? "Collapse" : "Expand"} Agent prompt: ${title}`}
+        onToggle={() => setOpen((v) => !v)}
+        meta={showStatusMeta && <ToolStatusMeta status={status} durationMs={durationMs} />}
       >
-        <span className="flex min-w-0 items-center gap-2">
-          <span className="petite-caps fray-bash-label shrink-0">Agent</span>
-          {canDrill ? (
-            // The description IS the drawer link (PathLink hover treatment). stopPropagation so opening
-            // the sub-agent doesn't also toggle the prompt body.
-            <span
-              role="button"
-              tabIndex={0}
-              title="Open sub-agent transcript"
-              onClick={(e) => { e.stopPropagation(); openDrawer() }}
-              onMouseDown={(e) => e.stopPropagation()}
-              className="min-w-0 truncate text-[11.5px] text-muted cursor-pointer hover:underline hover:text-fg/80"
-            >
-              {title}
-            </span>
-          ) : (
-            <span className="min-w-0 truncate text-[11.5px] text-muted">{title}</span>
-          )}
-          {subagentType && <span className="shrink-0 font-mono-keep text-[11px] text-muted/45">[{subagentType}]</span>}
-          {stateLabel && <span className="shrink-0 text-[11px] text-muted/55 whitespace-nowrap">{stateLabel}</span>}
-          {running && <LiveSpinner />}
-        </span>
-        <ChevronRight size={12} className={`shrink-0 text-muted transition-transform ${open ? "rotate-90" : ""}`} />
-      </button>
-      {open && (
-        <>
-          <pre className={`fray-bash-body${long && !expanded ? " fray-bash-clamp" : ""}`}>{prompt}</pre>
-          {long && (
-            <button
-              type="button"
-              onClick={() => setExpanded((v) => !v)}
-              onMouseDown={(e) => e.preventDefault()}
-              className="fray-bash-expand petite-caps px-2.5 pb-1.5"
-            >
-              {expanded ? "Collapse" : `Show all ${lineCount} lines`}
-            </button>
-          )}
-        </>
-      )}
+        <span className="petite-caps fray-bash-label shrink-0">Agent</span>
+        {canDrill ? (
+          <button
+            type="button"
+            aria-label={`Open sub-agent transcript: ${title}`}
+            title="Open sub-agent transcript"
+            onClick={openDrawer}
+            className="min-w-[4rem] flex-1 truncate text-left text-[11.5px] text-muted outline-none hover:underline hover:text-fg/80 focus-visible:underline focus-visible:text-fg/80"
+          >
+            {title}
+          </button>
+        ) : (
+          <span className="min-w-[4rem] flex-1 truncate text-[11.5px] text-muted">{title}</span>
+        )}
+        {subagentType && <span className="min-w-0 max-w-[9rem] truncate font-mono-keep text-[11px] text-muted/45">[{subagentType}]</span>}
+        {stateLabel && <span className="shrink-0 text-[11px] text-muted/55 whitespace-nowrap">{stateLabel}</span>}
+        {running && <span aria-hidden className="fray-live-dot" data-running-indicator="subagent-disclosure" />}
+      </ToolDisclosureHeader>
+      <div id={bodyId} hidden={!open}>
+        {open && (
+          <>
+            <pre className={`fray-bash-body${long && !expanded ? " fray-bash-clamp" : ""}`}>{prompt}</pre>
+            {long && (
+              <button
+                type="button"
+                onClick={() => setExpanded((v) => !v)}
+                onMouseDown={(e) => e.preventDefault()}
+                className="fray-bash-expand petite-caps px-2.5 pb-1.5"
+              >
+                {expanded ? "Collapse" : `Show all ${lineCount} lines`}
+              </button>
+            )}
+            {output && (
+              <>
+                <div className="fray-bash-output-label petite-caps">output</div>
+                <pre className="fray-bash-body fray-bash-output-body">{output}</pre>
+              </>
+            )}
+          </>
+        )}
+      </div>
     </div>
   )
 }
@@ -875,10 +1290,11 @@ function AgentBlock({
 // AgentBlock: COLLAPSED when a summary already conveys the gist, OPEN when there's no summary so a
 // bodied message isn't hidden behind a chevron showing nothing but the recipient.
 const SEND_MAX_LINES = 16
-function SendMessageCard({ to, summary, body, type }: { to?: string; summary?: string; body: string; type?: string }) {
+function SendMessageCard({ to, summary, body, type, status, durationMs }: { to?: string; summary?: string; body: string; type?: string; status?: ToolStatus; durationMs?: number }) {
   const isShutdown = type === "shutdown_request"
   const [open, setOpen] = useState(!summary)
   const [expanded, setExpanded] = useState(false)
+  const bodyId = useId()
   const html = useMemo(() => mdToHtml(body), [body])
   const lineCount = useMemo(() => body.split("\n").length, [body])
   const long = lineCount > SEND_MAX_LINES
@@ -890,7 +1306,10 @@ function SendMessageCard({ to, summary, body, type }: { to?: string; summary?: s
         type="button"
         onClick={() => setOpen((v) => !v)}
         onMouseDown={(e) => e.preventDefault()}
-        className="fray-bash-header w-full text-left"
+        aria-controls={hasBody ? bodyId : undefined}
+        aria-expanded={hasBody ? open : undefined}
+        aria-label={`${hasBody ? `${open ? "Collapse" : "Expand"} ` : ""}${label}${to ? ` to ${to}` : ""}`}
+        className="fray-bash-header w-full text-left outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-fg/60"
         disabled={!hasBody}
       >
         <span className="flex min-w-0 items-center gap-2">
@@ -898,28 +1317,147 @@ function SendMessageCard({ to, summary, body, type }: { to?: string; summary?: s
           {to && <span className="shrink-0 whitespace-nowrap text-[11.5px] text-fg/75">→ {to}</span>}
           {summary && <span className="min-w-0 truncate text-[11.5px] text-muted">{summary}</span>}
         </span>
-        {hasBody && <ChevronRight size={12} className={`shrink-0 text-muted transition-transform ${open ? "rotate-90" : ""}`} />}
+        <span className="flex shrink-0 items-center gap-2">
+          <ToolStatusMeta status={status} durationMs={durationMs} />
+          {hasBody && <ChevronRight aria-hidden="true" size={12} className={`shrink-0 text-muted transition-transform ${open ? "rotate-90" : ""}`} />}
+        </span>
       </button>
-      {open && hasBody && (
-        <>
-          {/* Quiet indented body: the border-top + 10px/8px padding mirror .fray-bash-body, but the
-              content is MARKDOWN (md-body — sans, 14px) so a peer message reads like prose, not a code
-              dump. The clamp caps a long body at ~320px until "Show all" expands it. */}
-          <div className={`border-t border-border px-2.5 py-2${long && !expanded ? " fray-bash-clamp" : ""}`}>
-            <div className="md-body" dangerouslySetInnerHTML={{ __html: html }} />
-          </div>
-          {long && (
-            <button
-              type="button"
-              onClick={() => setExpanded((v) => !v)}
-              onMouseDown={(e) => e.preventDefault()}
-              className="fray-bash-expand petite-caps px-2.5 pb-1.5"
-            >
-              {expanded ? "Collapse" : `Show all ${lineCount} lines`}
-            </button>
+      {hasBody && (
+        <div id={bodyId} hidden={!open}>
+          {open && (
+            <>
+              {/* Quiet indented body: the border-top + 10px/8px padding mirror .fray-bash-body, but the
+                  content is MARKDOWN (md-body — sans, 14px) so a peer message reads like prose, not a code
+                  dump. The clamp caps a long body at ~320px until "Show all" expands it. */}
+              <div className={`border-t border-border px-2.5 py-2${long && !expanded ? " fray-bash-clamp" : ""}`}>
+                <div className="md-body" dangerouslySetInnerHTML={{ __html: html }} />
+              </div>
+              {long && (
+                <button
+                  type="button"
+                  onClick={() => setExpanded((v) => !v)}
+                  onMouseDown={(e) => e.preventDefault()}
+                  className="fray-bash-expand petite-caps px-2.5 pb-1.5"
+                >
+                  {expanded ? "Collapse" : `Show all ${lineCount} lines`}
+                </button>
+              )}
+            </>
           )}
-        </>
+        </div>
       )}
+    </div>
+  )
+}
+
+// The most-recent user message, PINNED to the top of the scroll pane — a persistent reminder of the
+// human's latest ask while the agent's (often long) reply scrolls beneath it. Both surfaces render
+// the SAME user bubble (Message, role="user") inside this so they match by construction.
+//   • The wrapper is TRANSPARENT — the bubble simply FLOATS at the top. Everything else in the scroll
+//     pane (agent prose, tool cards) passes BEHIND it and stays visible to the LEFT of the bubble and
+//     ABOVE it (in the `pt-3` gap). Only `z-[9]` keeps it above the scrolling content, never masking it.
+//   • `pt-3` keeps the rounded bubble off the pane's top edge (flush rounded corners read as broken)
+//     and leaves a gap the transcript scrolls through above the floating bubble.
+//   • `max-h` + `overflow-y-auto`: a user message taller than the pane scrolls WITHIN the bubble instead
+//     of swallowing the whole viewport.
+//   • `flex flex-col` re-establishes the column so Message's `self-end` bubble stays right-aligned; the
+//     full-width transparent wrapper leaves the left region clear for content to show through.
+//   • `pointer-events-none` on the wrapper + `pointer-events-auto` on the bubble: the transparent
+//     full-width strip must NOT eat clicks/wheel over the content it floats above (to its left), while
+//     the bubble stays selectable and a tall bubble scrolls internally.
+// `stickyTopPx` offsets the stick point below the queue card's OWN sticky header (measured, since the
+// header height is dynamic); the drawer omits it and sticks flush at the scroll container's top.
+// `sourceId` mirrors data-transcript-source-id onto THIS node (the queue card keys its pagination
+// anchors off it) while data-transcript-sticky tells captureTranscriptViewportAnchor to skip it — a
+// pinned band has an invariant top and must never be chosen as the load-earlier scroll anchor.
+// The positioning wrapper only: sticks the floating bubble to the pane top. The HEIGHT/collapse (the
+// ~200px cap, the bottom text-fade, and hover-to-expand) live on the bubble itself (UserBubble, driven
+// by the `sticky` prop on Message) so the collapsed card stays fully rounded — a wrapper clip can't.
+export function StickyUserBand({ children, stickyTopPx, sourceId }: { children: ReactNode; stickyTopPx?: number; sourceId?: string }) {
+  const offset = stickyTopPx !== undefined
+  return (
+    <div
+      data-transcript-source-id={sourceId}
+      data-transcript-sticky="true"
+      style={offset ? ({ "--sticky-user-top": `${stickyTopPx}px` } as CSSProperties) : undefined}
+      className={`pointer-events-none [&>*]:pointer-events-auto sticky z-[9] flex flex-col pt-3 pb-1.5 ${
+        offset
+          ? "top-[var(--sticky-user-top)] max-[800px]:top-[calc(var(--sticky-user-top)_+_2.5rem)]"
+          : "top-0"
+      }`}
+    >
+      {children}
+    </div>
+  )
+}
+
+// The user chat bubble, right-justified. When `sticky` (the pinned most-recent ask), it COLLAPSES: a
+// fully-rounded ~200px card whose text FADES into the bubble colour near the bottom (no hard clip, no
+// ellipsis) with a soft "there's more" cue; hovering expands it to the full message (up to 85vh, then
+// it scrolls) and leaving re-collapses. Non-sticky (every historical bubble) is the plain, uncapped
+// bubble, unchanged. Its own component so the sticky hover/measure hooks stay out of memoized Message.
+function UserBubble({ text, queued, sticky }: { text: string; queued?: boolean; sticky?: boolean }) {
+  const ref = useRef<HTMLDivElement>(null)
+  const [expanded, setExpanded] = useState(false)
+  const [overflows, setOverflows] = useState(false)
+  // Whether the FULL message is taller than the expanded cap (85vh) — the ONLY case that genuinely
+  // needs a scrollbar. Everything shorter expands to fit, so it stays `overflow-hidden` even when
+  // expanded: no scrollbar ever appears (not even transiently mid-animation), so no reflow. (A real
+  // scrollbar, in the exceeds-cap case, rides a reserved gutter — see scrollbar-gutter in styles.css.)
+  const [exceedsCap, setExceedsCap] = useState(false)
+  // Scrolling is enabled only AFTER the expand animation finishes. During the grow, the bubble stays
+  // `overflow-hidden` — otherwise it's a live scroll container whose content scrolls as it resizes
+  // (the reported "card contents scroll during expansion" bug). transitionend flips this on.
+  const [scrollReady, setScrollReady] = useState(false)
+  // Measure the real content height so max-height animates BOTH ways smoothly (a bare 200px↔85vh
+  // transition visibly lags on collapse) and so the fade shows ONLY when the text actually overflows.
+  const [maxH, setMaxH] = useState<string | null>(null)
+  const measure = useCallback(() => {
+    const el = ref.current
+    if (!sticky || !el) { setMaxH(null); setOverflows(false); setExceedsCap(false); return }
+    const cap = Math.round((typeof window === "undefined" ? 800 : window.innerHeight) * 0.85)
+    setOverflows(el.scrollHeight > 205)
+    setExceedsCap(el.scrollHeight > cap)
+    setMaxH(expanded ? `${Math.min(el.scrollHeight, cap)}px` : "200px")
+  }, [sticky, expanded])
+  useLayoutEffect(() => { measure() }, [measure, text])
+  // Re-measure on viewport resize so the 85vh cap / exceedsCap gate never go stale under a window resize.
+  useEffect(() => {
+    if (typeof window === "undefined") return
+    const onResize = () => measure()
+    window.addEventListener("resize", onResize)
+    return () => window.removeEventListener("resize", onResize)
+  }, [measure])
+  const collapsed = sticky === true && !expanded
+  // Scroll ONLY when expanded, over the cap, AND the expand animation has settled.
+  const scrollable = sticky === true && expanded && exceedsCap && scrollReady
+  return (
+    <div className="self-end flex flex-col items-end gap-0.5 max-w-[85%]">
+      {/* OFF-WHITE bubble, BLACK text — the human's words POP against the dark page + agent prose. bg-user-bubble
+          is a tick less white than bg-fg so it reads as a card. whitespace-pre-wrap is load-bearing: user text
+          is verbatim, so its line breaks must survive. */}
+      <div
+        ref={ref}
+        onMouseEnter={sticky ? () => setExpanded(true) : undefined}
+        onMouseLeave={sticky ? () => { setExpanded(false); setScrollReady(false) } : undefined}
+        onTransitionEnd={sticky ? (e) => { if (e.propertyName === "max-height" && expanded && exceedsCap) setScrollReady(true) } : undefined}
+        // While NOT scrollable (collapsed, or expanding before it settles) the bubble is `overflow-hidden`
+        // and so lacks the scrollbar-gutter the scrollable state reserves — a 7px text shift when scroll
+        // turns on. Reserve the SAME width (`--sbw`, the app's scrollbar width) here so the text width is
+        // identical across every state: zero reflow even for over-cap messages.
+        style={{
+          ...(maxH ? { maxHeight: maxH } : {}),
+          ...(sticky && exceedsCap && !scrollable ? { paddingRight: "calc(0.875rem + var(--sbw))" } : {}),
+        }}
+        className={`relative rounded-2xl rounded-br-sm bg-user-bubble px-3.5 py-2 text-[14px] whitespace-pre-wrap [overflow-wrap:anywhere] text-bg ${queued ? "opacity-50" : ""} ${sticky ? `transition-[max-height] duration-200 ease-out ${scrollable ? "overflow-y-auto" : "overflow-hidden"}` : ""}`}
+      >
+        {text}
+        {/* Fade the last ~2.5rem of text into the bubble colour — keeps the box fully rounded + opaque
+            (no hard cut, no ellipsis). Only while collapsed AND actually overflowing. */}
+        {collapsed && overflows && (
+          <div className="pointer-events-none absolute inset-x-0 bottom-0 h-10 bg-gradient-to-t from-user-bubble to-transparent" />
+        )}
+      </div>
     </div>
   )
 }
@@ -941,13 +1479,15 @@ function SendMessageCard({ to, summary, body, type }: { to?: string; summary?: s
 // a per-message component deliberately doesn't get). Memo-friendly by construction: it's null (a stable
 // primitive) for every ordinary message, so only actual answers-messages ever see a prop change.
 // undefined (a consumer that doesn't precompute, e.g. the sub-agent sheet) → internal unpaired fallback.
-// `onArchive` (ChatView-only, passed to the FINAL message of an archivable session thread) surfaces
-// the Archive button on a ```done fence card; undefined everywhere else (historical fences, the queue
-// card, the sub-agent sheet) → the same card renders sans button.
-export const Message = memo(function Message({ m, answering, dense, paired, onArchive }: { m: ChatMessage; answering?: MessageAnswering; dense?: boolean; paired?: PairedAnswer[] | null; onArchive?: () => void }) {
+// Lifecycle controls never belong to a transcript message: every Done card stays presentation-only,
+// while the owning thread surface renders one stable footer.
+export const Message = memo(function Message({ m, answering, dense, paired, sticky, textOnly, showSendButton }: { m: ChatMessage; answering?: MessageAnswering; dense?: boolean; paired?: PairedAnswer[] | null; sticky?: boolean; textOnly?: boolean; showSendButton?: boolean }) {
   // An event line (a sub-agent completion) is transcript PUNCTUATION — a quiet full-width line, not a
   // bubble or a tool band. Rendered before the role branches (its role field is nominal).
-  if (m.kind === "event") return <EventLine text={m.text} />
+  if (m.kind === "event") return <EventLine text={m.text} boundary={m.boundary} />
+  // A model-reasoning summary (Codex) — quiet punctuation like an event line, but CLICKABLE to expand
+  // the full reasoning. Rendered before the role branches (its role field is nominal, like an event).
+  if (m.kind === "reasoning") return <ReasoningBlock text={m.text} durationMs={m.durationMs} />
   // User messages: right-justified chat bubble; agent output stays left-aligned prose. A follow-up
   // that's been sent but not yet echoed by the transcript shows as a grayed-out bubble — the dimming
   // alone signals queued (a "queued" tag under the bubble caused layout shift when it cleared).
@@ -955,23 +1495,13 @@ export const Message = memo(function Message({ m, answering, dense, paired, onAr
     // CR/CRLF → LF: a terminal-injected follow-up round-trips carriage-return-separated, and the pre-wrap
     // bubble honors \n but not a lone \r → the breaks collapse into a run-on. Normalize for BOTH render
     // paths (the server does this too, but this is the definitive per-surface guarantee for user text).
-    const text = m.text.replace(/\r\n?/g, "\n")
+    const text = messagePresentationText(m).replace(/\r\n?/g, "\n")
     // OUR OWN composed multi-block answer ("Answers:\n1. …\n2. …", from useLiveAnswering.sendAnswers)
     // renders as a structured answers card echoing the question component — not a flat run-on bubble.
     // Non-matching text (and a parse hiccup → null) falls back to the plain bubble; text is never lost.
     const answers = paired !== undefined ? paired : parseAnswersMessage(text)
     if (answers) return <AnswersCard answers={answers} queued={m.queued} />
-    return (
-      <div className="self-end flex flex-col items-end gap-0.5 max-w-[85%]">
-        {/* WHITE bubble, BLACK text — the human's words POP against the dark page + agent prose
-            (maintainer-settled: consistency, and the ONE component both the chat drawer and the queue
-            cards render, so they match by construction). 14px to match the assistant prose (.md-body).
-            whitespace-pre-wrap is load-bearing: user text is verbatim, so its line breaks must survive. */}
-        <div className={`rounded-2xl rounded-br-sm bg-fg px-3.5 py-2 text-[14px] whitespace-pre-wrap text-bg ${m.queued ? "opacity-50" : ""}`}>
-          {text}
-        </div>
-      </div>
-    )
+    return <UserBubble text={text} queued={m.queued} sticky={sticky} />
   }
 
   // Build ONE ordered list of block-level children, then interleave with explicit spacers. The
@@ -995,15 +1525,19 @@ export const Message = memo(function Message({ m, answering, dense, paired, onAr
             body={fseg.body}
             hints={fseg.hints}
             wrap={dense}
-            onArchive={fseg.fenceKind === "done" ? onArchive : undefined}
           />,
         )
         continue
       }
       for (const [si, seg] of splitQuestionBlocks(fseg.text).entries()) {
         if (seg.kind === "prose") {
-          for (const [j, p] of splitProseImages(seg.text).entries()) {
-            blocks.push(p.kind === "image" ? <BlockImage key={`${keyBase}-${fi}-p${si}-${j}`} path={p.path} /> : <ProseHtml key={`${keyBase}-${fi}-p${si}-${j}`} md={p.text} wrap={dense} />)
+          for (const [j, p] of splitProseAttachments(seg.text).entries()) {
+            const partKey = `${keyBase}-${fi}-p${si}-${j}`
+            blocks.push(
+              p.kind === "image" ? <BlockImage key={partKey} path={p.path} />
+              : p.kind === "file" ? <BlockFile key={partKey} path={p.path} />
+              : <ProseHtml key={partKey} md={p.text} wrap={dense} />,
+            )
           }
           continue
         }
@@ -1028,6 +1562,9 @@ export const Message = memo(function Message({ m, answering, dense, paired, onAr
     // its prose + question cards.
     m.parts.forEach((part, pi) => {
       if (part.kind === "tools") {
+        // textOnly (the queue card's first/last agent message): the batched tool band is dropped so only
+        // the agent's prose remains — its calls live inside the collapsed intermediate bar instead.
+        if (textOnly) return
         const collapsed = collapseTools(part.tools)
         if (collapsed.length) blocks.push(<ToolCalls key={`t${pi}`} tools={collapsed} dense={dense} />)
       } else {
@@ -1037,14 +1574,36 @@ export const Message = memo(function Message({ m, answering, dense, paired, onAr
   } else {
     // LEGACY fallback (a pre-restart server ships no `parts`): the old flat layout — tool band first,
     // then all prose. Degrades to today's (order-lossy) rendering until the server bounce.
-    const collapsed = collapseTools(m.tools)
-    if (collapsed.length > 0) blocks.push(<ToolCalls key="tools" tools={collapsed} dense={dense} />)
+    if (!textOnly) {
+      const collapsed = collapseTools(m.tools)
+      if (collapsed.length > 0) blocks.push(<ToolCalls key="tools" tools={collapsed} dense={dense} />)
+    }
     renderText(m.text, "leg")
   }
 
   // An assistant turn that produced no renderable block (empty/whitespace-only) contributes NOTHING —
   // a bare <div> would still take a slot in the parent's gap stack and double the surrounding gap.
   if (blocks.length === 0) return null
+  // The per-message Send button sits at the bottom of THIS message, scoped to just its own question
+  // block(s) (answering.onSubmit → sendAnswers(thisMessageIdentity)). `answering` is present only for a
+  // message that still carries an open ask, so the button only appears where there's something to send;
+  // the queue card leaves showSendButton unset (it owns a single card-level Send instead).
+  if (showSendButton && answering) {
+    blocks.push(
+      <div key="send-answers" className="flex justify-end">
+        <button
+          type="button"
+          data-send-answers
+          disabled={!answering.anyAnswered || answering.sending}
+          onClick={answering.onSubmit}
+          onMouseDown={(e) => e.preventDefault()}
+          className="rounded-md bg-fg px-3 py-1.5 text-[12px] font-medium text-bg outline-none transition-all hover:opacity-90 active:scale-95 disabled:opacity-30 disabled:hover:opacity-30"
+        >
+          Send answers
+        </button>
+      </div>,
+    )
+  }
   // No gap on the container — between-block spacing is entirely the explicit VSpace elements.
   return <div className="flex flex-col text-[13px] min-w-0">{withSpacers(blocks)}</div>
 })
@@ -1082,7 +1641,10 @@ function AnswersCard({ answers, queued }: { answers: PairedAnswer[]; queued?: bo
                 <span className={`mt-1.5 shrink-0 text-[10px] uppercase tabular-nums tracking-wide text-muted/70 ${a.question ? "invisible" : ""}`}>
                   {a.n}
                 </span>
-                <span className="min-w-0 flex-1 whitespace-pre-wrap rounded-md border border-accent bg-accent/10 px-2.5 py-1.5 text-[12px] leading-snug text-fg">
+                {/* Neutral recessed chip — a SETTLED answer, not "awaiting you". The bright yellow accent
+                    is reserved solely for the awaiting-you motif (see styles.css); a past choice reads
+                    quiet: a darker inset panel with a soft left rule to still mark it as the reply. */}
+                <span className="min-w-0 flex-1 whitespace-pre-wrap [overflow-wrap:anywhere] rounded-md border border-border-strong border-l-2 border-l-accent/40 bg-bg/50 px-2.5 py-1.5 text-[12px] leading-snug text-fg">
                   {a.answer}
                 </span>
               </div>
@@ -1104,14 +1666,20 @@ const QUEUE_WRAP = "[overflow-wrap:anywhere] [&_pre]:whitespace-pre-wrap [&_pre]
 
 function ProseHtml({ md, wrap }: { md: string; wrap?: boolean }) {
   const html = useMemo(() => mdToHtml(md), [md])
+  const ref = useRef<HTMLDivElement>(null)
+  // Make inline-code file references clickable (opens in the user's editor/default app) once the server
+  // confirms each resolves to a real file. Runs after render; a no-op when the prose has no such paths.
+  useLocalFileCodeLinks(ref, html)
   if (!html) return null
-  return <div className={`md-body${wrap ? ` ${QUEUE_WRAP}` : ""}`} dangerouslySetInnerHTML={{ __html: html }} />
+  return <div ref={ref} className={`md-body${wrap ? ` ${QUEUE_WRAP}` : ""}`} dangerouslySetInnerHTML={{ __html: html }} />
 }
 
 // A local absolute image path rendered inline via the gated /local-image route: rounded, bordered,
 // contained, with a muted mono basename caption. A load failure (route 4xx, missing file) falls back
-// to showing the plain path text so nothing is silently swallowed.
-function BlockImage({ path }: { path: string }) {
+// to showing the plain path text so nothing is silently swallowed. `hideCaption` drops the basename
+// line (SendUserFile images are hash-named cache copies whose basename is meaningless, and the
+// SentFilesCard carries its own caption); `altText` overrides the a11y alt (else the basename).
+export function BlockImage({ path, hideCaption, altText }: { path: string; hideCaption?: boolean; altText?: string }) {
   const [broken, setBroken] = useState(false)
   if (broken) return <div className="font-mono-keep text-[12px] text-muted/70 break-all">{path}</div>
   const base = path.split("/").filter(Boolean).pop() || path
@@ -1119,12 +1687,34 @@ function BlockImage({ path }: { path: string }) {
     <figure className="flex flex-col gap-1">
       <img
         src={`/local-image?path=${encodeURIComponent(path)}`}
-        alt={base}
+        alt={altText ?? base}
+        data-local-path={path}
+        data-local-image="true"
         onError={() => setBroken(true)}
-        className="max-w-full max-h-[420px] w-auto rounded-lg border border-border object-contain"
+        className="max-w-full max-h-[420px] w-auto cursor-pointer rounded-lg border border-border object-contain"
       />
-      <figcaption className="font-mono-keep text-[11px] text-muted/60 break-all">{base}</figcaption>
+      {!hideCaption && <figcaption className="font-mono-keep text-[11px] text-muted/60 break-all">{base}</figcaption>}
     </figure>
+  )
+}
+
+// A standalone local NON-image attachment path (pdf/text/code/…): an openable file chip showing the
+// basename, wired to the app-wide local-file click handler via `data-local-path` + the `local-file-
+// action` class (the server realpath-gates the open against the attachments/project roots, same as a
+// markdown file link). A bordered pill rather than the underlined inline treatment because it stands
+// alone on its own line, mirroring BlockImage's block presentation.
+export function BlockFile({ path }: { path: string }) {
+  const base = path.split("/").filter(Boolean).pop() || path
+  return (
+    <button
+      type="button"
+      className="local-file-action inline-flex max-w-full items-center gap-1.5 rounded-lg border border-border bg-panel-2 px-2.5 py-1.5 text-left align-top no-underline hover:border-accent"
+      data-local-path={path}
+      title={path}
+    >
+      <FileText size={14} strokeWidth={2} className="shrink-0 text-muted" />
+      <span className="font-mono-keep truncate text-[12px] text-fg">{base}</span>
+    </button>
   )
 }
 
@@ -1144,7 +1734,7 @@ interface BlockInteractive {
 // feel for single-select, toggleable checkboxes for `multi`) and the "Recommendation:" line as a muted
 // note. When `interactive` is present (the live message), chips are clickable and a one-line freetext
 // input appears; otherwise everything is read-only.
-function QuestionBlockCard({
+export function QuestionBlockCard({
   raw,
   questionKind,
   danger,
@@ -1160,7 +1750,8 @@ function QuestionBlockCard({
   const parsed = useMemo(() => parseQuestionBlock(raw, questionKind, danger), [raw, questionKind, danger])
   const html = useMemo(() => mdToHtml(parsed.contextMd), [parsed.contextMd])
   const trailingHtml = useMemo(() => (parsed.trailingMd ? mdToHtml(parsed.trailingMd) : ""), [parsed.trailingMd])
-  const recIdx = useMemo(() => recommendedIndex(parsed.recommendation, parsed.options), [parsed])
+  const recIdx = parsed.recommendedIdx
+  const recHtml = useMemo(() => (parsed.recommendation ? mdInlineToHtml(parsed.recommendation) : ""), [parsed.recommendation])
   const isApproval = parsed.kind === "approval"
   const isMulti = parsed.kind === "multi"
   const isDanger = parsed.danger
@@ -1200,9 +1791,9 @@ function QuestionBlockCard({
               label={opt}
               multi={isMulti}
               // The recommendation renders INSIDE its option as a badge (not as a caption below);
-              // the full recommendation line rides the chip's title for the rationale.
+              // the inline `(recommended: why)` rationale (or a legacy rec line) rides the chip's title.
               recommended={recIdx === i}
-              recTitle={recIdx === i ? parsed.recommendation : undefined}
+              recTitle={recIdx === i ? parsed.recommendedNote : undefined}
               // MULTI: selected == toggled in the set (coexists with freetext). SINGLE: selected only
               // while it's the effective answer — a freetext override clears it.
               selected={isMulti ? chosenSet.includes(i) : chosen === i && !freetext.trim()}
@@ -1239,7 +1830,14 @@ function QuestionBlockCard({
                   e.currentTarget.blur()
                   return
                 }
-                if (e.key === "Enter" && !e.shiftKey && !e.altKey) {
+                if (shouldSubmitComposerEnter({
+                  key: e.key,
+                  altKey: e.altKey,
+                  ctrlKey: e.ctrlKey,
+                  metaKey: e.metaKey,
+                  shiftKey: e.shiftKey,
+                  isComposing: e.nativeEvent.isComposing,
+                }, true)) {
                   e.preventDefault()
                   interactive.onSubmit()
                 }
@@ -1271,20 +1869,37 @@ function QuestionBlockCard({
       )}
       {/* The caption fallback survives ONLY when the recommendation didn't match an option. */}
       {parsed.recommendation && recIdx === null && (
-        <div className="mt-1.5 text-[11px] text-muted/70">{parsed.recommendation}</div>
+        <div className="md-inline mt-1.5 text-[11px] text-muted/70" dangerouslySetInnerHTML={{ __html: recHtml }} />
       )}
     </div>
   )
 }
 
 // A SIGNAL fence rendered as a card in place of the raw ```done / ```awaiting block (the fence
-// language IS the state; the body is the message). `done` → a compact success card whose Archive
-// button (present ONLY on the final message of a non-archived registered session thread) is the ONLY
-// archiver — the fence itself mutates nothing. `awaiting` → a quiet machine-wait card: the body prose
-// plus hint chips (pr/ci/timer/session) parsed from the fence body. Historical fences render the same
-// cards without the Archive button (onArchive undefined).
-function FenceCard({ fenceKind, body, hints, wrap, onArchive }: { fenceKind: FenceKind; body: string; hints: AwaitingHint[]; wrap?: boolean; onArchive?: () => void }) {
+// language IS the state; the body is the message). `done` → a compact presentation-only success card;
+// its thread's Archive lives in the stable lifecycle footer. `awaiting` → a quiet parked-wait card:
+// body prose plus parsed hint chips (human/timer, with legacy pr/ci/session support).
+export function FenceCard({ fenceKind, body, hints, wrap }: { fenceKind: FenceKind; body: string; hints: AwaitingHint[]; wrap?: boolean }) {
   const html = useMemo(() => (body ? mdToHtml(body) : ""), [body])
+  // The owning thread's slug — set by the thread view AND the queue card — so the confirm button
+  // resolves its thread and renders on both surfaces (null in a sub-agent's own transcript → no button).
+  const slug = useContext(ThreadSlugContext)
+  const board = useBoard()
+  // Resolve the owning thread + whether whole-thread lifecycle actions are applicable (session, not
+  // foreign). Shared by both branches: the done card's Mark-as-done button and the awaiting card's
+  // confirm-park button only render for a real, actionable session thread (null in the queue card /
+  // sub-agent transcript, where there's no ThreadSlugContext → the fence renders card-only).
+  const fenceThread = slug ? threadBySlug(board, slug) : undefined
+  const lifecycle = fenceThread ? threadLifecycleAvailability(fenceThread) : undefined
+  const canAct = !!(fenceThread && lifecycle?.footer)
+  // Once the Mark-as-done button has appeared, KEEP it mounted through completion. Clicking it flips
+  // the thread to archived (canAct → false); unmounting the button there shrank the card — a layout
+  // shift, and in the queue that resize also fed the passive scroll-anchor churn. StateButton latches
+  // disabled on click and never resets on success, so holding the last actionable thread keeps the
+  // button in place (disabled) instead of vanishing mid-dissolve.
+  const doneThreadRef = useRef<ThreadViewData | null>(null)
+  if (canAct && fenceThread) doneThreadRef.current = fenceThread
+  const doneThread = canAct && fenceThread ? fenceThread : doneThreadRef.current
   if (fenceKind === "done") {
     return (
       // NEUTRAL chrome (same quiet card family as the awaiting card / permission banner) — the green
@@ -1295,15 +1910,15 @@ function FenceCard({ fenceKind, body, hints, wrap, onArchive }: { fenceKind: Fen
           <Check size={12} className="shrink-0" /> Done
         </div>
         {html && <div className={`md-body${wrap ? ` ${QUEUE_WRAP}` : ""}`} dangerouslySetInnerHTML={{ __html: html }} />}
-        {onArchive && (
-          <div className="mt-3 flex justify-end">
-            <button
-              onClick={onArchive}
-              onMouseDown={(e) => e.preventDefault()}
-              className="flex items-center gap-1.5 rounded-md bg-fg px-3 py-1.5 text-[12px] font-medium text-bg outline-none transition-all hover:opacity-90 active:scale-95"
-            >
-              <Archive size={12} /> Archive
-            </button>
+        {/* A white "Mark as done" button, deliberately redundant with the stable lifecycle footer — the
+            same completion mutation, styled as the primary (light-on-dark) verb. Only shown when the
+            thread can actually take the action. */}
+        {doneThread && (
+          <div className="mt-3">
+            <StateButton
+              thread={doneThread}
+              className="bg-fg px-2.5 py-1 text-bg hover:opacity-90"
+            />
           </div>
         )}
       </div>
@@ -1317,19 +1932,80 @@ function FenceCard({ fenceKind, body, hints, wrap, onArchive }: { fenceKind: Fen
       {html && <div className={`md-body${wrap ? ` ${QUEUE_WRAP}` : ""}`} dangerouslySetInnerHTML={{ __html: html }} />}
       {hints.length > 0 && (
         <div className="mt-2 flex flex-wrap gap-1.5">
-          {hints.map((h, i) => (
-            <span key={i} className="flex items-center gap-1 rounded-md border border-border bg-panel px-2 py-0.5 text-[11px] text-fg/80">
+          {hints.map((h, i) => {
+            const timerLabel = h.kind === "timer" ? formatSnoozedUntil(h.value) : null
+            return (
+            <span key={i} className="flex min-w-0 items-center gap-1 rounded-md border border-border bg-panel px-2 py-0.5 text-[11px] text-fg/80">
               {/* petite-caps sit on the baseline → ~1px low under items-center (see styles.css); lift the
                   label onto the value's optical midline so "ci"/"pr" and the ref read on one line. */}
               <span className="petite-caps relative -top-px text-[9.5px] text-muted/60">{h.kind}</span>
-              <span className="font-mono-keep">{h.value}</span>
-              {/* A live countdown to a timer wait — fray-ui OWNS the wake (it resumes the session when
+              <span className={h.kind === "timer" ? "min-w-0 break-words" : "font-mono-keep"}>{timerLabel ?? (h.kind === "timer" ? "Schedule unavailable" : h.value)}</span>
+              {/* A live countdown to a timer wait — fray-ui owns this durable wake (it resumes the session when
                   this fires), so the card shows the human exactly when that happens. */}
-              {h.kind === "timer" && <TimerCountdown iso={h.value} />}
+              {/* The timestamp remains the primary information on a narrow queue card; hide the
+                  auxiliary live countdown there so neither value truncates or wraps awkwardly. */}
+              {h.kind === "timer" && <span className="hidden sm:inline"><TimerCountdown iso={h.value} /></span>}
             </span>
-          ))}
+            )
+          })}
         </div>
       )}
+      {canAct && fenceThread && <AwaitingParkButton thread={fenceThread} hints={hints} />}
+    </div>
+  )
+}
+
+// The awaiting card's white HUMAN-IN-THE-LOOP park button. The worker's ```awaiting fence already
+// auto-arms the durable wake (a `timer` fires at its instant; a `github-review` watcher wakes on new
+// non-bot PR activity) AND already files the thread into the dimmed Held band — this button lets the
+// human EXPLICITLY commit a USER-OWNED snooze on top, so the park carries a concrete wake time and is
+// durable across fence changes. It NEVER suppresses the auto-armed wake: a user snooze is a
+// board-presentation concern only (board.ts), independent of the scheduler. Kind → label + snooze
+// target: a future `timer` → "Confirm snooze" until that exact instant; `github-review` → "Confirm
+// watcher" (its own verb — the watcher is activity-based, so there is no instant to show); a plain
+// `human` gate → "Confirm snooze". For github-review/human there's no declared time, so we park for
+// the user's default snooze preset (a "remind me if it's still quiet" fallback; the watcher still
+// wakes on activity). Returns null when no hint is parkable (legacy pr/ci/session, or an
+// elapsed/malformed timer) — there's nothing to confirm.
+function awaitingParkAction(
+  hints: readonly AwaitingHint[],
+  nowMs = Date.now(),
+): { label: string; toastVerb: string; timerUntil: string | null } | null {
+  const timer = hints.find((h) => h.kind === "timer" && isValidAwaitingTimer(h.value) && Date.parse(h.value) > nowMs)
+  if (timer) return { label: "Confirm snooze", toastVerb: "Snoozed", timerUntil: timer.value }
+  if (hints.some((h) => h.kind === "github-review")) return { label: "Confirm watcher", toastVerb: "Parked", timerUntil: null }
+  if (hints.some((h) => h.kind === "human")) return { label: "Confirm snooze", toastVerb: "Snoozed", timerUntil: null }
+  return null
+}
+
+function AwaitingParkButton({ thread, hints }: { thread: ThreadViewData; hints: readonly AwaitingHint[] }) {
+  const [busy, setBusy] = useState(false)
+  const action = awaitingParkAction(hints)
+  if (!action) return null
+  const apply = () => {
+    // A future timer snoozes to its exact instant; kinds without a declared time use the default preset.
+    const until = action.timerUntil ?? snoozePresetInstant(prefs.snoozePreset)
+    setBusy(true)
+    rpc
+      .setThreadSnooze({ slug: thread.id, until })
+      .then(() => showToast(`${action.toastVerb} · ${formatSnoozeWake(until)}`))
+      .catch((error) => showToast(`Couldn’t snooze: ${(error as Error).message.slice(0, 80)}`))
+      .finally(() => setBusy(false))
+  }
+  return (
+    <div className="mt-3">
+      <button
+        type="button"
+        onClick={apply}
+        disabled={busy}
+        aria-label={action.label}
+        title={action.label}
+        onMouseDown={(e) => e.preventDefault()}
+        className="flex items-center gap-1.5 rounded-md bg-fg px-2.5 py-1 text-[12px] font-medium text-bg outline-none transition-opacity hover:opacity-90 focus-visible:ring-1 focus-visible:ring-fg/60 disabled:opacity-45"
+      >
+        {busy ? <Loader2 size={12} className="animate-spin" /> : <Clock size={12} />}
+        {action.label}
+      </button>
     </div>
   )
 }
@@ -1337,21 +2013,56 @@ function FenceCard({ fenceKind, body, hints, wrap, onArchive }: { fenceKind: Fen
 // A permission-blocked agent is INVISIBLE in the transcript (the turn is parked mid-tool_use, so no
 // message exists yet) — without this banner the card looks like a quietly-working agent. Rendered by
 // the queue card and the thread view whenever runtime is perm-prompt; the action lands the user in
-// the terminal, the only place the prompt can be answered.
+// an external terminal, the only place the prompt can be answered.
 export function PermPromptBanner({ onTerminal }: { onTerminal: () => void }) {
   return (
     <div className="flex items-center gap-2.5 rounded-md border border-border-strong bg-panel-2 px-3 py-2 text-[12px]">
       <KeyRound size={13} className="shrink-0 text-muted" />
       <span className="min-w-0 flex-1 text-fg/90">
-        The agent is waiting on a <span className="font-medium">permission approval</span> — respond in its terminal.
+        The agent is waiting on a <span className="font-medium">permission approval</span> — respond in your external terminal.
       </span>
       <button
         onClick={onTerminal}
         onMouseDown={(e) => e.preventDefault()}
         className="shrink-0 rounded-md border border-border px-2 py-1 text-[11px] text-fg/90 transition-colors hover:bg-panel hover:border-border-strong"
       >
-        Open terminal
+        Copy terminal command
       </button>
+    </div>
+  )
+}
+
+// A verified Codex-native modal is also invisible to the rollout, but unlike the legacy boolean
+// permission sniff we know its coarse family. Keep it prominent and explicit about the trust boundary:
+// Fray never copies option/payload detail into Chat and never chooses an answer on the user's behalf.
+export function NativeInputRequiredCard({ input, onTerminal }: { input: NativeInputRequiredData; onTerminal: () => void }) {
+  const label =
+    input.kind === "tool-approval"
+      ? "Tool approval required"
+      : input.kind === "permission"
+        ? "Permission choice required"
+        : input.kind === "confirmation"
+          ? "Confirmation required"
+          : "Choice required"
+  return (
+    <div data-native-input-required className="rounded-lg border border-accent/50 bg-accent/10 px-4 py-3 shadow-sm shadow-black/10">
+      <div className="flex items-start gap-2.5">
+        <AlertTriangle size={15} className="mt-0.5 shrink-0 text-accent" />
+        <div className="min-w-0 flex-1">
+          <div className="text-[10px] font-medium uppercase tracking-wide text-accent">{label}</div>
+          <div className="mt-1 text-[13px] font-medium leading-snug text-fg">{input.title}</div>
+          <div className="mt-1 text-[12px] leading-snug text-muted">Review and respond in your external terminal. Fray will not choose for you.</div>
+        </div>
+      </div>
+      <div className="mt-3 flex justify-end">
+        <button
+          onClick={onTerminal}
+          onMouseDown={(e) => e.preventDefault()}
+          className="rounded-md border border-accent/50 bg-panel px-2.5 py-1.5 text-[11px] font-medium text-fg transition-colors hover:border-accent hover:bg-panel-2"
+        >
+          Copy terminal command
+        </button>
+      </div>
     </div>
   )
 }
@@ -1363,12 +2074,26 @@ export function PermPromptBanner({ onTerminal }: { onTerminal: () => void }) {
 // mid-turn (it folds in the old at-rest SubAgentBanner — one surface beats two, and the anchored
 // position under the composer reads as ambient status rather than transcript content). A 30s tick keeps
 // elapsed fresh even when no board push arrives (a steadily-running op changes nothing to re-push).
-export function BackgroundOpsStrip({ slug }: { slug: string }) {
+export function BackgroundOpsStrip({
+  slug,
+  className = "px-4 pb-2 pt-1",
+  includeAgents = true,
+}: {
+  slug: string
+  className?: string
+  // Queue cards render live sub-agents as compact child lines directly under their composer. They
+  // still use this strip for unrelated background shells/Monitors, so suppress agent duplication.
+  includeAgents?: boolean
+}) {
   const board = useBoard()
   const thread = threadBySlug(board, slug)
-  const agents = thread?.subAgents ?? []
+  const agents = includeAgents ? thread?.subAgents ?? [] : []
   const shells = thread?.bgShells ?? []
   const total = agents.length + shells.length
+  // This is intentionally independent of transcript cards: it sits immediately below the affected
+  // prompt box so a resting worker that owns a live shell still reads as active at a glance. Do not
+  // add a thread-wide “Running” marker here: a foreground turn and several independent children are
+  // different operations, and only the row that owns a running state may advertise live work.
   const [, force] = useState(0)
   useEffect(() => {
     if (total === 0) return
@@ -1377,7 +2102,7 @@ export function BackgroundOpsStrip({ slug }: { slug: string }) {
   }, [total])
   if (total === 0) return null
   return (
-    <div className="flex flex-col gap-0.5 px-4 pb-2 pt-1">
+    <div className={`flex flex-col gap-0.5 ${className}`} data-background-ops>
       {agents.map((s, i) => (
         <OpRow
           key={`a${i}`}
@@ -1395,7 +2120,10 @@ export function BackgroundOpsStrip({ slug }: { slug: string }) {
   )
 }
 
-// One row of the ops strip: spinner (running) + petite-caps kind tag + label + elapsed. AGENT rows
+// One row of the ops strip: a live dot + petite-caps kind tag + label + elapsed. The dot has three
+// states — a bright accent pulse for a row with fresh output (running), a slow "breathing" dot for a
+// still-alive-but-quiet SHELL/Monitor (stale, but the process is live until its terminal signal), and
+// a flat gray dot for a stale AGENT (whose staleness can be a missed-completion fallback). AGENT rows
 // drill into the child's transcript (a hover arrow signals it); SHELL rows are display-only.
 function OpRow({ kind, label, state, startedAt, onOpen }: { kind: "AGENT" | "SHELL"; label: string; state: "running" | "stale"; startedAt: string; onOpen?: () => void }) {
   const when = elapsed(startedAt)
@@ -1411,7 +2139,15 @@ function OpRow({ kind, label, state, startedAt, onOpen }: { kind: "AGENT" | "SHE
           reads as ambient status hanging under the composer, not chrome (maintainer 2026-07-11). */}
       <span aria-hidden className="shrink-0 text-[11px] leading-none text-muted/40">⤷</span>
       <span className="flex w-[9px] shrink-0 justify-center">
-        {state !== "stale" ? <LiveSpinner /> : <span className="block h-1.5 w-1.5 rounded-full bg-muted/25" title="stale — no recent output" />}
+        {isRunningOperation(state) ? (
+          <span aria-hidden className="fray-live-dot" data-running-indicator="operation" />
+        ) : kind === "SHELL" ? (
+          // A tracked background shell/Monitor is a LIVE process even when quiet (the entry only
+          // clears on its terminal notification) — so it breathes rather than showing a dead gray dot.
+          <span aria-hidden className="fray-live-dot-quiet" data-running-indicator="operation-quiet" title="running — no recent output" />
+        ) : (
+          <span className="block h-1.5 w-1.5 rounded-full bg-muted/25" title="stale — no recent output" />
+        )}
       </span>
       <span className="petite-caps shrink-0 text-[9.5px] text-muted/45">{kind}</span>
       <span className={`min-w-0 truncate text-muted/70 ${clickable ? "group-hover:text-fg/80 group-hover:underline" : ""}`}>{label}</span>
@@ -1424,12 +2160,12 @@ function OpRow({ kind, label, state, startedAt, onOpen }: { kind: "AGENT" | "SHE
 // The read-only render of a PENDING native AskUserQuestion (the safety net for a session that bypassed
 // the thread-file ask channel). Shows the REAL question(s) + options as NON-interactive rows —
 // deliberately NOT answer-chips: answering a native TUI dialog by keystroke injection is too fragile, so
-// the ONE affordance flips this thread to its terminal tab, where the dialog can actually be answered.
+// the ONE affordance copies an external-terminal command, where the dialog can actually be answered.
 export function PendingAskCard({ ask, onTerminal }: { ask: PendingAsk; onTerminal: () => void }) {
   return (
     <div className="rounded-lg border border-accent/40 bg-accent/[0.06] px-4 py-3">
       <div className="mb-2 flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-accent/80">
-        <HelpCircle size={11} className="shrink-0" /> Waiting on your answer — in the terminal
+        <HelpCircle size={11} className="shrink-0" /> Waiting on your answer — in your external terminal
       </div>
       <div className="flex flex-col gap-3">
         {ask.questions.map((q, i) => (
@@ -1456,7 +2192,7 @@ export function PendingAskCard({ ask, onTerminal }: { ask: PendingAsk; onTermina
         onMouseDown={(e) => e.preventDefault()}
         className="mt-3 flex items-center gap-1.5 rounded-md bg-fg px-3 py-1.5 text-[12px] font-medium text-bg outline-none transition-all hover:opacity-90 active:scale-95"
       >
-        <KeyRound size={12} /> Answer in Terminal
+        <KeyRound size={12} /> Copy terminal command
       </button>
     </div>
   )
@@ -1477,12 +2213,7 @@ function TimerCountdown({ iso }: { iso: string }) {
   if (!Number.isFinite(target)) return null
   const remain = Math.floor((target - now) / 1000)
   if (remain <= 0) return <span className="ml-0.5 text-[10px] text-muted/60 italic">firing…</span>
-  const label =
-    remain < 60
-      ? `${remain}s`
-      : remain < 3600
-        ? `${Math.floor(remain / 60)}m ${String(remain % 60).padStart(2, "0")}s`
-        : `${Math.floor(remain / 3600)}h ${Math.floor((remain % 3600) / 60)}m`
+  const label = formatCountdownSeconds(remain)
   return <span className="ml-0.5 tabular-nums text-[10px] text-muted/60">in {label}</span>
 }
 
@@ -1491,43 +2222,75 @@ function elapsed(startedAt: string): string {
   const t = Date.parse(startedAt)
   if (!Number.isFinite(t)) return ""
   const mins = Math.floor((Date.now() - t) / 60_000)
-  if (mins < 1) return "just now"
-  if (mins < 60) return `${mins}m`
-  return `${Math.floor(mins / 60)}h ${mins % 60}m`
+  return formatElapsedMinutes(mins)
 }
 
 // Coarse duration for a FIXED span (a dispatch→completion elapsed, in ms): "<1m", "42m", "1h 3m".
 // Distinct from elapsed(), which measures an ISO start against now for a still-running child.
 function fmtDurationMs(ms: number): string {
-  if (!Number.isFinite(ms) || ms < 0) return ""
-  const mins = Math.floor(ms / 60_000)
-  if (mins < 1) return "<1m"
-  if (mins < 60) return `${mins}m`
-  return `${Math.floor(mins / 60)}h ${mins % 60}m`
+  return formatFixedDuration(ms)
 }
 
 // A sub-agent completion event — transcript PUNCTUATION between message bands. Quiet and muted (~12px,
 // no bubble, no icon chrome): a centered label flanked by faint hairlines so it reads as a timeline
 // marker, sitting at the same message rhythm as everything around it.
-function EventLine({ text }: { text: string }) {
-  return (
-    <div className="flex items-center gap-2.5 text-[12px] text-muted/55">
-      <span aria-hidden className="h-px flex-1 bg-border/60" />
-      <span className="shrink-0">{text}</span>
-      <span aria-hidden className="h-px flex-1 bg-border/60" />
-    </div>
-  )
+function EventLine({ text, boundary }: { text: string; boundary?: boolean }) {
+  // A turn BOUNDARY (an external wake — a background task/shell completion re-invoked the agent): a
+  // centered divider rule carrying the cause label ON it, so two consecutive assistant turns don't read
+  // as one bubble. This IS the section break the plain event line deliberately avoids.
+  if (boundary) {
+    return (
+      <div className="my-1 flex items-center gap-3" role="separator" aria-label={text}>
+        <span aria-hidden="true" className="h-px flex-1 bg-border/70" />
+        <span className="petite-caps min-w-0 break-words text-center text-[12px] text-muted/70">{text}</span>
+        <span aria-hidden="true" className="h-px flex-1 bg-border/70" />
+      </div>
+    )
+  }
+  // Transcript PUNCTUATION ("Thought for Ns", "Agent … finished — 35m") — a quiet, left-justified
+  // light-gray label. No flanking dividers: it reads as a subtle annotation, not a section break.
+  // petite-caps for consistency with the other inline dispatch readouts (the Agent label, etc.).
+  return <div className={TRANSCRIPT_META_LABEL_CLASS}>{text}</div>
 }
 
-// The exact Nav row-indicator spinner (7px, 1.5px stroke) — pairs with any LIVE (running, not stale)
-// sub-agent so its activity reads at a glance. Stale / finished children get no spinner.
-function LiveSpinner() {
+// A Codex model-reasoning SUMMARY — the coalesced `summary[]` steps of a turn's reasoning records
+// (Claude's thinking is redacted at every seam, so this is Codex-only). A PEER of the "N tool calls"
+// and "Thought for Ns" transcript-metadata labels: same petite-caps whisper (TRANSCRIPT_META_LABEL_CLASS),
+// content-width, chevron flush-right of the label — so the three quiet-metadata rows read as one family
+// (this is the "align thought metadata labels" work). Collapsed shows just the "reasoning" label; the
+// whole row toggles to reveal the train of thought as muted markdown in a ruled block. The `.fray-reasoning`
+// rule below quiets that body (12px/muted, and de-bolds codex's `**step header**` fragments) so an
+// expanded turn reads as a soft aside, never a wall of bold headers competing with the real answer.
+function ReasoningBlock({ text, durationMs }: { text: string; durationMs?: number }) {
+  const [open, setOpen] = useState(false)
+  const bodyId = useId()
+  // "Thought for N seconds" — the wall-clock the model spent thinking this turn (server-derived from the
+  // per-step reasoning gaps, tool time excluded). Sub-minute reads in whole seconds; a longer turn folds
+  // into "Nm Ms" so a multi-minute think doesn't render as a giant second count. No timing → bare "Thought".
+  const label =
+    durationMs != null && durationMs > 0
+      ? `Thought for ${durationMs < 60_000 ? `${Math.max(1, Math.round(durationMs / 1000))} seconds` : `${Math.floor(durationMs / 60_000)}m ${Math.round((durationMs % 60_000) / 1000)}s`}`
+      : "Thought"
   return (
-    <span
-      aria-hidden
-      className="block shrink-0 rounded-full border-[1.5px] border-muted/70 border-t-transparent animate-spin"
-      style={{ width: 7, height: 7 }}
-    />
+    <div className="flex flex-col">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        onMouseDown={(e) => e.preventDefault()}
+        aria-controls={bodyId}
+        aria-expanded={open}
+        aria-label={`${open ? "Collapse" : "Expand"} model reasoning`}
+        className={`${TRANSCRIPT_META_LABEL_CLASS} flex items-center gap-1 self-start rounded outline-none transition-colors hover:text-fg focus-visible:ring-1 focus-visible:ring-fg/60`}
+      >
+        <span>{label}</span>
+        <ChevronRight aria-hidden="true" size={12} className={`relative -top-px shrink-0 transition-transform ${open ? "rotate-90" : ""}`} />
+      </button>
+      {open && (
+        <div id={bodyId} className="fray-reasoning mt-1.5 ml-[5px] border-l border-border/70 pl-3">
+          <ProseHtml md={text} wrap />
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -1539,19 +2302,8 @@ function nextOptionId(options: string[]): string {
   return /\d/.test(id) ? `${Number(id) + 1}${punct}` : `${String.fromCharCode(id.toUpperCase().charCodeAt(0) + 1)}${punct}`
 }
 
-// Match a "Recommendation: B — …" line to its option by leading identifier ("B." / "B)" / "2." …).
-// Null when nothing matches (free-form recommendations keep the caption rendering).
-function recommendedIndex(recommendation: string | undefined, options: string[]): number | null {
-  if (!recommendation) return null
-  const m = recommendation.replace(/^\s*recommendation\s*:?\s*/i, "").match(/^([A-Za-z]|\d+)\b/)
-  if (!m) return null
-  const id = m[1].toUpperCase()
-  const idx = options.findIndex((o) => {
-    const om = o.match(/^\s*([A-Za-z]|\d+)[.)]\s/)
-    return om ? om[1].toUpperCase() === id : false
-  })
-  return idx === -1 ? null : idx
-}
+// recommendedIndex (rec-line → option index) now lives in ../lib/questionBlocks.ts alongside the rest
+// of the question parsing, so it's covered by the pure-logic unit tests.
 
 // A single answer choice: a left-aligned neutral button; when selected it takes the subtle accent
 // border (focus-adjacent selection). A `multi` chip additionally carries a checkbox square (empty →
@@ -1574,6 +2326,12 @@ function Chip({
   recTitle?: string
   onClick: () => void
 }) {
+  // The option text is worker-authored markdown — render its inline emphasis/`code`/links (a chip is
+  // one line, so inline-only: no `<p>`/list block chrome). Raw `label` used to leak `**bold**`/backticks.
+  // inertInteractive: the chip is itself a <button>, so a link/local-file path in the option text must
+  // NOT become a nested interactive element (invalid HTML + a click that both opens the link and selects
+  // the option). Flatten links to spans; emphasis/code still render.
+  const labelHtml = useMemo(() => mdInlineToHtml(label, { inertInteractive: true }), [label])
   return (
     <button
       type="button"
@@ -1599,12 +2357,17 @@ function Chip({
           {selected && <Check size={10} strokeWidth={3} />}
         </span>
       )}
-      <span className="min-w-0 flex-1">{label}</span>
-      {recommended && (
-        <span className="shrink-0 self-center rounded-full border border-border-strong px-1.5 py-px text-[9.5px] uppercase tracking-wide text-muted">
-          Recommended
-        </span>
-      )}
+      {/* The "Recommended" badge FLOATS to the top-right so the option text flows around it and reclaims
+          the full width on the lines below — instead of a flex sibling that permanently narrows the text
+          column. The badge must precede the label in source order for the float to take effect. */}
+      <span className="min-w-0 flex-1">
+        {recommended && (
+          <span className="float-right ml-2 mt-px rounded-full border border-border-strong px-1.5 py-px text-[9.5px] uppercase tracking-wide text-muted">
+            Recommended
+          </span>
+        )}
+        <span className="md-inline" dangerouslySetInnerHTML={{ __html: labelHtml }} />
+      </span>
     </button>
   )
 }

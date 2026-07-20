@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process"
-import { existsSync } from "node:fs"
-import { join, resolve } from "node:path"
+import { lstatSync, realpathSync } from "node:fs"
+import { basename, dirname, join, resolve } from "node:path"
 import { promisify } from "node:util"
+import { ThreadSlug } from "@fray-ui/shared"
 
 const execFileP = promisify(execFile)
 
@@ -59,27 +60,51 @@ export interface FrayBoard {
   errorItems: FrayErrorItem[]
 }
 
+function directFrayRoot(projectDir: string): string | null {
+  try {
+    const projectRoot = realpathSync(projectDir)
+    const path = join(projectRoot, ".fray")
+    const stat = lstatSync(path)
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return null
+    const real = realpathSync(path)
+    return dirname(real) === projectRoot && basename(real) === ".fray" ? real : null
+  } catch {
+    return null
+  }
+}
+
 // Whether the project has been fray-bootstrapped (.fray/ exists). When absent the board is
 // empty and we never invoke the CLI (it would just print a "no .fray/" notice).
 export function frayDirExists(projectDir: string): boolean {
-  return existsSync(join(projectDir, ".fray"))
+  return directFrayRoot(projectDir) !== null
 }
 
 export async function readBoard(projectDir: string, scriptsDir = frayScriptsDir()): Promise<FrayBoard> {
+  if (!directFrayRoot(projectDir)) throw new Error("unsafe or missing .fray directory")
   const { stdout } = await execFileP("node", [join(scriptsDir, "index.mjs"), "--json"], {
     cwd: projectDir,
     env: { ...process.env, CLAUDE_PROJECT_DIR: projectDir },
     maxBuffer: 32 * 1024 * 1024,
   })
   const parsed = JSON.parse(stdout) as Partial<FrayBoard>
+  const rawThreads = Array.isArray(parsed.threads) ? parsed.threads : []
+  const invalidIds = rawThreads
+    .map((thread) => thread?.id)
+    .filter((id) => !ThreadSlug.safeParse(id).success)
+  const invalidErrors = invalidIds.map((id) => `Ignored legacy thread with unsafe filename stem ${JSON.stringify(String(id))}`)
+  const invalidErrorItems: FrayErrorItem[] = invalidIds.map((id) => ({
+    file: JSON.stringify(String(id)),
+    kind: "other",
+    message: "Legacy thread filename must use lowercase ASCII letters, digits, and hyphens",
+  }))
   return {
     config: parsed.config ?? {},
-    threads: Array.isArray(parsed.threads) ? parsed.threads : [],
-    errors: Array.isArray(parsed.errors) ? parsed.errors : [],
+    threads: rawThreads.filter((thread) => ThreadSlug.safeParse(thread?.id).success),
+    errors: [...(Array.isArray(parsed.errors) ? parsed.errors : []), ...invalidErrors],
     warnings: Array.isArray(parsed.warnings) ? parsed.warnings : [],
     // Additive: absent on a pre-update fray script (older cc/scripts) → [] (the board just loses the
     // repair affordance, never the plain error strings).
-    errorItems: Array.isArray(parsed.errorItems) ? parsed.errorItems : [],
+    errorItems: [...(Array.isArray(parsed.errorItems) ? parsed.errorItems : []), ...invalidErrorItems],
   }
 }
 

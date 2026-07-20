@@ -1,5 +1,5 @@
 import { join } from "node:path"
-import { buildClaudeCommand, buildClaudeResumeCommand, workerPluginDir } from "../dispatch.ts"
+import { buildClaudeCommand, buildClaudeResumeCommand, claudeWorkerEnvironment, workerPluginDir } from "../dispatch.ts"
 import { parseLine as parseClaudeRecord, applyRecord, matchesPermPrompt, isRealUserMessage, type TailState } from "../tailer.ts"
 import type { AgentBackend, BuiltCommand, FoldState, NormalizedEvent, ResumeOpts, SpawnOpts } from "./types.ts"
 
@@ -69,7 +69,7 @@ export function parseClaudeLine(line: string): NormalizedEvent[] {
     return out
   }
 
-  if (rec.type === "user") {
+  if (rec.type === "user" && rec.isMeta !== true) {
     const content = rec.message?.content
     const synthetic = rec.promptSource === "system"
     if (Array.isArray(content)) {
@@ -89,7 +89,9 @@ export function parseClaudeLine(line: string): NormalizedEvent[] {
   }
 
   if (rec.type === "ai-title" && typeof rec.aiTitle === "string" && rec.aiTitle.trim()) return [{ kind: "title", title: rec.aiTitle.trim() }]
-  if (rec.type === "custom-title" && typeof rec.customTitle === "string" && rec.customTitle.trim()) return [{ kind: "title", title: rec.customTitle.trim() }]
+  // Native `/rename` writes an intermediate `custom-title` record. It is deliberately
+  // observation-only in the authoritative tailer until the rename controller verifies the
+  // readable replacement, so this normalized view must not promote it into Fray title state.
   return []
 }
 
@@ -111,22 +113,22 @@ export function createClaudeBackend(opts: ClaudeBackendOptions): AgentBackend {
         workerPrompt: o.workerContract,
         extraSystemPrompt: o.extraSystemPrompt,
       })
-      return { argv, env: {}, prewrite: [] }
+      return { argv, env: claudeWorkerEnvironment(), prewrite: [] }
     },
 
     buildResume(o: ResumeOpts): BuiltCommand {
-      // Resume re-attaches a pinned conversation, so `o.model`/`o.effort` are intentionally NOT
-      // forwarded (the model can't be retargeted mid-session).
       const argv = buildClaudeResumeCommand({
         sessionId: o.sessionId,
         permissionMode: o.permissionMode,
+        model: o.model,
+        effort: o.effort,
         message: o.message,
         claudeBin: opts.claudeBin,
         pluginDir: workerPluginDir(),
         workerPrompt: o.workerContract,
         extraSystemPrompt: o.extraSystemPrompt,
       })
-      return { argv, env: {}, prewrite: [] }
+      return { argv, env: claudeWorkerEnvironment(), prewrite: [] }
     },
 
     transcriptPath(sessionId: string): string {

@@ -9,7 +9,7 @@ import { join } from "node:path"
 // re-id, which fray does not use today), the read side has no recovery and the row strands.
 //
 // Every fray worker's transcript CONTENT carries a built-in discovery key: its scratchpad path
-// `scratch/<pinnedId>.md`, baked into the first user message (dispatch.ts composePrompt) AND re-injected
+// `threads/<pinnedId>/scratch.md`, baked into the first user message (dispatch.ts composePrompt) AND re-injected
 // in the per-turn system prompt (scratchpadOrientation), so it survives compaction and would survive a
 // fork. The pinnedId there is the ORIGINAL session id regardless of any filename drift. So to find a
 // session's real transcript we scan the project log dir for a *.jsonl whose HEAD contains that sentinel;
@@ -39,7 +39,7 @@ export const DISCOVERY_GRACE_MS = 60_000
 // The content sentinel for a session: its scratchpad path tail. Embeds the ORIGINAL pinned id, so it is
 // stable across filename drift. `/` and `.` are not JSON-escaped, so this matches the raw JSONL bytes.
 export function sentinelFor(sessionId: string): string {
-  return `scratch/${sessionId}.md`
+  return `threads/${sessionId}/scratch.md`
 }
 
 // Read up to HEAD_BYTES from the top of a file as UTF-8. Any error → "" (caller treats as no-match).

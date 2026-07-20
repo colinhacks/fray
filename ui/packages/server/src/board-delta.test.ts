@@ -164,15 +164,15 @@ test("deltaAction: ignore ≤ current, apply exactly next, resync on gap or no-k
   assert.equal(deltaAction(5, 99), "resync") // many dropped
 })
 
-// ---- bootReloadDecision (client restart-detection) ----
+// ---- bootReloadDecision (client restart detection) ----
 
-test("bootReloadDecision: record first, noop on match, reload on change, noop on absent id", () => {
+test("bootReloadDecision: record first, adopt a new server without navigation, noop on match/absent id", () => {
   assert.equal(bootReloadDecision(null, "boot-1"), "record") // first sight
   assert.equal(bootReloadDecision("boot-1", "boot-1"), "noop") // unchanged
-  assert.equal(bootReloadDecision("boot-1", "boot-2"), "reload") // server restarted
+  assert.equal(bootReloadDecision("boot-1", "boot-2"), "adopt") // server restarted; preserve client drafts
   assert.equal(bootReloadDecision("boot-1", undefined), "noop") // pre-restart server / unknown
   assert.equal(bootReloadDecision("boot-1", null), "noop")
   assert.equal(bootReloadDecision(null, undefined), "noop") // nothing to record
-  // Loop guard: the caller records the NEW id before reloading, so the reloaded page sees a match.
+  // The caller records the adopted id, so its next frame is stable.
   assert.equal(bootReloadDecision("boot-2", "boot-2"), "noop")
 })
