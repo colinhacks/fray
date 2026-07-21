@@ -17,6 +17,7 @@
     "@radix-ui/react-tabs": "^1.1.16",
     "@radix-ui/react-tooltip": "^1.2.11",
     "@tanstack/react-query": "^5",
+    "@tanstack/react-virtual": "^3.14.7",
     "@xstate/react": "^6.1.0",
     "@xterm/addon-fit": "^0.11",
     "@xterm/addon-webgl": "^0.19",

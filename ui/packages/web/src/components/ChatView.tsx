@@ -1,12 +1,13 @@
 import { createContext, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react"
 import { useSnapshot } from "valtio"
 import * as RadixTabs from "@radix-ui/react-tabs"
-import { useMutation, useQuery } from "@tanstack/react-query"
-import { AlertTriangle, ArrowUpRight, Check, ChevronRight, Clock, FileText, HelpCircle, KeyRound, ListChecks, Loader2, ShieldCheck, Sparkles, X } from "lucide-react"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { useVirtualizer } from "@tanstack/react-virtual"
+import { AlertTriangle, ArrowDown, ArrowUpRight, Check, ChevronRight, Clock, FileText, HelpCircle, KeyRound, ListChecks, Loader2, ShieldCheck, Sparkles, X } from "lucide-react"
 import type { AwaitingHint, NativeInputRequired as NativeInputRequiredData, PendingAsk, ThreadView as ThreadViewData, TranscriptEdit, TranscriptMessage, TranscriptToolCall } from "@fray-ui/shared"
 import { isValidAwaitingTimer } from "@fray-ui/shared"
 import { store, threadBySlug, pushDrawer, pushSubAgentDrawer, showToast } from "../store.ts"
-import { useBoard, useTranscript, useSocketTranscripts, type ChatMessage } from "../hooks.ts"
+import { useBoard, useTranscript, useSocketTranscripts, type ChatMessage, type TranscriptData } from "../hooks.ts"
 import { rpc } from "../api/rpc.ts"
 import { displayTitle, lastActiveLabelAt } from "../groups.ts"
 import { mdToHtml, mdInlineToHtml, stripFrontmatter } from "../lib/markdown.ts"
@@ -15,7 +16,7 @@ import { DiffBlock, PathLink } from "./DiffBlock.tsx"
 import { splitQuestionBlocks, parseQuestionBlock, type QuestionKind, type BlockAnswer, type MessageAnswering } from "../lib/questionBlocks.ts"
 import { splitFenceBlocks, type FenceKind } from "../lib/fenceBlocks.ts"
 import { parseAnswersMessage, pairAllAnswers, type PairedAnswer } from "../lib/answersMessage.ts"
-import { useLiveAnswering } from "../lib/answering.ts"
+import { useLiveAnswering, type LiveAnswering } from "../lib/answering.ts"
 import { useLocalFileCodeLinks } from "../lib/localFileCode.ts"
 import { shouldSubmitComposerEnter } from "../lib/composerKeyboard.ts"
 import { messagePresentationText } from "../lib/messagePresentation.ts"
@@ -38,6 +39,9 @@ import { LastActive } from "./LastActive.tsx"
 import { CopyTerminalCommandButton, useCopyTerminalCommand } from "./ExternalTerminalCommand.tsx"
 import { SignInModal } from "./SignInModal.tsx"
 import { PROVIDER_LABEL } from "../lib/signIn.ts"
+import { standaloneThreadHref } from "../lib/standaloneThreadRoute.ts"
+import { prependEarlierPage } from "../lib/transcriptPagination.ts"
+import { buildVirtualTranscriptMessageRows, earlierLoadGate, type VirtualTranscriptMessageRow } from "../lib/virtualTranscript.ts"
 
 // Answer types moved to lib/questionBlocks.ts (shared by the queue card, the thread view, and the
 // answering controller). Re-exported here so existing importers keep working.
@@ -66,7 +70,7 @@ export const ThreadSlugContext = createContext<string | null>(null)
 // scratchpad doc (a session thread's compaction-proof working memory — read-only).
 export type ThreadTab = "chat" | "scratch"
 
-export function ThreadView({ slug, tab, onTab, onStatusApplied, onClose }: { slug: string; tab: ThreadTab; onTab: (t: ThreadTab) => void; onStatusApplied?: () => void; onClose?: () => void }) {
+export function ThreadView({ slug, tab, onTab, onStatusApplied, onClose, virtualized = false }: { slug: string; tab: ThreadTab; onTab: (t: ThreadTab) => void; onStatusApplied?: () => void; onClose?: () => void; virtualized?: boolean }) {
   const board = useBoard()
   const thread = threadBySlug(board, slug)
   return (
@@ -86,14 +90,14 @@ export function ThreadView({ slug, tab, onTab, onStatusApplied, onClose }: { slu
         <ScratchpadPane slug={slug} />
         </RadixTabs.Content>
       ) : (
-        <ChatView slug={slug} onTab={onTab} />
+        <ChatView slug={slug} onTab={onTab} virtualized={virtualized} />
       )}
       {thread && <ThreadLifecycleFooter thread={thread} sticky safeArea onArchived={onStatusApplied} />}
     </RadixTabs.Root>
   )
 }
 
-function ChatView({ slug, onTab }: { slug: string; onTab: (t: ThreadTab) => void }) {
+function ChatView({ slug, onTab, virtualized }: { slug: string; onTab: (t: ThreadTab) => void; virtualized: boolean }) {
   const board = useBoard()
   const thread = threadBySlug(board, slug)
   const running = thread?.runtime === "running" || thread?.runtime === "spawning"
@@ -103,6 +107,10 @@ function ChatView({ slug, onTab }: { slug: string; onTab: (t: ThreadTab) => void
   const copyTerminalCommand = useCopyTerminalCommand(slug)
 
   const q = useTranscript(slug, { poll: running })
+  const queryClient = useQueryClient()
+  const loadingEarlierRef = useRef(false)
+  const [loadingEarlier, setLoadingEarlier] = useState(false)
+  const [earlierError, setEarlierError] = useState<string | null>(null)
   // Raw server order — each message renders its `parts` in block order (fidelity). Memoized so
   // useLiveAnswering's `liveMsg` identity check compares objects from THIS same list.
   const messages = useMemo(() => q.data?.messages ?? [], [q.data])
@@ -146,9 +154,37 @@ function ChatView({ slug, onTab }: { slug: string; onTab: (t: ThreadTab) => void
   const transcriptRef = useRef<HTMLDivElement>(null)
   const count = q.data?.messages.length ?? 0
   useEffect(() => {
+    if (virtualized) return
     const scroller = transcriptRef.current
     if (scroller && scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 240) scroller.scrollTop = scroller.scrollHeight
-  }, [count, running])
+  }, [count, running, virtualized])
+
+  const loadEarlier = useCallback(async () => {
+    if (loadingEarlierRef.current) return
+    const current = queryClient.getQueryData<TranscriptData>(["transcript", slug])
+    const cursor = current?.beforeCursor
+    const expectedKey = current?.transcriptKey
+    if (!current?.hasEarlier || !cursor || !expectedKey) return
+    loadingEarlierRef.current = true
+    setLoadingEarlier(true)
+    setEarlierError(null)
+    try {
+      const earlier = await rpc.threadTranscriptEarlier({ slug, cursor })
+      const latest = queryClient.getQueryData<TranscriptData>(["transcript", slug])
+      if (!latest?.transcriptKey || latest.transcriptKey !== expectedKey || earlier.transcriptKey !== expectedKey) {
+        await q.refetch()
+        showToast("Transcript changed while loading history; refreshed the current session")
+        return
+      }
+      queryClient.setQueryData(["transcript", slug], prependEarlierPage(latest as Parameters<typeof prependEarlierPage>[0], earlier))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not load earlier transcript history"
+      setEarlierError(message)
+    } finally {
+      loadingEarlierRef.current = false
+      setLoadingEarlier(false)
+    }
+  }, [q, queryClient, slug])
 
   return (
     <ThreadSlugContext.Provider value={slug}>
@@ -157,7 +193,31 @@ function ChatView({ slug, onTab }: { slug: string; onTab: (t: ThreadTab) => void
       data-drawer-scroll-ready={q.isPending ? "false" : "true"}
       className="flex-1 min-h-0 flex flex-col overflow-hidden outline-none"
     >
-      <div ref={transcriptRef} data-drawer-transcript-scroll className="min-h-0 flex-1 overflow-y-auto">
+      <div ref={transcriptRef} data-drawer-transcript-scroll data-standalone-transcript={virtualized || undefined} className="relative min-h-0 flex-1 overflow-y-auto">
+      {virtualized && count > 0 ? (
+        <VirtualizedThreadTranscript
+          slug={slug}
+          transcriptRef={transcriptRef}
+          transcriptKey={q.data?.transcriptKey}
+          messages={messages}
+          paired={paired}
+          answeringForMessage={answeringForMessage}
+          thread={thread}
+          nativeInputRequired={nativeInputRequired}
+          running={running}
+          copyTerminalCommand={copyTerminalCommand}
+          transportFallback={q.transportFallback}
+          isFetching={q.isFetching}
+          refresh={() => void q.refetch()}
+          retryLiveUpdates={q.retryLiveUpdates}
+          hasEarlier={q.data?.hasEarlier === true}
+          beforeCursor={q.data?.beforeCursor}
+          loadingEarlier={loadingEarlier}
+          earlierError={earlierError}
+          loadEarlier={() => void loadEarlier()}
+        />
+      ) : (
+      <>
       <InteractionStack
         thread={thread}
         className="px-6 pt-5"
@@ -302,6 +362,8 @@ function ChatView({ slug, onTab }: { slug: string; onTab: (t: ThreadTab) => void
           </>
         )}
       </div>
+      </>
+      )}
       </div>
       {/* This entire footer is deliberately non-scrolling: transcript history alone overflows. */}
       {/* Prompt box FIRST, then the background-ops strip UNDERNEATH it at the very bottom (maintainer
@@ -315,6 +377,340 @@ function ChatView({ slug, onTab }: { slug: string; onTab: (t: ThreadTab) => void
       </div>
     </RadixTabs.Content>
     </ThreadSlugContext.Provider>
+  )
+}
+
+type TranscriptTransportFallback = ReturnType<typeof useTranscript>["transportFallback"]
+type VirtualThreadRow =
+  | { key: "interactions"; kind: "interactions" }
+  | { key: "transport-fallback"; kind: "transport-fallback" }
+  | { key: string; kind: "earlier-history" }
+  | ({ kind: "message" } & VirtualTranscriptMessageRow)
+  | { key: "runtime-status"; kind: "runtime-status" }
+  | { key: string; kind: "queued"; message: ChatMessage; messageIndex: number; gap: number }
+
+function VirtualizedThreadTranscript({
+  slug,
+  transcriptRef,
+  transcriptKey,
+  messages,
+  paired,
+  answeringForMessage,
+  thread,
+  nativeInputRequired,
+  running,
+  copyTerminalCommand,
+  transportFallback,
+  isFetching,
+  refresh,
+  retryLiveUpdates,
+  hasEarlier,
+  beforeCursor,
+  loadingEarlier,
+  earlierError,
+  loadEarlier,
+}: {
+  slug: string
+  transcriptRef: React.RefObject<HTMLDivElement | null>
+  transcriptKey?: string
+  messages: ChatMessage[]
+  paired: (PairedAnswer[] | null)[]
+  answeringForMessage: LiveAnswering["answeringForMessage"]
+  thread: ThreadViewData | undefined
+  nativeInputRequired: NativeInputRequiredData | undefined
+  running: boolean
+  copyTerminalCommand: () => void
+  transportFallback: TranscriptTransportFallback
+  isFetching: boolean
+  refresh: () => void
+  retryLiveUpdates: () => void
+  hasEarlier: boolean
+  beforeCursor?: string | null
+  loadingEarlier: boolean
+  earlierError: string | null
+  loadEarlier: () => void
+}) {
+  const messageRows = useMemo(() => buildVirtualTranscriptMessageRows(
+    messages,
+    messageRendersNothing,
+    messageHeadIsMeta,
+    messageTailIsMeta,
+    STEP,
+  ), [messages])
+  const lastUserIdx = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "user" && !messages[i].queued) return i
+    }
+    return -1
+  }, [messages])
+  const hasRuntimeStatus = Boolean(
+    (thread?.providerFault && !thread.foreign)
+      || thread?.pendingAsk
+      || nativeInputRequired
+      || thread?.runtime === "perm-prompt"
+      || running,
+  )
+  const rows = useMemo<VirtualThreadRow[]>(() => {
+    const next: VirtualThreadRow[] = [{ key: "interactions", kind: "interactions" }]
+    if (transportFallback) next.push({ key: "transport-fallback", kind: "transport-fallback" })
+    if (hasEarlier || loadingEarlier || earlierError) {
+      next.push({ key: `earlier-history:${beforeCursor ?? "complete"}`, kind: "earlier-history" })
+    }
+    next.push(...messageRows.map((row) => ({ ...row, kind: "message" as const })))
+    if (hasRuntimeStatus) next.push({ key: "runtime-status", kind: "runtime-status" })
+    let queuedGap = hasRuntimeStatus || messageRows.length > 0 ? STEP : 0
+    messages.forEach((message, messageIndex) => {
+      if (!message.queued) return
+      const key = `queued:${message.deliveryId ?? message.sourceId ?? messageIndex}`
+      next.push({ key, kind: "queued", message, messageIndex, gap: queuedGap })
+      queuedGap = STEP
+    })
+    return next
+  }, [beforeCursor, earlierError, hasEarlier, hasRuntimeStatus, loadingEarlier, messageRows, messages, transportFallback])
+
+  const virtualizer = useVirtualizer({
+    count: rows.length,
+    getScrollElement: () => transcriptRef.current,
+    getItemKey: (index) => rows[index]?.key ?? index,
+    estimateSize: (index) => {
+      const row = rows[index]
+      if (!row) return 80
+      if (row.kind === "interactions") return 1
+      if (row.kind === "earlier-history") return 42
+      if (row.kind === "transport-fallback") return 76
+      if (row.kind === "runtime-status") return 54
+      return row.kind === "message" ? 108 + row.gap : 82 + row.gap
+    },
+    overscan: 8,
+    paddingStart: 20,
+    paddingEnd: 20,
+    anchorTo: "end",
+    followOnAppend: true,
+    scrollEndThreshold: 240,
+  })
+  const [atEnd, setAtEnd] = useState(true)
+  const tailReadyRef = useRef(false)
+  const readerMovedRef = useRef(false)
+  const nearTopLoadArmedRef = useRef(true)
+  const pendingPrependAnchorRef = useRef<{ rowKey: string; viewportTop: number } | null>(null)
+  const initialTranscriptKeyRef = useRef<string | undefined>(undefined)
+
+  const requestEarlier = useCallback(() => {
+    const scroller = transcriptRef.current
+    if (scroller) {
+      const scrollerTop = scroller.getBoundingClientRect().top
+      const firstVisible = Array.from(scroller.querySelectorAll<HTMLElement>("[data-transcript-source-id]"))
+        .find((element) => element.getBoundingClientRect().bottom > scrollerTop + 1)
+      const rowKey = firstVisible?.dataset.transcriptRowKey
+      if (firstVisible && rowKey) {
+        pendingPrependAnchorRef.current = {
+          rowKey,
+          viewportTop: firstVisible.getBoundingClientRect().top - scrollerTop,
+        }
+      }
+    }
+    loadEarlier()
+  }, [loadEarlier, transcriptRef])
+
+  useLayoutEffect(() => {
+    if (!transcriptKey || rows.length === 0 || initialTranscriptKeyRef.current === transcriptKey) return
+    initialTranscriptKeyRef.current = transcriptKey
+    tailReadyRef.current = false
+    readerMovedRef.current = false
+    nearTopLoadArmedRef.current = true
+    const frame = requestAnimationFrame(() => {
+      virtualizer.scrollToEnd({ behavior: "instant" })
+      tailReadyRef.current = true
+      setAtEnd(true)
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [rows.length, transcriptKey, virtualizer])
+
+  useLayoutEffect(() => {
+    const anchor = pendingPrependAnchorRef.current
+    const scroller = transcriptRef.current
+    if (!anchor || !scroller || loadingEarlier) return
+    const alignAnchor = () => {
+      const anchoredRow = Array.from(scroller.querySelectorAll<HTMLElement>("[data-transcript-row-key]"))
+        .find((element) => element.dataset.transcriptRowKey === anchor.rowKey)
+      if (!anchoredRow) return
+      const nextTop = anchoredRow.getBoundingClientRect().top - scroller.getBoundingClientRect().top
+      scroller.scrollTop += nextTop - anchor.viewportTop
+    }
+    // Dynamic markdown/tool rows settle after TanStack's ResizeObserver measurement. Correct once
+    // synchronously and across the next two frames so the same message stays under the reader's eye.
+    alignAnchor()
+    let secondFrame = 0
+    const firstFrame = requestAnimationFrame(() => {
+      alignAnchor()
+      secondFrame = requestAnimationFrame(() => {
+        alignAnchor()
+        if (pendingPrependAnchorRef.current === anchor) pendingPrependAnchorRef.current = null
+      })
+    })
+    return () => {
+      cancelAnimationFrame(firstFrame)
+      cancelAnimationFrame(secondFrame)
+    }
+  }, [loadingEarlier, messageRows.length, transcriptRef])
+
+  useEffect(() => {
+    const scroller = transcriptRef.current
+    if (!scroller) return
+    const inspect = () => {
+      const nextAtEnd = virtualizer.isAtEnd(240)
+      setAtEnd((current) => current === nextAtEnd ? current : nextAtEnd)
+      const gate = earlierLoadGate({
+        armed: nearTopLoadArmedRef.current,
+        scrollTop: scroller.scrollTop,
+        readerMoved: tailReadyRef.current && readerMovedRef.current,
+        hasEarlier,
+        loading: loadingEarlier,
+      })
+      nearTopLoadArmedRef.current = gate.armed
+      if (gate.shouldLoad) requestEarlier()
+    }
+    const markReaderIntent = () => {
+      readerMovedRef.current = true
+      requestAnimationFrame(inspect)
+    }
+    const markKeyboardIntent = (event: KeyboardEvent) => {
+      if (!["ArrowUp", "PageUp", "Home", " "].includes(event.key)) return
+      if (scroller.scrollTop <= 480) nearTopLoadArmedRef.current = true
+      markReaderIntent()
+    }
+    const markWheelIntent = (event: WheelEvent) => {
+      if (event.deltaY < 0 && scroller.scrollTop <= 480) nearTopLoadArmedRef.current = true
+      markReaderIntent()
+    }
+    const markTouchIntent = () => {
+      if (scroller.scrollTop <= 480) nearTopLoadArmedRef.current = true
+      markReaderIntent()
+    }
+    scroller.addEventListener("scroll", inspect, { passive: true })
+    scroller.addEventListener("wheel", markWheelIntent, { passive: true })
+    scroller.addEventListener("touchstart", markTouchIntent, { passive: true })
+    scroller.addEventListener("pointerdown", markReaderIntent, { passive: true })
+    scroller.addEventListener("keydown", markKeyboardIntent)
+    const frame = requestAnimationFrame(inspect)
+    return () => {
+      cancelAnimationFrame(frame)
+      scroller.removeEventListener("scroll", inspect)
+      scroller.removeEventListener("wheel", markWheelIntent)
+      scroller.removeEventListener("touchstart", markTouchIntent)
+      scroller.removeEventListener("pointerdown", markReaderIntent)
+      scroller.removeEventListener("keydown", markKeyboardIntent)
+    }
+  }, [hasEarlier, loadingEarlier, requestEarlier, transcriptRef, virtualizer])
+
+  const virtualItems = virtualizer.getVirtualItems()
+  const totalSize = virtualizer.getTotalSize()
+  const jumpTop = Math.max(
+    12,
+    (virtualizer.scrollOffset ?? 0) + (virtualizer.scrollRect?.height ?? transcriptRef.current?.clientHeight ?? 0) - 48,
+  )
+
+  return (
+    <div
+      data-virtualized-transcript
+      data-virtual-row-count={virtualItems.length}
+      className="relative w-full"
+      style={{ height: totalSize }}
+    >
+      {virtualItems.map((virtualRow) => {
+        const row = rows[virtualRow.index]
+        if (!row) return null
+        return (
+          <div
+            key={row.key}
+            ref={virtualizer.measureElement}
+            data-index={virtualRow.index}
+            data-transcript-row-key={row.key}
+            data-transcript-source-id={row.kind === "message" ? row.message.sourceId : undefined}
+            className="absolute left-0 top-0 w-full"
+            style={{ transform: `translateY(${virtualRow.start}px)` }}
+          >
+            {row.kind === "interactions" ? (
+              <InteractionStack thread={thread} className="px-6 pt-5" autoFocusFirst />
+            ) : row.kind === "transport-fallback" ? (
+              transportFallback ? <div className="px-6 pt-3"><div
+                data-transcript-sync-fallback
+                className="flex flex-wrap items-center gap-2.5 rounded-md border border-border-strong bg-panel-2 px-3 py-2 text-[12px]"
+                title={transportFallback.kind === "payload-too-large"
+                  ? `Live payload ${transportFallback.actualBytes} bytes; socket limit ${transportFallback.maxBytes} bytes`
+                  : `Transcript read budget reached (${transportFallback.scope}); retry after about ${transportFallback.retryAfterMs}ms`}
+              >
+                <AlertTriangle size={13} className="shrink-0 text-muted" />
+                <div className="min-w-[180px] flex-1 leading-snug text-fg/85">
+                  <span className="font-medium">Live transcript updates paused.</span>{" "}
+                  {transportFallback.kind === "payload-too-large"
+                    ? "The transcript is too large for push; the last complete HTTP-loaded copy remains visible."
+                    : "The live read budget was reached; the last complete copy remains visible. Retry in a moment."}
+                </div>
+                <button type="button" disabled={isFetching} onClick={refresh} className="shrink-0 rounded-md border border-border px-2 py-1 text-[11px] text-fg/90 transition-colors hover:bg-panel disabled:opacity-40">
+                  {isFetching ? "Refreshing…" : "Refresh once"}
+                </button>
+                <button type="button" onClick={retryLiveUpdates} className="shrink-0 rounded-md border border-border px-2 py-1 text-[11px] text-fg/90 transition-colors hover:bg-panel">
+                  Retry live
+                </button>
+              </div></div> : null
+            ) : row.kind === "earlier-history" ? (
+              <div className="flex min-h-10 items-center justify-center px-6 text-[11px] text-muted" role="status">
+                {earlierError ? (
+                  <span className="flex flex-wrap items-center justify-center gap-2 text-center">
+                    <span>{earlierError}</span>
+                    <button type="button" onClick={requestEarlier} className="rounded-md border border-border px-2 py-1 text-fg/90 hover:bg-panel-2">Retry</button>
+                  </span>
+                ) : loadingEarlier ? (
+                  <span className="flex items-center gap-2"><Loader2 size={12} className="animate-spin" /> Loading earlier messages…</span>
+                ) : (
+                  <span>Scroll up to load earlier messages</span>
+                )}
+              </div>
+            ) : row.kind === "message" ? (
+              <div className="flex flex-col px-6" style={{ paddingTop: row.gap }}>
+                <Message
+                  m={row.message}
+                  answering={answeringForMessage(row.message)}
+                  showSendButton
+                  paired={paired[row.messageIndex]}
+                />
+              </div>
+            ) : row.kind === "runtime-status" ? (
+              <div className="px-6" style={{ paddingTop: STEP }}>
+                {thread?.providerFault && !thread.foreign ? (
+                  <ProviderFaultCard slug={slug} fault={thread.providerFault} retryText={lastUserIdx >= 0 ? messages[lastUserIdx]?.text : undefined} />
+                ) : thread?.pendingAsk ? (
+                  <PendingAskCard ask={thread.pendingAsk} onTerminal={copyTerminalCommand} />
+                ) : nativeInputRequired ? (
+                  <NativeInputRequiredCard input={nativeInputRequired} onTerminal={copyTerminalCommand} />
+                ) : thread?.runtime === "perm-prompt" ? (
+                  <PermPromptBanner onTerminal={copyTerminalCommand} />
+                ) : running ? (
+                  <WorkingIndicator since={thread?.lastUserAt} />
+                ) : null}
+              </div>
+            ) : (
+              <div className="flex flex-col px-6" style={{ paddingTop: row.gap }}>
+                <Message m={row.message} paired={paired[row.messageIndex]} />
+              </div>
+            )}
+          </div>
+        )
+      })}
+      {!atEnd && (
+        <button
+          type="button"
+          data-jump-to-latest
+          onClick={() => virtualizer.scrollToEnd({ behavior: "smooth" })}
+          className="absolute right-4 z-20 flex items-center gap-1.5 rounded-full border border-border-strong bg-elevated px-3 py-1.5 text-[11px] font-medium text-fg shadow-lg shadow-black/30 hover:bg-panel-2"
+          style={{ top: jumpTop }}
+        >
+          <ArrowDown size={12} />
+          Jump to latest
+        </button>
+      )}
+    </div>
   )
 }
 
@@ -486,6 +882,19 @@ export function ThreadHeader({ slug, tab, onStatusApplied, onClose }: { slug: st
             doneBusy={markComplete.isPending}
             onStatusApplied={onStatusApplied}
           />
+          {onClose && (
+            <Tooltip label="Open in new tab">
+              <a
+                href={standaloneThreadHref(slug)}
+                target="_blank"
+                rel="noopener"
+                aria-label="Open in new tab"
+                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted outline-none transition-colors hover:bg-panel-2 hover:text-fg focus-visible:ring-1 focus-visible:ring-fg/60"
+              >
+                <ArrowUpRight size={14} />
+              </a>
+            </Tooltip>
+          )}
         </div>
         {/* Close-X for the DRAWER context (onClose passed by ThreadSheet) — parity with the Settings,
             sub-agent, and Doc drawers, all of which carry a corner "Close". Wired to the SAME animated
