@@ -736,19 +736,17 @@ export function createRouter(ctx: AppContext) {
       },
     }),
 
-    // Copy only a provider-native resume invocation. The board snapshot is the ownership authority:
-    // a row in SQLite alone is insufficient if it is no longer an owned session view. The command is a
-    // provider-native `claude --resume`/`codex resume` that attaches a SECOND client to the same session
-    // — it never touches Fray's private tmux pane — so it is offered in every runtime state, live too
-    // (see the handler body). Do not return a command for foreign discovery, legacy docs, or an
-    // absent/replaced registry row.
+    // Copy only a provider-native resume invocation. The durable session registry is the ownership
+    // boundary: board session views are derived from these exact rows, while foreign discoveries and
+    // legacy docs have no row. Avoid rebuilding the full board on this latency-sensitive click path.
+    // The command attaches a SECOND provider client and never touches Fray's private tmux pane, so it
+    // is offered in every runtime state, live too. An absent/replaced row fails closed.
     threadTerminalCommand: query({
       input: SlugInput,
       output: z.object({ command: z.string().nullable(), mode: z.enum(["resume", "unavailable"]), reason: z.string().nullable() }),
       handler: async ({ input }) => {
         const row = ctx.storage.getSession(input.slug)
-        const thread = (await ctx.board.snapshot()).threads.find((candidate) => candidate.id === input.slug)
-        if (!row || !thread || thread.kind !== "session" || thread.foreign) {
+        if (!row) {
           throw new Error("No Fray-owned terminal session is available for this thread")
         }
         // Resuming the SAME session from another terminal is safe and supported by both CLIs whether or

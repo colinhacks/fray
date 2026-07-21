@@ -2089,7 +2089,7 @@ export function PermPromptBanner({ onTerminal }: { onTerminal: () => void }) {
         The agent is waiting on a <span className="font-medium">permission approval</span> — respond in your external terminal.
       </span>
       <button
-        onClick={onTerminal}
+        onClick={() => onTerminal()}
         onMouseDown={(e) => e.preventDefault()}
         className="shrink-0 rounded-md border border-border px-2 py-1 text-[11px] text-fg/90 transition-colors hover:bg-panel hover:border-border-strong"
       >
@@ -2123,7 +2123,7 @@ export function NativeInputRequiredCard({ input, onTerminal }: { input: NativeIn
       </div>
       <div className="mt-3 flex justify-end">
         <button
-          onClick={onTerminal}
+          onClick={() => onTerminal()}
           onMouseDown={(e) => e.preventDefault()}
           className="rounded-md border border-accent/50 bg-panel px-2.5 py-1.5 text-[11px] font-medium text-fg transition-colors hover:border-accent hover:bg-panel-2"
         >
@@ -2255,7 +2255,7 @@ export function PendingAskCard({ ask, onTerminal }: { ask: PendingAsk; onTermina
         ))}
       </div>
       <button
-        onClick={onTerminal}
+        onClick={() => onTerminal()}
         onMouseDown={(e) => e.preventDefault()}
         className="mt-3 flex items-center gap-1.5 rounded-md bg-fg px-3 py-1.5 text-[12px] font-medium text-bg outline-none transition-all hover:opacity-90 active:scale-95"
       >
