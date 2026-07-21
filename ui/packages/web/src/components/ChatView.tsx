@@ -32,7 +32,7 @@ import { threadLifecycleAvailability } from "../lib/threadLifecycle.ts"
 import { Tooltip } from "./Tooltip.tsx"
 import { ToolDisclosureHeader } from "./ToolDisclosureHeader.ts"
 import { hasRunningToolIndicator, isRunningOperation, liveBackgroundOperationState } from "../lib/operationIndicators.ts"
-import { formatCountdownSeconds, formatElapsedMinutes, formatFixedDuration, formatToolDuration } from "../lib/durationLabels.ts"
+import { formatElapsedMinutes, formatFixedDuration, formatToolDuration } from "../lib/durationLabels.ts"
 import { TRANSCRIPT_META_LABEL_CLASS } from "../lib/transcriptMetaLabels.ts"
 import { InteractionStack } from "./InteractionCards.tsx"
 import { LastActive } from "./LastActive.tsx"
@@ -2384,11 +2384,6 @@ export function FenceCard({ fenceKind, body, hints, wrap }: { fenceKind: FenceKi
                   label onto the value's optical midline so "ci"/"pr" and the ref read on one line. */}
               <span className="petite-caps relative -top-px text-[9.5px] text-muted/60">{h.kind}</span>
               <span className={h.kind === "timer" ? "min-w-0 break-words" : "font-mono-keep"}>{timerLabel ?? (h.kind === "timer" ? "Schedule unavailable" : h.value)}</span>
-              {/* A live countdown to a timer wait — fray-ui owns this durable wake (it resumes the session when
-                  this fires), so the card shows the human exactly when that happens. */}
-              {/* The timestamp remains the primary information on a narrow queue card; hide the
-                  auxiliary live countdown there so neither value truncates or wraps awkwardly. */}
-              {h.kind === "timer" && <span className="hidden sm:inline"><TimerCountdown iso={h.value} /></span>}
             </span>
             )
           })}
@@ -2697,25 +2692,6 @@ export function PendingAskCard({ ask, onTerminal }: { ask: PendingAsk; onTermina
       </button>
     </div>
   )
-}
-
-// A live countdown to a timer wait's ISO instant, rendered inside the awaiting card's `timer` chip.
-// fray-ui's wakers scheduler OWNS this wake — it resumes the session when `now >= iso` — so the human
-// sees exactly how long until that happens. Ticks once a second (cheap; unmounts with the card). Past
-// due → "firing…" (the scheduler resumes within a tick; the fence then clears and this card vanishes).
-function TimerCountdown({ iso }: { iso: string }) {
-  const target = useMemo(() => Date.parse(iso), [iso])
-  const [now, setNow] = useState(() => Date.now())
-  useEffect(() => {
-    if (!Number.isFinite(target)) return
-    const id = setInterval(() => setNow(Date.now()), 1000)
-    return () => clearInterval(id)
-  }, [target])
-  if (!Number.isFinite(target)) return null
-  const remain = Math.floor((target - now) / 1000)
-  if (remain <= 0) return <span className="ml-0.5 text-[10px] text-muted/60 italic">firing…</span>
-  const label = formatCountdownSeconds(remain)
-  return <span className="ml-0.5 tabular-nums text-[10px] text-muted/60">in {label}</span>
 }
 
 // Human-friendly elapsed since an ISO timestamp: "just now", "12m", "1h 3m". Empty when unparseable.
