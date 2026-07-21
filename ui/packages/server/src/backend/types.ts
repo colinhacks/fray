@@ -70,6 +70,7 @@ export interface NormalizedTail {
   subAgents: SubAgentView[] // codex: always []
   bgShells: BgShellView[] // codex: always []
   pendingAsk?: PendingAskData // codex: undefined
+  authFault?: "authentication_rejected" // runtime provider-auth rejection (see FoldState.authFault)
 }
 
 // The backend-NEUTRAL fold accumulator: the running derivation a backend folds each transcript line
@@ -110,6 +111,12 @@ export interface FoldState {
   lastUserText?: string // exact text of that genuine human turn when the backend records it
   lastFence?: FenceView // done/awaiting excusal fence on the final message (cleared by any user turn)
   lastAssistantHasQuestion: boolean // the final message carries an unanswered ```question fence
+  // Runtime provider-auth rejection (claude-auth plan, Slice A). Set when the backend records a
+  // SYNTHETIC auth-error response (Claude: isApiErrorMessage + 401/login text) — never from user or
+  // ordinary assistant content — and cleared by the next real assistant text (a genuine response
+  // proves the credential works). Only this typed category ever leaves the fold; raw error/pane text
+  // stays out of persisted state.
+  authFault?: "authentication_rejected"
 }
 
 // A file a backend needs on disk BEFORE the detached spawn (e.g. codex's session-scoped AGENTS.md).

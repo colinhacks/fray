@@ -332,6 +332,11 @@ function sessionThreadView(
     nativeInputRequired: tele?.nativeInputRequired,
     pendingQuestion: tele?.pendingQuestion ?? false,
     lastUserAt: tele?.lastUserAt,
+    // Runtime provider-auth rejection (claude-auth plan): only the typed category travels — the raw
+    // error/pane text never leaves the server. Drives the trusted sign-in recovery card in ChatView.
+    providerFault: tele?.authFault
+      ? { backend: row.backend === "codex" ? "codex" as const : "claude" as const, category: tele.authFault }
+      : undefined,
     kind: "session",
     foreign: false,
     lastFence: tele?.lastFence,

@@ -7,7 +7,7 @@ import { createStorage, type Storage, type SessionRow } from "./storage.ts"
 import { Bus } from "./bus.ts"
 import type { ServerEvent } from "@fray-ui/shared"
 import { permMarkerPath, type Project } from "./project.ts"
-import { parseLine, applyRecord, applyEvent, computeTurn, newTailState, createTailer, matchesPermPrompt, hasQuestionBlock, isRealUserMessage, parseSignalFence, FOREIGN_FRESH_MS } from "./tailer.ts"
+import { parseLine, applyRecord, applyEvent, computeTurn, newTailState, createTailer, matchesPermPrompt, hasQuestionBlock, isClaudeAuthErrorText, isRealUserMessage, parseSignalFence, FOREIGN_FRESH_MS } from "./tailer.ts"
 import type { AgentBackend, NormalizedEvent } from "./backend/types.ts"
 import { createClaudeBackend } from "./backend/claude.ts"
 import { createCodexBackend } from "./backend/codex.ts"
@@ -2074,4 +2074,83 @@ test("tailer: a later Codex marker cannot overwrite a manual title after an omit
   assert.equal(t.get("t")?.aiTitle, "Recovered generated title", "live telemetry may observe the later signal")
   assert.equal(h.storage.getSession("t")?.title, "Manual title wins")
   assert.equal(h.storage.getSession("t")?.title_auto, 0, "the storage CAS preserves explicit provenance")
+})
+
+// ---- Runtime auth classifier (claude-auth plan, Slice A) ----
+
+const AUTH_401_TEXT = "Please run /login · API Error: 401 Invalid authentication credentials"
+
+test("authFault: a synthetic isApiErrorMessage 401 record sets authentication_rejected", () => {
+  const s = newTailState("t", "sid", "/x")
+  applyRecord(s, {
+    type: "assistant",
+    isApiErrorMessage: true,
+    timestamp: "2026-07-01T00:00:01.000Z",
+    message: { model: "<synthetic>", content: [{ type: "text", text: AUTH_401_TEXT }] },
+  })
+  assert.equal(s.authFault, "authentication_rejected")
+})
+
+test("authFault: a NON-auth API error (overloaded) neither sets nor clears the fault", () => {
+  const s = newTailState("t", "sid", "/x")
+  applyRecord(s, {
+    type: "assistant",
+    isApiErrorMessage: true,
+    message: { model: "<synthetic>", content: [{ type: "text", text: AUTH_401_TEXT }] },
+  })
+  applyRecord(s, {
+    type: "assistant",
+    isApiErrorMessage: true,
+    message: { model: "<synthetic>", content: [{ type: "text", text: "API Error: 529 Overloaded" }] },
+  })
+  assert.equal(s.authFault, "authentication_rejected", "an unrelated later API error keeps the last auth verdict")
+  const fresh = newTailState("t2", "sid2", "/y")
+  applyRecord(fresh, {
+    type: "assistant",
+    isApiErrorMessage: true,
+    message: { model: "<synthetic>", content: [{ type: "text", text: "API Error: 529 Overloaded" }] },
+  })
+  assert.equal(fresh.authFault, undefined, "a non-auth API error never sets the fault")
+})
+
+test("authFault: user-authored or assistant-quoted 401 text can NEVER set the fault", () => {
+  const s = newTailState("t", "sid", "/x")
+  applyRecord(s, {
+    type: "user",
+    timestamp: "2026-07-01T00:00:01.000Z",
+    message: { content: [{ type: "text", text: AUTH_401_TEXT }] },
+  })
+  assert.equal(s.authFault, undefined)
+  applyRecord(s, {
+    type: "assistant",
+    message: { content: [{ type: "text", text: `The observed failure was: ${AUTH_401_TEXT} — fixing now.` }] },
+  })
+  assert.equal(s.authFault, undefined, "a real assistant message quoting the line lacks isApiErrorMessage")
+})
+
+test("authFault: cleared by the next REAL assistant text, kept across an intervening user retry", () => {
+  const s = newTailState("t", "sid", "/x")
+  applyRecord(s, {
+    type: "assistant",
+    isApiErrorMessage: true,
+    message: { model: "<synthetic>", content: [{ type: "text", text: AUTH_401_TEXT }] },
+  })
+  applyRecord(s, { type: "user", timestamp: "2026-07-01T00:00:02.000Z", message: { content: [{ type: "text", text: "retry please" }] } })
+  assert.equal(s.authFault, "authentication_rejected", "a user retry alone is not proof auth recovered")
+  applyRecord(s, {
+    type: "assistant",
+    timestamp: "2026-07-01T00:00:03.000Z",
+    message: { model: "claude-opus-4-8", content: [{ type: "text", text: "On it." }] },
+  })
+  assert.equal(s.authFault, undefined, "a genuine response proves the credential works")
+})
+
+test("isClaudeAuthErrorText: narrow conjunction", () => {
+  assert.equal(isClaudeAuthErrorText(AUTH_401_TEXT), true)
+  assert.equal(isClaudeAuthErrorText("Please run /login"), true)
+  assert.equal(isClaudeAuthErrorText("401 invalid authentication"), true)
+  assert.equal(isClaudeAuthErrorText("OAuth token 401"), true)
+  assert.equal(isClaudeAuthErrorText("fix the 401 handling in api.ts"), false)
+  assert.equal(isClaudeAuthErrorText("API Error: 529 Overloaded"), false)
+  assert.equal(isClaudeAuthErrorText("HTTP 4010 items"), false)
 })

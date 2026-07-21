@@ -839,3 +839,30 @@ test("board stop drains a watcher setup that races shutdown and immediately unsu
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test("board exposes a typed providerFault from tailer auth telemetry — category only, no raw text", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "fray-board-auth-fault-"))
+  const project: Project = { dir, id: "board-auth-fault", name: "fixture", label: "fixture", stateDir: dir, cwdSlug: "fixture" }
+  const storage = createStorage(join(dir, "ui.db"))
+  storage.upsertSession(row({ slug: "auth-fault", tmux_name: "fray-auth-fault", backend: "claude" }))
+  const tailer = {
+    get: (slug: string) => (slug === "auth-fault" ? tele({ authFault: "authentication_rejected" }) : undefined),
+    foreignIds: () => [],
+    subAgent: () => undefined,
+    forget: () => {},
+    start: () => {},
+    stop: () => {},
+    tick: () => {},
+  } satisfies Tailer
+  const board = createBoard(project, storage, new Bus(), tailer, "auth-fault-boot")
+  try {
+    const thread = (await board.snapshot()).threads.find((candidate) => candidate.id === "auth-fault")!
+    assert.deepEqual(thread.providerFault, { backend: "claude", category: "authentication_rejected" })
+    const clean = (await board.snapshot()).threads.find((candidate) => candidate.id === "auth-fault")!
+    assert.equal(JSON.stringify(clean).includes("401"), false, "no raw provider text rides the snapshot")
+  } finally {
+    board.stop()
+    storage.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

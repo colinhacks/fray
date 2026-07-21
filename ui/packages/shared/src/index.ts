@@ -299,6 +299,14 @@ export const ThreadView = z.object({
   // ISO8601 of the newest REAL user interaction (answer/steer/dispatch) — the chronological listing
   // sort key. Optional; the listing falls back to spawnedAt when absent (a dispatch IS an interaction).
   lastUserAt: z.string().optional(),
+  // Runtime provider-auth rejection (claude-auth plan): the session's provider positively rejected
+  // its credential (Claude: synthetic isApiErrorMessage 401 record, or the 401/login text on a
+  // boot-failed pane). Bounded by design — only the typed category travels, never raw provider/pane
+  // text. Drives the trusted sign-in recovery card. Optional so old snapshots/servers parse.
+  providerFault: z.object({
+    backend: z.enum(["claude", "codex"]),
+    category: z.enum(["authentication_required", "authentication_rejected"]),
+  }).optional(),
 
   // ---- Session-first fields (ALL optional: absent ⇒ a legacy .fray-file row / pre-restart server;
   // the client treats such rows as Legacy-shelf material). Deliberately not zod-defaulted so server
@@ -534,7 +542,9 @@ export const DispatchProfileSnapshot = z.object({
   backend: Backend,
   model: z.string().trim().min(1).max(200),
   effort: Settings.shape.effort.unwrap(),
-  permissionMode: PermissionMode,
+  // IGNORED: dispatch permission is fixed server-side (WORKER_DISPATCH_PERMISSION) — every created
+  // worker launches maximally non-interactive. Optional so old clients that still send it parse.
+  permissionMode: PermissionMode.optional(),
 }).strict()
 export type DispatchProfileSnapshot = z.infer<typeof DispatchProfileSnapshot>
 
@@ -552,7 +562,6 @@ export const SetDispatchPreferenceInput = z.discriminatedUnion("field", [
   }),
   z.object({ field: z.literal("model"), backend: Backend, value: z.string().trim().min(1).max(200) }),
   z.object({ field: z.literal("effort"), backend: Backend, value: Settings.shape.effort.unwrap() }),
-  z.object({ field: z.literal("permissionMode"), backend: Backend, value: PermissionMode }),
 ])
 export type SetDispatchPreferenceInput = z.infer<typeof SetDispatchPreferenceInput>
 
@@ -565,6 +574,8 @@ export const DispatchInput = z.object({
   title: z.string().min(1).optional(),
   prompt: z.string().min(1),
   slug: ThreadSlug.optional(), // derived from title if omitted
+  // IGNORED: dispatch permission is fixed server-side (WORKER_DISPATCH_PERMISSION) — every created
+  // worker launches maximally non-interactive. Accepted-but-ignored so old clients still parse.
   permissionMode: PermissionMode.optional(),
   model: z.string().optional(),
   // The agent backend for THIS dispatch (Codex-support epic, Phase 3). Omitted ⇒ the dispatcher

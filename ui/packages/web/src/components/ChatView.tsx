@@ -36,6 +36,8 @@ import { TRANSCRIPT_META_LABEL_CLASS } from "../lib/transcriptMetaLabels.ts"
 import { InteractionStack } from "./InteractionCards.tsx"
 import { LastActive } from "./LastActive.tsx"
 import { CopyTerminalCommandButton, useCopyTerminalCommand } from "./ExternalTerminalCommand.tsx"
+import { SignInModal } from "./SignInModal.tsx"
+import { PROVIDER_LABEL } from "../lib/signIn.ts"
 
 // Answer types moved to lib/questionBlocks.ts (shared by the queue card, the thread view, and the
 // answering controller). Re-exported here so existing importers keep working.
@@ -254,12 +256,19 @@ function ChatView({ slug, onTab }: { slug: string; onTab: (t: ThreadTab) => void
               })
               return out
             })()}
-            {(thread?.pendingAsk || nativeInputRequired || thread?.runtime === "perm-prompt" || running) && <VSpace />}
+            {(thread?.providerFault || thread?.pendingAsk || nativeInputRequired || thread?.runtime === "perm-prompt" || running) && <VSpace />}
             {/* A frozen native AskUserQuestion takes precedence over the generic perm banner and the
                 Working… spinner — it's the salient state (the safety net). Background sub-agents/shells
                 are NOT surfaced here anymore: they live in the anchored ops strip (below), which is
-                visible even mid-turn. */}
-            {thread?.pendingAsk ? (
+                visible even mid-turn. A provider auth fault outranks everything: nothing else in the
+                thread can make progress until the credential is restored. */}
+            {thread?.providerFault && !thread.foreign ? (
+              <ProviderFaultCard
+                slug={slug}
+                fault={thread.providerFault}
+                retryText={lastUserIdx >= 0 ? messages[lastUserIdx]?.text : undefined}
+              />
+            ) : thread?.pendingAsk ? (
               <PendingAskCard ask={thread.pendingAsk} onTerminal={copyTerminalCommand} />
             ) : nativeInputRequired ? (
               <NativeInputRequiredCard input={nativeInputRequired} onTerminal={copyTerminalCommand} />
@@ -2015,6 +2024,63 @@ function AwaitingParkButton({ thread, hints }: { thread: ThreadViewData; hints: 
 // message exists yet) — without this banner the card looks like a quietly-working agent. Rendered by
 // the queue card and the thread view whenever runtime is perm-prompt; the action lands the user in
 // an external terminal, the only place the prompt can be answered.
+// Trusted provider-auth recovery card (claude-auth plan). Rendered ONLY from the server's TYPED
+// providerFault field — never parsed from assistant-authored content — so a model cannot manufacture
+// a sign-in affordance in Chat. "Sign in" opens the same modal as the dispatch gate (copyable
+// `claude auth login` + re-check). "Retry" re-sends the thread's LAST user message through the
+// ordinary follow-up path (resume already handles a dead worker); it exists only as an explicit user
+// action — a prompt is never replayed automatically after login.
+export function ProviderFaultCard({
+  slug,
+  fault,
+  retryText,
+}: {
+  slug: string
+  fault: NonNullable<ThreadViewData["providerFault"]>
+  retryText?: string
+}) {
+  const [signIn, setSignIn] = useState(false)
+  const label = PROVIDER_LABEL[fault.backend]
+  const retry = useMutation({
+    mutationFn: (message: string) => rpc.followUp({ slug, message }),
+    onSuccess: () => showToast("Retrying with the previous message…"),
+    onError: (e) => showToast(`Retry failed: ${(e as Error).message.slice(0, 80)}`),
+  })
+  return (
+    <div data-provider-fault className="flex items-center gap-2.5 rounded-md border border-red-500/40 bg-panel-2 px-3 py-2 text-[12px]">
+      <KeyRound size={13} className="shrink-0 text-red-400" />
+      <span className="min-w-0 flex-1 text-fg/90">
+        <span className="font-medium">{label} sign-in required</span> — the provider rejected this
+        session's credential. Sign in, then retry.
+      </span>
+      {retryText?.trim() && (
+        <button
+          onClick={() => retry.mutate(retryText)}
+          disabled={retry.isPending}
+          onMouseDown={(e) => e.preventDefault()}
+          className="shrink-0 rounded-md border border-border px-2 py-1 text-[11px] text-fg/90 transition-colors hover:bg-panel hover:border-border-strong disabled:opacity-60"
+        >
+          Retry
+        </button>
+      )}
+      <button
+        onClick={() => setSignIn(true)}
+        onMouseDown={(e) => e.preventDefault()}
+        className="shrink-0 rounded-md bg-accent px-2 py-1 text-[11px] font-medium text-white transition-opacity hover:opacity-90"
+      >
+        Sign in
+      </button>
+      {signIn && (
+        <SignInModal
+          backend={fault.backend}
+          onClose={() => setSignIn(false)}
+          onAuthed={() => setSignIn(false)}
+        />
+      )}
+    </div>
+  )
+}
+
 export function PermPromptBanner({ onTerminal }: { onTerminal: () => void }) {
   return (
     <div className="flex items-center gap-2.5 rounded-md border border-border-strong bg-panel-2 px-3 py-2 text-[12px]">

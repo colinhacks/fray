@@ -328,7 +328,16 @@ interface Record {
   permissionMode?: unknown // present only on Claude permission-mode sidecars
   content?: unknown // top-level string on queue-operation records — carries the <task-notification> XML
   promptSource?: string // on user records: typed/queued (human) · "system" (peer msg / task-notification)
+  isApiErrorMessage?: boolean // synthetic assistant record claude writes for a provider API error
   message?: { stop_reason?: string; content?: unknown; model?: string }
+}
+
+// Narrow text conjunction for a Claude AUTH error (vs other API errors riding the same synthetic
+// record — overloaded, rate-limit, 5xx). The canonical observed line is
+// "Please run /login · API Error: 401 Invalid authentication credentials".
+export function isClaudeAuthErrorText(text: string): boolean {
+  if (/Please run \/login/i.test(text)) return true
+  return /\b401\b/.test(text) && /authenticat|credential|OAuth/i.test(text)
 }
 
 // A fresh, unread tail cursor for a session (exported for tick + tests).
@@ -828,6 +837,17 @@ export function applyRecord(state: TailState, rec: Record): void {
       state.profileRevision = (state.profileRevision ?? 0) + 1
     }
     const raw = lastTextBlock(rec.message?.content)
+    // Runtime auth classifier (claude-auth plan): claude records a rejected credential as a SYNTHETIC
+    // assistant record (isApiErrorMessage:true, model "<synthetic>") whose text is the 401/login
+    // recovery line. Keying on the synthetic flag makes user-authored or quoted "401" text
+    // structurally unable to trigger the fault; the text conjunction keeps other API errors
+    // (overloaded, rate-limit) from reading as auth. A later REAL assistant text clears it —
+    // a genuine response is proof the credential works again.
+    if (rec.isApiErrorMessage === true) {
+      if (raw !== undefined && isClaudeAuthErrorText(raw)) state.authFault = "authentication_rejected"
+    } else if (raw !== undefined) {
+      state.authFault = undefined
+    }
     if (raw !== undefined) {
       const preview = previewText(raw)
       if (preview !== undefined) state.lastAssistant = preview
@@ -1457,7 +1477,15 @@ export function createTailer(deps: TailerDeps): Tailer {
     } catch {
       pane = ""
     }
-    const detail = pane.trim() || "(pane empty / unavailable)"
+    // Boot-failure auth classifier (claude-auth plan): a worker that dies before writing a transcript
+    // with the 401/login text on its pane is a rejected credential, not a generic stall. Only the
+    // typed category persists — the raw pane (which may carry OAuth URLs/codes from a login attempt)
+    // is REDACTED from the console line and the stall sink in this case.
+    const authFailure = row.backend !== "codex" && isClaudeAuthErrorText(pane)
+    if (authFailure) state.authFault = "authentication_rejected"
+    const detail = authFailure
+      ? "(claude authentication failure — pane content redacted; sign in and retry)"
+      : pane.trim() || "(pane empty / unavailable)"
     console.error(
       `[fray-ui] thread ${row.slug} (session ${row.session_id}): no transcript ${DISCOVERY_GRACE_MS / 1000}s after dispatch — likely a boot failure. Pane:\n${detail.slice(0, 4000)}`,
     )
@@ -1820,7 +1848,7 @@ export function createTailer(deps: TailerDeps): Tailer {
       // an unanswered ```question fence (a user reply clears the flag and flips the turn in-flight).
       const pendingQuestion = s.turn === "idle" && s.lastAssistantHasQuestion
       const nowMs = now()
-      return { turn: s.turn, permPrompt: s.permPrompt, nativeInputRequired: s.nativeInputRequired, model: s.model, effort: s.effort, profileAt: s.profileAt, profileRevision: s.profileRevision, permissionMode: s.permissionMode, permissionModeAt: s.permissionModeAt, permissionModeRevision: s.permissionModeRevision, lastActivityAt: s.lastActivityAt, lastAssistantAt: s.lastAssistantAt, lastAssistant: s.lastAssistant, aiTitle: s.aiTitle, customTitle: s.customTitle, customTitleRevision: s.customTitleRevision, subAgents: subAgentViews(s, nowMs), bgShells: bgShellViews(s, nowMs), pendingAsk: s.pendingAsk, pendingQuestion, lastUserAt: s.lastUserAt, lastUserText: s.lastUserText, lastFence: s.lastFence, noTranscript: s.noTranscript }
+      return { turn: s.turn, permPrompt: s.permPrompt, nativeInputRequired: s.nativeInputRequired, model: s.model, effort: s.effort, profileAt: s.profileAt, profileRevision: s.profileRevision, permissionMode: s.permissionMode, permissionModeAt: s.permissionModeAt, permissionModeRevision: s.permissionModeRevision, lastActivityAt: s.lastActivityAt, lastAssistantAt: s.lastAssistantAt, lastAssistant: s.lastAssistant, aiTitle: s.aiTitle, customTitle: s.customTitle, customTitleRevision: s.customTitleRevision, subAgents: subAgentViews(s, nowMs), bgShells: bgShellViews(s, nowMs), pendingAsk: s.pendingAsk, pendingQuestion, lastUserAt: s.lastUserAt, lastUserText: s.lastUserText, lastFence: s.lastFence, noTranscript: s.noTranscript, authFault: s.authFault }
     },
     // The CURRENT fresh foreign session ids (mtime within FOREIGN_FRESH_MS, capped), mtime-desc. Kept
     // as the last scan's result — recomputed at most every FOREIGN_SCAN_EVERY ticks.
