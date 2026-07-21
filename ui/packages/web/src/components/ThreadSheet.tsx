@@ -301,8 +301,12 @@ export function ThreadSheet({ id, slug, depth, widthDepth, initiallyOpen }: { id
           // other outside pointer (backdrop, blank sidebar, sibling rows) dismisses as before —
           // sibling opens also route through the store policy, which closes this layer anyway.
           onPointerDownOutside={(event) => {
-            const topLive = [...store.drawers].reverse().find((drawer) => !drawer.closing)
-            if (topLive && topLive.id !== id) {
+            // CLOSING layers still count as "above": Radix dispatches this event AFTER the
+            // backdrop's own onMouseDown has already marked the top sheet closing (verified in the
+            // real event order), so a live-only check would see this buried sheet as topmost during
+            // exactly the backdrop-click unwind it must survive.
+            const idx = store.drawers.findIndex((drawer) => drawer.id === id)
+            if (idx !== -1 && idx < store.drawers.length - 1) {
               event.preventDefault()
               return
             }
