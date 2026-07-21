@@ -163,24 +163,13 @@ test("composer inspection matches the exact wrapped nonempty Nub pane and the di
     { kind: "typed", text: "Compare alpha - beta before proceeding.", queueHint: false },
     "a standalone punctuation hyphen preserves the real following space",
   )
-  const multiParagraphDraft =
-    "\u001b[0;1m›\u001b[0m Do not keep legacy code around.\n\n  Implement this all fully.\n\n  gpt-5.6-sol xhigh · ~/project · gpt-5.6-sol · xhigh · Context 71% used · weekly 98% left"
-  assert.deepEqual(inspectCodexComposer(multiParagraphDraft), { kind: "unavailable" })
-  assert.equal(
-    codexComposerMatches(multiParagraphDraft, "Do not keep legacy code around.\n\nImplement this all fully."),
-    false,
-    "an already-typed multi-paragraph draft is never auto-submitted from ambiguous plain rows",
-  )
-  const footerLikeDraft =
-    "\u001b[0;1m›\u001b[0m Explain this phrase.\n\n  tab to queue message is user-authored.\n\n  gpt-5.6-sol xhigh\n\n  gpt-5.6-sol xhigh · ~/project · gpt-5.6-sol · xhigh · Context 71% used · weekly 98% left"
-  assert.equal(
-    codexComposerMatches(footerLikeDraft, "Explain this phrase."),
-    false,
-    "footer-like user paragraphs cannot be discarded and prefix-submitted",
-  )
-  const modelLikeFinalParagraph = "\u001b[0;1m›\u001b[0m SAFE\n\n  gpt-5.6-sol xhigh"
-  assert.deepEqual(inspectCodexComposer(modelLikeFinalParagraph), { kind: "unavailable" })
-  assert.equal(codexComposerMatches(modelLikeFinalParagraph, "SAFE"), false)
+  // NOTE: the earlier fail-closed assertions for multi-paragraph / model-slug-tail drafts followed by
+  // a PLAIN (unstyled) footer were removed here. captureCodexComposer no longer guesses the footer
+  // boundary — a real Codex status line has no stable, draft-distinct signature (it can be a bare
+  // model slug), so guessing it wedged real multi-paragraph steers. Delivery is now decided by the
+  // target-aware codexComposerMatches (see "captures a multi-paragraph draft across internal blank
+  // lines"), which deliberately prefers delivering a matching steer over failing closed on an
+  // ambiguous plain tail; inspectCodexComposer (no target) reports the leading paragraph as typed.
   const styledFooter =
     "\u001b[0;1m›\u001b[0m Keep the exact draft.\n\n  \u001b[38;2;246;226;183mgpt-5.6-sol xhigh\u001b[2m\u001b[39m · ~/project\u001b[0m\n  \u001b[2mtab to queue message\u001b[0m"
   assert.deepEqual(inspectCodexComposer(styledFooter), {
@@ -193,10 +182,60 @@ test("composer inspection matches the exact wrapped nonempty Nub pane and the di
     true,
     "a one-paragraph legacy draft remains recoverable only with independently styled footer rows",
   )
-  const fullStatusUserTail =
-    "\u001b[0;1m›\u001b[0m SAFE\n\n  gpt-5.6-sol xhigh · ~/project · gpt-5.6-sol · xhigh · Context 71% used · weekly 98% left"
-  assert.deepEqual(inspectCodexComposer(fullStatusUserTail), { kind: "unavailable" })
-  assert.equal(codexComposerMatches(fullStatusUserTail, "SAFE"), false)
+})
+
+// Regression: a MULTI-PARAGRAPH draft (blank rows between paragraphs) is the common shape of a real
+// steer. captureCodexComposer used to break at the first blank row, truncating the capture to the
+// first paragraph; codexComposerMatches then compared that prefix against the full normalized text
+// and returned false, so the durable queue wedged forever on "existing draft". The blank row is an
+// internal paragraph break, not the composer's end — only the footer/status line ends it.
+test("composer inspection captures a multi-paragraph draft across internal blank lines", () => {
+  const twoParagraphs =
+    "[1m›[0m First paragraph line one\n  continues on row two\n\n  Second paragraph after a blank line\n\n  gpt-5.6-sol xhigh · ~/Documents/projects/fray · Context 66% used"
+  assert.equal(inspectCodexComposer(twoParagraphs).kind, "typed", "a multi-paragraph draft is a typed composer")
+  assert.equal(
+    codexComposerMatches(twoParagraphs, "First paragraph line one continues on row two\n\nSecond paragraph after a blank line"),
+    true,
+    "the exact multi-paragraph staged text matches and can be submitted",
+  )
+  // Three-blank-line gaps collapse identically (normalizedInput turns any whitespace run into one space).
+  const threeBlanks =
+    "[1m›[0m Alpha\n\n\n  Bravo\n\n  gpt-5.6-sol xhigh · ~/x · 100% context left"
+  assert.equal(codexComposerMatches(threeBlanks, "Alpha\n\nBravo"), true)
+  // Fail-closed preserved: a genuinely different draft is never accepted just because we scan further.
+  assert.equal(
+    codexComposerMatches(twoParagraphs, "First paragraph line one continues on row two\n\nA DIFFERENT second paragraph"),
+    false,
+    "a non-matching multi-paragraph draft still fails closed",
+  )
+  // A footer hint rendered TIGHT under the draft (no blank between) still ends the draft — parity with
+  // the old parts-based capture, so delivery never re-wedges if Codex drops the pre-footer blank row.
+  const esc = String.fromCharCode(27)
+  assert.equal(codexComposerMatches(`${esc}[1m›${esc}[0m Do the safe thing\n  ${esc}[2m100% context left${esc}[0m`, "Do the safe thing"), true)
+})
+
+// Regression (adversarial review): the footer terminator must be the DIM, anchored footer row — not a
+// loose substring — or a real steer row that merely says "context left" / "tab to queue message" ends
+// the draft early and wedges the queue (the exact failure this path exists to prevent). Footer rows are
+// dim (\x1b[2m…); draft rows are not.
+test("a legitimate multi-row steer mentioning footer phrases is delivered, not wedged", () => {
+  const esc = String.fromCharCode(27)
+  const dim = `${esc}[2m`
+  const reset = `${esc}[0m`
+  // Second paragraph mentions "context left" mid-sentence (plain, not dim).
+  const steerA = `${esc}[1m\u203a${reset} Keep going on the task.\n\n  You still have plenty of context left, keep going.\n\n  ${dim}100% context left${reset}`
+  assert.equal(
+    codexComposerMatches(steerA, "Keep going on the task.\n\nYou still have plenty of context left, keep going."),
+    true,
+    "a steer paragraph mentioning 'context left' is not mistaken for the footer",
+  )
+  // A plain wrapped continuation row that STARTS with a footer phrase is still draft text.
+  const steerB = `${esc}[1m\u203a${reset} Please remember to\n  tab to queue message support later.\n\n  ${dim}100% context left${reset}`
+  assert.equal(
+    codexComposerMatches(steerB, "Please remember to tab to queue message support later."),
+    true,
+    "a plain wrapped row starting with a footer phrase is draft text, not the footer",
+  )
 })
 
 test("Claude composer inspection distinguishes the idle prompt from an unsent draft or modal", () => {
@@ -729,7 +768,11 @@ test("a two-paragraph follow-up is atomically pasted and submitted from an empty
   assert.equal(JSON.parse(h.storage.getSession(slug)?.codex_input_queue ?? "[]")[0].state, "submitted")
 })
 
-test("an ambiguous footer-like final paragraph cannot auto-submit only its queued prefix", () => {
+// Under the deliver-first contract, a composer that already holds EXACTLY the queued text before what
+// reads as a footer is submitted (Enter) rather than failing closed. Trade-off (deliberate — see
+// captureCodexComposer): were that trailing model-slug line actually user-typed rather than Codex's
+// own footer, this would submit it too — judged near-impossible and preferable to wedging a real steer.
+test("a composer already holding the queued text before a footer-like tail is submitted", () => {
   const h = harness()
   const slug = "footer-like-user-text"
   h.storage.upsertSession(row(slug))
@@ -739,9 +782,9 @@ test("an ambiguous footer-like final paragraph cannot auto-submit only its queue
 
   h.controller.queueFollowUp(slug, "SAFE")
 
-  assert.deepEqual(h.sent, [])
-  assert.match(h.storage.getSession(slug)?.control_error ?? "", /ambiguous Codex composer/)
-  assert.equal(JSON.parse(h.storage.getSession(slug)?.codex_input_queue ?? "[]")[0].state, "pending")
+  assert.deepEqual(h.sent, ["key:Enter"])
+  assert.equal(h.storage.getSession(slug)?.control_error, null)
+  assert.equal(JSON.parse(h.storage.getSession(slug)?.codex_input_queue ?? "[]")[0].state, "submitted")
 })
 
 test("a scheduler delivery id makes durable Codex wake enqueue idempotent", () => {
