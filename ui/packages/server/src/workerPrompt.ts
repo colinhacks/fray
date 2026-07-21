@@ -509,6 +509,20 @@ sandbox-denied action fails straight back to you rather than prompting a human �
 the blocker in your final message.`,
 }
 
+// Backend-neutral: fray injects the `fray_spawn` MCP server into BOTH claude and codex workers, so the
+// tool and its usage are identical. Kept as one shared section (not a per-kind record) — there is
+// nothing backend-specific to say about it.
+const SPAWN_THREAD = `## Spawning a separate fray thread
+
+You have a \`spawn_fray_thread\` MCP tool (server \`fray_spawn\`) — DISTINCT from an in-session sub-agent.
+It dispatches a brand-new, SEPARATE top-level fray thread: its own board card, session, and scratchpad,
+driving INDEPENDENTLY. Reach for it when a distinct, self-contained effort belongs on the board in its
+own right rather than run inline or handed to a helper you must collect. Give it a fully self-contained
+\`prompt\` (plus optional \`title\` / \`model\` / \`backend\` / \`effort\`); it returns the new thread's slug and
+a ready-to-paste markdown link \`[title](/thread/<slug>)\`. PUT THAT LINK IN YOUR HANDOFF so the human can
+click it to open the spawned thread in the drawer. Unlike a sub-agent, you do NOT collect its result and
+it does NOT block your rest — it owns its own independent lifecycle.`
+
 const THREAD_EXECUTION: Record<BackendKind, string> = {
   claude: `## Thread types
 
@@ -584,6 +598,7 @@ export function buildWorkerPrompt(kind: BackendKind = "claude", { runtimeGate = 
     SIGNALS,
     SCRATCHPAD[kind],
     BACKEND[kind],
+    SPAWN_THREAD,
     THREAD_EXECUTION[kind],
     AGENT_COMPLETION,
     runtimeGate ? RUNTIME_GATE : null,

@@ -127,6 +127,16 @@ export interface BuiltCommand {
   prewrite: PrewriteFile[]
 }
 
+// Present ⇒ mount the fray "spawn a new board thread" MCP tool (server `fray_spawn`, tool
+// `spawn_fray_thread`) for this worker. Carries the abs path to the stdio MCP server script and the
+// project state dir it reads `server.lock` from. Computed by the dispatch layer (resolveWorkerPluginDir
+// + project.stateDir) and threaded through both backends; absent in tests / when the plugin dir or
+// script can't be resolved (→ no injection, worker simply lacks the tool).
+export interface SpawnThreadMcp {
+  scriptPath: string
+  stateDir: string
+}
+
 export interface SpawnOpts {
   sessionId: string // claude: pinned via --session-id. codex: advisory (id is discovered post-spawn)
   cwd: string
@@ -136,6 +146,7 @@ export interface SpawnOpts {
   permissionMode: PermissionMode
   model?: string
   effort?: string
+  spawnThreadMcp?: SpawnThreadMcp
 }
 export interface ResumeOpts extends Omit<SpawnOpts, "prompt"> {
   // Omitted when fray is only re-attaching an idle saved conversation to apply a per-thread

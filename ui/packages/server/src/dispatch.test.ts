@@ -40,6 +40,37 @@ test("Claude dispatch supplies the discovered worker plugin via --plugin-dir", (
   assert.deepEqual(argv.slice(argv.indexOf("--plugin-dir"), argv.indexOf("--plugin-dir") + 2), ["--plugin-dir", plugin])
 })
 
+test("Claude dispatch mounts the spawn-thread MCP server + pre-approves its tool when the descriptor is present", () => {
+  const argv = buildClaudeCommand({
+    sessionId: "mcp-dispatch",
+    permissionMode: "auto",
+    prompt: "test",
+    workerPrompt: "",
+    spawnThreadMcp: { scriptPath: "/abs/plugin/bin/spawn-thread-mcp.mjs", stateDir: "/home/.fray/projects/pid" },
+  })
+  const cfgRaw = argv[argv.indexOf("--mcp-config") + 1]
+  assert.ok(cfgRaw, "argv must carry an inline --mcp-config")
+  const cfg = JSON.parse(cfgRaw)
+  assert.deepEqual(cfg.mcpServers.fray_spawn, {
+    command: "node",
+    args: ["/abs/plugin/bin/spawn-thread-mcp.mjs"],
+    env: { FRAY_STATE_DIR: "/home/.fray/projects/pid" },
+  })
+  // The tool is pre-approved so a headless worker never blocks on a permission prompt.
+  assert.deepEqual(
+    argv.slice(argv.indexOf("--allowedTools"), argv.indexOf("--allowedTools") + 2),
+    ["--allowedTools", "mcp__fray_spawn__spawn_fray_thread"],
+  )
+  // The prompt stays the trailing positional (flags never displace it).
+  assert.equal(argv[argv.length - 1], "test")
+})
+
+test("Claude dispatch omits all MCP flags when no spawn-thread descriptor is supplied", () => {
+  const argv = buildClaudeCommand({ sessionId: "no-mcp", permissionMode: "auto", prompt: "test", workerPrompt: "" })
+  assert.ok(!argv.includes("--mcp-config"))
+  assert.ok(!argv.includes("--allowedTools"))
+})
+
 test("Claude worker surfaces share the canonical per-session scratchpad path", () => {
   const sessionId = "scratch-canonical"
   const canonical = `.fray/threads/${sessionId}/scratch.md`

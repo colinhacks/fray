@@ -3,7 +3,7 @@ import { homedir } from "node:os"
 import { readdirSync, statSync, readFileSync, appendFileSync, mkdirSync, realpathSync } from "node:fs"
 import type { PermissionMode } from "@fray-ui/shared"
 import { applyEvent } from "../tailer.ts"
-import type { AgentBackend, BuiltCommand, FoldState, NativeInputRequiredData, NormalizedEvent, ResumeOpts, SpawnOpts } from "./types.ts"
+import type { AgentBackend, BuiltCommand, FoldState, NativeInputRequiredData, NormalizedEvent, ResumeOpts, SpawnOpts, SpawnThreadMcp } from "./types.ts"
 
 // CodexBackend: everything Codex-CLI-specific behind the AgentBackend seam (Codex-support epic,
 // Phase 2). Unlike ClaudeBackend — which reuses the tailer's corpus-verified applyRecord — codex's
@@ -123,6 +123,22 @@ function frayUiRoutingFlags(): string[] {
 
 function workerSkillIsolationFlags(): string[] {
   return ["-c", FRAY_UI_DISABLED_SKILLS_CONFIG]
+}
+
+// Mount the fray spawn-thread MCP server as an ADDITIVE, process-scoped `-c` override — it deep-merges
+// onto the operator's own `[mcp_servers.*]` and NEVER touches ~/.codex/config.toml on disk (verified:
+// `codex mcp list --json` shows both fray_spawn and the user's servers). The `-c` value is parsed as
+// TOML, so the path/table values are TOML basic strings (only `\` and `"` need escaping). Codex runs
+// with `-a never`, so the tool executes without an approval prompt. A namespaced id (`fray_spawn`)
+// avoids overriding a user's own server. Absent descriptor → no flags (parity with Claude).
+function codexSpawnThreadMcpFlags(mcp?: SpawnThreadMcp): string[] {
+  if (!mcp) return []
+  const toml = (v: string) => v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+  return [
+    "-c", "mcp_servers.fray_spawn.command=node",
+    "-c", `mcp_servers.fray_spawn.args=["${toml(mcp.scriptPath)}"]`,
+    "-c", `mcp_servers.fray_spawn.env={FRAY_STATE_DIR="${toml(mcp.stateDir)}"}`,
+  ]
 }
 
 // ---- opinionated Codex output defaults (process-scoped, presence-gated) ----
@@ -853,6 +869,7 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): AgentBackend
         ...firstOutputTitleDeveloperInstructionFlags(),
         ...frayUiRoutingFlags(),
         ...workerSkillIsolationFlags(),
+        ...codexSpawnThreadMcpFlags(o.spawnThreadMcp),
         ...outputDefaultFlags(codexHome),
         ...effortFlags(o.effort),
         composeSpawnPrompt(o),
@@ -882,6 +899,7 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): AgentBackend
         "check_for_update_on_startup=false",
         ...frayUiRoutingFlags(),
         ...workerSkillIsolationFlags(),
+        ...codexSpawnThreadMcpFlags(o.spawnThreadMcp),
         ...outputDefaultFlags(codexHome),
         ...effortFlags(o.effort),
         "-s",
