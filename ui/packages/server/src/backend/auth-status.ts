@@ -76,6 +76,12 @@ export async function readClaudeAuthState(configDir = claudeConfigDir()): Promis
 // either an API key (OPENAI_API_KEY) or a ChatGPT-plan OAuth blob (tokens.access_token); either one
 // present ⇒ authed. Missing file ⇒ signed-out; present-but-unreadable/unparseable ⇒ unknown (fail open).
 export function readCodexAuthState(codexHome = defaultCodexHome()): ProviderAuth {
+  // Codex ALSO authenticates from the environment — fray forwards OPENAI_API_KEY / CODEX_API_KEY /
+  // CODEX_ACCESS_TOKEN into the spawned app-server (CODEX_APP_SERVER_ENV_KEYS in codex-app-server.ts).
+  // A user authed that way has NO auth.json, so checking the file alone would falsely block them with
+  // no way to recover (the "codex login" the modal suggests isn't how they authed). Honor those keys
+  // first, matching the exact set fray forwards.
+  if (process.env.OPENAI_API_KEY || process.env.CODEX_API_KEY || process.env.CODEX_ACCESS_TOKEN) return "authed"
   let raw: string
   try {
     raw = readFileSync(join(codexHome, "auth.json"), "utf8")
