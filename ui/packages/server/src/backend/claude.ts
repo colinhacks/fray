@@ -112,6 +112,7 @@ export function createClaudeBackend(opts: ClaudeBackendOptions): AgentBackend {
         pluginDir: workerPluginDir(),
         workerPrompt: o.workerContract,
         extraSystemPrompt: o.extraSystemPrompt,
+        spawnThreadMcp: o.spawnThreadMcp,
       })
       return { argv, env: claudeWorkerEnvironment(), prewrite: [] }
     },
@@ -127,6 +128,7 @@ export function createClaudeBackend(opts: ClaudeBackendOptions): AgentBackend {
         pluginDir: workerPluginDir(),
         workerPrompt: o.workerContract,
         extraSystemPrompt: o.extraSystemPrompt,
+        spawnThreadMcp: o.spawnThreadMcp,
       })
       return { argv, env: claudeWorkerEnvironment(), prewrite: [] }
     },

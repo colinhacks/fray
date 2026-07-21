@@ -6,11 +6,6 @@ import { closeDrawerAnimated, focusDrawer } from "./lib/overlays.ts"
 // Where a scroll-to-card lands a card's outer border below the viewport top (px).
 const QUEUE_CARD_VIEWPORT_TOP = 12
 
-// Absolute scrollY that lands `slug`'s bordered card root at the standard viewport-top landing.
-// Shared by the sidebar's scroll-to-card and the queue's dismissal auto-scroll. Accounts for the
-// narrow-layout fixed chrome the cards' sticky headers also dodge (max-[800px]:top-10 → 40px), so a
-// landed card's header sits at its natural position instead of being pushed down into the body.
-// null when the card isn't mounted.
 // The BORDERED CARD ROOT inside a queue slot. The outer `[data-queue-card]` slot also wraps the
 // inter-card hairline rule and its my-10 margins, so anything visual — the scroll landing, the
 // arrival ring — must target this root or it silently addresses ~80px of empty gutter plus the rule.
@@ -221,16 +216,17 @@ export function openThread(slug: string): void {
 // queue"). Returns false if no card is mounted (not queued / not rendered), so the caller falls back to
 // opening the drawer instead.
 export function scrollToQueueCard(slug: string): boolean {
-  if (typeof document === "undefined") return false
-  const el = document.querySelector(`[data-queue-card="${CSS.escape(slug)}"]`)
-  if (!el) return false
+  const root = queueCardRoot(slug)
+  if (!root) return false
   const targetY = queueCardTargetY(slug)
   // Absolute scroll is intentional. A narrow layout may have just changed document geometry while a
   // drawer finished closing; a relative scroll in that transition can be applied to the old root and
   // strand the reader midway through a tall card. Land the bordered root atomically.
   if (targetY !== null && Math.abs(window.scrollY - targetY) > 0.5) window.scrollTo({ top: targetY, left: 0, behavior: "auto" })
-  el.classList.add("queue-flash")
-  window.setTimeout(() => el.classList.remove("queue-flash"), 1100)
+  // The ring goes on the bordered root, NOT the slot: the slot wraps the inter-card hairline rule and
+  // its my-10 margins, so ringing it drew the card AND the gutter+rule below as one highlighted box.
+  root.classList.add("queue-flash")
+  window.setTimeout(() => root.classList.remove("queue-flash"), 1100)
   return true
 }
 

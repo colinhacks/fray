@@ -23,6 +23,7 @@ import {
   claudeWorkerEnvironment,
   effectivePermissionMode,
   workerPluginDir,
+  resolveSpawnThreadMcp,
   scratchpadOrientation,
   frayConfigBlock,
   loadWorkerPrompt,
@@ -153,6 +154,7 @@ function spawnPinnedSession(
   // would silently get the RUNTIME RELEASE GATE forced back on the moment its worker respawns.
   const runtimeGate = deps.getSettings().runtimeGate !== false
   if (row.backend === "codex") ensureCwdTrusted(deps.project.dir, deps.codexHome)
+  const spawnThreadMcp = resolveSpawnThreadMcp(deps.project.stateDir)
   const built = backend
     ? backend.buildResume({
         sessionId: nativeSessionId,
@@ -163,6 +165,7 @@ function spawnPinnedSession(
         permissionMode,
         model: launchProfile?.model ?? row.model ?? undefined,
         effort: launchProfile?.effort ?? row.effort ?? undefined,
+        spawnThreadMcp,
       })
     : {
         argv: buildClaudeResumeCommand({
@@ -174,6 +177,7 @@ function spawnPinnedSession(
           model: launchProfile?.model ?? row.model ?? undefined,
           effort: launchProfile?.effort ?? row.effort ?? undefined,
           workerPrompt: loadWorkerPrompt("claude", runtimeGate),
+          spawnThreadMcp,
         }),
         env: claudeWorkerEnvironment(),
         prewrite: [],

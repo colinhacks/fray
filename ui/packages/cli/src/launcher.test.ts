@@ -1975,7 +1975,7 @@ test("concurrent installer processes publish only complete shims and clean up te
       assert.equal(code, 0, `installer exited with ${String(signal)}`);
     }
     const shim = readFileSync(join(dir, "fray-dev"), "utf8");
-    assert.match(shim, /fray-dev-source-launcher:v4/);
+    assert.match(shim, /fray-dev-source-launcher:v3/);
     assert.match(shim, /packages\/cli\/src\/index\.ts/);
     assert.deepEqual(readdirSync(dir), ["fray-dev"]);
   } finally {

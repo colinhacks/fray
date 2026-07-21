@@ -59,6 +59,27 @@ function firstLineOf(pred: (rec: any) => boolean): string {
   throw new Error("no fixture line matched")
 }
 
+test("codex spawn/resume inject the spawn-thread MCP server as additive -c overrides (TOML-quoted)", () => {
+  const backend = createCodexBackend()
+  const mcp = { scriptPath: '/abs/plug in/bin/spawn-thread-mcp.mjs', stateDir: "/home/.fray/projects/pid" }
+  const base = { sessionId: "sid", cwd: "/repo", workerContract: "c", permissionMode: "default" as const, spawnThreadMcp: mcp }
+  const spawn = backend.buildSpawn({ ...base, prompt: "hi" }).argv
+  const resume = backend.buildResume({ ...base, message: "go" }).argv
+  for (const [label, argv] of [["spawn", spawn], ["resume", resume]] as const) {
+    // Each -c flag is its own argv pair; find the mcp_servers assignments (execvp passes them literally).
+    const cVals = argv.map((a, i) => (a === "-c" ? argv[i + 1] : null)).filter(Boolean) as string[]
+    assert.ok(cVals.includes("mcp_servers.fray_spawn.command=node"), `${label}: command flag`)
+    // Path with a space stays a valid TOML basic string inside the array value.
+    assert.ok(cVals.includes('mcp_servers.fray_spawn.args=["/abs/plug in/bin/spawn-thread-mcp.mjs"]'), `${label}: args flag`)
+    assert.ok(cVals.includes('mcp_servers.fray_spawn.env={FRAY_STATE_DIR="/home/.fray/projects/pid"}'), `${label}: env flag`)
+  }
+})
+
+test("codex spawn omits the spawn-thread MCP flags when no descriptor is supplied", () => {
+  const argv = createCodexBackend().buildSpawn({ sessionId: "sid", cwd: "/repo", prompt: "hi", workerContract: "c", permissionMode: "default" }).argv
+  assert.ok(!argv.some((a) => typeof a === "string" && a.startsWith("mcp_servers.fray_spawn")))
+})
+
 // ==== native TUI modal detection (real Codex 0.144.1 chrome, pane-only) ====
 
 const githubApprovalPane = `

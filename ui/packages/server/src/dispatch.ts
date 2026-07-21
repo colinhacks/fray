@@ -15,7 +15,7 @@ import {
 import { PERM_DIR_ENV, permRequestDir, type Project } from "./project.ts"
 import type { SessionRow, Storage } from "./storage.ts"
 import type { BoardManager } from "./board.ts"
-import type { AgentBackend, BackendKind, BuiltCommand } from "./backend/types.ts"
+import type { AgentBackend, BackendKind, BuiltCommand, SpawnThreadMcp } from "./backend/types.ts"
 import { buildWorkerPrompt } from "./workerPrompt.ts"
 import { ensureCwdTrusted, discoverCodexRollout, codexSessionSentinel } from "./backend/codex.ts"
 import { readBoard, type FrayBoard, type FrayThread } from "./fray.ts"
@@ -367,6 +367,34 @@ function systemPromptFlags(sessionId: string, system: string): string[] {
   return ["--append-system-prompt-file", path]
 }
 
+// Resolve the descriptor for the fray spawn-thread MCP tool: the abs path to the stdio server script
+// (shipped as a sibling of bin/fray in the worker plugin dir, so it rides the SAME ship+resolve path
+// that already carries the plugin to prod) + the project state dir the script reads server.lock from.
+// Returns undefined when the plugin dir or script can't be found — the worker then simply lacks the
+// tool rather than failing to spawn. `env`/`moduleUrl` injectable for tests.
+export function resolveSpawnThreadMcp(
+  stateDir: string,
+  moduleUrl = import.meta.url,
+  env: NodeJS.ProcessEnv = process.env,
+): SpawnThreadMcp | undefined {
+  const pluginDir = resolveWorkerPluginDir(moduleUrl, env)
+  if (!pluginDir) return undefined
+  const scriptPath = join(pluginDir, "bin", "spawn-thread-mcp.mjs")
+  if (!existsSync(scriptPath)) return undefined
+  return { scriptPath, stateDir }
+}
+
+// Claude flags that mount the spawn-thread MCP server via inline `--mcp-config` JSON and PRE-APPROVE
+// its one tool (`--allowedTools`) so a headless worker never blocks on a permission prompt it has
+// nobody to answer. execvp runs the argv with NO shell (tmux.ts), so the JSON travels literally.
+function claudeSpawnThreadMcpFlags(mcp?: SpawnThreadMcp): string[] {
+  if (!mcp) return []
+  const config = JSON.stringify({
+    mcpServers: { fray_spawn: { command: "node", args: [mcp.scriptPath], env: { FRAY_STATE_DIR: mcp.stateDir } } },
+  })
+  return ["--mcp-config", config, "--allowedTools", "mcp__fray_spawn__spawn_fray_thread"]
+}
+
 // The `claude` argv for a fresh dispatch. session-id is PINNED so we can resume the exact
 // conversation later. claudeBin is injectable so tests build the command without spawning.
 export function buildClaudeCommand(opts: {
@@ -382,11 +410,13 @@ export function buildClaudeCommand(opts: {
   // Extra spawn-specific system-prompt text appended AFTER the worker norms (e.g. the adoption
   // orientation) — system-level so the visible transcript carries only the human's own words.
   extraSystemPrompt?: string
+  spawnThreadMcp?: SpawnThreadMcp
 }): string[] {
   const argv = [opts.claudeBin ?? "claude", "--session-id", opts.sessionId, "--permission-mode", workerPermissionMode(opts.permissionMode)]
   if (opts.model) argv.push("--model", opts.model)
   if (opts.effort) argv.push("--effort", opts.effort)
   if (opts.pluginDir) argv.push("--plugin-dir", opts.pluginDir)
+  argv.push(...claudeSpawnThreadMcpFlags(opts.spawnThreadMcp))
   // The fixed worker norms live in the SYSTEM prompt: rebuilt on every invocation (incl. resume)
   // and immune to compaction, unlike a first user message.
   const worker = opts.workerPrompt ?? loadWorkerPrompt()
@@ -446,11 +476,14 @@ export function buildClaudeResumeCommand(opts: {
   // Extra system-prompt text appended AFTER the worker norms (e.g. the scratchpad orientation) — the
   // system prompt is rebuilt per invocation, so a resume must re-carry it or the scratchpad is forgotten.
   extraSystemPrompt?: string
+  // The spawn-thread MCP tool must ride resume too (a resumed worker keeps the capability).
+  spawnThreadMcp?: SpawnThreadMcp
 }): string[] {
   const argv = [opts.claudeBin ?? "claude", "--permission-mode", workerPermissionMode(opts.permissionMode)]
   if (opts.model) argv.push("--model", opts.model)
   if (opts.effort) argv.push("--effort", opts.effort)
   if (opts.pluginDir) argv.push("--plugin-dir", opts.pluginDir)
+  argv.push(...claudeSpawnThreadMcpFlags(opts.spawnThreadMcp))
   // The system prompt is rebuilt per invocation — the resume must re-carry the worker norms too.
   // Same file-based path as buildClaudeCommand (see systemPromptFlags): inline would blow tmux's
   // command-length limit.
@@ -581,6 +614,7 @@ export function createDispatcher(deps: DispatchDeps): Dispatcher {
     kind?: BackendKind
     runtimeGate: boolean
   }): BuiltCommand {
+    const spawnThreadMcp = resolveSpawnThreadMcp(deps.project.stateDir)
     const backend = deps.backendFor?.(o.kind)
     if (backend) {
       const built = backend.buildSpawn({
@@ -592,6 +626,7 @@ export function createDispatcher(deps: DispatchDeps): Dispatcher {
         permissionMode: o.permissionMode,
         model: o.model,
         effort: o.effort,
+        spawnThreadMcp,
       })
       // Codex inlines the ~18KB worker contract into its prompt argv — too long for the tmux command
       // line. Spill it to a temp file (see transportCodexPrompt). Claude already writes its system
@@ -608,6 +643,7 @@ export function createDispatcher(deps: DispatchDeps): Dispatcher {
       pluginDir: workerPluginDir(),
       extraSystemPrompt: o.extraSystemPrompt,
       workerPrompt: loadWorkerPrompt("claude", o.runtimeGate),
+      spawnThreadMcp,
     })
     return { argv, env: claudeWorkerEnvironment(), prewrite: [] }
   }

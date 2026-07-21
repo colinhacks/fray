@@ -7,6 +7,7 @@ import { connectSync } from "./api/socket.ts"
 import { initFont } from "./lib/font.ts"
 import { installExternalLinkInterceptor } from "./lib/external-links.ts"
 import { installLocalFileLinkInterceptor } from "./lib/local-file-links.ts"
+import { installThreadLinkInterceptor } from "./lib/thread-links.ts"
 import { primeRoute } from "./lib/router.ts"
 
 const settingsFixture = typeof window !== "undefined" && window.location.pathname.endsWith("/settings-formatting-fixture.html")
@@ -28,6 +29,7 @@ if (!settingsFixture) {
   initFont(queryClient)
   installExternalLinkInterceptor()
   installLocalFileLinkInterceptor()
+  installThreadLinkInterceptor()
 }
 
 // No StrictMode: it double-mounts effects, which would open the terminal
