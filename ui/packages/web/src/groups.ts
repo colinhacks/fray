@@ -375,9 +375,9 @@ export function sectionOf(t: ThreadView): SectionKey | null {
   // to Inactive only once it comes to rest still-archived. (A user BUMP un-archives it for good via
   // resume; this is the display safety net for a running-yet-archived session.)
   if (t.state === "archived" && !isActivelyRunning(t)) return "inactive"
-  // Only truthful human/future-timer waiters split into the labeled, dimmed Held band.
-  // Everything else open — running, needs-you, bare rest, done-fenced, awaiting-its-own-subs, or an
-  // awaiting `session`/hintless wait — is Active.
+  // Only confirmed review/future-timer waiters split into the labeled, dimmed Held band.
+  // Everything else open — running, needs-you, bare rest, done-fenced, awaiting-its-own-subs, or a
+  // hintless/invalid proposal — is Active.
   if (isHeld(t)) return "held"
   return "active"
 }

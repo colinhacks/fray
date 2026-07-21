@@ -423,8 +423,8 @@ triages. Queue membership is now server-derived from process rest, not dependent
 signaling:
 
 - Every owned, open session whose top-level turn is genuinely at rest enters Queue by default.
-- A live child/Monitor still counts as in-flight work. A truthful external-human or future-timer
-  `awaiting` fence remains dimmed in Held. Legacy CI/PR/session and hintless waits do not excuse rest.
+- A live child/Monitor still counts as in-flight work. A confirmed external-review or future-timer
+  `awaiting` fence remains dimmed in Held. Unsupported and hintless proposals do not excuse rest.
 - A human may durably Snooze an ordinary handoff (default one day, presets/custom exact instant) or
   Archive it. Due snoozes automatically re-enter Queue; Archive never does.
 - Questions, permissions/native approvals, typed interactions, and crashes break through Snooze so a

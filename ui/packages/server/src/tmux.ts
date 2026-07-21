@@ -131,7 +131,7 @@ function codexCommandMatches(command: string, sessionId: string): boolean {
 
 // Identity match for a legacy pane's start command, per backend.  Codex and Claude pin the native
 // conversation id in entirely different argv shapes; a wrong matcher silently degrades a live codex
-// worker to "unknown", stranding every timer/CI wake (see crossSocketLiveOwner's terminal throw).
+// worker to "unknown", stranding every confirmed timer/review wake (see crossSocketLiveOwner's terminal throw).
 function commandMatchesIdentity(command: string, nativeSessionId: string, backend: string | undefined): boolean {
   return backend === "codex"
     ? codexCommandMatches(command, nativeSessionId)
