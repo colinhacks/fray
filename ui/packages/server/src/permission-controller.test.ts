@@ -156,6 +156,36 @@ test("composer inspection matches the exact wrapped nonempty Nub pane and the di
   )
 })
 
+// Regression: a MULTI-PARAGRAPH draft (blank rows between paragraphs) is the common shape of a real
+// steer. captureCodexComposer used to break at the first blank row, truncating the capture to the
+// first paragraph; codexComposerMatches then compared that prefix against the full normalized text
+// and returned false, so the durable queue wedged forever on "existing draft". The blank row is an
+// internal paragraph break, not the composer's end — only the footer/status line ends it.
+test("composer inspection captures a multi-paragraph draft across internal blank lines", () => {
+  const twoParagraphs =
+    "[1m›[0m First paragraph line one\n  continues on row two\n\n  Second paragraph after a blank line\n\n  gpt-5.6-sol xhigh · ~/Documents/projects/fray · Context 66% used"
+  assert.equal(inspectCodexComposer(twoParagraphs).kind, "typed", "a multi-paragraph draft is a typed composer")
+  assert.equal(
+    codexComposerMatches(twoParagraphs, "First paragraph line one continues on row two\n\nSecond paragraph after a blank line"),
+    true,
+    "the exact multi-paragraph staged text matches and can be submitted",
+  )
+  // Three-blank-line gaps collapse identically (normalizedInput turns any whitespace run into one space).
+  const threeBlanks =
+    "[1m›[0m Alpha\n\n\n  Bravo\n\n  gpt-5.6-sol xhigh · ~/x · 100% context left"
+  assert.equal(codexComposerMatches(threeBlanks, "Alpha\n\nBravo"), true)
+  // Fail-closed preserved: a genuinely different draft is never accepted just because we scan further.
+  assert.equal(
+    codexComposerMatches(twoParagraphs, "First paragraph line one continues on row two\n\nA DIFFERENT second paragraph"),
+    false,
+    "a non-matching multi-paragraph draft still fails closed",
+  )
+  // A footer hint rendered TIGHT under the draft (no blank between) still ends the draft — parity with
+  // the old parts-based capture, so delivery never re-wedges if Codex drops the pre-footer blank row.
+  const esc = String.fromCharCode(27)
+  assert.equal(codexComposerMatches(`${esc}[1m›${esc}[0m Do the safe thing\n  ${esc}[2m100% context left${esc}[0m`, "Do the safe thing"), true)
+})
+
 test("Claude composer inspection distinguishes the idle prompt from an unsent draft or modal", () => {
   assert.deepEqual(inspectClaudeComposer("history\n❯\u00a0\n────────\n  ⏵⏵ auto mode on"), { kind: "empty" })
   assert.deepEqual(inspectClaudeComposer("history\n❯\u00a0UNSENT_DRAFT_PROBE\n────────"), { kind: "typed", text: "UNSENT_DRAFT_PROBE" })

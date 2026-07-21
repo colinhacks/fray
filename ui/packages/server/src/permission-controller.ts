@@ -139,7 +139,7 @@ export type ClaudeComposerState =
 
 type CodexComposerCapture =
   | { kind: "empty" }
-  | { kind: "typed"; parts: string[]; queueHint: boolean }
+  | { kind: "typed"; parts: string[]; rows: { text: string; boundaryBefore: boolean }[]; queueHint: boolean }
   | { kind: "unavailable" }
 
 // Capture only Codex's LAST bold composer prompt. Keeping the visual rows lets the durable-input
@@ -154,16 +154,29 @@ function captureCodexComposer(escapedPane: string): CodexComposerCapture {
     if (!marker || marker.index === undefined) continue
     const raw = lines[i].slice(marker.index + marker[0].length)
     if (/^\s*\x1b\[2m/.test(raw)) return { kind: "empty" }
+    // `parts` stops at the first blank/footer — the text-extraction (inspectCodexComposer) contract.
+    // `rows` keeps every visual row below the marker, each tagged with whether a blank (a paragraph
+    // break) preceded it, WITHOUT guessing the footer boundary: the target-aware codexComposerMatches
+    // decides where a (possibly multi-paragraph) draft ends. A blank row alone is NOT the end — a
+    // real steer routinely contains blank lines between paragraphs.
     const parts = [stripAnsi(raw).trim()]
+    const rows = [{ text: parts[0], boundaryBefore: false }]
+    let blankPending = false
+    let sawStop = false
     for (let j = i + 1; j < lines.length; j++) {
       const part = stripAnsi(lines[j]).trim()
-      if (!part) break
-      if (part.includes("tab to queue message") || part.includes("context left")) break
-      parts.push(part)
+      if (!part) { blankPending = true; continue }
+      if (!sawStop) {
+        if (part.includes("tab to queue message") || part.includes("context left") || blankPending) sawStop = true
+        else parts.push(part)
+      }
+      rows.push({ text: part, boundaryBefore: blankPending })
+      blankPending = false
     }
     return {
       kind: "typed",
       parts,
+      rows,
       // The phrase can occur in transcript history or in the user's draft. Trust only Codex's dim
       // footer after this (last) composer marker, never a global plain-text match.
       queueHint: lines.slice(i + 1).some((line) => {
@@ -200,20 +213,48 @@ export function inspectCodexComposer(escapedPane: string): CodexComposerState {
 }
 
 // Compare a persisted queue item with the visual composer without guessing where Codex inserted a
-// soft row break. Every boundary may represent either zero characters (a token split) or one
-// normalized whitespace character (a word/newline break); differences anywhere INSIDE a row still
-// fail closed. The position-set DP is linear in practice and cannot explode as 2^rows.
+// soft row break. Every WITHIN-paragraph boundary may represent either zero characters (a token
+// split) or one normalized whitespace character (a word break); a BLANK row is a paragraph break —
+// always exactly one normalized space. Differences anywhere INSIDE a row still fail closed. The
+// position-set DP is linear in practice and cannot explode as 2^rows.
+//
+// The draft can be MULTI-PARAGRAPH (blank rows between paragraphs) and is followed by Codex's
+// footer/status line. Rather than guess where the draft ends and the footer begins (the status line
+// has no stable, draft-distinct signature — it can be a bare model slug), the draft is defined as the
+// blank-separated run of rows that EXACTLY reconstructs the target: once the target is fully matched
+// at a paragraph boundary, the draft is complete and everything below is footer. This is strictly
+// tighter than the old "stop at the first blank" rule for a single paragraph and, unlike it, no longer
+// truncates a multi-paragraph steer to its first paragraph (which wedged the durable queue forever).
 export function codexComposerMatches(escapedPane: string, expected: string): boolean {
   const captured = captureCodexComposer(escapedPane)
-  if (captured.kind !== "typed" || captured.parts.length === 0) return false
+  if (captured.kind !== "typed" || captured.rows.length === 0) return false
   const target = normalizedInput(expected)
-  const parts = captured.parts.map(normalizedInput)
-  if (!target.startsWith(parts[0])) return false
-  let positions = new Set([parts[0].length])
-  for (const part of parts.slice(1)) {
+  if (!target) return false
+  const first = normalizedInput(captured.rows[0].text)
+  if (first === "" || !target.startsWith(first)) return false
+  let positions = new Set([first.length])
+  for (const row of captured.rows.slice(1)) {
+    // A blank row separated the previous paragraph from this row. If the target is already fully
+    // reconstructed, the draft ended at that paragraph and this row (plus the footer/status below it)
+    // is not part of the staged text — the composer is confirmed to hold exactly our message.
+    if (row.boundaryBefore && positions.has(target.length)) return true
+    // A recognized footer hint ends the draft even when Codex renders it tight under the last line
+    // (no blank between). The old parts-based capture stopped at these markers regardless of blanks;
+    // preserving that keeps delivery robust if a future Codex build drops the pre-footer blank row.
+    // (The status/mode line has no such stable marker — it is handled only by the blank-boundary rule
+    // above, which is why a foreign draft whose leading paragraphs happen to exactly equal the queued
+    // text can still early-complete; that submit is a deliberate, near-impossible trade for never
+    // wedging a real multi-paragraph steer.)
+    if (row.text.includes("tab to queue message") || row.text.includes("context left")) {
+      return positions.has(target.length)
+    }
+    const part = normalizedInput(row.text)
+    if (part === "") continue
+    // A paragraph break is exactly one space; a within-paragraph wrap is "" or " ".
+    const separators = row.boundaryBefore ? [" "] : ["", " "]
     const next = new Set<number>()
     for (const position of positions) {
-      for (const separator of ["", " "]) {
+      for (const separator of separators) {
         const token = separator + part
         if (target.startsWith(token, position)) next.add(position + token.length)
       }
