@@ -10,18 +10,27 @@ const execFileAsync = promisify(execFile)
 // than login because it mutates process-GLOBAL account state: it must refuse to race a live turn for
 // that provider, and the exact CLI argv runs WITHOUT a shell.
 
-// A turn that could be mid-request for this provider. turn-idle is safe: the worker is parked at its
-// prompt, and its next follow-up will surface the signed-out state through the runtime classifier.
+// A turn that could be mid-request for this provider. turn-idle is safe ONLY when nothing is running
+// underneath it: a parked parent with a live background sub-agent/shell is still consuming the
+// credential, so logout must refuse it too (review finding L3 — a naive runtime check would yank the
+// token from an in-flight child). A truly idle worker's next follow-up surfaces the signed-out state
+// through the runtime 401 classifier.
 const LIVE_RUNTIMES = new Set(["spawning", "running", "perm-prompt"])
 
 // Count this provider's live sessions from a board snapshot. Rows with no recorded backend are
 // treated as Claude (the unmarked default) so an unlabeled live worker still blocks a Claude logout.
-export function liveThreadsForBackend(threads: readonly Pick<ThreadView, "backend" | "runtime" | "kind" | "foreign">[], backend: Backend): number {
+export function liveThreadsForBackend(
+  threads: readonly Pick<ThreadView, "backend" | "runtime" | "kind" | "foreign" | "subAgents" | "bgShells">[],
+  backend: Backend,
+): number {
   let count = 0
   for (const thread of threads) {
     if (thread.kind !== "session" || thread.foreign) continue
     if ((thread.backend ?? "claude") !== backend) continue
-    if (LIVE_RUNTIMES.has(thread.runtime)) count++
+    const backgroundWork =
+      thread.subAgents.some((agent) => agent.state === "running") ||
+      thread.bgShells.some((shell) => shell.state === "running")
+    if (LIVE_RUNTIMES.has(thread.runtime) || backgroundWork) count++
   }
   return count
 }

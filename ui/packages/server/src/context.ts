@@ -135,6 +135,9 @@ export interface AppContext {
   // The dispatch Claude executable (tests use a stand-in). The account logout action runs the SAME
   // binary so sign-out targets the credential the workers actually use.
   claudeBin?: string
+  // Same seam for Codex: the resolved app-server/backend executable, so codex login/logout target
+  // the binary fray actually runs rather than whatever "codex" is first on PATH.
+  codexBin?: string
   // Slice B account utility: the restricted short-lived `claude auth login` terminal behind the
   // sign-in modal's primary action. Attempts ride the /term transport via slug-shaped opaque ids.
   loginUtility: LoginUtility
@@ -519,6 +522,7 @@ function createContextUnchecked(opts: ContextOptions, resources: PartialContextR
     setSettings: (s) => setSettings(storage, s),
     resetSettings: () => resetSettings(storage),
     claudeBin: opts.claudeBin,
-    loginUtility: createLoginUtility({ claudeBin: opts.claudeBin, cwd: project.dir }),
+    codexBin: opts.codexBin,
+    loginUtility: createLoginUtility({ claudeBin: opts.claudeBin, codexBin: opts.codexBin, cwd: project.dir }),
   }
 }

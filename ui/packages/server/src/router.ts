@@ -955,6 +955,7 @@ export function createRouter(ctx: AppContext) {
         return runProviderLogout({
           backend: input.backend,
           claudeBin: ctx.claudeBin,
+          codexBin: ctx.codexBin,
           liveThreads: liveThreadsForBackend(snapshot.threads, input.backend),
         })
       },

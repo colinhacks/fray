@@ -5,8 +5,15 @@ import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { liveThreadsForBackend, runProviderLogout } from "./account-actions.ts"
 
-function thread(over: Partial<{ backend: "claude" | "codex"; runtime: string; kind: "session" | "legacy"; foreign: boolean }> = {}) {
-  return { backend: over.backend, runtime: over.runtime ?? "turn-idle", kind: over.kind ?? ("session" as const), foreign: over.foreign ?? false } as never
+function thread(over: Partial<{ backend: "claude" | "codex"; runtime: string; kind: "session" | "legacy"; foreign: boolean; subAgents: { state: string }[]; bgShells: { state: string }[] }> = {}) {
+  return {
+    backend: over.backend,
+    runtime: over.runtime ?? "turn-idle",
+    kind: over.kind ?? ("session" as const),
+    foreign: over.foreign ?? false,
+    subAgents: over.subAgents ?? [],
+    bgShells: over.bgShells ?? [],
+  } as never
 }
 
 test("liveThreadsForBackend: counts only this provider's live session threads", () => {
@@ -22,6 +29,16 @@ test("liveThreadsForBackend: counts only this provider's live session threads", 
   ]
   assert.equal(liveThreadsForBackend(threads, "claude"), 3)
   assert.equal(liveThreadsForBackend(threads, "codex"), 1)
+})
+
+test("liveThreadsForBackend: a parked parent with a RUNNING background child still blocks logout", () => {
+  const threads = [
+    thread({ backend: "claude", runtime: "turn-idle", subAgents: [{ state: "running" }] }),
+    thread({ backend: "claude", runtime: "turn-idle", bgShells: [{ state: "running" }] }),
+    thread({ backend: "claude", runtime: "turn-idle", subAgents: [{ state: "done" }], bgShells: [{ state: "done" }] }),
+    thread({ backend: "claude", runtime: "exited", subAgents: [{ state: "running" }] }), // stale telemetry on a dead pane still counts — safe side
+  ]
+  assert.equal(liveThreadsForBackend(threads, "claude"), 3)
 })
 
 function withStub(script: string, fn: (bin: string) => Promise<void>): Promise<void> {
