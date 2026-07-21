@@ -37,8 +37,9 @@ test("Codex and Claude provider guidance prefer declared tooling and make no Lun
   assert.doesNotMatch(codex, /exactly one `gpt-5\.6-luna` \+ `medium` monitor child/)
   assert.match(claude, /use native `Monitor`/)
 
-  const codexPrompt = readFileSync(join(root, "ui/packages/server/src/WORKER_PROMPT.codex.golden.txt"), "utf8")
-  const claudePrompt = readFileSync(join(root, "ui/packages/server/src/WORKER_PROMPT.claude.golden.txt"), "utf8")
+  const promptDir = join(root, "ui/packages/server/src")
+  const codexPrompt = readFileSync(join(promptDir, "WORKER_PROMPT.codex.golden.txt"), "utf8")
+  const claudePrompt = readFileSync(join(promptDir, "WORKER_PROMPT.claude.golden.txt"), "utf8")
   for (const prompt of [codexPrompt, claudePrompt]) {
     assert.match(prompt, /project-local `AGENTS\.md`/)
     assert.match(prompt, /terminal event\/exit semantics/)
