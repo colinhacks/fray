@@ -377,7 +377,19 @@ test("local atomic text-and-key send pastes the complete multiline payload and c
   try {
     spawn(
       slug,
-      [process.execPath, "-e", "process.stdin.on('data', d => process.stdout.write('LOCAL:' + JSON.stringify(d.toString())))"],
+      [process.execPath, "-e", `
+        process.stdin.setRawMode(true);
+        let sawPayload = false;
+        process.stdin.on('data', d => {
+          const value = d.toString();
+          if (value === '\\r') {
+            process.stdout.write(sawPayload ? 'SUBMIT_AFTER_PASTE' : 'COALESCED_SUBMIT');
+          } else {
+            sawPayload = true;
+            process.stdout.write('PAYLOAD:' + value);
+          }
+        });
+      `],
       process.cwd(),
     )
     const payload = `${secret} first paragraph\n\nsecond paragraph`
@@ -389,11 +401,13 @@ test("local atomic text-and-key send pastes the complete multiline payload and c
     const deadline = Date.now() + 2_000
     while (Date.now() < deadline) {
       pane = execFileSync("tmux", ["-L", socketName(), "capture-pane", "-p", "-t", tmuxSessionName(slug)], { encoding: "utf8" })
-      if (pane.includes(secret) && pane.includes("second paragraph")) break
+      if (pane.includes("first paragraph") && pane.includes("second paragraph") && pane.includes("SUBMIT_AFTER_PASTE")) break
       await new Promise((resolve) => setTimeout(resolve, 10))
     }
-    assert.match(pane, new RegExp(secret))
+    assert.match(pane, /first paragraph/)
     assert.match(pane, /second paragraph/)
+    assert.match(pane, /SUBMIT_AFTER_PASTE/, "the submit key reaches the application in a later input event than the paste")
+    assert.doesNotMatch(pane, /COALESCED_SUBMIT/)
 
     killSession(slug)
     assert.equal(sendTextWithKey(slug, secret, "Enter"), false)
@@ -401,6 +415,141 @@ test("local atomic text-and-key send pastes the complete multiline payload and c
     assert.doesNotMatch(buffers(), new RegExp(secret))
   } finally {
     killSession(slug)
+    setSocket(originalSocket)
+  }
+})
+
+test("a pane replaced during the paste settle boundary receives no delayed key and strands no input buffer", { skip: !tmuxAvailable }, async () => {
+  const originalSocket = socketName()
+  const slug = `local-settle-race-${process.pid}`
+  const holder = `local-settle-holder-${process.pid}`
+  const testSocket = `fray-local-settle-race-test-${process.pid}`
+  setSocket(testSocket)
+  const buffers = (): string => {
+    try {
+      return execFileSync("tmux", ["-L", testSocket, "list-buffers", "-F", "#{buffer_name}"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+    } catch {
+      return ""
+    }
+  }
+  try {
+    spawn(holder, [process.execPath, "-e", "setInterval(() => {}, 1000)"], process.cwd())
+    spawn(slug, [process.execPath, "-e", "process.stdin.resume()"], process.cwd())
+    const moduleUrl = new URL("./tmux.ts", import.meta.url).href
+    let output = ""
+    const child = spawnChild(process.execPath, ["--input-type=module", "-e", `
+      import { setSocket, sendTextWithKey } from ${JSON.stringify(moduleUrl)};
+      setSocket(${JSON.stringify(testSocket)});
+      process.stdout.write("FRAY_SETTLE_READY\\n");
+      const result = sendTextWithKey(${JSON.stringify(slug)}, "MUST_NOT_REACH_REPLACEMENT", "Enter");
+      process.stdout.write("RESULT:" + result + "\\n");
+    `], { stdio: ["ignore", "pipe", "pipe"] })
+    child.stdout.on("data", (chunk) => { output += String(chunk) })
+
+    const bufferDeadline = Date.now() + 2_000
+    while (Date.now() < bufferDeadline && !buffers().includes("fray-input-")) {
+      await new Promise((resolve) => setTimeout(resolve, 1))
+    }
+    assert.match(buffers(), /fray-input-/, "the target is replaced while the server-side settle queue is paused")
+
+    killSession(slug)
+    spawn(slug, [process.execPath, "-e", "process.stdin.on('data', d => process.stdout.write('COMPETITOR:' + d))"], process.cwd())
+    const code = await new Promise<number | null>((resolve) => child.once("close", resolve))
+    assert.equal(code, 0)
+    assert.match(output, /RESULT:false/)
+    assert.doesNotMatch(buffers(), /fray-input-/)
+
+    const competitor = execFileSync(
+      "tmux",
+      ["-L", testSocket, "capture-pane", "-p", "-t", tmuxSessionName(slug)],
+      { encoding: "utf8" },
+    )
+    assert.doesNotMatch(competitor, /MUST_NOT_REACH_REPLACEMENT|COMPETITOR:/)
+  } finally {
+    killSession(slug)
+    killSession(holder)
+    setSocket(originalSocket)
+  }
+})
+
+test("an exact adopted pane replaced during settle receives no delayed key and strands no input buffer", { skip: !tmuxAvailable }, async () => {
+  const originalSocket = socketName()
+  const slug = `exact-settle-race-${process.pid}`
+  const holder = `exact-settle-holder-${process.pid}`
+  const token = randomUUID()
+  const competitorToken = randomUUID()
+  const testSocket = `fray-exact-settle-race-test-${process.pid}`
+  setSocket(testSocket)
+  const buffers = (): string => {
+    try {
+      return execFileSync("tmux", ["-L", testSocket, "list-buffers", "-F", "#{buffer_name}"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+    } catch {
+      return ""
+    }
+  }
+  let exact: ReturnType<typeof spawn> | undefined
+  try {
+    spawn(holder, [process.execPath, "-e", "setInterval(() => {}, 1000)"], process.cwd())
+    exact = spawn(slug, [process.execPath, "-e", "process.stdin.resume()"], process.cwd(), undefined, {
+      adoptionAttemptToken: token,
+    })
+    const expected = {
+      attempt_token: token,
+      pane_id: exact.paneId,
+      pane_pid: exact.panePid,
+      session_created: exact.sessionCreated,
+    }
+    const moduleUrl = new URL("./tmux.ts", import.meta.url).href
+    let output = ""
+    const child = spawnChild(process.execPath, ["--input-type=module", "-e", `
+      import { setSocket, sendTextWithKeyToExpectedAdoptionPane } from ${JSON.stringify(moduleUrl)};
+      setSocket(${JSON.stringify(testSocket)});
+      process.stdout.write("FRAY_EXACT_SETTLE_READY\\n");
+      const result = sendTextWithKeyToExpectedAdoptionPane(
+        ${JSON.stringify(expected)},
+        "MUST_NOT_REACH_EXACT_REPLACEMENT",
+        "Enter",
+      );
+      process.stdout.write("RESULT:" + result + "\\n");
+    `], { stdio: ["ignore", "pipe", "pipe"] })
+    child.stdout.on("data", (chunk) => { output += String(chunk) })
+
+    const bufferDeadline = Date.now() + 2_000
+    while (Date.now() < bufferDeadline && !buffers().includes("fray-exact-")) {
+      await new Promise((resolve) => setTimeout(resolve, 1))
+    }
+    assert.match(buffers(), /fray-exact-/, "the exact owner is replaced while its settle queue is paused")
+
+    killPane(exact)
+    exact = undefined
+    spawn(
+      slug,
+      [process.execPath, "-e", "process.stdin.on('data', d => process.stdout.write('COMPETITOR:' + d))"],
+      process.cwd(),
+      undefined,
+      { adoptionAttemptToken: competitorToken },
+    )
+    const code = await new Promise<number | null>((resolve) => child.once("close", resolve))
+    assert.equal(code, 0)
+    assert.match(output, /RESULT:false/)
+    assert.doesNotMatch(buffers(), /fray-exact-/)
+
+    const competitor = execFileSync(
+      "tmux",
+      ["-L", testSocket, "capture-pane", "-p", "-t", tmuxSessionName(slug)],
+      { encoding: "utf8" },
+    )
+    assert.doesNotMatch(competitor, /MUST_NOT_REACH_EXACT_REPLACEMENT|COMPETITOR:/)
+  } finally {
+    if (exact) killPane(exact)
+    killSession(slug)
+    killSession(holder)
     setSocket(originalSocket)
   }
 })
