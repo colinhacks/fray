@@ -126,7 +126,13 @@ export function Sidebar() {
     // HEIGHT MODEL: a sticky, exactly viewport-height wrapper that CENTERS the inner column, which
     // grows fit-content to a near-flush cap and scrolls internally only past it. overflow-x is CLIPPED
     // (titles wrap; min-w-0 at every level). No bg/clip on the column itself.
-    <aside className="sticky top-0 self-start h-screen w-[clamp(320px,34vw,680px)] shrink-0 flex flex-col justify-center min-[801px]:z-[100] max-[800px]:static max-[800px]:h-auto max-[800px]:w-full max-[800px]:justify-start max-[800px]:pt-16">
+    // NO z-index. The rail and the workpane are side-by-side flex columns that never overlap, so the
+    // old desktop `z-[100]` bought nothing — but it outranked every ordinary overlay (the ⌘K palette
+    // at z-[60], the new-thread modal and settings drawer at z-50, toasts at z-[70]), so each of them
+    // painted BEHIND the prompt box and had to escalate past 100 to be seen. That escalation is the
+    // recurring "hidden underneath the prompt box" bug. Default stacking is the fix: overlays win by
+    // simply being overlays. Do not re-add a z here — raise the specific overlay instead.
+    <aside className="sticky top-0 self-start h-screen w-[clamp(320px,34vw,680px)] shrink-0 flex flex-col justify-center max-[800px]:static max-[800px]:h-auto max-[800px]:w-full max-[800px]:justify-start max-[800px]:pt-16">
       {/* The content column FILLS the aside track (no narrow inner cap). */}
       <div className="flex max-h-[calc(100vh-32px)] min-h-0 min-w-0 w-full flex-col max-[800px]:max-h-none">
         {/* THE PROMPT BOX lives at the sidebar top (it replaced the New-thread pill — maintainer
