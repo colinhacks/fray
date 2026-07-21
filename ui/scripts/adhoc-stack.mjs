@@ -10,7 +10,7 @@
 // The project defaults to the fray repo itself (a gh-authed repo, an empty board under the temp HOME).
 //
 // Usage:
-//   npx tsx ui/scripts/adhoc-stack.mjs [--port=4930] [--project=/abs/dir] [--wakers] [--keep] [--seed]
+//   npx tsx ui/scripts/adhoc-stack.mjs [--port=4930] [--project=/abs/dir] [--wakers] [--reaper] [--keep] [--seed]
 //
 // It prints ONE json line to stdout: {"url","port","home","socket","project"} once /health is green,
 // then stays up until SIGINT/SIGTERM, deleting the temp HOME on exit (unless --keep). Run it with Bash
@@ -37,6 +37,10 @@ mkdirSync(join(home, ".fray"), { recursive: true })
 process.env.HOME = home
 process.env.FRAY_TMUX_SOCKET = `fray-adhoc-${port}-${process.pid}`
 if (!flag("wakers")) process.env.FRAY_WAKERS_OFF = "1"
+// A disposable stack must never reap the real machine's leaked worker processes (the orphan reaper
+// enumerates ALL processes, not just this stack's). Off by default, exactly like the scheduler; pass
+// --reaper to arm it when verifying the reaper itself.
+if (!flag("reaper")) process.env.FRAY_ORPHAN_REAPER_OFF = "1"
 process.chdir(projectDir)
 
 // Optional: drop a tiny fixture note so the board isn't stone empty when eyeballing the shell. Off by
