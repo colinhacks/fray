@@ -17,6 +17,7 @@ import {
 } from "./resume.ts"
 import { createClaudeBackend } from "./backend/claude.ts"
 import { createCodexBackend } from "./backend/codex.ts"
+import { readClaudeAuthStatusCli, readCodexAuthState } from "./backend/auth-status.ts"
 import type { AgentBackend } from "./backend/types.ts"
 import { detectGithub, type GithubDetection } from "./github.ts"
 import * as tmux from "./tmux.ts"
@@ -458,6 +459,13 @@ function createContextUnchecked(opts: ContextOptions, resources: PartialContextR
     getSettings: () => getSettings(storage),
     claudeBin: opts.claudeBin,
     backendFor,
+    // Auth preflight (claude-auth plan, Slice A): Claude asks its own CLI (`claude auth status
+    // --json`, run in the project cwd with the dispatch executable); Codex reads the local
+    // auth.json/env. Both block only on a positive "signed-out" — everything else fails open.
+    preflightAuth: (kind) =>
+      kind === "codex"
+        ? Promise.resolve(readCodexAuthState())
+        : readClaudeAuthStatusCli({ claudeBin: opts.claudeBin, cwd: project.dir }),
   })
 
   // Durable timer waker + legacy pr/ci compatibility. Reuses the SAME resume path as followUp;

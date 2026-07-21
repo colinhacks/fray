@@ -102,6 +102,62 @@ export function readCodexAuthState(codexHome = defaultCodexHome()): ProviderAuth
   return apiKey || accessToken ? "authed" : "signed-out"
 }
 
+// Dispatch preflight rejection: the server refuses to create ANY thread state (scratchpad, tmux
+// session, registry row) for a provider that is positively signed out. The message is a stable
+// sentinel the web client parses to open the sign-in modal instead of a generic failure toast.
+export class ProviderAuthRequiredError extends Error {
+  readonly backend: "claude" | "codex"
+  constructor(backend: "claude" | "codex") {
+    super(`AUTH_REQUIRED:${backend}`)
+    this.name = "ProviderAuthRequiredError"
+    this.backend = backend
+  }
+}
+
+// Parse `claude auth status --json` stdout into a tri-state. Positive-signal only: a definite
+// `loggedIn: false` in the JSON is the ONLY thing that reads as signed-out; anything unparseable is
+// undefined (→ unknown upstream, fail open). The CLI may print human noise around the JSON, so scan
+// for the outermost object rather than trusting the whole stream to be JSON.
+export function parseClaudeAuthStatusJson(stdout: string): boolean | undefined {
+  const start = stdout.indexOf("{")
+  const end = stdout.lastIndexOf("}")
+  if (start === -1 || end <= start) return undefined
+  try {
+    const doc = JSON.parse(stdout.slice(start, end + 1)) as Record<string, unknown>
+    return typeof doc.loggedIn === "boolean" ? doc.loggedIn : undefined
+  } catch {
+    return undefined
+  }
+}
+
+// The dispatch-preflight Claude signal: `claude auth status --json` run with the worker's own
+// executable in the project cwd (maintainer call: the auth-status CLI is the right detection signal
+// for Claude). Exit 0 ⇒ the CLI considers the user logged in. A non-zero exit is only signed-out when
+// the emitted JSON POSITIVELY says `loggedIn: false` — a missing binary, timeout, or unparseable
+// output is "unknown" so the gate fails open. NOTE this is a presence check, not validity proof: an
+// expired/revoked token still passes and is caught by the runtime 401 classifier.
+export async function readClaudeAuthStatusCli(opts?: {
+  claudeBin?: string
+  cwd?: string
+  timeoutMs?: number
+}): Promise<ProviderAuth> {
+  const bin = opts?.claudeBin ?? "claude"
+  try {
+    const { stdout } = await execFileAsync(bin, ["auth", "status", "--json"], {
+      encoding: "utf8",
+      timeout: opts?.timeoutMs ?? 5000,
+      ...(opts?.cwd ? { cwd: opts.cwd } : {}),
+    })
+    return parseClaudeAuthStatusJson(String(stdout)) === false ? "signed-out" : "authed"
+  } catch (err) {
+    const stdout = (err as { stdout?: unknown }).stdout
+    const loggedIn = typeof stdout === "string" ? parseClaudeAuthStatusJson(stdout) : undefined
+    if (loggedIn === false) return "signed-out"
+    if (loggedIn === true) return "authed"
+    return "unknown"
+  }
+}
+
 // The per-provider auth snapshot the new-thread gate reads. Never throws — each provider degrades to
 // "unknown" independently, and the gate fails open on "unknown".
 export async function readAuthSnapshot(): Promise<AuthSnapshot> {

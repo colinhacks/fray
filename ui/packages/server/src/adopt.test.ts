@@ -51,6 +51,7 @@ function harness(options: {
   onSpawn?: (storage: Storage, spawn: SpawnRecord) => void
   readBoard?: (threads: readonly FrayThread[], dir: string) => FrayBoard | Promise<FrayBoard>
   adoptionRuntime?: AdoptionRecoveryRuntime
+  preflightAuth?: (kind: string) => Promise<"authed" | "signed-out" | "unknown">
 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "fray-adopt-"))
   const storage = createStorage(join(dir, "ui.db"))
@@ -123,6 +124,7 @@ function harness(options: {
     // Adoption must never reach its legacy name-targeted cleanup seam.
     killSession: (slug) => void killedNames.push(slug),
     adoptionRuntime: options.adoptionRuntime,
+    preflightAuth: options.preflightAuth,
   })
 
   const discoverLegacy = (slug: string, over: Partial<FrayThread> = {}) => {
@@ -581,4 +583,56 @@ test("a registry owner that wins after spawn is preserved and only the exact los
   assert.equal(saved?.exited, 1)
   assert.equal(saved?.archived, 1)
   assert.equal(saved?.state, "archived")
+})
+
+// ---- Dispatch auth preflight (claude-auth plan, Slice A) ----
+
+test("signed-out preflight rejects dispatch before scratch, tmux, and storage", async () => {
+  const seen: string[] = []
+  const h = harness({
+    preflightAuth: async (kind) => {
+      seen.push(kind)
+      return "signed-out"
+    },
+  })
+  await assert.rejects(h.dispatcher.dispatch({ prompt: "do the thing" }), /AUTH_REQUIRED:claude$/)
+  assert.deepEqual(seen, ["claude"])
+  assert.equal(h.spawned.length, 0)
+  assert.equal(h.ensureCalls(), 0)
+  // Zero trace: no scratchpad tree, no registry row.
+  assert.equal(existsSync(join(h.dir, ".fray")), false)
+})
+
+test("signed-out preflight names the codex backend when the dispatch targets codex", async () => {
+  const h = harness({ preflightAuth: async () => "signed-out" })
+  await assert.rejects(
+    h.dispatcher.dispatch({ prompt: "do the thing", backend: "codex" }, { backend: "codex" }),
+    /AUTH_REQUIRED:codex$/,
+  )
+  assert.equal(h.spawned.length, 0)
+})
+
+test("unknown preflight fails OPEN — dispatch proceeds", async () => {
+  const h = harness({ preflightAuth: async () => "unknown" })
+  const res = await h.dispatcher.dispatch({ prompt: "do the thing" })
+  assert.equal(h.spawned.length, 1)
+  assert.ok(h.storage.getSession(res.slug))
+})
+
+test("a preflight that itself throws fails OPEN — dispatch proceeds", async () => {
+  const h = harness({
+    preflightAuth: async () => {
+      throw new Error("keychain exploded")
+    },
+  })
+  const res = await h.dispatcher.dispatch({ prompt: "do the thing" })
+  assert.equal(h.spawned.length, 1)
+  assert.ok(h.storage.getSession(res.slug))
+})
+
+test("no injected preflight (unit-test composition) leaves dispatch untouched", async () => {
+  const h = harness()
+  const res = await h.dispatcher.dispatch({ prompt: "do the thing" })
+  assert.equal(h.spawned.length, 1)
+  assert.ok(h.storage.getSession(res.slug))
 })

@@ -9,11 +9,6 @@ import { Composer } from "./Composer.tsx"
 import { GithubTrigger } from "./GithubTrigger.tsx"
 import { ProfileGridSelector } from "./ProfileGridSelector.tsx"
 import { SignInModal } from "./SignInModal.tsx"
-import { Select } from "./ui/Select.tsx"
-import {
-  PERMISSION_COLOR,
-  permOptionsFor,
-} from "../lib/options.ts"
 import {
   applyDispatchPreferenceUpdate,
   dispatchProfileGroups,
@@ -94,6 +89,16 @@ export function DispatchForm({
       // effortless without overwriting text typed during the failed request.
       if (!draftStore.get(promptKey)) setPrompt(submittedDraftRef.current || input.prompt)
       setPendingDispatch(null)
+      // Server-side auth preflight rejection (the client gate can miss on a stale snapshot): open the
+      // same sign-in modal with the dispatch stashed, instead of a dead-end failure toast. The server
+      // created no thread state, and the draft was restored above.
+      const auth = /^AUTH_REQUIRED:(claude|codex)$/.exec((e as Error).message)
+      if (auth) {
+        gatedInputRef.current = input
+        setSignInFor(auth[1] as Backend)
+        showToast(`Signed out of ${auth[1] === "claude" ? "Claude" : "Codex"}`, { duration: 3000 })
+        return
+      }
       showToast(`Dispatch failed: ${(e as Error).message.slice(0, 80)}`)
     },
   })
@@ -133,10 +138,8 @@ export function DispatchForm({
     }
     const input: DispatchInput = {
       prompt: prompt.trim(),
-      // For codex the stored permissionMode is mapped to the sandbox-facing value shown in the
-      // readout, so the dispatch carries exactly what the user sees (the server's codexSandbox then
-      // maps it to `-s`). Model and effort were already validated against the hydrated catalogue.
-      permissionMode: resolved.permissionMode,
+      // No permissionMode: the server stamps every created worker with its fixed non-interactive
+      // mode (WORKER_DISPATCH_PERMISSION) — dispatch offers no permission choice.
       model: resolved.model,
       backend: resolved.backend,
       effort: resolved.effort as DispatchInput["effort"],
@@ -164,47 +167,33 @@ export function DispatchForm({
   const footer = useMemo(() => {
     if (!resolved) {
       return (
-        <>
-          <ProfileGridSelector
-            groups={[]}
-            value={undefined}
-            onValueChange={() => {}}
-            placeholder={preferences.isError || codexModels.isError ? "Profile unavailable" : "Profile loading…"}
-            ariaLabel="Model and effort loading"
-            disabled
-          />
-          <Select variant="readout" className={PROMPT_CONTROL_TYPOGRAPHY_CLASS} value="" onValueChange={() => {}} options={[]} placeholder="Loading…" ariaLabel="Permission mode loading" indicatorPosition="right" disabled />
-        </>
+        <ProfileGridSelector
+          groups={[]}
+          value={undefined}
+          onValueChange={() => {}}
+          placeholder={preferences.isError || codexModels.isError ? "Profile unavailable" : "Profile loading…"}
+          ariaLabel="Model and effort loading"
+          disabled
+        />
       )
     }
     const profileGroups = dispatchProfileGroups(codexList)
     return (
-      <>
-        <ProfileGridSelector
-          groups={profileGroups}
-          value={{ provider: resolved.backend, model: resolved.model, effort: resolved.effort }}
-          onValueChange={(selection) => savePreference({
-            field: "profile",
-            backend: selection.provider as typeof resolved.backend,
-            model: selection.model,
-            effort: selection.effort as DispatchInput["effort"] & string,
-          })}
-          ariaLabel="Model and effort"
-          title={resolved.modelAvailable && resolved.effortAvailable
-            ? "Model and reasoning effort"
-            : "Saved model or reasoning effort unavailable — choose a supported pair"}
-          className="max-w-[min(21rem,72vw)]"
-        />
-        <Select
-          variant="readout"
-          className={`${PROMPT_CONTROL_TYPOGRAPHY_CLASS} ${PERMISSION_COLOR[resolved.permissionMode]}`}
-          value={resolved.permissionMode}
-          onValueChange={(value) => savePreference({ field: "permissionMode", backend: resolved.backend, value: value as typeof resolved.permissionMode })}
-          options={permOptionsFor(resolved.backend)}
-          indicatorPosition="right"
-          ariaLabel={resolved.backend === "codex" ? "Sandbox" : "Permission mode"}
-        />
-      </>
+      <ProfileGridSelector
+        groups={profileGroups}
+        value={{ provider: resolved.backend, model: resolved.model, effort: resolved.effort }}
+        onValueChange={(selection) => savePreference({
+          field: "profile",
+          backend: selection.provider as typeof resolved.backend,
+          model: selection.model,
+          effort: selection.effort as DispatchInput["effort"] & string,
+        })}
+        ariaLabel="Model and effort"
+        title={resolved.modelAvailable && resolved.effortAvailable
+          ? "Model and reasoning effort"
+          : "Saved model or reasoning effort unavailable — choose a supported pair"}
+        className="max-w-[min(21rem,72vw)]"
+      />
     )
   }, [resolved, codexList, preferences.isError, codexModels.isError])
 

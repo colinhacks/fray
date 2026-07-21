@@ -3,7 +3,7 @@ import assert from "node:assert/strict"
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
-import { readClaudeAuthState, readCodexAuthState } from "./auth-status.ts"
+import { parseClaudeAuthStatusJson, readClaudeAuthState, readClaudeAuthStatusCli, readCodexAuthState } from "./auth-status.ts"
 
 // Codex reads env keys BEFORE the file, so a file-based test must run with those keys cleared or an
 // ambient OPENAI_API_KEY in the dev shell would mask the file logic. Clears + restores around fn.
@@ -109,3 +109,56 @@ async function withTmpAsync(fn: (dir: string) => Promise<void>): Promise<void> {
     rmSync(dir, { recursive: true, force: true })
   }
 }
+
+// ---- Claude CLI preflight (`claude auth status --json`) — stubbed executable, no real CLI ----
+
+function withStub(script: string, fn: (bin: string) => Promise<void>): Promise<void> {
+  return withTmpAsync(async (dir) => {
+    const bin = join(dir, "claude-stub")
+    writeFileSync(bin, `#!/bin/sh\n${script}\n`, { mode: 0o755 })
+    await fn(bin)
+  })
+}
+
+test("auth-status CLI: exit 0 with loggedIn true → authed", () =>
+  withStub(`echo '{"loggedIn": true, "authMethod": "oauth"}'`, async (bin) => {
+    assert.equal(await readClaudeAuthStatusCli({ claudeBin: bin }), "authed")
+  }))
+
+test("auth-status CLI: exit 0 with unparseable output → authed (exit code is the login signal)", () =>
+  withStub(`echo 'Logged in as someone'`, async (bin) => {
+    assert.equal(await readClaudeAuthStatusCli({ claudeBin: bin }), "authed")
+  }))
+
+test("auth-status CLI: nonzero exit with positive loggedIn false → signed-out", () =>
+  withStub(`echo '{"loggedIn": false}'; exit 1`, async (bin) => {
+    assert.equal(await readClaudeAuthStatusCli({ claudeBin: bin }), "signed-out")
+  }))
+
+test("auth-status CLI: loggedIn false printed amid human noise → signed-out", () =>
+  withStub(`echo 'Not logged in.'; echo '{"loggedIn": false}'; exit 1`, async (bin) => {
+    assert.equal(await readClaudeAuthStatusCli({ claudeBin: bin }), "signed-out")
+  }))
+
+test("auth-status CLI: nonzero exit WITHOUT parseable loggedIn → unknown (fail open)", () =>
+  withStub(`echo 'config corrupted'; exit 1`, async (bin) => {
+    assert.equal(await readClaudeAuthStatusCli({ claudeBin: bin }), "unknown")
+  }))
+
+test("auth-status CLI: missing binary → unknown (fail open)", async () => {
+  assert.equal(await readClaudeAuthStatusCli({ claudeBin: "/nonexistent/claude-definitely-absent" }), "unknown")
+})
+
+test("auth-status CLI: hang beyond the timeout → unknown (fail open)", () =>
+  withStub(`sleep 30`, async (bin) => {
+    assert.equal(await readClaudeAuthStatusCli({ claudeBin: bin, timeoutMs: 200 }), "unknown")
+  }))
+
+test("parseClaudeAuthStatusJson: strict positive-signal parsing", () => {
+  assert.equal(parseClaudeAuthStatusJson(`{"loggedIn": false}`), false)
+  assert.equal(parseClaudeAuthStatusJson(`{"loggedIn": true}`), true)
+  assert.equal(parseClaudeAuthStatusJson(`{"loggedIn": "no"}`), undefined)
+  assert.equal(parseClaudeAuthStatusJson(`not json`), undefined)
+  assert.equal(parseClaudeAuthStatusJson(``), undefined)
+  assert.equal(parseClaudeAuthStatusJson(`prefix {"loggedIn": false} suffix`), false)
+})

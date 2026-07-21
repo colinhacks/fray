@@ -11,6 +11,7 @@ import {
   tmuxSessionName,
   type Settings,
   type PermissionMode,
+  type ProviderAuth,
 } from "@fray-ui/shared"
 import { PERM_DIR_ENV, permRequestDir, type Project } from "./project.ts"
 import type { SessionRow, Storage } from "./storage.ts"
@@ -18,6 +19,7 @@ import type { BoardManager } from "./board.ts"
 import type { AgentBackend, BackendKind, BuiltCommand, SpawnThreadMcp } from "./backend/types.ts"
 import { buildWorkerPrompt } from "./workerPrompt.ts"
 import { ensureCwdTrusted, discoverCodexRollout, codexSessionSentinel } from "./backend/codex.ts"
+import { ProviderAuthRequiredError } from "./backend/auth-status.ts"
 import { readBoard, type FrayBoard, type FrayThread } from "./fray.ts"
 import * as tmux from "./tmux.ts"
 import { SYSTEM_PROMPT_DIR, cleanupAdoptionSessionFiles, systemPromptPath } from "./session-files.ts"
@@ -341,6 +343,17 @@ function workerPermissionMode(m: PermissionMode): PermissionMode {
   return m === "plan" ? "auto" : m
 }
 
+// Every fray-CREATED worker launches maximally non-interactive: an unattended headless worker cannot
+// answer an interactive prompt, so a dispatch-time permission CHOICE is a footgun, not a feature —
+// restrictive modes just stall the thread on a modal nobody is watching. Claude gets `auto`; codex
+// gets `bypassPermissions` (→ `-s danger-full-access`). The dispatch/adopt paths stamp this
+// unconditionally (client-sent permissionMode is ignored); the LIVE per-thread permission control
+// still exists to steer an already-running session.
+export const WORKER_DISPATCH_PERMISSION: Record<BackendKind, PermissionMode> = {
+  claude: "auto",
+  codex: "bypassPermissions",
+}
+
 // Canonical value that describes the permission policy the backend ACTUALLY receives. Claude's
 // headless-worker plan request is coerced to auto (above); Codex's three sandbox levels share the
 // PermissionMode storage field, so all workspace-write aliases collapse to `default`.
@@ -580,6 +593,12 @@ export interface DispatchDeps {
   codexDiscoveryTimeoutMs?: number
   codexDiscoveryIntervalMs?: number
   codexDiscoverySleep?: (ms: number) => Promise<void>
+  // Provider auth preflight (claude-auth plan, Slice A): resolves the target provider's credential
+  // state BEFORE any thread state exists; a positive "signed-out" rejects the dispatch with
+  // ProviderAuthRequiredError. Injected by the composition layer (context.ts: `claude auth status
+  // --json` for Claude, the local auth.json read for Codex). Absent (tests) ⇒ no preflight, so unit
+  // tests never shell out or depend on the developer's real credential state.
+  preflightAuth?: (kind: BackendKind) => Promise<ProviderAuth>
   // Durable adoption recovery seams. Production uses tmux's token-aware exact-pane implementation;
   // focused tests inject an in-memory private server and deterministic time.
   adoptionRuntime?: AdoptionRecoveryRuntime
@@ -704,6 +723,13 @@ export function createDispatcher(deps: DispatchDeps): Dispatcher {
       input = DispatchInput.parse(input)
       const settings = deps.getSettings()
       const kind: BackendKind = opts?.backend ?? "claude"
+      // Auth preflight (Slice A): block ONLY on a positive "signed-out" — "unknown" (flaky read,
+      // missing binary, timeout) fails OPEN so a network blip never traps a logged-in user. Runs
+      // before the scratchpad/tmux/registry so a rejected dispatch leaves zero trace; the browser
+      // keeps the draft and opens the sign-in modal off the sentinel message.
+      if (deps.preflightAuth && (await deps.preflightAuth(kind).catch((): ProviderAuth => "unknown")) === "signed-out") {
+        throw new ProviderAuthRequiredError(kind)
+      }
       // Title: explicit human title, else the heuristic chop. (A headless `claude -p` titling pass
       // was tried and REMOVED — print mode is going away for Max subscription auth, which is the
       // whole reason the workers run as interactive tmux sessions. Claude's own evolving ai-title
@@ -717,7 +743,7 @@ export function createDispatcher(deps: DispatchDeps): Dispatcher {
       // provider/Fray signal may still replace it through the title_auto CAS.
       const registryTitle = title
       const sessionId = randomUUID()
-      const permissionMode = effectivePermissionMode(kind, input.permissionMode ?? settings.permissionMode)
+      const permissionMode = WORKER_DISPATCH_PERMISSION[kind]
       // Resolve the profile ONCE for this session. It feeds both the CLI argv and the persisted row,
       // so the thread UI describes what this dispatch actually launched with rather than whatever the
       // mutable global defaults happen to be when the drawer is opened later.
@@ -958,7 +984,7 @@ export function createDispatcher(deps: DispatchDeps): Dispatcher {
         throw unavailable()
       }
       const prompt = composePrompt(sessionId, task, settings.dispatchPreamble)
-      const permissionMode = effectivePermissionMode("claude", settings.permissionMode)
+      const permissionMode = WORKER_DISPATCH_PERMISSION.claude
       const runtimeGate = settings.runtimeGate !== false
       try {
         built = buildSpawnCommand({
