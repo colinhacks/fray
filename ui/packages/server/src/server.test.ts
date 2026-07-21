@@ -547,7 +547,7 @@ test("dispatch(codex): pre-arms cwd trust, spawns the codex argv, and pins the d
   assert.equal(rowdb.backend, "codex")
   assert.equal(rowdb.agent_session_id, h.CODEX_ID, "the discovered codex rollout id is pinned")
   assert.equal(rowdb.session_id, sessionId, "session_id stays the fray-minted key")
-  assert.equal(rowdb.permission_mode, "default", "Codex workspace-write is stored in its canonical shared value")
+  assert.equal(rowdb.permission_mode, "bypassPermissions", "every created codex worker launches full-access (WORKER_DISPATCH_PERMISSION)")
   assert.ok(existsSync(join(h.dir, ".fray", "threads", sessionId, "scratch.md")), "scratchpad keyed on the fray session_id")
 })
 

@@ -44,13 +44,12 @@ const noopTailer: Tailer = {
   tick: () => {},
 }
 
-test("GitHub dispatch payload preserves the exact captured backend profile and permission", () => {
+test("GitHub dispatch payload preserves the exact captured backend profile (no permission passthrough)", () => {
   const batch = {
     items: [{ kind: "pr" as const, number: 91 }],
     backend: "codex" as const,
     model: "gpt-5.6-sol",
     effort: "ultra" as const,
-    permissionMode: "bypassPermissions" as const,
   }
   assert.deepEqual(
     githubDispatcherRequest(batch, { prompt: "review", title: "Review owner/repo#91", slug: "review-owner-repo-91" }),
@@ -62,30 +61,27 @@ test("GitHub dispatch payload preserves the exact captured backend profile and p
         backend: "codex",
         model: "gpt-5.6-sol",
         effort: "ultra",
-        permissionMode: "bypassPermissions",
       },
       options: { backend: "codex" },
     },
   )
 })
 
-test("GitHub dispatch validation rejects invalid pairs and cross-provider permissions visibly", () => {
+test("GitHub dispatch validation rejects invalid pairs visibly and ignores permission entirely", () => {
   const base = {
     items: [{ kind: "issue" as const, number: 1 }],
     backend: "claude" as const,
     model: "opus",
     effort: "high" as const,
-    permissionMode: "auto" as const,
   }
   assert.doesNotThrow(() => validateGithubDispatchProfile(base))
   assert.throws(
     () => validateGithubDispatchProfile({ ...base, effort: "ultra" }),
     /Unsupported claude model\/effort pair: opus \/ ultra/,
   )
-  assert.throws(
-    () => validateGithubDispatchProfile({ ...base, permissionMode: "plan" }),
-    /Unsupported claude permission mode: plan/,
-  )
+  // Permission is not part of the captured tuple: dispatch stamps the fixed non-interactive mode
+  // server-side, so even a stale client-sent value passes validation untouched.
+  assert.doesNotThrow(() => validateGithubDispatchProfile({ ...base, permissionMode: "plan" }))
 })
 
 function row(slug: string): SessionRow {

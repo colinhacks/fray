@@ -48,18 +48,16 @@ test("dispatch preferences persist provider-specific selections across a databas
 
   setDispatchPreference(storage, settings, { field: "model", backend: "claude", value: "sonnet" })
   setDispatchPreference(storage, settings, { field: "effort", backend: "claude", value: "max" })
-  setDispatchPreference(storage, settings, { field: "permissionMode", backend: "claude", value: "acceptEdits" })
   setDispatchPreference(storage, settings, { field: "model", backend: "codex", value: "gpt-5.5" })
   setDispatchPreference(storage, settings, { field: "effort", backend: "codex", value: "xhigh" })
-  setDispatchPreference(storage, settings, { field: "permissionMode", backend: "codex", value: "plan" })
   setDispatchPreference(storage, settings, { field: "backend", value: "claude" })
   storage.close()
 
   storage = createStorage(path)
   assert.deepEqual(getDispatchPreferences(storage, settings), {
     backend: "claude",
-    claude: { model: "sonnet", effort: "max", permissionMode: "acceptEdits" },
-    codex: { model: "gpt-5.5", effort: "xhigh", permissionMode: "plan" },
+    claude: { model: "sonnet", effort: "max", permissionMode: "auto" },
+    codex: { model: "gpt-5.5", effort: "xhigh", permissionMode: "default" },
   })
   storage.close()
 })
