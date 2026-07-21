@@ -176,7 +176,13 @@ export function deriveNeedsYou(
   if (tele?.pendingQuestion) return true
   // A top-level turn that is resting only while its own child/Monitor still runs is still in flight,
   // not a human handoff. Once that operation clears, the next board refresh queues the bare rest.
-  if (hasLiveBackgroundWork(tele)) return false
+  // This excuse holds ONLY while the parent pane is alive: a child cannot outlive the process that
+  // spawned it. The tailer already zeroes bgShells on pane death (bgShellViews), but a dead pane's
+  // SUB-AGENTS keep reading "running" until their transcript goes stale — or forever when the child's
+  // output file never resolved (subAgentViews has no paneDead guard). So an EXITED parent still showing
+  // "running" background work is a crash mid-background-work; surface it rather than bury it on stale
+  // child liveness (found 2026-07-21: such a thread silently dangled).
+  if (runtime !== "exited" && hasLiveBackgroundWork(tele)) return false
   if (hasParkedExternalWait(tele, nowMs)) return false
   // A final ```done fence is a CHECKED completion handoff: show its success card in the queue until the
   // human explicitly Archives the thread. Like a question, merely viewing it does not resolve it. The
@@ -298,7 +304,12 @@ function sessionThreadView(
   const state = effectiveSessionState(row, registeredLegacyTerminal)
   const archived = state === "archived"
   const needsYou = archived ? false : deriveNeedsYou(row, tele, runtime, interactionPresence.needsUser, nowMs)
-  const crashed = runtime === "exited" && tele?.turn === "in-flight"
+  // A pane that exited with work still outstanding — a turn in flight, OR a sub-agent still reading
+  // "running" (its parent is gone, so it cannot actually be live) — is a crash/stall, not a clean
+  // handoff, so it cards as "stalled" not a bare "rest". Mirrors deriveNeedsYou's surfacing above. (The
+  // tailer already zeroes bgShells on pane death, so in practice the background-work arm keys on
+  // sub-agents; it flips back to bare rest once the child's transcript goes stale.)
+  const crashed = runtime === "exited" && (tele?.turn === "in-flight" || hasLiveBackgroundWork(tele))
   const snoozedUntil = futureSnooze(row, nowMs)
   const profile = resolveSessionProfile(row, tele)
   const permissionMode = resolveSessionPermission(row, tele)
