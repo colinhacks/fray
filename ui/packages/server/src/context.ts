@@ -35,6 +35,7 @@ import {
   adoptionRuntimeBinding,
   reconcileAdoptionClaims,
 } from "./adoption-recovery.ts"
+import { startOrphanReaper } from "./orphan-reaper.ts"
 import {
   createRetryableCleanup,
   createShutdownBarrier,
@@ -375,6 +376,17 @@ function createContextUnchecked(opts: ContextOptions, resources: PartialContextR
   }, ADOPTION_RECONCILE_INTERVAL_MS)
   adoptionReconcileTimer.unref?.()
   contextUnsubscribers.push(() => clearInterval(adoptionReconcileTimer))
+
+  // Reap this machine's leaked worker aux — verification browsers (agent-browser/chrome-devtools/
+  // puppeteer) and MCP/dev servers that daemonized out of a stopped worker's tmux tree, so nothing
+  // else ever collects them. A sweep on startup clears accumulated leaks; the interval catches new
+  // orphans (a stopped/crashed thread's browsers) within a bounded window. Reaps ONLY processes
+  // whose FRAY_UI_THREAD slug has no live claude/codex root; never a session/tmux/self process.
+  // FRAY_ORPHAN_REAPER_OFF disables it for disposable adhoc/test stacks (mirrors FRAY_WAKERS_OFF) so a
+  // throwaway instance never reaps the real machine's processes.
+  if (!process.env.FRAY_ORPHAN_REAPER_OFF) {
+    contextUnsubscribers.push(startOrphanReaper({ log: (m) => console.log(`[fray-ui] ${m}`) }))
+  }
   reconcileSessions(storage)
   opts.startup?.afterPhase?.("subscriptions")
 
