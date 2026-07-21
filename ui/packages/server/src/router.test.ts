@@ -201,10 +201,13 @@ test("threadTerminalCommand offers the verified provider resume command in every
 
     const expected = { command: `cd '${h.dir}' && codex resume 'codex-rollout-id'`, mode: "resume", reason: null }
 
+    h.board.snapshot = async () => {
+      throw new Error("the copy path must not rebuild the board")
+    }
     assert.deepEqual(
       await h.router.threadTerminalCommand.handler({ input: { slug: "codex-resume" } }),
       expected,
-      "Codex resumes its provider rollout ID rather than Fray's local owner UUID",
+      "Codex resumes its provider rollout ID directly from the owned registry row",
     )
 
     // Resuming a live session in another terminal is safe + supported, so the command is offered while
