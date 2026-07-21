@@ -14,6 +14,7 @@ import "./styles.css"
 //     a user snooze via setThreadSnooze.
 // RPC is mocked like completion-lifecycle-fixture so nothing real is hit.
 const mode = new URLSearchParams(window.location.search).get("mode") === "executing" ? "executing" : "resting"
+const calloutsOnly = new URLSearchParams(window.location.search).get("callouts") === "1"
 const nativeFetch = window.fetch.bind(window)
 const rpcResult = (result: unknown) => new Response(JSON.stringify({ result }), {
   headers: { "content-type": "application/json", "x-fray-boot": "done-card-button-fixture" },
@@ -106,6 +107,18 @@ function Fixture() {
     window.addEventListener("fixture-rpc", onRpc)
     return () => window.removeEventListener("fixture-rpc", onRpc)
   }, [])
+  if (calloutsOnly) {
+    return (
+      <main data-callout-gallery className="mx-auto flex min-h-screen w-full max-w-xl flex-col gap-3 px-4 py-8">
+        {cards.filter((card) => card.fence === "awaiting").map((card) => (
+          <ThreadSlugContext.Provider key={card.slug} value={card.slug}>
+            <FenceCard fenceKind={card.fence} body={card.body} hints={card.hints} />
+          </ThreadSlugContext.Provider>
+        ))}
+        <p data-fixture-rpc-calls className="sr-only">RPC calls: {calls.join(" | ") || "none"}</p>
+      </main>
+    )
+  }
   return (
     <main className="mx-auto flex min-h-screen w-full max-w-xl flex-col gap-5 px-4 py-8">
       <p className="petite-caps text-[10px] text-accent">FenceCard buttons ({mode})</p>

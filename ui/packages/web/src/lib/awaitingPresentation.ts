@@ -27,10 +27,14 @@ export function awaitingHintSentence(hints: readonly AwaitingHint[], nowMs = Dat
   return `Wait for session ${legacy.value}`
 }
 
-export function awaitingPresentationLine(body: string, hint: string | null): string {
+export function awaitingCalloutPresentation(
+  body: string,
+  hints: readonly AwaitingHint[],
+  nowMs = Date.now(),
+): { lead: string; description: string | null } {
   const prose = body.trim()
-  if (!prose) return hint ?? "Waiting for an external update."
-  if (!hint) return prose
-  const separator = /[.!?…][*_~`"')\]]*$/.test(prose) ? " " : " — "
-  return `${prose}${separator}${hint}`
+  const hint = awaitingHintSentence(hints, nowMs)
+  if (hint) return { lead: hint, description: prose || null }
+  if (prose) return { lead: prose, description: null }
+  return { lead: "Waiting for an external update", description: null }
 }

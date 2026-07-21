@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { awaitingHintSentence, awaitingPresentationLine } from "./awaitingPresentation.ts"
+import { awaitingCalloutPresentation, awaitingHintSentence } from "./awaitingPresentation.ts"
 
 const now = Date.parse("2026-07-21T18:00:00.000Z")
 
@@ -41,14 +41,20 @@ test("legacy hints degrade to readable text and an empty hint set stays empty", 
   assert.equal(awaitingHintSentence([], now), null)
 })
 
-test("body and action join as clean prose without period-dash punctuation", () => {
-  assert.equal(
-    awaitingPresentationLine("Park until the checkpoint.", "Snooze until today at 2:00 PM"),
-    "Park until the checkpoint. Snooze until today at 2:00 PM",
+test("callout presentation separates the bold action lead from supporting prose", () => {
+  const timer = awaitingCalloutPresentation(
+    "Park until the checkpoint.",
+    [{ kind: "timer", value: "2026-07-21T21:00:00.000Z" }],
+    now,
   )
-  assert.equal(
-    awaitingPresentationLine("Park until the checkpoint", "Snooze until today at 2:00 PM"),
-    "Park until the checkpoint — Snooze until today at 2:00 PM",
+  assert.match(timer.lead, /^Snooze until /)
+  assert.equal(timer.description, "Park until the checkpoint.")
+  assert.deepEqual(
+    awaitingCalloutPresentation("The worker left a plain handoff.", [], now),
+    { lead: "The worker left a plain handoff.", description: null },
   )
-  assert.equal(awaitingPresentationLine("", null), "Waiting for an external update.")
+  assert.deepEqual(
+    awaitingCalloutPresentation("", [], now),
+    { lead: "Waiting for an external update", description: null },
+  )
 })
