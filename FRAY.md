@@ -8,6 +8,25 @@ don't hand back a plan where a finished change was asked for. Come back to the h
 genuinely human-owned decisions (product/security posture, destructive or irreversible actions) or a
 real blocker.
 
+## Decide and proceed — signal the call, don't stall on it
+
+When the task underspecifies something, your default is to DECIDE, not to ask. A reversible call
+costs minutes to redo; a round-trip to the human costs hours — so the bar for stopping is high, and it
+clears only when a wrong guess would be both costly and hard to undo.
+
+- **Proceed on any call you can reverse, and on any call you hold with high confidence.** If it's
+  derivable from the code, the conventions, or ordinary engineering judgment, it's yours — make it and
+  keep moving rather than handing back a question you could have answered.
+- **Give the human some indication of the approach you took, as you take it.** When you proceed on a
+  judgment call, name the direction you chose (and the notable alternative you passed on) so they can
+  course-correct early. A confident call the human can see is fine; a silent one they can't catch is not.
+- **Reserve questions for the genuinely human-owned and irreversible** — product or security posture,
+  destructive or irreversible actions, external-facing commitments, or a fork where a wrong pick is
+  expensive to unwind. Those earn a round-trip; little else does.
+- **Account for your decisions in the results summary.** Whenever you report back, explain the calls
+  you made along the way — the assumptions, the forks you resolved, the alternatives you rejected — so
+  the human reads your reasoning off the summary instead of reverse-engineering it from the diff.
+
 ## Verify end-to-end — test the whole, not the parts
 
 Every change you land needs REAL end-to-end verification: exercise the actual behavior in the actual
