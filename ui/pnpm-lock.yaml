@@ -34,18 +34,13 @@ importers:
     dependencies:
       '@fray-ui/server':
         specifier: workspace:*
-        version: file:packages/server(@tanstack/react-query@5.101.2(react@19.2.7))(react@19.2.7)
+        version: link:../server
       '@fray-ui/shared':
         specifier: workspace:*
-        version: file:packages/shared
+        version: link:../shared
       esbuild:
         specifier: ^0.25.0
         version: 0.25.12
-    dependenciesMeta:
-      '@fray-ui/server':
-        injected: true
-      '@fray-ui/shared':
-        injected: true
 
   packages/rpc:
     dependencies:
@@ -70,13 +65,13 @@ importers:
     dependencies:
       '@fray-ui/claude-agent-sdk-runtime':
         specifier: workspace:*
-        version: file:packages/claude-agent-sdk-runtime(@anthropic-ai/sdk@0.111.0(zod@3.25.76))(@modelcontextprotocol/sdk@1.29.0(zod@3.25.76))
+        version: link:../claude-agent-sdk-runtime
       '@fray-ui/rpc':
         specifier: workspace:*
-        version: file:packages/rpc(@tanstack/react-query@5.101.2(react@19.2.7))(react@19.2.7)
+        version: link:../rpc
       '@fray-ui/shared':
         specifier: workspace:*
-        version: file:packages/shared
+        version: link:../shared
       '@hono/node-server':
         specifier: ^1.13
         version: 1.19.14(hono@4.12.27)
@@ -98,13 +93,6 @@ importers:
       zod:
         specifier: ^3.24
         version: 3.25.76
-    dependenciesMeta:
-      '@fray-ui/claude-agent-sdk-runtime':
-        injected: true
-      '@fray-ui/rpc':
-        injected: true
-      '@fray-ui/shared':
-        injected: true
     devDependencies:
       '@types/better-sqlite3':
         specifier: ^7.6
@@ -133,10 +121,10 @@ importers:
     dependencies:
       '@fray-ui/rpc':
         specifier: workspace:*
-        version: file:packages/rpc(@tanstack/react-query@5.101.2(react@19.2.7))(react@19.2.7)
+        version: link:../rpc
       '@fray-ui/shared':
         specifier: workspace:*
-        version: file:packages/shared
+        version: link:../shared
       '@radix-ui/react-dialog':
         specifier: ^1.1.18
         version: 1.1.18(@types/react-dom@19.2.3(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)
@@ -197,11 +185,6 @@ importers:
       zod:
         specifier: ^3.24
         version: 3.25.76
-    dependenciesMeta:
-      '@fray-ui/rpc':
-        injected: true
-      '@fray-ui/shared':
-        injected: true
     devDependencies:
       '@tailwindcss/vite':
         specifier: ^4
@@ -706,26 +689,6 @@ packages:
 
   '@floating-ui/utils@0.2.11':
     resolution: {integrity: sha512-RiB/yIh78pcIxl6lLMG0CgBXAZ2Y0eVHqMPYugu+9U0AeT6YBeiJpf7lbdJNIugFP5SIjwNRgo4DhR1Qxi26Gg==}
-
-  '@fray-ui/claude-agent-sdk-runtime@file:packages/claude-agent-sdk-runtime':
-    resolution: {directory: packages/claude-agent-sdk-runtime, type: directory}
-
-  '@fray-ui/rpc@file:packages/rpc':
-    resolution: {directory: packages/rpc, type: directory}
-    peerDependencies:
-      '@tanstack/react-query': ^5
-      react: ^19
-    peerDependenciesMeta:
-      '@tanstack/react-query':
-        optional: true
-      react:
-        optional: true
-
-  '@fray-ui/server@file:packages/server':
-    resolution: {directory: packages/server, type: directory}
-
-  '@fray-ui/shared@file:packages/shared':
-    resolution: {directory: packages/shared, type: directory}
 
   '@hono/node-server@1.19.14':
     resolution: {integrity: sha512-GwtvgtXxnWsucXvbQXkRgqksiH2Qed37H9xHZocE5sA3N8O8O8/8FA3uclQXxXVzc9XBZuEOMK7+r02FmSpHtw==}
@@ -2546,21 +2509,6 @@ snapshots:
   '@anthropic-ai/claude-agent-sdk-win32-x64@0.3.207':
     optional: true
 
-  '@anthropic-ai/claude-agent-sdk@0.3.207(@anthropic-ai/sdk@0.111.0(zod@3.25.76))(@modelcontextprotocol/sdk@1.29.0(zod@3.25.76))(zod@4.4.3)':
-    dependencies:
-      '@anthropic-ai/sdk': 0.111.0(zod@3.25.76)
-      '@modelcontextprotocol/sdk': 1.29.0(zod@3.25.76)
-      zod: 4.4.3
-    optionalDependencies:
-      '@anthropic-ai/claude-agent-sdk-darwin-arm64': 0.3.207
-      '@anthropic-ai/claude-agent-sdk-darwin-x64': 0.3.207
-      '@anthropic-ai/claude-agent-sdk-linux-arm64': 0.3.207
-      '@anthropic-ai/claude-agent-sdk-linux-arm64-musl': 0.3.207
-      '@anthropic-ai/claude-agent-sdk-linux-x64': 0.3.207
-      '@anthropic-ai/claude-agent-sdk-linux-x64-musl': 0.3.207
-      '@anthropic-ai/claude-agent-sdk-win32-arm64': 0.3.207
-      '@anthropic-ai/claude-agent-sdk-win32-x64': 0.3.207
-
   '@anthropic-ai/claude-agent-sdk@0.3.207(@anthropic-ai/sdk@0.111.0(zod@4.4.3))(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(zod@4.4.3)':
     dependencies:
       '@anthropic-ai/sdk': 0.111.0(zod@4.4.3)
@@ -2575,26 +2523,6 @@ snapshots:
       '@anthropic-ai/claude-agent-sdk-linux-x64-musl': 0.3.207
       '@anthropic-ai/claude-agent-sdk-win32-arm64': 0.3.207
       '@anthropic-ai/claude-agent-sdk-win32-x64': 0.3.207
-
-  '@anthropic-ai/claude-agent-sdk@0.3.207(zod@4.4.3)':
-    dependencies:
-      zod: 4.4.3
-    optionalDependencies:
-      '@anthropic-ai/claude-agent-sdk-darwin-arm64': 0.3.207
-      '@anthropic-ai/claude-agent-sdk-darwin-x64': 0.3.207
-      '@anthropic-ai/claude-agent-sdk-linux-arm64': 0.3.207
-      '@anthropic-ai/claude-agent-sdk-linux-arm64-musl': 0.3.207
-      '@anthropic-ai/claude-agent-sdk-linux-x64': 0.3.207
-      '@anthropic-ai/claude-agent-sdk-linux-x64-musl': 0.3.207
-      '@anthropic-ai/claude-agent-sdk-win32-arm64': 0.3.207
-      '@anthropic-ai/claude-agent-sdk-win32-x64': 0.3.207
-
-  '@anthropic-ai/sdk@0.111.0(zod@3.25.76)':
-    dependencies:
-      json-schema-to-ts: 3.1.1
-      standardwebhooks: 1.0.0
-    optionalDependencies:
-      zod: 3.25.76
 
   '@anthropic-ai/sdk@0.111.0(zod@4.4.3)':
     dependencies:
@@ -2906,54 +2834,6 @@ snapshots:
 
   '@floating-ui/utils@0.2.11': {}
 
-  '@fray-ui/claude-agent-sdk-runtime@file:packages/claude-agent-sdk-runtime':
-    dependencies:
-      '@anthropic-ai/claude-agent-sdk': 0.3.207(zod@4.4.3)
-      zod: 4.4.3
-    transitivePeerDependencies:
-      - '@anthropic-ai/sdk'
-      - '@modelcontextprotocol/sdk'
-
-  '@fray-ui/claude-agent-sdk-runtime@file:packages/claude-agent-sdk-runtime(@anthropic-ai/sdk@0.111.0(zod@3.25.76))(@modelcontextprotocol/sdk@1.29.0(zod@3.25.76))':
-    dependencies:
-      '@anthropic-ai/claude-agent-sdk': 0.3.207(@anthropic-ai/sdk@0.111.0(zod@3.25.76))(@modelcontextprotocol/sdk@1.29.0(zod@3.25.76))(zod@4.4.3)
-      zod: 4.4.3
-    transitivePeerDependencies:
-      - '@anthropic-ai/sdk'
-      - '@modelcontextprotocol/sdk'
-
-  '@fray-ui/rpc@file:packages/rpc(@tanstack/react-query@5.101.2(react@19.2.7))(react@19.2.7)':
-    dependencies:
-      hono: 4.12.27
-      zod: 3.25.76
-    optionalDependencies:
-      '@tanstack/react-query': 5.101.2(react@19.2.7)
-      react: 19.2.7
-
-  '@fray-ui/server@file:packages/server(@tanstack/react-query@5.101.2(react@19.2.7))(react@19.2.7)':
-    dependencies:
-      '@fray-ui/claude-agent-sdk-runtime': file:packages/claude-agent-sdk-runtime
-      '@fray-ui/rpc': file:packages/rpc(@tanstack/react-query@5.101.2(react@19.2.7))(react@19.2.7)
-      '@fray-ui/shared': file:packages/shared
-      '@hono/node-server': 1.19.14(hono@4.12.27)
-      '@parcel/watcher': 2.5.6
-      better-sqlite3: 12.11.1
-      hono: 4.12.27
-      node-pty: 1.1.0
-      ws: 8.21.0
-      zod: 3.25.76
-    transitivePeerDependencies:
-      - '@anthropic-ai/sdk'
-      - '@modelcontextprotocol/sdk'
-      - '@tanstack/react-query'
-      - bufferutil
-      - react
-      - utf-8-validate
-
-  '@fray-ui/shared@file:packages/shared':
-    dependencies:
-      zod: 3.25.76
-
   '@hono/node-server@1.19.14(hono@4.12.27)':
     dependencies:
       hono: 4.12.27
@@ -2976,28 +2856,6 @@ snapshots:
     dependencies:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.5.5
-
-  '@modelcontextprotocol/sdk@1.29.0(zod@3.25.76)':
-    dependencies:
-      '@hono/node-server': 1.19.14(hono@4.12.27)
-      ajv: 8.20.0
-      ajv-formats: 3.0.1(ajv@8.20.0)
-      content-type: 1.0.5
-      cors: 2.8.6
-      cross-spawn: 7.0.6
-      eventsource: 3.0.7
-      eventsource-parser: 3.1.0
-      express: 5.2.1
-      express-rate-limit: 8.5.2(express@5.2.1)
-      hono: 4.12.27
-      jose: 6.2.3
-      json-schema-typed: 8.0.2
-      pkce-challenge: 5.0.1
-      raw-body: 3.0.2
-      zod: 3.25.76
-      zod-to-json-schema: 3.25.2(zod@3.25.76)
-    transitivePeerDependencies:
-      - supports-color
 
   '@modelcontextprotocol/sdk@1.29.0(zod@4.4.3)':
     dependencies:
@@ -4673,10 +4531,6 @@ snapshots:
       string-width: 7.2.0
       y18n: 5.0.8
       yargs-parser: 22.0.0
-
-  zod-to-json-schema@3.25.2(zod@3.25.76):
-    dependencies:
-      zod: 3.25.76
 
   zod-to-json-schema@3.25.2(zod@4.4.3):
     dependencies:

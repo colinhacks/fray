@@ -445,6 +445,21 @@ export const QuotaSnapshot = z.object({
 })
 export type QuotaSnapshot = z.infer<typeof QuotaSnapshot>
 
+// ---- Provider auth (local credential presence) ----
+// Whether a provider's LOCAL credential exists — the signal the new-thread dispatch gate keys on.
+// DISTINCT from quota's "unavailable": that is overloaded with transient endpoint failures, whereas
+// this reports credential presence only. "signed-out" = we positively found no credential; "unknown" =
+// we couldn't determine it (read error). The gate BLOCKS on "signed-out" and FAILS OPEN on "unknown".
+export const ProviderAuth = z.enum(["authed", "signed-out", "unknown"])
+export type ProviderAuth = z.infer<typeof ProviderAuth>
+
+// The per-provider auth snapshot the new-thread gate reads — one entry per agent backend.
+export const AuthSnapshot = z.object({
+  claude: ProviderAuth,
+  codex: ProviderAuth,
+})
+export type AuthSnapshot = z.infer<typeof AuthSnapshot>
+
 // ---- Settings ----
 
 export const PermissionMode = z.enum(["auto", "default", "acceptEdits", "plan", "bypassPermissions"])
