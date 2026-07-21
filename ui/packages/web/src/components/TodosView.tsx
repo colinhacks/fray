@@ -118,8 +118,8 @@ function resumeNativeAnchoring(): void {
 export function TodosView() {
   const board = useBoard()
   // The queue is EXACTLY the server-derived Needs-you session threads (t.needsYou) — legacy .fray rows
-  // never card anymore. Concrete unresolved asks/crashes lead passive rest/done handoffs, with
-  // interaction recency providing deterministic order inside each priority band.
+  // never card anymore. One strictly time-ordered list (no priority band): every card orders by
+  // last-active alone, FIFO (oldest-first) by default or LIFO per the queueOrder preference.
   const items = orderQueue(asThreads(board?.threads ?? []).filter(queued), useSnapshot(prefs).queueOrder)
   const itemKey = items.map((i) => i.id).join(",")
 
