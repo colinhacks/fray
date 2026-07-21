@@ -490,8 +490,11 @@ export function createPermissionController(deps: PermissionControllerDeps): Perm
     if (composer.kind !== "typed" || !composer.text) throw new Error("No nonempty Codex terminal draft is available to submit")
 
     const tele = deps.tailer.get(slug)
-    const key = (composer.queueHint || tele?.turn === "idle") ? "Enter" : undefined
-    if (!key) throw new Error("Codex is neither idle nor advertising active-turn input controls")
+    if (tele?.permPrompt || tele?.pendingAsk || tele?.nativeInputRequired) {
+      throw new Error("Codex is showing a modal; resolve it in Terminal before submitting the draft")
+    }
+    const key = (composer.queueHint || tele?.turn === "idle" || tele?.turn === "in-flight") ? "Enter" : undefined
+    if (!key) throw new Error("Codex input readiness could not be confirmed")
 
     const queue = parseInputQueue(row.codex_input_queue)
     if (queue.some((item) => item.source === "existing-draft" && item.state === "submitted")) {
@@ -890,9 +893,13 @@ export function createPermissionController(deps: PermissionControllerDeps): Perm
 
     const escaped = captureOwned(row, true) ?? ""
     const composer = inspectCodexComposer(escaped)
+    const tele = deps.tailer.get(slug)
+    if (tele?.permPrompt || tele?.pendingAsk || tele?.nativeInputRequired) {
+      setError(slug, "Queued message blocked by an ambiguous Codex composer or modal; resolve it in Terminal")
+      return true
+    }
     if (composer.kind === "empty") {
-      const tele = deps.tailer.get(slug)
-      const key = (codexQueueHint(escaped) || tele?.turn === "idle") ? "Enter" : undefined
+      const key = (codexQueueHint(escaped) || tele?.turn === "idle" || tele?.turn === "in-flight") ? "Enter" : undefined
       if (!key) {
         setError(slug, "Queued Codex message is waiting for an idle or steerable composer")
         return true
@@ -909,8 +916,7 @@ export function createPermissionController(deps: PermissionControllerDeps): Perm
       return true
     }
     if (composer.kind === "typed" && codexComposerMatches(escaped, item.text)) {
-      const tele = deps.tailer.get(slug)
-      const key = (composer.queueHint || tele?.turn === "idle") ? "Enter" : undefined
+      const key = (composer.queueHint || tele?.turn === "idle" || tele?.turn === "in-flight") ? "Enter" : undefined
       if (!key) {
         setError(slug, "Queued Codex message is waiting for an idle or steerable composer")
         return true
