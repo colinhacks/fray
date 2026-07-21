@@ -315,7 +315,11 @@ export function Composer({
         rows={1}
         spellCheck={false}
         style={{ minHeight, maxHeight }}
-        className={`block w-full resize-none bg-transparent px-3.5 ${footer ? "py-2.5 pb-3" : "py-2.5"} ${leftAction ? "pr-28" : "pr-20"} text-[13px] leading-relaxed text-fg outline-none placeholder:text-muted scrollbar-none disabled:opacity-60`}
+        // With a footer strip the box is an INSET-FOOTER layout: the strip below already reserves the
+        // vertical band the floating buttons occupy, so the text runs FULL width (no right rail carved
+        // out of every line). Without a footer the box is a single compact row and the right padding is
+        // what keeps text from sliding under the floating paperclip/send buttons.
+        className={`block w-full resize-none bg-transparent px-3.5 ${footer ? "py-2.5 pb-3" : `py-2.5 ${leftAction ? "pr-28" : "pr-20"}`} text-[13px] leading-relaxed text-fg outline-none placeholder:text-muted scrollbar-none disabled:opacity-60`}
       />
       {/* Attachment chips along the bottom row — one square tile per attached file (image thumbnail or
           file-type icon), each removable. The paths still live in `value`; these tiles just render them

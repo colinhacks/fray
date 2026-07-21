@@ -70,28 +70,45 @@ export type ComposerAttachment = { path: string; kind: "image" | "file" }
 
 // The composer keeps attachment absolute paths INSIDE the draft value (trailing lines) so submit,
 // draft persistence, and the worker/transcript pipeline all stay untouched — but presents them as
-// chips instead of raw path text. This peels the TRAILING contiguous run of attachment parts off the
-// value: everything before it is the prose the textarea shows; the peeled paths render as chips. Only
-// a trailing run is peeled (via the same fence-aware split) so a path typed mid-message stays inline
-// as prose and is never yanked into a chip or reordered.
+// chips instead of raw path text. This peels the TRAILING contiguous run of attachment-path LINES off
+// the value: everything before it is the prose the textarea shows; the peeled paths render as chips.
+// Only a trailing run is peeled, and a path inside an unclosed fence stays code, so a path typed
+// mid-message is never yanked into a chip or reordered.
+//
+// split/join MUST round-trip the prose VERBATIM: the composer re-derives the textarea's contents from
+// join(split(...)) on EVERY keystroke while chips exist, so any normalization here (a trim, a dropped
+// whitespace-only chunk) eats the character the user just typed. That is why this walks raw lines
+// directly instead of reusing splitProseAttachments, whose flush discards whitespace-only prose.
 export function splitComposerValue(value: string): { prose: string; attachments: ComposerAttachment[] } {
-  const parts = splitProseAttachments(value)
-  let i = parts.length
-  const attachments: ComposerAttachment[] = []
-  while (i > 0 && parts[i - 1].kind !== "md") {
-    const p = parts[i - 1] as { kind: "image" | "file"; path: string }
-    attachments.unshift({ path: p.path, kind: p.kind })
-    i--
+  const lines = value.split("\n")
+  // Forward fence-parity pass: delimiter lines and lines inside an open fence are never peelable.
+  const fenced: boolean[] = new Array(lines.length)
+  let inFence = false
+  for (let i = 0; i < lines.length; i++) {
+    if (FENCE_LINE.test(lines[i])) {
+      inFence = !inFence
+      fenced[i] = true
+    } else fenced[i] = inFence
   }
-  const prose = parts.slice(0, i).map((p) => (p.kind === "md" ? p.text : p.path)).join("\n")
-  return { prose, attachments }
+  const attachments: ComposerAttachment[] = []
+  let end = lines.length
+  while (end > 0 && !fenced[end - 1]) {
+    const line = lines[end - 1]
+    const image = line.match(IMAGE_LINE)
+    const doc = image ? null : line.match(DOC_LINE)
+    if (image) attachments.unshift({ path: image[1], kind: "image" })
+    else if (doc) attachments.unshift({ path: doc[1], kind: "file" })
+    else break
+    end--
+  }
+  return { prose: lines.slice(0, end).join("\n"), attachments }
 }
 
 // Recombine edited prose with the (possibly edited) attachment path list into the single draft value
 // the parent owns — prose first, then each attachment path on its own trailing line, matching exactly
-// the format takeFiles has always appended.
+// the format takeFiles has always appended. No trimming: prose must survive verbatim (trailing spaces
+// and newlines included) or the composer's per-keystroke round-trip destroys what was just typed.
 export function joinComposerValue(prose: string, paths: string[]): string {
   if (!paths.length) return prose
-  const head = prose.trimEnd()
-  return `${head}${head ? "\n" : ""}${paths.join("\n")}`
+  return `${prose}${prose ? "\n" : ""}${paths.join("\n")}`
 }

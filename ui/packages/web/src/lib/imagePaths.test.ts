@@ -125,3 +125,16 @@ test("joinComposerValue with no paths is the prose verbatim; empty prose yields 
   assert.equal(joinComposerValue("", ["/tmp/a.png"]), "/tmp/a.png")
   assert.equal(joinComposerValue("hi", ["/tmp/a.png"]), "hi\n/tmp/a.png")
 })
+
+// The composer re-derives the textarea from join(split(...)) on EVERY keystroke while chips exist, so
+// any prose normalization eats the character just typed. Regression: trailing spaces vanished as the
+// user typed once a file was attached (join used to trimEnd the prose).
+test("composer round-trip preserves prose verbatim: trailing space, trailing newline, whitespace-only", () => {
+  for (const prose of ["hello ", "hello\n", "hello  \n\n", " ", "\n"]) {
+    const value = joinComposerValue(prose, ["/tmp/a.png"])
+    const split = splitComposerValue(value)
+    assert.equal(split.prose, prose)
+    assert.deepEqual(split.attachments, [{ path: "/tmp/a.png", kind: "image" }])
+    assert.equal(joinComposerValue(split.prose, split.attachments.map((a) => a.path)), value)
+  }
+})
