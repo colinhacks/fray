@@ -223,11 +223,33 @@ export function scrollToQueueCard(slug: string): boolean {
   // drawer finished closing; a relative scroll in that transition can be applied to the old root and
   // strand the reader midway through a tall card. Land the bordered root atomically.
   if (targetY !== null && Math.abs(window.scrollY - targetY) > 0.5) window.scrollTo({ top: targetY, left: 0, behavior: "auto" })
-  // The ring goes on the bordered root, NOT the slot: the slot wraps the inter-card hairline rule and
-  // its my-10 margins, so ringing it drew the card AND the gutter+rule below as one highlighted box.
-  root.classList.add("queue-flash")
-  window.setTimeout(() => root.classList.remove("queue-flash"), 1100)
+  flashQueueCard(slug, root)
   return true
+}
+
+// Pending ring teardowns, keyed by slug. A RE-CLICK inside the window must replay the ring and own the
+// single removal; without this the first click's timer would cut the second ring short.
+const queueFlashTimers = new Map<string, number>()
+
+// The arrival ring. It goes on the bordered card ROOT, never the outer `[data-queue-card]` slot: the
+// slot also wraps the inter-card hairline rule and its my-10 margins, so ringing it drew the card AND
+// ~80px of gutter plus that rule as one highlighted box (maintainer, 2026-07-21).
+// An ATTRIBUTE rather than a class, because the root's className is REACT-OWNED (it flips on the card's
+// `resolving` state) — a re-render rewrites className wholesale and would silently wipe an imperatively
+// added class mid-flash. React never touches an attribute absent from its props.
+function flashQueueCard(slug: string, root: HTMLElement): void {
+  const pending = queueFlashTimers.get(slug)
+  if (pending !== undefined) window.clearTimeout(pending)
+  // Re-setting an attribute that is already present does NOT restart a CSS animation, so clicking the
+  // same sidebar row twice would produce no visible response at all (the scroll is already at the
+  // landing, and the caller deliberately doesn't fall through to a drawer). Drop it and force a reflow.
+  root.removeAttribute("data-queue-flash")
+  void root.offsetWidth
+  root.setAttribute("data-queue-flash", "")
+  queueFlashTimers.set(slug, window.setTimeout(() => {
+    queueFlashTimers.delete(slug)
+    root.removeAttribute("data-queue-flash")
+  }, 1100))
 }
 
 // Open a plan artifact (.fray/plans/*.md) as a doc-style drawer layer. `path` is the PlanView.path (the
