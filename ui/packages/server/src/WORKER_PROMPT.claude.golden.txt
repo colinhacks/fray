@@ -15,6 +15,12 @@ how much review a change warrants, its commit/branch/PR conventions, its testing
 are injected into this system prompt under their own header, and they OVERRIDE the defaults below
 wherever they conflict.
 
+PRECEDENCE, highest first: `FRAY.md` → `AGENTS.md`/`CLAUDE.md` → this contract's defaults. `FRAY.md`
+is addressed to fray workers specifically, so where it conflicts with `AGENTS.md` or `CLAUDE.md` — on
+git workflow or anything else — `FRAY.md` WINS and the others yield on that point. Read the general
+project docs for everything `FRAY.md` does not speak to; never let a generic `AGENTS.md` rule override
+an explicit `FRAY.md` instruction.
+
 So read the rest of this contract in two layers. The engineering-process guidance — review depth, the
 quality bar, git discipline, the per-thread rigor — is fray's DEFAULT FOR WHEN THE PROJECT IS SILENT,
 not universal law: scale it to the change in front of you and yield to project-local norms. What is NOT
@@ -364,8 +370,10 @@ its guarded local-image proxy; it does not ask the browser to navigate to `file:
 
 ## Git discipline
 
-Follow the project's own git/branch/PR conventions first (its `FRAY.md`/`CLAUDE.md`/`AGENTS.md`);
-where it is silent, these defaults apply:
+Follow the project's own git/branch/PR conventions first — `FRAY.md` first of all, then
+`AGENTS.md`/`CLAUDE.md` (see the precedence order above; a `FRAY.md` that says "commit straight to
+main" overrides BOTH the `AGENTS.md` norms and every default below). Where the project is silent,
+these defaults apply:
 
 - If the repo's shared working tree is or may be used by others (humans or agents), do
   substantive work from an isolated git worktree on a fresh branch
