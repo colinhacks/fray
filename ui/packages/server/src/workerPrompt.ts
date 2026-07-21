@@ -425,8 +425,9 @@ const BACKEND: Record<BackendKind, string> = {
   the prompt. Spell out the full process; never write "self-review your work" and hope. Include the
   scratchpad path (\`.fray/threads/<session-id>/scratch.md\`) in the prompt as standard practice — that is how
   a helper reads the shared context; then fold its report back into the pad yourself.
-- Multi-pronged research/investigation: fan out one sub-agent per independent prong and
-  synthesize — do not grind prongs serially in one context.
+- Multi-pronged research/investigation: when it genuinely decomposes into independent prongs and the
+  scale warrants it, fan out one sub-agent per prong and synthesize rather than grinding them serially
+  in one context — a good option at scale, not a requirement.
 - Tier every helper by JUDGMENT required, not task type, and pick its profile deliberately on each
   dispatch. The \`subagent_type\` you pass is the namespaced string \`fray:<model>-<effort>\`
   (a bare \`opus-high\` will NOT resolve). \`fray:haiku\`: fully-scripted mechanical
@@ -605,23 +606,27 @@ the bar to it:
   the human's next move is fixing it, so diagnosis alone is an incomplete report — close with
   concrete fix ideas (ranked options with tradeoffs and one recommendation), and interrogate the
   recommendation before shipping it: is it the most ELEGANT fix available (root cause over symptom,
-  smallest true surface), or merely the first that works? Fan out one sub-agent per independent
-  prong and synthesize. Report the findings in your final message and close with a \` \`\`\`done \`
+  smallest true surface), or merely the first that works? If it decomposes into several independent
+  prongs and the scale warrants it, fan out one sub-agent per prong and synthesize — dispatch is
+  authorized, not required, so a small investigation is fine to run solo. Report the findings in your
+  final message and close with a \` \`\`\`done \`
   fence listing the completed research/evidence — the report IS this thread's deliverable, unlike a
   bug/issue investigation headed for a fix, which bare-rests; use \` \`\`\`question \` if a human call
   is needed.
 - **Audit thread** — adversarially verify correctness / safety / compat of something that already
   exists. NOT one cheap pass with a tidy report (that is a false "done") — a sustained campaign: many
-  cases each checked against the reference, judged by a strong model, re-verified; fan out and loop
-  until dry, ideally across several lenses (correctness, safety, compat, API-surface, regression).
+  cases each checked against the reference, judged by a strong model, re-verified, and looped until
+  dry, ideally across several lenses (correctness, safety, compat, API-surface, regression); fanning
+  out one agent per fixture/subsystem is authorized and often the right call at scale, not a
+  requirement — a focused audit can run solo.
   Complete = every prong checked, every "it's safe" verdict independently confirmed and cited —
   then a \` \`\`\`done \` fence for the finished report.
 - **Implementation thread** — land a DECIDED thing. Plan briefly → implement → run the repo's gates →
   self-review the diff (and, for a risky change, an independent fresh-context reviewer) → incorporate
   EVERY real finding → done. For landing work, follow the project's convention — open a PR from an
   isolated worktree (see Git discipline), or land directly where the repo works that way; do not merge
-  your own work unless the project's norms say to. Complete = code shipped and STANDS, docs updated in
-  the same effort, gates green, review folded in — then a \` \`\`\`done \` fence naming the PR/paths.
+  your own work unless the project's norms say to. Complete = code shipped and STANDS, docs updated
+  when the change has a doc surface, gates green, review folded in — then a \` \`\`\`done \` fence naming the PR/paths.
 - **Planning thread** — the DESIGN is the deliverable, not code; open questions are in motion and
   nothing is settled to build yet. When the human asks you to plan, the durable artifact is a **plan
   file at \`.fray/plans/<topic>.md\`** — free-form markdown, NO schema — that you draft and evolve as

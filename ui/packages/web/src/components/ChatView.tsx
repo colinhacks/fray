@@ -55,6 +55,14 @@ export type { BlockAnswer, MessageAnswering }
 // drill-in) AND its done/awaiting fence cards resolve their thread to show the confirm button.
 export const ThreadSlugContext = createContext<string | null>(null)
 
+// A QUEUE card provides this so any in-transcript dismissal control — the ```done fence's Mark-as-done
+// button, the ```awaiting fence's park button — routes its OWN card through the queue's user-initiated
+// exit (fade → auto-scroll the next card to the viewport top) instead of the passive board-departure
+// "hold a neighbour in place" path. It is exactly the card's `onResolve(slug)`, reached without
+// threading it through the fence renderer. Null off the queue (the thread drawer), where there is no
+// queue to scroll — there the fence buttons behave as before (archive/snooze, no scroll).
+export const QueueDismissContext = createContext<(() => void) | null>(null)
+
 // The default thread surface: the session transcript (parsed server-side from the JSONL) rendered
 // as a conversation — assistant prose as markdown, tool calls as compact one-liners, a spinner
 // while the turn is in flight. The raw terminal is the ⌘T power-user toggle.
@@ -270,7 +278,14 @@ function ChatView({ slug, onTab, virtualized }: { slug: string; onTab: (t: Threa
       <div className="flex min-h-full flex-col px-6 py-5">
         {count === 0 ? (
           <div className="flex-1 flex items-center justify-center text-sm text-muted">
-            {running ? (
+            {q.isPending ? (
+              // The transcript hasn't loaded YET — `count` is 0 only because `q.data` is still
+              // undefined, not because the session is empty. For a long-running chat the initial
+              // fetch/parse of a large transcript can take a beat, and claiming "Session starting…"
+              // there is wrong (it may have been running for hours). Show a neutral load state until
+              // the query resolves and we actually know whether there are messages.
+              <span className="flex items-center gap-2"><Dots /> Loading…</span>
+            ) : running ? (
               <span className="flex items-center gap-2"><Dots /> Session starting…</span>
             ) : canAdoptThread(thread) ? (
               // A thread fray-ui never originated (pre-existing .fray board): no session, no
@@ -2328,6 +2343,10 @@ export function FenceCard({ fenceKind, body, hints, wrap }: { fenceKind: FenceKi
   // The owning thread's slug — set by the thread view AND the queue card — so the confirm button
   // resolves its thread and renders on both surfaces (null in a sub-agent's own transcript → no button).
   const slug = useContext(ThreadSlugContext)
+  // On the queue this dismisses THIS card through the user-initiated auto-scroll exit; null in the
+  // drawer. Wired into both fence actions so Mark-as-done / park scroll the next card up, exactly like
+  // the footer's Mark-as-done and Snooze do (maintainer 2026-07-21: every card-dismissing control must).
+  const queueDismiss = useContext(QueueDismissContext)
   const board = useBoard()
   // Resolve the owning thread + whether whole-thread lifecycle actions are applicable (session, not
   // foreign). Shared by both branches: the done card's Mark-as-done button and the awaiting card's
@@ -2362,6 +2381,7 @@ export function FenceCard({ fenceKind, body, hints, wrap }: { fenceKind: FenceKi
             <StateButton
               thread={doneThread}
               className="bg-fg px-2.5 py-1 text-bg hover:opacity-90"
+              onArchived={queueDismiss ?? undefined}
             />
           </div>
         )}
@@ -2424,6 +2444,9 @@ function awaitingParkAction(
 
 function AwaitingParkButton({ thread, hints }: { thread: ThreadViewData; hints: readonly AwaitingHint[] }) {
   const [busy, setBusy] = useState(false)
+  // On the queue, confirming the park dismisses THIS card through the user-initiated auto-scroll exit
+  // (like Snooze); null in the drawer, where the card just leaves the board.
+  const queueDismiss = useContext(QueueDismissContext)
   const action = awaitingParkAction(hints)
   if (!action) return null
   const apply = () => {
@@ -2432,7 +2455,10 @@ function AwaitingParkButton({ thread, hints }: { thread: ThreadViewData; hints: 
     setBusy(true)
     rpc
       .setThreadSnooze({ slug: thread.id, until })
-      .then(() => showToast(`${action.toastVerb} · ${formatSnoozeWake(until)}`))
+      .then(() => {
+        showToast(`${action.toastVerb} · ${formatSnoozeWake(until)}`)
+        queueDismiss?.()
+      })
       .catch((error) => showToast(`Couldn’t snooze: ${(error as Error).message.slice(0, 80)}`))
       .finally(() => setBusy(false))
   }

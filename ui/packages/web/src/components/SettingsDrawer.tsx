@@ -18,16 +18,12 @@ import {
   codexEffortOptions,
   codexModelFor,
   backendForModel,
-  permOptionsFor,
-  permValueFor,
   codexEffortForModel,
 } from "../lib/options.ts"
 
 type NotifPerm = "default" | "granted" | "denied" | "unsupported"
 export const SETTINGS_HELP = {
   model: "Choose the default model used when you create or dispatch work from this project.",
-  permission: "Sets how Claude asks before it performs actions in new work.",
-  sandbox: "Sets the Codex sandbox level for new work.",
   effort: "Controls the default reasoning effort for new work. Available options depend on the selected model.",
   font: "Changes the interface reading font for this browser.",
   localFileOpener: "Chooses how vetted local artifact links open. Image clicks always use the OS default viewer.",
@@ -128,8 +124,8 @@ export function SettingsDrawer() {
 
   const dirty = !!(draft && settings.data && JSON.stringify(draft) !== JSON.stringify(settings.data))
 
-  // The backend the current model selection implies — drives which permission/effort axis the
-  // dependent controls present. Derived from the model (the single source of truth) rather than the
+  // The backend the current model selection implies — drives which effort axis the dependent
+  // controls present. Derived from the model (the single source of truth) rather than the
   // persisted `backend`, so the controls react the instant the model changes.
   const backend = backendForModel(draft?.model, codexList)
   // The selected codex model (when this is one) — gates the effort dropdown to exactly its cache efforts.
@@ -157,9 +153,10 @@ export function SettingsDrawer() {
           <div className="p-4 text-[13px] text-muted">Loading…</div>
         ) : (
           <div className="flex-1 overflow-y-auto p-5 flex flex-col gap-6">
-            {/* Model is the FIRST control: it drives the backend, and the permission/effort controls
-                below present the chosen backend's axis (Claude permission-mode vs Codex sandbox; the
-                codex effort set). Picking a model stamps the derived backend into the draft. */}
+            {/* Model is the FIRST control: it drives the backend, and the effort control below
+                presents the chosen backend's option set. Picking a model stamps the derived backend
+                into the draft. Permission is NOT a setting: every created worker launches with the
+                fixed non-interactive mode (WORKER_DISPATCH_PERMISSION, server-side). */}
             <SettingsField label="Model" help={SETTINGS_HELP.model}>
               <Select
                 variant="bordered"
@@ -168,22 +165,6 @@ export function SettingsDrawer() {
                 groups={modelGroups(codexList, { withDefault: true })}
                 indicatorPosition="right"
                 ariaLabel="Model"
-              />
-            </SettingsField>
-
-            {/* Permission mode (Claude) / Sandbox (Codex) — same stored `permissionMode` field; for
-                codex the options are a VIEW that the server's codexSandbox() maps to `-s`. */}
-            <SettingsField
-              label={backend === "codex" ? "Sandbox" : "Permission mode"}
-              help={backend === "codex" ? SETTINGS_HELP.sandbox : SETTINGS_HELP.permission}
-            >
-              <Select
-                variant="bordered"
-                value={permValueFor(backend, draft.permissionMode)}
-                onValueChange={(v) => setTrackedDraft({ ...draft, permissionMode: v as Settings["permissionMode"] })}
-                options={permOptionsFor(backend)}
-                indicatorPosition="right"
-                ariaLabel={backend === "codex" ? "Sandbox" : "Permission mode"}
               />
             </SettingsField>
 

@@ -451,3 +451,18 @@ changes may skip CDP/independent review, while uncertainty applies the gate. Thi
 all four delivered surfaces, and the Claude expansion golden changes intentionally. The Codex addendum
 no longer mislabels an author's inline second read as independent review: use delegation when available,
 or report the gate unmet.
+
+## 2026-07-21: Plugin slim-down — one contract copy, gh is the only injected skill
+
+The plugin stops shipping three of its four skills. `skills/worker` is DELETED: it was a second copy
+of the worker contract whose single source is `ui/packages/server/src/workerPrompt.ts` (the system
+prompt, rebuilt on every dispatch/resume and compaction-immune) — every contract edit had to be made
+twice, and the copies drifted. The session-seed pointer sentences that said "Load the `fray:worker`
+skill for the full contract" now point at the system-prompt contract only, and the contract tests pin
+the two backend prompts (not a skill copy). `skills/dialectic` is dropped from the plugin (generic
+methodology nobody wired into the seed or prompt; workers on other people's projects never asked for
+it). `skills/adhoc-cdp` MOVED to the fray repo's own `.agents/skills/adhoc-cdp` (agent-neutral; `.claude/skills/adhoc-cdp` is a symlink to it so Claude and Codex share one copy) — its content is
+fray-ui-specific (adhoc-stack.mjs / shot.mjs), so it is a project skill, not global plugin cargo; the
+generic "verify in a real browser" principle already lives in the prompt's runtime-gate section.
+`skills/gh` remains the ONE injected skill: bulky, conditionally relevant, and its pointer is already
+auth-gated in the seed — exactly the on-demand shape skills are for.

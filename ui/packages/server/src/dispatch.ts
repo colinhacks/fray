@@ -17,6 +17,7 @@ import { PERM_DIR_ENV, permRequestDir, type Project } from "./project.ts"
 import type { SessionRow, Storage } from "./storage.ts"
 import type { BoardManager } from "./board.ts"
 import type { AgentBackend, BackendKind, BuiltCommand, SpawnThreadMcp } from "./backend/types.ts"
+import { CHROME_DEVTOOLS_MCP } from "./backend/types.ts"
 import { buildWorkerPrompt } from "./workerPrompt.ts"
 import { ensureCwdTrusted, discoverCodexRollout, codexSessionSentinel } from "./backend/codex.ts"
 import { ProviderAuthRequiredError } from "./backend/auth-status.ts"
@@ -397,19 +398,33 @@ export function resolveSpawnThreadMcp(
   return { scriptPath, stateDir }
 }
 
-// Claude flags that mount the spawn-thread MCP server via inline `--mcp-config` JSON and PRE-APPROVE
-// its one tool (`--allowedTools`) so a headless worker never blocks on a permission prompt it has
-// nobody to answer. execvp runs the argv with NO shell (tmux.ts), so the JSON travels literally.
-function claudeSpawnThreadMcpFlags(mcp?: SpawnThreadMcp): string[] {
-  if (!mcp) return []
-  const config = JSON.stringify({
+// Claude flags that mount the fray-injected MCP servers via ONE inline `--mcp-config` JSON and
+// PRE-APPROVE their tools (`--allowedTools`) so a headless worker never blocks on a permission prompt
+// it has nobody to answer. execvp runs the argv with NO shell (tmux.ts), so the JSON travels literally.
+// chrome-devtools is ALWAYS mounted (the runtime release gate needs a browser out of the box on any
+// machine — parity with the codex backend's `-c` injection, same CHROME_DEVTOOLS_MCP spec); the
+// server-level `mcp__chrome-devtools` rule pre-approves every tool it exposes. fray_spawn rides along
+// when its descriptor resolved.
+export function claudeMcpFlags(mcp?: SpawnThreadMcp): string[] {
+  const servers: Record<string, unknown> = {
+    [CHROME_DEVTOOLS_MCP.name]: { command: CHROME_DEVTOOLS_MCP.command, args: [...CHROME_DEVTOOLS_MCP.args] },
+  }
+  const allowed = [`mcp__${CHROME_DEVTOOLS_MCP.name}`]
+  if (mcp) {
     // command is the ABSOLUTE node path (process.execPath — the node running the fray server), NOT bare
     // "node": Claude spawns the MCP-server process itself, and a worker's PATH varies by launch context
     // (a GUI-launched tmux, a login-shell difference) — if `node` isn't on it, the MCP server never
     // starts and the tool silently never appears in the worker. An absolute path removes that dependency.
-    mcpServers: { fray_spawn: { command: process.execPath, args: [mcp.scriptPath], env: { FRAY_STATE_DIR: mcp.stateDir } } },
-  })
-  return ["--mcp-config", config, "--allowedTools", "mcp__fray_spawn__spawn_fray_thread"]
+    servers.fray_spawn = { command: process.execPath, args: [mcp.scriptPath], env: { FRAY_STATE_DIR: mcp.stateDir } }
+    allowed.push("mcp__fray_spawn__spawn_fray_thread")
+  }
+  const config = JSON.stringify({ mcpServers: servers })
+  // ONE comma-joined `--allowedTools=` in EQUALS form: the flag is VARIADIC, so a space-separated
+  // value with a positional right behind it (e.g. the minimal no-system-prompt argv, where the prompt
+  // directly follows) would be swallowed as a second rule. The equals form binds exactly one token —
+  // immune to argv reordering. Verified live: `claude -p --allowedTools=mcp__chrome-devtools <prompt>`
+  // runs the tools unprompted with the prompt surviving as the positional.
+  return ["--mcp-config", config, `--allowedTools=${allowed.join(",")}`]
 }
 
 // The `claude` argv for a fresh dispatch. session-id is PINNED so we can resume the exact
@@ -433,7 +448,7 @@ export function buildClaudeCommand(opts: {
   if (opts.model) argv.push("--model", opts.model)
   if (opts.effort) argv.push("--effort", opts.effort)
   if (opts.pluginDir) argv.push("--plugin-dir", opts.pluginDir)
-  argv.push(...claudeSpawnThreadMcpFlags(opts.spawnThreadMcp))
+  argv.push(...claudeMcpFlags(opts.spawnThreadMcp))
   // The fixed worker norms live in the SYSTEM prompt: rebuilt on every invocation (incl. resume)
   // and immune to compaction, unlike a first user message.
   const worker = opts.workerPrompt ?? loadWorkerPrompt()
@@ -500,7 +515,7 @@ export function buildClaudeResumeCommand(opts: {
   if (opts.model) argv.push("--model", opts.model)
   if (opts.effort) argv.push("--effort", opts.effort)
   if (opts.pluginDir) argv.push("--plugin-dir", opts.pluginDir)
-  argv.push(...claudeSpawnThreadMcpFlags(opts.spawnThreadMcp))
+  argv.push(...claudeMcpFlags(opts.spawnThreadMcp))
   // The system prompt is rebuilt per invocation — the resume must re-carry the worker norms too.
   // Same file-based path as buildClaudeCommand (see systemPromptFlags): inline would blow tmux's
   // command-length limit.

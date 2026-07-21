@@ -291,7 +291,10 @@ test("buildClaudeCommand: pins session-id, permission mode, optional model/effor
     claudeBin: "sleep",
     workerPrompt: "", // disabled for the argv-shape assertion
   })
-  assert.deepEqual(base, ["sleep", "--session-id", "uuid-1", "--permission-mode", "acceptEdits", "hello"])
+  // Every dispatch mounts chrome-devtools (+ its equals-form pre-approval) — see claudeMcpFlags.
+  const CDT_CFG = JSON.stringify({ mcpServers: { "chrome-devtools": { command: "npx", args: ["-y", "chrome-devtools-mcp@latest", "--experimentalPageIdRouting", "--isolated", "--no-usage-statistics"] } } })
+  const CDT_FLAGS = ["--mcp-config", CDT_CFG, "--allowedTools=mcp__chrome-devtools"]
+  assert.deepEqual(base, ["sleep", "--session-id", "uuid-1", "--permission-mode", "acceptEdits", ...CDT_FLAGS, "hello"])
 
   const full = buildClaudeCommand({
     sessionId: "uuid-2",
@@ -315,16 +318,18 @@ test("buildClaudeCommand: pins session-id, permission mode, optional model/effor
     "--effort",
     "high",
   ])
-  assert.equal(full[9], "--append-system-prompt-file")
+  // After the fixed head come the always-mounted MCP flags, then the system-prompt file flag.
+  assert.deepEqual(full.slice(9, 9 + CDT_FLAGS.length), CDT_FLAGS)
+  assert.equal(full[9 + CDT_FLAGS.length], "--append-system-prompt-file")
   assert.equal(systemPromptOf(full), "WORKER_NORMS")
   assert.equal(full[full.length - 1], "go")
 
   // A worker is NEVER spawned in interactive plan mode (no coherent headless semantics + softlock):
   // `plan` is coerced to the safe default `auto` in the argv, on both dispatch and resume.
   const planned = buildClaudeCommand({ sessionId: "u", permissionMode: "plan", prompt: "p", workerPrompt: "" })
-  assert.deepEqual(planned, ["claude", "--session-id", "u", "--permission-mode", "auto", "p"])
+  assert.deepEqual(planned, ["claude", "--session-id", "u", "--permission-mode", "auto", ...CDT_FLAGS, "p"])
   const rplan = buildClaudeResumeCommand({ sessionId: "s", permissionMode: "plan", message: "m", workerPrompt: "" })
-  assert.deepEqual(rplan, ["claude", "--permission-mode", "auto", "-r", "s", "m"])
+  assert.deepEqual(rplan, ["claude", "--permission-mode", "auto", ...CDT_FLAGS, "-r", "s", "m"])
 
   // Default (no injection): the shipped WORKER_PROMPT.md rides --append-system-prompt-file.
   const dflt = buildClaudeCommand({ sessionId: "u", permissionMode: "auto", prompt: "p" })
@@ -334,7 +339,8 @@ test("buildClaudeCommand: pins session-id, permission mode, optional model/effor
 
 test("buildClaudeResumeCommand: -r <sessionId> with the follow-up + worker system prompt", () => {
   const cmd = buildClaudeResumeCommand({ sessionId: "sid", permissionMode: "acceptEdits", message: "more", workerPrompt: "" })
-  assert.deepEqual(cmd, ["claude", "--permission-mode", "acceptEdits", "-r", "sid", "more"])
+  const RESUME_CDT_CFG = JSON.stringify({ mcpServers: { "chrome-devtools": { command: "npx", args: ["-y", "chrome-devtools-mcp@latest", "--experimentalPageIdRouting", "--isolated", "--no-usage-statistics"] } } })
+  assert.deepEqual(cmd, ["claude", "--permission-mode", "acceptEdits", "--mcp-config", RESUME_CDT_CFG, "--allowedTools=mcp__chrome-devtools", "-r", "sid", "more"])
   // Resume re-carries the worker norms (system prompt is rebuilt per invocation) via the file flag.
   const dflt = buildClaudeResumeCommand({ sessionId: "sid", permissionMode: "auto", message: "m" })
   assert.ok(dflt.includes("--append-system-prompt-file"))
@@ -520,13 +526,24 @@ test("dispatch(codex): pre-arms cwd trust, spawns the codex argv, and pins the d
   const script = cmd[2]
   assert.ok(script.includes(`exec 'codex' '--cd' '${h.project.dir}'`), "the wrapper execs the real codex argv")
   assert.ok(script.includes("'-a' 'never'"), "approvals never (unattended)")
+  // Out-of-the-box browser QA: the chrome-devtools MCP server + its never-prompt approval ride the
+  // spawn argv (presence-gated on the operator declaring the server themselves — this harness's
+  // codexHome has no config), so a fresh machine needs no plugin install for the runtime gate.
+  assert.ok(script.includes("mcp_servers.chrome-devtools.command="), "chrome-devtools MCP is injected")
+  assert.ok(
+    script.includes('mcp_servers.chrome-devtools.default_tools_approval_mode="approve"'),
+    "chrome-devtools MCP tools are pre-approved (headless workers cannot answer codex approval modals)",
+  )
   const promptFile = cmd[cmd.length - 1]
   const promptText = h.spawned[0].promptText!
   assert.ok(promptText.includes(`fray-session:${sessionId}`), "the discovery sentinel rides the prompt file")
   assert.ok(promptText.length > 10_000, "the ~18KB worker contract rides the prompt file")
   assert.equal(h.spawned[0].promptMode, 0o600, "the full task/contract is owner-readable only while Codex consumes it")
   assert.equal(existsSync(promptFile), false, "verified discovery removes the successful dispatch's prompt transport")
-  assert.ok(cmd.join(" ").length < 2_000, "the tmux command line stays well under the length limit")
+  // Bound grew when the chrome-devtools MCP injection (4 `-c` flags) joined the argv. The failure this
+  // guards is the ~18KB inline worker contract blowing tmux's command-length limit; a few KB of flags
+  // is far from it — the guard just keeps the prompt riding the FILE, never the command line.
+  assert.ok(cmd.join(" ").length < 4_000, "the tmux command line stays well under the length limit")
 
   // 2b. the contract a codex worker receives is the CODEX variant — codex's own session/wake +
   //     model/effort/sandbox framing, and NONE of the Claude-Code-only guidance it can't act on

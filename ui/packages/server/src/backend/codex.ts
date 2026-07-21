@@ -4,6 +4,7 @@ import { readdirSync, statSync, readFileSync, appendFileSync, mkdirSync, realpat
 import type { PermissionMode } from "@fray-ui/shared"
 import { applyEvent } from "../tailer.ts"
 import type { AgentBackend, BuiltCommand, FoldState, NativeInputRequiredData, NormalizedEvent, ResumeOpts, SpawnOpts, SpawnThreadMcp } from "./types.ts"
+import { CHROME_DEVTOOLS_MCP } from "./types.ts"
 
 // CodexBackend: everything Codex-CLI-specific behind the AgentBackend seam (Codex-support epic,
 // Phase 2). Unlike ClaudeBackend — which reuses the tailer's corpus-verified applyRecord — codex's
@@ -141,6 +142,45 @@ function codexSpawnThreadMcpFlags(mcp?: SpawnThreadMcp): string[] {
     "-c", `mcp_servers.fray_spawn.args=["${toml(mcp.scriptPath)}"]`,
     "-c", `mcp_servers.fray_spawn.env={FRAY_STATE_DIR="${toml(mcp.stateDir)}"}`,
   ]
+}
+
+// ---- Chrome DevTools MCP for codex workers (spawn-scoped, presence-gated) ----
+// The runtime release gate requires driving a real browser, and codex renders a native terminal modal
+// for any non-read-only MCP tool call — which a headless worker can never answer, so the thread stalls
+// until a human attaches (the stuck-modal incident, 2026-07-21). Inject the server definition AND its
+// pre-approval as `-c` overrides so EVERY fray-created codex worker gets a working, never-prompting
+// chrome-devtools out of the box — no plugin install, no config edit, any project, any machine.
+// `default_tools_approval_mode="approve"` is codex's never-prompt mode (AppToolApproval::Approve);
+// `-a never` alone does NOT cover MCP tool approvals. Mirrors codex/.mcp.json (the plugin path, which
+// only reaches machines that installed + re-synced the fray marketplace plugin).
+// Verified empirically (codex 0.144.6): in a FRESH CODEX_HOME these flags run new_page/navigate_page
+// unprompted under `codex exec`; without the approve key the same calls are auto-cancelled; with the
+// fray-codex plugin also installed the injection coexists cleanly (single tool namespace, no error).
+// Derived from the canonical CHROME_DEVTOOLS_MCP spec (types.ts) so claude and codex inject the
+// IDENTICAL server. JSON.stringify(args) is a valid TOML string array (basic strings, no spaces).
+export const FRAY_CHROME_DEVTOOLS_MCP_CONFIG = [
+  `mcp_servers.${CHROME_DEVTOOLS_MCP.name}.command="${CHROME_DEVTOOLS_MCP.command}"`,
+  `mcp_servers.${CHROME_DEVTOOLS_MCP.name}.args=${JSON.stringify(CHROME_DEVTOOLS_MCP.args)}`,
+  `mcp_servers.${CHROME_DEVTOOLS_MCP.name}.startup_timeout_sec=${CHROME_DEVTOOLS_MCP.startupTimeoutSec}`,
+  `mcp_servers.${CHROME_DEVTOOLS_MCP.name}.default_tools_approval_mode="approve"`,
+] as const
+
+// Presence-gated as one unit: an operator who declares `mcp_servers.chrome-devtools` themselves (table
+// header or dotted assignment, bare or quoted key) owns its transport AND approval policy — injecting
+// a partial table on top would either fight their transport or, worse, fail config validation
+// ("invalid transport") when only approval keys land on an undeclared server. Same fail-safe direction
+// as codexConfigDeclaresKey: unreadable/absent config → nothing declared → inject everything.
+function chromeDevtoolsMcpFlags(codexHome: string): string[] {
+  let configText = ""
+  try {
+    configText = readFileSync(join(codexHome, "config.toml"), "utf8")
+  } catch {
+    configText = ""
+  }
+  const declared =
+    /\[\s*mcp_servers\s*\.\s*["']?chrome-devtools["']?\s*[\].]/.test(configText) ||
+    /(^|\n)\s*["']?mcp_servers["']?\s*\.\s*["']?chrome-devtools["']?\s*\./.test(configText)
+  return declared ? [] : FRAY_CHROME_DEVTOOLS_MCP_CONFIG.flatMap((config) => ["-c", config])
 }
 
 // ---- opinionated Codex output defaults (process-scoped, presence-gated) ----
@@ -873,6 +913,7 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): AgentBackend
         ...workerSkillIsolationFlags(),
         ...codexSpawnThreadMcpFlags(o.spawnThreadMcp),
         ...outputDefaultFlags(codexHome),
+        ...chromeDevtoolsMcpFlags(codexHome),
         ...effortFlags(o.effort),
         composeSpawnPrompt(o),
       ]
@@ -903,6 +944,7 @@ export function createCodexBackend(opts: CodexBackendOptions = {}): AgentBackend
         ...workerSkillIsolationFlags(),
         ...codexSpawnThreadMcpFlags(o.spawnThreadMcp),
         ...outputDefaultFlags(codexHome),
+        ...chromeDevtoolsMcpFlags(codexHome),
         ...effortFlags(o.effort),
         "-s",
         codexSandbox(o.permissionMode),

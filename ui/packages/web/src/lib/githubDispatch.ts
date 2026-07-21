@@ -6,9 +6,6 @@ import type {
 import type { ResolvedDispatchPreferences } from "./dispatchPreferences.ts"
 import { CLAUDE_MODELS, EFFORTS } from "./options.ts"
 
-const CLAUDE_PERMISSIONS = new Set(["auto", "default", "acceptEdits", "bypassPermissions"])
-const CODEX_PERMISSIONS = new Set(["default", "plan", "bypassPermissions"])
-
 export type ProfileCaptureResult =
   | { ok: true; profile: DispatchProfileSnapshot }
   | { ok: false; error: string }
@@ -26,11 +23,12 @@ export function captureDispatchProfile(
   if (!resolved.effortAvailable) {
     return { ok: false, error: "Saved reasoning level is unavailable — choose another level before opening GitHub" }
   }
+  // No permissionMode: the server stamps every created worker with its fixed non-interactive mode
+  // (WORKER_DISPATCH_PERMISSION) — the GitHub flow carries no permission choice either.
   const profile: DispatchProfileSnapshot = {
     backend: resolved.backend,
     model: resolved.model,
     effort: resolved.effort as DispatchProfileSnapshot["effort"],
-    permissionMode: resolved.permissionMode,
   }
   const error = dispatchProfileError(profile, resolved.backend === "codex" && resolved.codexModel
     ? [resolved.codexModel]
@@ -51,9 +49,6 @@ export function dispatchProfileError(
     if (!(EFFORTS as readonly string[]).includes(profile.effort)) {
       return `Reasoning level ${profile.effort} is not available for ${profile.model}`
     }
-    if (!CLAUDE_PERMISSIONS.has(profile.permissionMode)) {
-      return `Permission ${profile.permissionMode} is not valid for Claude dispatch`
-    }
     return undefined
   }
 
@@ -61,9 +56,6 @@ export function dispatchProfileError(
   if (!model) return `Codex model ${profile.model} is no longer available`
   if (!model.efforts.includes(profile.effort)) {
     return `Reasoning level ${profile.effort} is not available for ${profile.model}`
-  }
-  if (!CODEX_PERMISSIONS.has(profile.permissionMode)) {
-    return `Sandbox ${profile.permissionMode} is not valid for Codex dispatch`
   }
   return undefined
 }
@@ -77,6 +69,5 @@ export function buildGithubBatchInput(
     backend: profile.backend,
     model: profile.model,
     effort: profile.effort,
-    permissionMode: profile.permissionMode,
   }
 }
