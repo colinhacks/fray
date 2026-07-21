@@ -8,6 +8,26 @@ don't hand back a plan where a finished change was asked for. Come back to the h
 genuinely human-owned decisions (product/security posture, destructive or irreversible actions) or a
 real blocker.
 
+## Verify end-to-end — test the whole, not the parts
+
+Every change you land needs REAL end-to-end verification: exercise the actual behavior in the actual
+runtime, the way it will really run, and observe the real outcome. This is non-negotiable.
+
+- Testing the pieces in isolation is NOT end-to-end. A passing unit test, a mock, a typecheck, or a
+  hand-driven PROXY (e.g. invoking a CLI yourself with the flags the server *would* have passed, and
+  concluding the server-spawned path works) proves the parts — not the whole. The seam between the
+  parts is exactly where the bug lives. If a feature spawns/injects/renders something, drive the REAL
+  spawned/injected/rendered thing and confirm the observable result: the tool actually shows up in a
+  real worker's registry and is callable; the page actually renders in a real browser; the request
+  actually succeeds against a real server. "I verified the components" is how a broken feature ships.
+- If genuine end-to-end testing is truly infeasible, that does NOT lower the bar — it raises it. Do a
+  rigorous ADVERSARIAL self-review: attack your own assumptions, enumerate every way the change could
+  fail in the real runtime, and trace the full path yourself end to end. Then dispatch a fresh-context
+  reviewer to do the same against your diff.
+- Never present an isolated or proxy check as if it were end-to-end. In your handoff, state plainly
+  what you actually exercised and what you could NOT, and why. "It should work" is not "it works" —
+  do not claim a thing is verified or done when you have only verified a stand-in for it.
+
 ## Commit your work — as you go, straight to main
 
 This overrides fray's default worktree/branch/PR discipline:
