@@ -13,8 +13,9 @@ const RESTART_BODY =
 //    Space keyup, which no keydown guard sees — the only durable seal is to keep it unfocusable).
 //    This covers portaled surfaces (Radix dialogs/menus) that live outside the inert app subtree too.
 //  • Enter — a composer submit, belt-and-suspenders with the blur/focus move.
-//  • ⌘/Ctrl + N/K/I — the global dispatch/palette/doc chords (App.tsx), which would otherwise open
-//    surfaces behind the scrim.
+//  • ⌘/Ctrl + K/I — the global palette/doc chords (App.tsx), which would otherwise open surfaces
+//    behind the scrim. NOT N: ⌘N is the browser's new-window shortcut and fray no longer binds it,
+//    so swallowing it here would hijack the browser for no gain.
 // The rpc-layer mutation gate remains as a final backstop; between these, the "Fray is restarting"
 // red error is unreachable through ordinary interaction.
 function swallowsInteractionKey(event: KeyboardEvent): boolean {
@@ -22,7 +23,7 @@ function swallowsInteractionKey(event: KeyboardEvent): boolean {
   const meta = event.metaKey || event.ctrlKey
   if (meta) {
     const key = event.key.toLowerCase()
-    if (key === "n" || key === "k" || key === "i") return true
+    if (key === "k" || key === "i") return true
   }
   return false
 }
