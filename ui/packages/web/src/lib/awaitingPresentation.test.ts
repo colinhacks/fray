@@ -1,13 +1,13 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { awaitingHintSentence, awaitingPresentationLine } from "./awaitingPresentation.ts"
+import { awaitingCalloutPresentation, awaitingHintSentence } from "./awaitingPresentation.ts"
 
 const now = Date.parse("2026-07-21T18:00:00.000Z")
 
 test("awaiting hints become one compact plain-English action", () => {
   assert.match(
     awaitingHintSentence([{ kind: "timer", value: "2026-07-21T21:00:00.000Z" }], now) ?? "",
-    /^Snooze until /,
+    /^Until /,
   )
   assert.equal(
     awaitingHintSentence([{ kind: "github-review", value: "owner/repo#42" }], now),
@@ -41,14 +41,42 @@ test("legacy hints degrade to readable text and an empty hint set stays empty", 
   assert.equal(awaitingHintSentence([], now), null)
 })
 
-test("body and action join as clean prose without period-dash punctuation", () => {
-  assert.equal(
-    awaitingPresentationLine("Park until the checkpoint.", "Snooze until today at 2:00 PM"),
-    "Park until the checkpoint. Snooze until today at 2:00 PM",
+test("callout presentation separates the bold action lead from supporting prose", () => {
+  const timer = awaitingCalloutPresentation(
+    "Park until the checkpoint.",
+    [{ kind: "timer", value: "2026-07-21T21:00:00.000Z" }],
+    now,
   )
-  assert.equal(
-    awaitingPresentationLine("Park until the checkpoint", "Snooze until today at 2:00 PM"),
-    "Park until the checkpoint — Snooze until today at 2:00 PM",
+  assert.equal(timer.lead, "Recommended snooze")
+  assert.match(timer.description ?? "", /^Until .*\. Park until the checkpoint\.$/)
+  assert.deepEqual(
+    awaitingCalloutPresentation(
+      "The implementation is ready for review.",
+      [{ kind: "github-review", value: "owner/repo#42" }],
+      now,
+    ),
+    {
+      lead: "Review watcher",
+      description: "Watch owner/repo#42 for new human review activity. The implementation is ready for review.",
+    },
   )
-  assert.equal(awaitingPresentationLine("", null), "Waiting for an external update.")
+  assert.deepEqual(
+    awaitingCalloutPresentation(
+      "The API shape needs approval.",
+      [{ kind: "human", value: "Alice to approve the API shape" }],
+      now,
+    ),
+    {
+      lead: "Human approval",
+      description: "Wait for Alice to approve the API shape. The API shape needs approval.",
+    },
+  )
+  assert.deepEqual(
+    awaitingCalloutPresentation("The worker left a plain handoff.", [], now),
+    { lead: "Wait note", description: "The worker left a plain handoff." },
+  )
+  assert.deepEqual(
+    awaitingCalloutPresentation("", [], now),
+    { lead: "Wait note", description: "Waiting for an external update." },
+  )
 })

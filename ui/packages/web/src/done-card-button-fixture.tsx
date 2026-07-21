@@ -2,6 +2,7 @@ import { createRoot } from "react-dom/client"
 import { useEffect, useState } from "react"
 import type { AwaitingHint, BoardSnapshot, ThreadView } from "@fray-ui/shared"
 import { FenceCard, ThreadSlugContext, Message } from "./components/ChatView.tsx"
+import { QueueSubAgentLines } from "./components/QueueSubAgentLines.tsx"
 import { setBoard } from "./store.ts"
 import "./styles.css"
 
@@ -14,6 +15,10 @@ import "./styles.css"
 //     a user snooze via setThreadSnooze.
 // RPC is mocked like completion-lifecycle-fixture so nothing real is hit.
 const mode = new URLSearchParams(window.location.search).get("mode") === "executing" ? "executing" : "resting"
+const calloutsOnly = new URLSearchParams(window.location.search).get("callouts") === "1"
+const agentOnly = new URLSearchParams(window.location.search).get("agent") === "1"
+const requestedDelay = Number(new URLSearchParams(window.location.search).get("delay") ?? "0")
+const responseDelayMs = Number.isFinite(requestedDelay) ? Math.min(Math.max(requestedDelay, 0), 5_000) : 0
 const nativeFetch = window.fetch.bind(window)
 const rpcResult = (result: unknown) => new Response(JSON.stringify({ result }), {
   headers: { "content-type": "application/json", "x-fray-boot": "done-card-button-fixture" },
@@ -28,6 +33,7 @@ window.fetch = async (input, init) => {
   }
   if (url.pathname === "/rpc/setThreadSnooze") {
     const body = JSON.parse(String(init?.body ?? "{}")) as { slug?: string; until?: string }
+    if (responseDelayMs) await new Promise((resolve) => setTimeout(resolve, responseDelayMs))
     window.dispatchEvent(new CustomEvent("fixture-rpc", { detail: { rpc: "setThreadSnooze", ...body } }))
     return rpcResult(null)
   }
@@ -76,8 +82,8 @@ const queueCards: { slug: string; label: string; text: string }[] = [
   { slug: "queue-timer", label: "timer snooze", text: "```awaiting\nPark until the checkpoint.\ntimer: " + timerIso + "\n```" },
 ]
 
-// A queue thread with a LIVE sub-agent dispatch — proves that, now the queue card provides
-// ThreadSlugContext, an AgentBlock there resolves its child and goes live (running header + drill-in).
+// A queue thread with a LIVE sub-agent dispatch. Dense messages intentionally omit the nested Agent
+// tool card; QueueSubAgentLines is the queue's one flat, drillable child surface.
 const agentSlug = "queue-agent"
 const agentId = "sub-live-1"
 const agentThread = baseThread(agentSlug, "agent · live sub-agent", [
@@ -95,6 +101,13 @@ const board: BoardSnapshot = {
 }
 setBoard(board)
 
+const agentMessage = {
+  role: "assistant" as const,
+  text: "",
+  tools: [],
+  parts: [{ kind: "tools" as const, tools: [{ name: "Agent", detail: "Investigate the failing test", prompt: "Go investigate the failing test and report back.", subagentType: "fray:opus-high", agentId, status: "pending" as const }] }],
+}
+
 function Fixture() {
   const [calls, setCalls] = useState<string[]>([])
   useEffect(() => {
@@ -106,43 +119,58 @@ function Fixture() {
     window.addEventListener("fixture-rpc", onRpc)
     return () => window.removeEventListener("fixture-rpc", onRpc)
   }, [])
+  if (calloutsOnly) {
+    return (
+      <main data-callout-gallery className="mx-auto flex min-h-screen w-full max-w-xl flex-col gap-3 px-4 py-8">
+        {cards.filter((card) => card.fence === "awaiting").map((card) => (
+          <ThreadSlugContext.Provider key={card.slug} value={card.slug}>
+            <FenceCard fenceKind={card.fence} body={card.body} hints={card.hints} />
+          </ThreadSlugContext.Provider>
+        ))}
+        <p data-fixture-rpc-calls className="sr-only">RPC calls: {calls.join(" | ") || "none"}</p>
+      </main>
+    )
+  }
+  if (agentOnly) {
+    return (
+      <main data-agent-gallery className="mx-auto min-h-screen w-full max-w-xl px-4 py-8">
+        <article data-agent-queue-card className="overflow-hidden rounded-lg border border-border bg-panel">
+          <header className="border-b border-border/60 px-4 py-3">
+            <strong className="text-[13px] font-semibold">Fix queue regression</strong>
+          </header>
+          <div className="px-4 py-3">
+            <ThreadSlugContext.Provider value={agentSlug}>
+              <Message m={agentMessage} dense />
+            </ThreadSlugContext.Provider>
+            <QueueSubAgentLines slug={agentSlug} subAgents={agentThread.subAgents} />
+          </div>
+        </article>
+      </main>
+    )
+  }
   return (
-    <main className="mx-auto flex min-h-screen w-full max-w-xl flex-col gap-5 px-4 py-8">
-      <p className="petite-caps text-[10px] text-accent">FenceCard buttons ({mode})</p>
+    <main className="mx-auto flex min-h-screen w-full max-w-xl flex-col gap-3 px-4 py-8">
       {cards.map((c) => (
-        <div key={c.slug} className="flex flex-col gap-1.5">
-          <p className="text-[11px] text-muted">{c.label}</p>
+        <div key={c.slug} data-fixture-label={c.label}>
           <ThreadSlugContext.Provider value={c.slug}>
             <FenceCard fenceKind={c.fence} body={c.body} hints={c.hints} />
           </ThreadSlugContext.Provider>
         </div>
       ))}
-      <p className="petite-caps mt-4 text-[10px] text-accent">Queue path — Message dense inside ThreadSlugContext</p>
       {queueCards.map((c) => (
-        <div key={c.slug} data-queue-fixture={c.slug} className="flex flex-col gap-1.5 rounded-lg border border-border bg-panel p-3">
-          <p className="text-[11px] text-muted">{c.label}</p>
+        <div key={c.slug} data-queue-fixture={c.slug} data-fixture-label={c.label}>
           <ThreadSlugContext.Provider value={c.slug}>
             <Message m={{ role: "assistant", text: c.text, tools: [], parts: [{ kind: "text", text: c.text }] }} dense />
           </ThreadSlugContext.Provider>
         </div>
       ))}
-      {/* B (maintainer 2026-07-15): queue sub-agent blocks go live via ThreadSlugContext. This proves an
-          AgentBlock in a queue card resolves its running child + offers drill-in. */}
-      <div data-queue-fixture={agentSlug} className="flex flex-col gap-1.5 rounded-lg border border-border bg-panel p-3">
-        <p className="text-[11px] text-muted">agent · live sub-agent (drill-in)</p>
+      <div data-queue-fixture={agentSlug}>
         <ThreadSlugContext.Provider value={agentSlug}>
-          <Message
-            m={{
-              role: "assistant",
-              text: "",
-              tools: [],
-              parts: [{ kind: "tools", tools: [{ name: "Agent", detail: "Investigate the failing test", prompt: "Go investigate the failing test and report back.", subagentType: "fray:opus-high", agentId, status: "pending" }] }],
-            }}
-            dense
-          />
+          <Message m={agentMessage} dense />
         </ThreadSlugContext.Provider>
+        <QueueSubAgentLines slug={agentSlug} subAgents={agentThread.subAgents} />
       </div>
-      <p data-fixture-rpc-calls className="text-[11px] text-muted">RPC calls: {calls.join(" | ") || "none"}</p>
+      <p data-fixture-rpc-calls className="sr-only">RPC calls: {calls.join(" | ") || "none"}</p>
     </main>
   )
 }
