@@ -34,7 +34,10 @@ const TOOL = {
     "Spawn a brand-new, separate top-level fray thread (its own board card, session, and scratchpad, " +
     "driving independently) — NOT an in-session sub-agent. Returns the new thread's slug and a ready-to-" +
     "paste markdown link `[title](/thread/<slug>)` that opens the thread in the fray drawer when clicked. " +
-    "Use this to hand a distinct, self-contained effort to a fresh fray thread rather than doing it inline.",
+    "Use this to hand a distinct, self-contained effort to a fresh fray thread rather than doing it inline. " +
+    "You MUST deliberately choose `model` and `effort` to match the NEW thread's task complexity — they are " +
+    "required, there is NO default. Do not reflexively pick the cheapest; a hard task on a weak model/effort " +
+    "wastes the whole thread.",
   inputSchema: {
     type: "object",
     properties: {
@@ -42,12 +45,33 @@ const TOOL = {
         type: "string",
         description: "The full task/prompt for the new thread's worker. Be self-contained — the new thread starts with empty context.",
       },
+      model: {
+        type: "string",
+        description:
+          "REQUIRED — pick by the NEW task's complexity; there is no default. For the `claude` backend: " +
+          "`opus` (hardest reasoning, architecture, subtle correctness/security, adversarial review, the " +
+          "fix that must land), `sonnet` (ordinary substantive implementation/research), `haiku` (simple, " +
+          "fully-specified mechanical work), `fable` (fastest/cheapest — ONLY trivial throwaway tasks). For " +
+          "the `codex` backend use a codex model id instead (e.g. `gpt-5.6-sol`/`gpt-5.6-terra`/`gpt-5.6-luna`). " +
+          "Match the model to the backend you choose. Bias toward Opus/a strong model when the task is " +
+          "non-trivial or its outcome is load-bearing.",
+      },
+      effort: {
+        type: "string",
+        enum: ["low", "medium", "high", "xhigh", "max"],
+        description:
+          "REQUIRED — reasoning effort, pick by complexity; no default. `low` only for trivial tasks; " +
+          "`medium` for routine work; `high` for ordinary substantive work; `xhigh` for hard coding/agentic " +
+          "work; `max` for the single hardest problems. (Codex also accepts `ultra`.)",
+      },
+      backend: {
+        type: "string",
+        enum: ["claude", "codex"],
+        description: "Optional agent backend (default `claude`). If `codex`, `model` must be a codex model id.",
+      },
       title: { type: "string", description: "Optional short title for the new thread (else derived from the prompt)." },
-      model: { type: "string", description: "Optional model id override (else the project's default)." },
-      backend: { type: "string", enum: ["claude", "codex"], description: "Optional agent backend (else claude)." },
-      effort: { type: "string", description: "Optional reasoning-effort level (else the project's default)." },
     },
-    required: ["prompt"],
+    required: ["prompt", "model", "effort"],
   },
 }
 
@@ -87,12 +111,17 @@ function serverLockPort() {
 async function dispatchThread(args) {
   const prompt = typeof args.prompt === "string" ? args.prompt.trim() : ""
   if (!prompt) throw new Error("`prompt` is required and must be a non-empty string")
+  // model + effort are REQUIRED (no default) so the caller must choose by task complexity — a defaulted
+  // model (e.g. the project's cheap default) is exactly the bug this guards. Enforced server-side too,
+  // not only in the tool schema, so a lenient client can't skip the decision.
+  const model = typeof args.model === "string" ? args.model.trim() : ""
+  if (!model) throw new Error("`model` is required — choose one by the new task's complexity (claude: opus/sonnet/haiku/fable; codex: a gpt-5.6 model id). There is no default.")
+  const effort = typeof args.effort === "string" ? args.effort.trim() : ""
+  if (!effort) throw new Error("`effort` is required — choose one by complexity (low/medium/high/xhigh/max). There is no default.")
 
   /** @type {Record<string, unknown>} */
-  const body = { prompt }
+  const body = { prompt, model, effort }
   if (typeof args.title === "string" && args.title.trim()) body.title = args.title.trim()
-  if (typeof args.model === "string" && args.model.trim()) body.model = args.model.trim()
-  if (typeof args.effort === "string" && args.effort.trim()) body.effort = args.effort.trim()
   if (args.backend === "claude" || args.backend === "codex") body.backend = args.backend
 
   const port = serverLockPort()
