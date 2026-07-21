@@ -362,7 +362,7 @@ export async function startServer(opts: StartOptions = {}): Promise<StartedServe
   const cleanupTerminal = createRetryableCleanup(async () => { await terminal?.close() })
   const cleanupAppSocket = createRetryableCleanup(async () => { await appSocket?.close() })
   const cleanupTailer = createRetryableCleanup(() => ctx?.tailer.stop())
-  const cleanupLoginUtility = createRetryableCleanup(() => ctx?.loginUtility.stop())
+  const cleanupLoginUtility = createRetryableCleanup(() => ctx?.loginUtility?.stop())
   const cleanupPermission = createRetryableCleanup(() => ctx?.permissionController.stop())
   const cleanupProfile = createRetryableCleanup(() => ctx?.profileController?.stop())
   const cleanupSubscriptions = createRetryableCleanup(() => ctx?.stopSubscriptions())

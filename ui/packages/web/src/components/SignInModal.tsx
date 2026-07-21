@@ -1,12 +1,15 @@
 import * as RadixDialog from "@radix-ui/react-dialog"
-import { useEffect, useRef, useState } from "react"
+import { Suspense, lazy, useEffect, useRef, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Copy, Check, Loader2 } from "lucide-react"
 import type { AccountLogoutResult, AuthSnapshot, Backend } from "@fray-ui/shared"
 import { rpc } from "../api/rpc.ts"
 import { showToast } from "../store.ts"
 import { SIGN_IN_COMMAND, PROVIDER_LABEL } from "../lib/signIn.ts"
-import { TerminalPane } from "./TerminalPane.tsx"
+
+// LAZY: TerminalPane pulls in @xterm/xterm, a browser-only module that must not be evaluated when
+// node (tests) imports this file transitively — it only loads once an embedded attempt renders.
+const TerminalPane = lazy(() => import("./TerminalPane.tsx").then((m) => ({ default: m.TerminalPane })))
 
 // The sign-in gate modal. Shown when a dispatch targets a signed-out provider or the runtime 401
 // classifier flags a rejected credential. The PRIMARY action embeds the provider's own login CLI
@@ -119,7 +122,9 @@ export function SignInModal({
               {/* The restricted account terminal: a global provider sign-in session, NOT a thread —
                   it inherits no project prompt and accepts no other command. */}
               <div className="mb-4 h-[340px] overflow-hidden rounded-lg border border-border bg-[#0d0e10]">
-                <TerminalPane slug={attempt} />
+                <Suspense fallback={<div className="flex h-full items-center justify-center text-[12px] text-muted">Opening terminal…</div>}>
+                  <TerminalPane slug={attempt} />
+                </Suspense>
               </div>
               <div className="flex items-center justify-end gap-2">
                 <button
