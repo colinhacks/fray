@@ -1,9 +1,9 @@
-import { statSync, openSync, readSync, closeSync, readdirSync, mkdirSync, writeFileSync } from "node:fs"
+import { statSync, openSync, readSync, closeSync, readdirSync, mkdirSync, writeFileSync, readFileSync } from "node:fs"
 import { join } from "node:path"
 import { homedir, tmpdir } from "node:os"
 import { PermissionMode } from "@fray-ui/shared"
 import type { Bus } from "./bus.ts"
-import type { Project } from "./project.ts"
+import { permMarkerPath, type Project } from "./project.ts"
 import type { Storage, SessionRow } from "./storage.ts"
 import { discoverTranscriptId, DISCOVERY_GRACE_MS } from "./discover.ts"
 import type { AgentBackend, FoldState, NativeInputRequiredData, NormalizedEvent, NormalizedTail } from "./backend/types.ts"
@@ -112,7 +112,8 @@ export interface SessionTelemetry extends NormalizedTail {
   // Monotonic within this tail state. The permission controller uses it to distinguish an
   // authoritative profile emitted by the freshly attached backend from the pre-reattach fold.
   permissionModeRevision?: number
-  lastActivityAt?: string // ISO8601 of the last timestamped record
+  lastActivityAt?: string // ISO8601 of the last timestamped record (ANY record, incl. sub-agent/system)
+  lastAssistantAt?: string // ISO8601 of the agent's OWN last output — rest time (excludes sub-agent/system bumps)
   lastAssistant?: string // trimmed preview (~200 chars) of the last assistant text block
   aiTitle?: string // Claude's own auto-generated session title (latest ai-title sidecar record)
   // Claude's native `/rename` is distinguished from ordinary ai-title churn so the control plane can
@@ -218,6 +219,11 @@ interface SubAgentEntry {
   startedAt: string // ISO8601 — the dispatch record's timestamp
   subagentType?: string // the dispatch's input.subagent_type verbatim (agents only; may be absent)
   outputFile?: string // the child/shell's output path (from the launch tool_result); its mtime = liveness
+  // The RUNTIME task id (Bash "…with ID: <id>", Monitor "(task <id>…)", Agent "agentId: <id>"), parsed
+  // from the launch ack. This is the ONE identifier a `TaskStop` references (its `input.task_id`) and
+  // it also rides every natural completion notification as `<task-id>` — so it is the correlation key
+  // for a MANUAL stop, which carries no tool_use id at all. Absent until the launch ack is seen.
+  taskId?: string
 }
 
 // A live background shell as surfaced to the board (mirrors @fray-ui/shared BgShellView).
@@ -567,6 +573,23 @@ function retireToRing(state: TailState, entry: SubAgentEntry, finishedAt: string
   }
 }
 
+// Retire a live entry however it was CORRELATED (by tool_use id from a notification, or by runtime
+// task id from a manual stop) — the map key is always its tool_use id. A display-only SHELL just
+// clears; an AGENT moves into the review ring. The single exit for every terminal signal.
+function retireLive(state: TailState, entry: SubAgentEntry, finishedAt: string | undefined, status: "completed" | "failed" | "killed"): void {
+  state.subAgents.delete(entry.toolUseId)
+  if (entry.kind === "shell") return // display-only — nothing to review, no retention ring
+  retireToRing(state, entry, finishedAt, status)
+}
+
+// Find a live tracked op by its RUNTIME task id — the correlation key a manual `TaskStop` carries (it
+// has no tool_use id). Maps hold a handful of live ops, so a scan beats a second index that every
+// removal path would have to keep in sync (index desync is the exact bug class this change closes).
+function findLiveByTaskId(state: TailState, taskId: string): SubAgentEntry | undefined {
+  for (const e of state.subAgents.values()) if (e.taskId === taskId) return e
+  return undefined
+}
+
 // Resolve a tracked child's transcript path from its launch ack, best shape first: an explicit
 // "output_file:" (older Agent ack), the shell ack's "Output is being written to:", else DERIVED from
 // the mailbox ack's agentId — subagent transcripts live at <session-dir>/subagents/agent-<id>.jsonl
@@ -580,6 +603,18 @@ function launchOutputFile(state: TailState, text: string): string | undefined {
   const aid = text.match(/agentId:\s*(\S+)/)?.[1]
   if (aid) return `${state.path.replace(/\.jsonl$/, "")}/subagents/agent-${aid}.jsonl`
   return undefined
+}
+
+// The RUNTIME task id from a launch ack — the key a later `TaskStop` (and every natural completion
+// notification) references. One per corpus-verified ack shape: the Bash background ack, the Monitor
+// ack, and the mailbox Agent ack (whose agentId doubles as its TaskStop handle). Undefined for the
+// path-only older Agent ack, which has no manual-stop handle and clears on its notification anyway.
+function launchTaskId(text: string): string | undefined {
+  return (
+    text.match(/Command running in background with ID:\s*(\S+)/)?.[1]?.replace(/\.$/, "") ??
+    text.match(/Monitor started \(task\s+(\w+)/)?.[1] ??
+    text.match(/agentId:\s*(\S+)/)?.[1]
+  )
 }
 
 // Process tool_results for tracked background ops: enrich a launch ack with the child's transcript
@@ -603,6 +638,7 @@ function trackLaunchResults(state: TailState, rec: Record): void {
     if (!entry) continue
     const text = toolResultText(b.content)
     if (!entry.outputFile) entry.outputFile = launchOutputFile(state, text)
+    if (!entry.taskId) entry.taskId = launchTaskId(text)
     if (LAUNCH_ACK_RE.test(text)) continue // background launch ack — the child/shell is alive, keep tracking
     if (entry.kind === "shell") {
       state.subAgents.delete(id) // synchronous launch failure: no notification will ever arrive
@@ -644,18 +680,42 @@ function trackCompletions(state: TailState, rec: Record): void {
   for (const block of raw.match(/<task-notification>[\s\S]*?<\/task-notification>/g) ?? []) {
     const status = block.match(/<status>([^<]*)<\/status>/)?.[1]
     if (status !== "completed" && status !== "failed" && status !== "killed") continue
-    // Prefer the tool-use-id correlation key; fall back to task-id (user-shaped notifications from
-    // some emitters omit tool-use-id — task-id matches nothing tracked, so it stays a safe no-op
-    // rather than mis-retiring).
+    // Correlate by tool-use-id, then fall back to the runtime task-id (both ride the notification).
+    // Some emitters omit tool-use-id; before we captured task ids at launch that was a safe no-op, and
+    // now it RESOLVES against the entry's captured task id instead of leaking a phantom row.
     const id = block.match(/<tool-use-id>([^<]*)<\/tool-use-id>/)?.[1]
-    if (!id) continue
-    const entry = state.subAgents.get(id)
+    const taskId = block.match(/<task-id>([^<]*)<\/task-id>/)?.[1]
+    const entry = (id ? state.subAgents.get(id) : undefined) ?? (taskId ? findLiveByTaskId(state, taskId) : undefined)
     if (!entry) continue // not live (unknown id, or already retired by an earlier notify) — no-op
-    state.subAgents.delete(id)
-    // Background SHELLS are display-only — nothing to review, so they just clear (no retention ring).
-    if (entry.kind === "shell") continue
-    // Sub-agents retain for drawer review: re-insert at the ring's tail (newest-wins); evict the oldest.
-    retireToRing(state, entry, typeof rec.timestamp === "string" ? rec.timestamp : undefined, status)
+    retireLive(state, entry, typeof rec.timestamp === "string" ? rec.timestamp : undefined, status)
+  }
+}
+
+// A manual `TaskStop` is a first-class STOP event, symmetric with the launch `tool_use` that started
+// the op. Its structured result confirms "Successfully stopped task: <id>" and carries the runtime
+// `task_id` — the SAME id captured at launch, and the ONLY correlation key a manual stop exposes (it
+// has no tool_use id). This is the signal that retires a shell/agent killed by hand — the one the
+// board previously never saw, leaving a phantom pulsing row until the pane died.
+function stoppedTaskId(text: string): string | undefined {
+  // Guard on the success confirmation so a failed/no-op stop never retires a still-live row, then read
+  // the structured task_id field (the first match is the real field — it precedes `command` in the JSON).
+  if (!/Successfully stopped task/.test(text)) return undefined
+  return text.match(/"task_id"\s*:\s*"([^"]+)"/)?.[1]
+}
+
+function trackStops(state: TailState, rec: Record): void {
+  if (state.subAgents.size === 0) return
+  const content = rec.message?.content
+  if (!Array.isArray(content)) return
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue
+    const b = block as { type?: string; content?: unknown }
+    if (b.type !== "tool_result") continue
+    const taskId = stoppedTaskId(toolResultText(b.content))
+    if (!taskId) continue
+    const entry = findLiveByTaskId(state, taskId)
+    if (!entry) continue // already retired by its own notification, or never tracked — safe no-op
+    retireLive(state, entry, typeof rec.timestamp === "string" ? rec.timestamp : undefined, "killed")
   }
 }
 
@@ -752,6 +812,11 @@ export function applyRecord(state: TailState, rec: Record): void {
   } else if (type === "assistant") {
     state.sawRecords = true
     state.lastKind = "assistant"
+    // The agent's OWN output timestamp = the rest-time key. For an at-rest thread the last assistant
+    // record IS its final resting message; unlike lastActivityAt this never moves from a sub-agent's
+    // completion notification (a promptSource:system USER record), so the queue never reshuffles on
+    // background-child motion. tool_result echoes are `type:user`, not assistant, so they don't bump it.
+    if (typeof rec.timestamp === "string") state.lastAssistantAt = rec.timestamp
     state.lastStopReason = typeof rec.message?.stop_reason === "string" ? rec.message.stop_reason : undefined
     // Claude records the actual resolved model on every assistant message. It does NOT record the
     // launch effort, so that half continues to come from the persisted dispatch profile. Ignore the
@@ -792,6 +857,7 @@ export function applyRecord(state: TailState, rec: Record): void {
     // earlier over-fix that WAS a real bug).
     if (!systemUserRec && typeof rec.timestamp === "string" && isRealUserMessage(rec.message?.content)) state.lastUserAt = rec.timestamp
     trackLaunchResults(state, rec) // resolve a background dispatch's transcript path from its launch result
+    trackStops(state, rec) // a manual TaskStop is a terminal signal — retire the op it killed
     clearAskOnResult(state, rec) // the AskUserQuestion answer landed → clear the pending ask
   } else if (type === "ai-title") {
     // Sidecar record carrying Claude's own auto-generated session title. Emitted repeatedly (often
@@ -845,18 +911,23 @@ export function applyEvent(state: FoldState, ev: NormalizedEvent): void {
       break
     case "turn-end":
       // A turn bracketed closed → idle. finalText (when the backend carries the final message on the
-      // bracket) is authoritative: (re)derive preview + question/excusal fence from it.
+      // bracket) is authoritative: (re)derive preview + question/excusal fence from it. The bracket's
+      // `at` is the agent's rest time — the queue/at-rest-label key (see NormalizedTail.lastAssistantAt).
       state.sawRecords = true
       state.turn = "idle"
+      if (typeof ev.at === "string") state.lastAssistantAt = ev.at
       if (ev.finalText !== undefined) applyFinalText(state, ev.finalText)
       break
     case "assistant-text":
       // Streamed assistant text. The FINAL answer sets preview + question/excusal fence; a non-final
       // (commentary) block only refreshes the row preview and must NOT carry a fence. Turn state is
-      // untouched — the turn brackets on turn-start/turn-end, not on a text block.
+      // untouched — the turn brackets on turn-start/turn-end, not on a text block. A FINAL block's `at`
+      // is the agent's own output time → the rest-time key (turn-end usually carries the same instant).
       state.sawRecords = true
-      if (ev.final) applyFinalText(state, ev.text)
-      else {
+      if (ev.final) {
+        if (typeof ev.at === "string") state.lastAssistantAt = ev.at
+        applyFinalText(state, ev.text)
+      } else {
         const preview = previewText(ev.text)
         if (preview !== undefined) state.lastAssistant = preview
       }
@@ -978,6 +1049,28 @@ export interface TailerDeps {
   // composition layer; when absent (tests) the single `backend`/default Claude fold covers every row —
   // byte-identical to before. Takes precedence over `backend` when both are set.
   backendFor?: (kind?: string) => AgentBackend
+  // The structured PermissionRequest signal (Claude workers with the cc-worker plugin): the worker's
+  // perm-observe.mjs hook drops `<stateDir>/perm-requests/<slug>.json` the instant Claude creates a
+  // tool-approval prompt. Injectable for tests; the default reads that file. Absent stateDir (narrow
+  // test fixtures) → always undefined, so the pane-sniff regex fallback covers exactly as before.
+  readPermMarker?: (slug: string) => PermMarker | undefined
+}
+
+// The durable "blocked on <tool>" marker written by the worker's PermissionRequest hook. `at` is the
+// ISO time the request was created; the tailer treats the marker as an ACTIVE block only while `at` is
+// newer than the last transcript activity (a resolved request always advances the transcript past it).
+export interface PermMarker {
+  slug: string
+  tool: string | null
+  promptId: string | null
+  permissionMode: string | null
+  at: string
+}
+
+function isPermMarker(v: unknown): v is PermMarker {
+  if (!v || typeof v !== "object") return false
+  const m = v as Partial<PermMarker>
+  return typeof m.slug === "string" && typeof m.at === "string"
 }
 
 // A sub-agent transcript's mtime in epoch-ms, or undefined if it can't be stat'd (not yet created,
@@ -996,6 +1089,21 @@ export function defaultLogDir(project: Project): string {
   return join(homedir(), ".claude", "projects", project.cwdSlug)
 }
 
+// Reads the worker's PermissionRequest marker from the per-project stateDir. Telemetry-grade: a missing
+// stateDir (narrow test fixtures), an absent/half-written/corrupt file all degrade to undefined — the
+// pane-sniff fallback then covers exactly as before. Never throws.
+function defaultReadPermMarker(project: Project): (slug: string) => PermMarker | undefined {
+  if (!project.stateDir) return () => undefined
+  return (slug) => {
+    try {
+      const parsed = JSON.parse(readFileSync(permMarkerPath(project, slug), "utf8"))
+      return isPermMarker(parsed) ? parsed : undefined
+    } catch {
+      return undefined
+    }
+  }
+}
+
 // The slice of AgentBackend the tailer drives: locate a session's transcript, fold a raw line into
 // the accumulator, and (registered sessions only) sniff the pane for a permission prompt.
 type TailBackend = Pick<AgentBackend, "transcriptPath" | "foldLine" | "matchesPermPrompt" | "detectNativeInput">
@@ -1010,6 +1118,7 @@ export function createTailer(deps: TailerDeps): Tailer {
   const captureExpectedAdoptionPane = deps.captureExpectedAdoptionPane ?? tmux.captureExpectedAdoptionPane
   const logDir = deps.sessionLogDir ?? defaultLogDir(deps.project)
   const mtimeMs = deps.mtimeMs ?? defaultMtimeMs
+  const readPermMarker = deps.readPermMarker ?? defaultReadPermMarker(deps.project)
 
   function adoptionBinding(row: SessionRow) {
     const binding = adoptionRuntimeBinding(deps.storage, row)
@@ -1139,10 +1248,39 @@ export function createTailer(deps: TailerDeps): Tailer {
     return a?.kind === b?.kind && a?.title === b?.title
   }
 
-  // Native-modal verdict for a session: only spend one capture-pane after an in-flight turn has gone
-  // quiet for PERM_SNIFF_MS. Both the legacy Claude permission matcher and the structured backend
-  // detector consume that same capture. Once a structured modal is visible, keep capturing each tick
-  // until it disappears so the blocker clears promptly even before the rollout appends again.
+  // A live PermissionRequest marker (Claude workers with the fray plugin) is an ACTIVE block iff its
+  // timestamp is newer than the last transcript activity — a resolved request always advances the
+  // transcript past it. The caller gates this on turn === "in-flight" (a real block is always mid
+  // tool_use) and on the row being non-codex, which both bounds the per-tick file read to actively-
+  // working Claude sessions and means a stale marker on a crashed/exited pane is inert (deriveRuntime
+  // returns "exited" before it ever consults permPrompt).
+  function permMarkerBlocks(state: TailState, row: SessionRow): boolean {
+    const marker = readPermMarker(row.slug)
+    if (!marker) return false
+    const at = Date.parse(marker.at)
+    if (!Number.isFinite(at)) return false
+    // Stale-generation guard: a marker written BEFORE this process generation's spawn belongs to an
+    // already-ended block — e.g. a worker killed while parked on a prompt, then resumed. spawned_at is
+    // bumped to the current generation on every (re)spawn (storage.beginRuntimeGeneration), so on prime
+    // the replayed old transcript (lastActivityAt < at) would otherwise flash "Needs you" until the
+    // resume record lands. An unparseable spawned_at skips this guard (never suppress a live block).
+    const spawnedMs = Date.parse(row.spawned_at)
+    if (Number.isFinite(spawnedMs) && at < spawnedMs) return false
+    const last = state.lastActivityAt ? Date.parse(state.lastActivityAt) : Number.NEGATIVE_INFINITY
+    return at > last
+  }
+
+  // Perm-blocked verdict for a session. PRIMARY: the structured PermissionRequest marker — precise (it
+  // fires exactly when Claude created the prompt), so it surfaces immediately with no quiet-gate delay
+  // and cannot false-trip on transcript text that merely LOOKS like a prompt. FALLBACK (unchanged): a
+  // pane-sniff of a quiet in-flight turn, for the screens that emit no PermissionRequest (pre-boot
+  // workspace-trust, /login and other selectors) and for plugin-less foreign sessions. The native
+  // structured detector (Codex) still rides the same single capture.
+  //
+  // KNOWN EDGE (accepted): a background sub-agent completing WHILE the parent is blocked appends a
+  // system user-record that advances lastActivityAt past the marker, so permMarkerBlocks briefly reads
+  // false. This is not a regression — it degrades to the regex fallback, which re-detects the real
+  // modal after PERM_SNIFF_MS of quiet (the same latency the pre-marker path always had).
   function sniffPane(
     state: TailState,
     row: SessionRow,
@@ -1151,6 +1289,9 @@ export function createTailer(deps: TailerDeps): Tailer {
     backend: TailBackend,
   ): PaneSniff {
     if (state.foreign) return { permPrompt: false } // structural: foreign threads never touch tmux
+    if (turn === "in-flight" && row.backend !== "codex" && permMarkerBlocks(state, row)) {
+      return { permPrompt: true }
+    }
     if (!state.nativeInputRequired) {
       if (turn !== "in-flight" || !state.lastActivityAt) return { permPrompt: false }
       const at = Date.parse(state.lastActivityAt)
@@ -1679,7 +1820,7 @@ export function createTailer(deps: TailerDeps): Tailer {
       // an unanswered ```question fence (a user reply clears the flag and flips the turn in-flight).
       const pendingQuestion = s.turn === "idle" && s.lastAssistantHasQuestion
       const nowMs = now()
-      return { turn: s.turn, permPrompt: s.permPrompt, nativeInputRequired: s.nativeInputRequired, model: s.model, effort: s.effort, profileAt: s.profileAt, profileRevision: s.profileRevision, permissionMode: s.permissionMode, permissionModeAt: s.permissionModeAt, permissionModeRevision: s.permissionModeRevision, lastActivityAt: s.lastActivityAt, lastAssistant: s.lastAssistant, aiTitle: s.aiTitle, customTitle: s.customTitle, customTitleRevision: s.customTitleRevision, subAgents: subAgentViews(s, nowMs), bgShells: bgShellViews(s, nowMs), pendingAsk: s.pendingAsk, pendingQuestion, lastUserAt: s.lastUserAt, lastUserText: s.lastUserText, lastFence: s.lastFence, noTranscript: s.noTranscript }
+      return { turn: s.turn, permPrompt: s.permPrompt, nativeInputRequired: s.nativeInputRequired, model: s.model, effort: s.effort, profileAt: s.profileAt, profileRevision: s.profileRevision, permissionMode: s.permissionMode, permissionModeAt: s.permissionModeAt, permissionModeRevision: s.permissionModeRevision, lastActivityAt: s.lastActivityAt, lastAssistantAt: s.lastAssistantAt, lastAssistant: s.lastAssistant, aiTitle: s.aiTitle, customTitle: s.customTitle, customTitleRevision: s.customTitleRevision, subAgents: subAgentViews(s, nowMs), bgShells: bgShellViews(s, nowMs), pendingAsk: s.pendingAsk, pendingQuestion, lastUserAt: s.lastUserAt, lastUserText: s.lastUserText, lastFence: s.lastFence, noTranscript: s.noTranscript }
     },
     // The CURRENT fresh foreign session ids (mtime within FOREIGN_FRESH_MS, capped), mtime-desc. Kept
     // as the last scan's result — recomputed at most every FOREIGN_SCAN_EVERY ticks.

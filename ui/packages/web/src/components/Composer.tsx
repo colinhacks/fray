@@ -19,7 +19,7 @@ import { queueComposerHandlesOptionEnter } from "../lib/queueComposerKeyboard.ts
 // message text: workers open it with their Read/file tool; the chat renders images via /local-image and
 // non-image files as an openable chip. The safe-tier allowlist (images + common docs/text/code) is
 // enforced server-side too — the /attach route is the trust gate.
-async function uploadAttachment(file: File): Promise<string | null> {
+async function uploadAttachment(file: File, name: string): Promise<string | null> {
   const buf = await file.arrayBuffer()
   let bin = ""
   const bytes = new Uint8Array(buf)
@@ -27,7 +27,7 @@ async function uploadAttachment(file: File): Promise<string | null> {
   const res = await fetch("/attach", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ name: file.name || "pasted.png", data: btoa(bin) }),
+    body: JSON.stringify({ name, data: btoa(bin) }),
   })
   if (!res.ok) return null
   const json = (await res.json()) as { path?: string }
@@ -105,30 +105,56 @@ export function Composer({
       showToast("An upload is already in progress — try again in a moment")
       return
     }
-    const picked = [...files].filter((f) => f.type.startsWith("image/") || isAllowedAttachmentName(f.name))
-    if (!picked.length) return
+    // Effective upload name: the file's real name, else — for a nameless image paste — one derived
+    // from its actual MIME subtype. The old blanket `"pasted.png"` fallback stored a TIFF/JPEG paste
+    // as lying .png bytes (broken thumbnail, misled worker Read). The name then goes through the SAME
+    // shared allowlist the server enforces, so nothing uploads only to 400, and every rejection gets
+    // a toast instead of the old silent drop (dropping a .zip or unsupported image did nothing).
+    const named = [...files].map((f) => {
+      const sub = f.type.startsWith("image/") ? f.type.slice("image/".length).toLowerCase() : ""
+      const ext = sub === "jpeg" ? "jpg" : sub === "svg+xml" ? "svg" : sub
+      return { file: f, name: f.name || (ext ? `pasted.${ext}` : "") }
+    })
+    const typed = named.filter(({ name }) => {
+      if (isAllowedAttachmentName(name)) return true
+      showToast(`${name || "File"}: unsupported file type`)
+      return false
+    })
+    if (!typed.length) return
     // Reject an oversized file up front with a clear message (the server would 400 anyway — surface it
-    // instead of silently dropping). MB is base-10 to match how the OS reports file sizes.
-    const allowed = picked.filter((f) => {
-      if (f.size > ATTACHMENT_MAX_BYTES) {
-        showToast(`${f.name || "File"} is too large (max ${Math.round(ATTACHMENT_MAX_BYTES / 1e6)} MB)`)
+    // instead of silently dropping). MB is base-10 to match how the OS reports file sizes; floor, so
+    // the stated max is never larger than what the server actually accepts.
+    const allowed = typed.filter(({ file, name }) => {
+      if (file.size > ATTACHMENT_MAX_BYTES) {
+        showToast(`${name} is too large (max ${Math.floor(ATTACHMENT_MAX_BYTES / 1e6)} MB)`)
         return false
       }
       return true
     })
     if (!allowed.length) return
+    // Snapshot the draft at intake: if it is non-empty now but EMPTY when the upload lands, the
+    // message was sent (or the draft deliberately cleared) mid-upload — committing the path then
+    // would plant an orphan chip that silently rides along with the user's NEXT, unrelated message.
+    // Discard with a toast instead. (Enter/Send inside this box are gated on `uploading`, but a
+    // surface can still clear the draft externally — the queue card's "Send answers" button.)
+    const baseValue = valueRef.current
     setUploading(true)
     const paths: string[] = []
     try {
-      for (const f of allowed) {
-        const path = await uploadAttachment(f)
-        // A null means /attach rejected it (unsupported type the MIME filter let through, decode/write
-        // failure). Don't leave the user guessing why nothing appeared.
+      for (const { file, name } of allowed) {
+        const path = await uploadAttachment(file, name)
+        // A null means /attach rejected it (decode/write failure — the type allowlist already ran
+        // client-side above). Don't leave the user guessing why nothing appeared.
         if (path) paths.push(path)
-        else showToast(`Could not attach ${f.name || "file"}`)
+        else showToast(`Could not attach ${name}`)
       }
     } finally {
       setUploading(false)
+    }
+    if (paths.length && baseValue !== "" && valueRef.current === "") {
+      showToast("Attachment discarded — the message was sent before the upload finished")
+      requestAnimationFrame(() => taRef.current?.focus())
+      return
     }
     // Commit against the LATEST value (valueRef), not this callback's render-time closure — the user
     // may have typed, or a prior intake committed, while the upload was in flight. Re-derive prose +
@@ -179,7 +205,11 @@ export function Composer({
       if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame)
       observer?.disconnect()
     }
-  }, [value, maxHeight, footer])
+    // Footer PRESENCE (not node identity) is the layout signal: it flips the textarea's bottom
+    // padding class. Some call sites rebuild the footer JSX every parent render (each board tick on
+    // an open thread), and depending on the node itself tore down and rebuilt the ResizeObserver +
+    // fonts.ready hook on every one of those renders for zero layout change.
+  }, [value, maxHeight, Boolean(footer)])
 
   // The browser BLURS a focused element the instant it becomes `disabled`, so every `busy` window
   // evicts the caret and the user must re-click the box to keep typing. A focusout whose target is
@@ -225,6 +255,7 @@ export function Composer({
       metaKey: e.metaKey,
       shiftKey: e.shiftKey,
       isComposing: e.nativeEvent.isComposing,
+      keyCode: e.keyCode,
     }
     if (queueComposerHandlesOptionEnter(surface, e.key, e.altKey)) {
       // Option-Enter inserts a newline EXPLICITLY (Claude Code muscle memory). Merely exempting it
@@ -239,7 +270,11 @@ export function Composer({
       requestAnimationFrame(() => el.setSelectionRange(start + 1, start + 1))
       return
     }
-    if (shouldSubmitComposerEnter(keyboardEvent, hasContent && !busy)) {
+    // `!uploading` closes a confirmed data-loss race: Enter while /attach is in flight used to send
+    // the prose WITHOUT the pending attachment, whose path then landed in the cleared composer and
+    // silently rode along with the next unrelated message. Typing stays enabled during upload (the
+    // commit re-derives from valueRef); only SENDING waits for the attachment to land.
+    if (shouldSubmitComposerEnter(keyboardEvent, hasContent && !busy && !uploading)) {
       // Only a plain Enter submits. Modified Enter and IME composition deliberately retain native
       // textarea behavior, so they cannot accidentally submit or lose their newline.
       e.preventDefault()
@@ -260,9 +295,10 @@ export function Composer({
         requestAnimationFrame(() => el.setSelectionRange(start + 1, start + 1))
       })
     }
-    if (e.key === "Escape") {
+    if (e.key === "Escape" && !e.nativeEvent.isComposing) {
       // Climb out: blur the textarea and STOP the event — the same physical keypress must not also
       // reach App's window handler and pop a drawer. The NEXT Esc, at rest, unwinds normally.
+      // Mid-IME-composition Esc is the IME's own cancel — leave it to the editor, don't blur.
       e.preventDefault()
       e.stopPropagation()
       el.blur()
@@ -305,6 +341,10 @@ export function Composer({
         onChange={(e) => setProse(e.target.value)}
         onKeyDown={onKeyDown}
         onPaste={(e) => {
+          // Any file item claims the whole paste (preventDefault) — deliberately. An image paste
+          // usually carries a junk text/html or filename text/plain fallback that must NOT be
+          // inserted as text. Known trade-off: a genuinely mixed text+file clipboard loses its text
+          // half; revisit only with a heuristic that can tell the fallback from real prose.
           const files = [...e.clipboardData.items].filter((i) => i.kind === "file").map((i) => i.getAsFile()!).filter(Boolean)
           if (files.length) {
             e.preventDefault()
@@ -377,12 +417,13 @@ export function Composer({
         // click path, so there is nothing to restore — and a surface that blurs on send stays in charge.
         onMouseDown={(e) => e.preventDefault()}
         onClick={onSubmit}
-        disabled={!hasContent || busy}
+        // `uploading` mirrors the Enter gate above: sending mid-upload dropped the pending attachment.
+        disabled={!hasContent || busy || uploading}
         title="Send (Enter)"
         aria-label="Send"
         className={`absolute bottom-2 right-2 flex h-7 w-7 items-center justify-center rounded-lg transition-all ${
           // Active = neutral-bright (light-on-dark) primary, NOT accent — yellow stays the focus motif.
-          hasContent && !busy
+          hasContent && !busy && !uploading
             ? "bg-fg text-bg hover:opacity-90 active:scale-95"
             : "bg-panel-2 text-muted"
         }`}

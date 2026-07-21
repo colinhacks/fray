@@ -8,7 +8,7 @@ import { isValidAwaitingTimer } from "@fray-ui/shared"
 import { store, threadBySlug, pushDrawer, pushSubAgentDrawer, showToast } from "../store.ts"
 import { useBoard, useTranscript, useSocketTranscripts, type ChatMessage } from "../hooks.ts"
 import { rpc } from "../api/rpc.ts"
-import { displayTitle } from "../groups.ts"
+import { displayTitle, lastActiveLabelAt } from "../groups.ts"
 import { mdToHtml, mdInlineToHtml, stripFrontmatter } from "../lib/markdown.ts"
 import { splitProseAttachments } from "../lib/imagePaths.ts"
 import { DiffBlock, PathLink } from "./DiffBlock.tsx"
@@ -457,7 +457,7 @@ export function ThreadHeader({ slug, tab, onStatusApplied, onClose }: { slug: st
               </Tooltip>
             )}
           </div>
-          <LastActive at={thread.lastActivityAt} fallbackAt={thread.spawnedAt} className="mt-0.5 block truncate text-[11px] leading-tight text-muted/75" />
+          <LastActive at={lastActiveLabelAt(thread)} fallbackAt={thread.spawnedAt} className="mt-0.5 block truncate text-[11px] leading-tight text-muted/75" />
         </div>
       </div>
       {/* At constrained drawer widths, controls get their own deliberate row. This keeps the

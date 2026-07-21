@@ -30,6 +30,9 @@ test("composer modifier Enter paths preserve the textarea newline default", () =
 test("composer never submits an IME composition confirmation", () => {
   assert.equal(shouldSubmitComposerEnter(key({ isComposing: true }), true), false)
   assert.equal(shouldSubmitComposerEnter(key({ key: "Process", isComposing: true }), true), false)
+  // WebKit/Safari can confirm an IME candidate with isComposing=false but keyCode=229.
+  assert.equal(shouldSubmitComposerEnter(key({ isComposing: false, keyCode: 229 }), true), false)
+  assert.equal(shouldSubmitComposerEnter(key({ keyCode: 13 }), true), true, "a real Enter keyCode still submits")
 })
 
 test("Option-Enter fallback is eligible only without Ctrl or Command", () => {

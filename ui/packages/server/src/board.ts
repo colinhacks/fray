@@ -325,6 +325,7 @@ function sessionThreadView(
     lastAssistant: tele?.lastAssistant,
     spawnedAt: row.spawned_at,
     lastActivityAt: tele?.lastActivityAt,
+    lastAssistantAt: tele?.lastAssistantAt,
     subAgents: tele?.subAgents ?? [],
     bgShells: tele?.bgShells ?? [],
     pendingAsk: tele?.pendingAsk ? { questions: tele.pendingAsk.questions } : undefined,

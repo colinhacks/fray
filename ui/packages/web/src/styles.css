@@ -598,11 +598,17 @@ a[href] {
   }
 }
 
-/* Brief highlight when a sidebar row scrolls the queue to its card (scrollToQueueCard). */
+/* Brief highlight when a sidebar row scrolls the queue to its card (scrollToQueueCard). Applied to the
+   BORDERED CARD ROOT, never the outer slot — the slot also wraps the inter-card hairline rule and its
+   my-10 margins, so a ring on it traced ~80px of empty gutter and the rule along with the card.
+   OUTLINE, not box-shadow: the root already owns `shadow-lg shadow-black/25`, which a box-shadow
+   keyframe would clobber for the whole 1.1s (the card would drop its elevation, then pop back); an
+   inset ring would additionally be painted over by the card's own opaque sticky header. Outline is a
+   separate property, follows the root's border-radius, and paints above descendants. */
 .queue-flash { animation: queue-flash 1.1s ease-out; }
 @keyframes queue-flash {
-  0%, 15% { box-shadow: 0 0 0 2px var(--color-accent, #e8b923) inset; border-radius: 12px; }
-  100% { box-shadow: 0 0 0 0 transparent inset; border-radius: 12px; }
+  0%, 15% { outline: 2px solid var(--color-accent, #e8b923); outline-offset: 2px; }
+  100% { outline: 2px solid transparent; outline-offset: 2px; }
 }
 @media (prefers-reduced-motion: reduce) { .queue-flash { animation: none; } }
 

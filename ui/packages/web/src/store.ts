@@ -3,8 +3,37 @@ import type { BoardSnapshot, ThreadView, BoardDelta, DispatchProfileSnapshot } f
 import { applyBoardDelta, DispatchProfileSnapshot as DispatchProfileSnapshotSchema } from "@fray-ui/shared"
 import { closeDrawerAnimated, focusDrawer } from "./lib/overlays.ts"
 
-// Where the sidebar's scroll-to-card lands a card's outer border below the viewport top (px).
+// Where a scroll-to-card lands a card's outer border below the viewport top (px).
 const QUEUE_CARD_VIEWPORT_TOP = 12
+
+// Absolute scrollY that lands `slug`'s bordered card root at the standard viewport-top landing.
+// Shared by the sidebar's scroll-to-card and the queue's dismissal auto-scroll. Accounts for the
+// narrow-layout fixed chrome the cards' sticky headers also dodge (max-[800px]:top-10 → 40px), so a
+// landed card's header sits at its natural position instead of being pushed down into the body.
+// null when the card isn't mounted.
+// The BORDERED CARD ROOT inside a queue slot. The outer `[data-queue-card]` slot also wraps the
+// inter-card hairline rule and its my-10 margins, so anything visual — the scroll landing, the
+// arrival ring — must target this root or it silently addresses ~80px of empty gutter plus the rule.
+// Falls back to the slot itself for a slot that renders no root (fixtures, future card shapes).
+function queueCardRoot(slug: string): HTMLElement | null {
+  if (typeof document === "undefined") return null
+  const el = document.querySelector(`[data-queue-card="${CSS.escape(slug)}"]`)
+  if (!el) return null
+  return el.querySelector<HTMLElement>(`[data-queue-card-root="${CSS.escape(slug)}"]`) ?? (el as HTMLElement)
+}
+
+// Absolute scrollY that lands `slug`'s bordered card root at the standard viewport-top landing.
+// Shared by the sidebar's scroll-to-card and the queue's dismissal auto-scroll. Accounts for the
+// narrow-layout fixed chrome the cards' sticky headers also dodge (max-[800px]:top-10 → 40px), so a
+// landed card's header sits at its natural position instead of being pushed down into the body.
+// null when the card isn't mounted.
+export function queueCardTargetY(slug: string): number | null {
+  const root = queueCardRoot(slug)
+  if (!root) return null
+  // matchMedia guarded: unit tests stub a minimal window without it (store.queue-navigation.test.ts).
+  const navOffset = typeof window.matchMedia === "function" && window.matchMedia("(max-width: 800px)").matches ? 40 : 0
+  return Math.max(0, window.scrollY + root.getBoundingClientRect().top - QUEUE_CARD_VIEWPORT_TOP - navOffset)
+}
 
 export type ConnectionState = "connecting" | "open" | "closed"
 export interface SocketPayloadFallback {
@@ -56,8 +85,10 @@ export const store = proxy({
   sidebarCollapsed: { active: false, inactive: true, plans: true } as Record<"active" | "inactive" | "plans", boolean>,
   // The SIDE-DRAWER STACK — arbitrary depth. `thread` layers are full thread views (the Open-thread
   // sheet); `doc` layers are the fray-document markdown; `subagent` layers are a live/stale sub-agent's
-  // read-only transcript (the drill-in that overlays a thread). Each new layer stacks OVER the previous
-  // (higher z, slight inset); Esc / backdrop / browser-Back unwind the TOP layer first. There is no
+  // read-only transcript (the drill-in that overlays a thread). A drill-in within one thread's family
+  // (its doc, its sub-agents) stacks OVER the previous layer (higher z, slight inset); any lateral open
+  // REPLACES the layers it doesn't stack over (one drawer at a time — see openOrRaiseDrawer). Esc /
+  // backdrop / browser-Back unwind the TOP layer first. There is no
   // standalone thread page — this stack is the only thread surface. The subagent-only fields (subId /
   // label / subagentType / startedAt) ride the same entry so App can render its sheet without a lookup.
   drawers: [] as {
@@ -129,7 +160,23 @@ function sameDrawer(a: Drawer, b: Pick<Drawer, "kind" | "slug" | "path" | "subId
   return a.slug === b.slug
 }
 
+// The only layers a new drawer legitimately stacks OVER are its own thread's family: a sub-agent
+// transcript over its parent thread/doc, and a thread⇄doc pair sharing a slug. Everything else —
+// sibling threads, sibling sub-agents, plans — is a lateral move, not a drill-in.
+function stacksOver(below: Drawer, next: Pick<Drawer, "kind" | "slug">): boolean {
+  if (next.kind === "subagent") return (below.kind === "thread" || below.kind === "doc") && below.slug === next.slug
+  if (next.kind === "doc") return below.kind === "thread" && below.slug === next.slug
+  if (next.kind === "thread") return below.kind === "doc" && below.slug === next.slug
+  return false
+}
+
 function openOrRaiseDrawer(next: Omit<Drawer, "id" | "closing" | "openedAt">): void {
+  // ONE-DRAWER POLICY (maintainer 2026-07-21): opening a layer REPLACES every live layer it doesn't
+  // logically stack over, so lateral moves (sidebar sibling thread/sub-agent/plan clicks) swap the
+  // open drawer instead of piling up; only drilling into the open thread's own child/doc stacks.
+  const displaced = store.drawers.filter((d) => !d.closing && !sameDrawer(d, next) && !stacksOver(d, next)).map((d) => d.id)
+  if (displaced.length) closeDrawersById(displaced)
+
   const matches = store.drawers.filter((drawer) => sameDrawer(drawer, next))
   if (!matches.length) {
     store.drawers.push({ ...next, id: ++drawerSeq, openedAt: ++drawerOpenSeq })
@@ -177,14 +224,11 @@ export function scrollToQueueCard(slug: string): boolean {
   if (typeof document === "undefined") return false
   const el = document.querySelector(`[data-queue-card="${CSS.escape(slug)}"]`)
   if (!el) return false
-  // The outer slot includes the inter-card rule. The bordered card root is the visual identity a
-  // sidebar click promises to reveal, especially for a very tall narrow-layout transcript.
-  const root = el.querySelector<HTMLElement>(`[data-queue-card-root="${CSS.escape(slug)}"]`) ?? el
-  const targetY = Math.max(0, window.scrollY + root.getBoundingClientRect().top - QUEUE_CARD_VIEWPORT_TOP)
+  const targetY = queueCardTargetY(slug)
   // Absolute scroll is intentional. A narrow layout may have just changed document geometry while a
   // drawer finished closing; a relative scroll in that transition can be applied to the old root and
   // strand the reader midway through a tall card. Land the bordered root atomically.
-  if (Math.abs(window.scrollY - targetY) > 0.5) window.scrollTo({ top: targetY, left: 0, behavior: "auto" })
+  if (targetY !== null && Math.abs(window.scrollY - targetY) > 0.5) window.scrollTo({ top: targetY, left: 0, behavior: "auto" })
   el.classList.add("queue-flash")
   window.setTimeout(() => el.classList.remove("queue-flash"), 1100)
   return true

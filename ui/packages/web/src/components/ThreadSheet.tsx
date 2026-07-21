@@ -290,6 +290,25 @@ export function ThreadSheet({ id, slug, depth, widthDepth, initiallyOpen }: { id
           aria-describedby={undefined}
           tabIndex={-1}
           onEscapeKeyDown={handleDialogEscape}
+          // A non-modal Radix layer also dismisses on any pointer-down OUTSIDE its content. Two
+          // cases must not self-dismiss: (1) this sheet is BURIED under another drawer layer (a
+          // sub-agent/doc sheet stacked over it, or a lateral swap in flight) — only the TOPMOST
+          // live layer owns outside-pointer dismissal, otherwise a click inside the child sheet
+          // silently closes the parent underneath it; (2) the pointer landed on one of THIS
+          // thread's own sub-agent rows (sidebar child rows / queue card lines carry
+          // data-subagent-parent) — that click is a drill-IN, and the drawer policy in
+          // openOrRaiseDrawer stacks the child over this sheet instead of dismissing it. Every
+          // other outside pointer (backdrop, blank sidebar, sibling rows) dismisses as before —
+          // sibling opens also route through the store policy, which closes this layer anyway.
+          onPointerDownOutside={(event) => {
+            const topLive = [...store.drawers].reverse().find((drawer) => !drawer.closing)
+            if (topLive && topLive.id !== id) {
+              event.preventDefault()
+              return
+            }
+            const target = event.target instanceof Element ? event.target.closest("[data-subagent-parent]") : null
+            if (target?.getAttribute("data-subagent-parent") === slug) event.preventDefault()
+          }}
           // A non-modal Radix layer dismisses on focus-OUTSIDE by default. That fired the self-close
           // bug: opening a second thread from the sidebar dismisses THIS layer via pointer-down-outside
           // (expected), and ~210ms later its close restores focus to its opener row — a focusin OUTSIDE

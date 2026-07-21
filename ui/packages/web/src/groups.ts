@@ -148,20 +148,29 @@ function interactionAt(t: ThreadView): number {
   return Number.isFinite(max) ? max : 0
 }
 
-// THE listing sort key: "last active" = the newest activity ON THE THREAD, matching the row's visible
-// "Last active" label (which renders `lastActivityAt`). For a thread AT REST, `lastActivityAt` is
-// exactly when it last came to rest (its final assistant/system record) — a stable, meaningful moment
-// — so the order and the label finally agree (maintainer 2026-07-15: "last active just means the last
-// time the thread was active … it should also be looking at the rest timestamp"). A RUNNING thread's
-// `lastActivityAt` churns on every tool_result, which would reshuffle live rows the user never
-// touched, so a running row falls back to `interactionAt` — preserving the no-mid-turn-reshuffle
-// guarantee. Missing `lastActivityAt` → `interactionAt` (spawn/last-user), which is ALSO the label's
-// own fallback (activityTimestamp), so the two clocks never diverge. `isActivelyRunning` is hoisted.
+// THE at-rest listing sort key: "last active" = when the thread's OWN agent last came to REST — its
+// `lastAssistantAt` (last assistant output). NOT `lastActivityAt`: that is bumped by a background
+// sub-agent's completion notification (a promptSource:system record) and by tool_results, so keying on
+// it let a CHILD finishing reshuffle the parent (maintainer 2026-07-16: "it should just be based on
+// when the agent rested … user turns don't actually factor in"). User turns don't factor in either:
+// a steer flips the thread to running, and only its next REST re-times it. A RUNNING row is not in the
+// queue/rested band — it belongs to the active rail, ordered by user recency — so it keeps
+// `interactionAt` (max lastUserAt/spawnedAt), which also guards against mid-turn churn. Missing rest
+// time (never produced output yet) → `interactionAt` (spawn/last-user). `isActivelyRunning` is hoisted.
 function lastActiveAt(t: ThreadView): number {
-  const base = interactionAt(t)
-  if (isActivelyRunning(t)) return base
-  const a = Date.parse(t.lastActivityAt ?? "")
-  return Number.isFinite(a) ? Math.max(a, base) : base
+  if (isActivelyRunning(t)) return interactionAt(t)
+  const rest = Date.parse(t.lastAssistantAt ?? "")
+  return Number.isFinite(rest) ? rest : interactionAt(t)
+}
+
+// The timestamp the "Last active" label should DISPLAY, kept in lockstep with the order key so the
+// queue's labels read monotonically and never lie. A RUNNING row shows its live activity
+// (`lastActivityAt` — "just now" while it works); an AT-REST row shows its rest time (`lastAssistantAt`),
+// so a background sub-agent completing can never flip a rested row's label to "just now". Falls back to
+// lastActivityAt then spawn when a backend never recorded the rest instant (legacy/foreign rows).
+export function lastActiveLabelAt(t: Pick<ThreadView, "runtime" | "lastActivityAt" | "lastAssistantAt" | "spawnedAt" | "subAgents" | "bgShells">): string | undefined {
+  if (isActivelyRunning(t as ThreadView)) return t.lastActivityAt ?? t.spawnedAt
+  return t.lastAssistantAt ?? t.lastActivityAt ?? t.spawnedAt
 }
 
 // The listing DIRECTION the queue/rested band orders by (a per-browser view preference — see

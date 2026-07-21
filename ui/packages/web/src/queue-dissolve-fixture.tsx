@@ -6,16 +6,21 @@ import { TooltipProvider } from "./components/Tooltip.tsx"
 import { store } from "./store.ts"
 import "./styles.css"
 
-// Browser QA for the DISSOLVE-in-place queue-card collapse: resolving a card (Mark as done) dissolves it
-// with blur+scale (receding from centre) while its height closes and the cards below rise into the freed
-// space. The queue does NO programmatic scrolling — the viewport stays put; native scroll anchoring holds
-// visible content steady when the collapse happens off-screen.
-//   Four tall needs-human cards so the page scrolls; the divider between cards collapses with the card.
+// Browser QA for the DISSOLVE-in-place queue-card collapse + the dismissal auto-scroll: resolving a card
+// (Mark as done, or answering its question chips) dissolves it with blur+scale (receding from centre);
+// at the unmount, a USER-INITIATED dismissal auto-scrolls the next card (successor, else predecessor) to
+// the viewport-top landing (maintainer 2026-07-21: "some card should be at the top of the screen after
+// any action that dismisses a card"), while a pure board departure only holds a visible neighbour in place.
+//   Four tall needs-human cards (each ending in a live ```question ask) so the page scrolls and both the
+//   answer path and the mark-done path can be driven; the divider between cards collapses with the card.
 
 const longReply = (n: number) =>
   Array.from({ length: 6 }, (_, i) =>
     `**Step ${i + 1}.** Card ${n}: agent output, realistic triage-card length. The page scrolls across the four cards so a mid-queue resolve has room above it. Lorem ipsum dolor sit amet.`,
-  ).join("\n\n")
+  ).join("\n\n") +
+  // A live trailing ask so each card carries answer chips — the answer path is a dismissal too and must
+  // drive the same auto-scroll as Mark-as-done.
+  "\n\n```question\nShip this now or wait for review?\n\n- A. Ship now (recommended: low risk)\n- B. Wait for review\n```"
 
 const CARDS = [
   { id: "auth-refresh", title: "Silent token refresh on 401" },
@@ -99,10 +104,26 @@ window.fetch = async (input, init) => {
     }
     return new Response(JSON.stringify({ result: { needsConfirmation: false } }), { headers: { "content-type": "application/json" } })
   }
+  // A reply (answering the card's question) clears the queue in production once the agent's turn
+  // starts; model that by pruning the thread so the resolve() 8s guard never reappears the card.
+  if (url.pathname === "/rpc/followUp") {
+    const slug = slugFromBody(init)
+    if (slug && store.board) {
+      store.board = { ...store.board, threads: store.board.threads.filter((t) => t.id !== slug) } as BoardSnapshot
+    }
+    return new Response(JSON.stringify({ result: {} }), { headers: { "content-type": "application/json" } })
+  }
   if (url.pathname.startsWith("/rpc/")) {
     return new Response(JSON.stringify({ result: {} }), { headers: { "content-type": "application/json" } })
   }
   return originalFetch(input, init)
+}
+
+// QA hook: prune a thread from the board WITHOUT any user action on the card — a pure board
+// departure (an agent/another client resolved it), which must take the hold-in-place pin path,
+// never the user-dismissal auto-scroll.
+;(window as unknown as { __pruneThread: (slug: string) => void }).__pruneThread = (slug) => {
+  if (store.board) store.board = { ...store.board, threads: store.board.threads.filter((t) => t.id !== slug) } as BoardSnapshot
 }
 
 // Mirror App's <main> so page-scroll + my-auto centering behave exactly as production.

@@ -1808,7 +1808,8 @@ test("installer manages only an executable source-backed immutable fray-dev shim
     });
     const shim = join(dir, "fray-dev");
     const body = readFileSync(shim, "utf8");
-    assert.match(body, /fray-dev-source-launcher:v3/);
+    assert.match(body, /fray-dev-source-launcher:v4/);
+    assert.match(body, /env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN/);
     assert.match(body, /FRAY_SOURCE_COMMAND='fray-dev'/);
     assert.match(body, /packages\/cli\/src\/index\.ts/);
     assert.match(body, /\bnub\b/);
@@ -1954,7 +1955,7 @@ test("forced install replaces a symlink itself without changing its target", () 
       encoding: "utf8",
     });
     assert.equal(readFileSync(protectedTarget, "utf8"), protectedBody);
-    assert.match(readFileSync(shim, "utf8"), /fray-dev-source-launcher:v3/);
+    assert.match(readFileSync(shim, "utf8"), /fray-dev-source-launcher:v4/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1974,7 +1975,7 @@ test("concurrent installer processes publish only complete shims and clean up te
       assert.equal(code, 0, `installer exited with ${String(signal)}`);
     }
     const shim = readFileSync(join(dir, "fray-dev"), "utf8");
-    assert.match(shim, /fray-dev-source-launcher:v3/);
+    assert.match(shim, /fray-dev-source-launcher:v4/);
     assert.match(shim, /packages\/cli\/src\/index\.ts/);
     assert.deepEqual(readdirSync(dir), ["fray-dev"]);
   } finally {

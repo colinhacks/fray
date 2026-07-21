@@ -1,4 +1,4 @@
-import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync, writeFileSync, renameSync, mkdirSync, rmSync, type Stats } from "node:fs"
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync, statSync, writeFileSync, renameSync, mkdirSync, rmSync, type Stats } from "node:fs"
 import { basename, join, resolve, dirname } from "node:path"
 import { tmpdir } from "node:os"
 import { fileURLToPath } from "node:url"
@@ -12,7 +12,7 @@ import {
   type Settings,
   type PermissionMode,
 } from "@fray-ui/shared"
-import type { Project } from "./project.ts"
+import { PERM_DIR_ENV, permRequestDir, type Project } from "./project.ts"
 import type { SessionRow, Storage } from "./storage.ts"
 import type { BoardManager } from "./board.ts"
 import type { AgentBackend, BackendKind, BuiltCommand } from "./backend/types.ts"
@@ -289,6 +289,38 @@ export function scratchpadOrientation(sessionId: string, planPath?: string | nul
   return lines.join("\n")
 }
 
+// A project can ship a repo-committed `FRAY.md` at its root to steer fray workers with its OWN
+// engineering-PROCESS norms — gates, review depth, commit/PR conventions — which OVERRIDE fray's
+// built-in PROCESS defaults (NOT the fray-mechanical contract: signal fences, scratchpad, the browser
+// runtime gate stay in force — the injected header says so, matching the "Defer" section of the worker
+// contract). When present, its contents are injected into every worker's SYSTEM prompt (dispatch,
+// adopt, AND resume; both backends) under that header, so both backends see it without relying on the
+// agent choosing to open the file. Read fresh on every spawn/resume, so an edit takes effect on the
+// next launch.
+//
+// The read is guarded by statSync BEFORE readFileSync: only a regular file under a size cap is read.
+// That keeps one accidental/hostile FRAY.md from wedging the server's event loop on EVERY dispatch and
+// resume — a FIFO would make readFileSync block forever, a symlink loop throws, a directory/device
+// isn't a regular file, and a runaway/generated file is rejected by size rather than fully slurped.
+// The surviving content is then clipped to keep token/context cost bounded. Returns "" when
+// absent/oversized/non-regular/empty — the caller drops it from the composed extra-system-prompt.
+const FRAY_MD_MAX_CHARS = 12_000
+const FRAY_MD_MAX_BYTES = 64 * 1024
+export function frayConfigBlock(projectDir: string): string {
+  const path = join(projectDir, "FRAY.md")
+  let body: string
+  try {
+    const st = statSync(path) // follows a symlink to its target; ENOENT/ELOOP throw → caught
+    if (!st.isFile() || st.size > FRAY_MD_MAX_BYTES) return "" // not a regular file, or runaway size
+    body = readFileSync(path, "utf8").trim()
+  } catch {
+    return "" // no FRAY.md, unreadable, symlink loop, etc. → inject nothing
+  }
+  if (!body) return ""
+  const clipped = body.length > FRAY_MD_MAX_CHARS ? `${body.slice(0, FRAY_MD_MAX_CHARS)}\n\n[FRAY.md truncated]` : body
+  return `PROJECT FRAY CONFIG (from this repo's FRAY.md) — the project's own conventions for fray workers. They OVERRIDE the fray worker PROCESS defaults above (review depth, gates, git/PR conventions, the quality bar) wherever they conflict; follow them. They do NOT relax the fray-mechanical contract — the signal fences, scratchpad, and browser runtime gate still bind:\n\n${clipped}`
+}
+
 // A DispatchInput.planPath is honored only when it is a well-formed .fray/plans/*.md path AND the file
 // exists; anything else is ignored (stored as null). Shape check forecloses traversal.
 const PLAN_PATH_RE = /^\.fray\/plans\/[A-Za-z0-9][A-Za-z0-9._ -]*\.md$/
@@ -392,22 +424,11 @@ export function workerPluginDir(): string | undefined {
 // Claude Code reads these inherited process variables as sub-agent profile defaults. A Fray worker
 // chooses its profile explicitly through the launch argv and plugin agent profiles, so let neither
 // a shell nor a globally configured Claude session silently replace that selection. Empty tmux
-// environment entries override inherited values.
-//
-// The API-key pair is blanked for a different reason: an inherited ANTHROPIC_API_KEY makes Claude
-// Code open a BLOCKING "Detected a custom API key … use this key?" prompt at boot unless the key is
-// already in ~/.claude.json's customApiKeyResponses.approved. A worker pane has nobody to answer it,
-// so the session hangs with no transcript and trips the boot-failure detector. This is not
-// hypothetical shell hygiene: a tmux server inherits its environment from whichever client first
-// started it and then outlives that shell, so one launch from a directory whose .env exports the key
-// poisons every worker spawned on that socket thereafter. Blanking both means workers always
-// authenticate with the user's logged-in Claude session rather than whatever key happened to leak in.
+// environment entries override inherited values while preserving every auth/config variable.
 export function claudeWorkerEnvironment(): Record<string, string> {
   return {
     CLAUDE_CODE_SUBAGENT_MODEL: "",
     CLAUDE_CODE_EFFORT_LEVEL: "",
-    ANTHROPIC_API_KEY: "",
-    ANTHROPIC_AUTH_TOKEN: "",
   }
 }
 
@@ -681,7 +702,7 @@ export function createDispatcher(deps: DispatchDeps): Dispatcher {
         model,
         effort,
         prompt,
-        extraSystemPrompt: scratchpadOrientation(sessionId, planPath, kind),
+        extraSystemPrompt: [scratchpadOrientation(sessionId, planPath, kind), frayConfigBlock(deps.project.dir)].filter(Boolean).join("\n\n"),
         kind,
         runtimeGate,
       })
@@ -699,7 +720,7 @@ export function createDispatcher(deps: DispatchDeps): Dispatcher {
       ensureServer()
       try {
         writePrewrites(built)
-        spawn(slug, built.argv, deps.project.dir, { ...built.env, FRAY_UI_THREAD: slug })
+        spawn(slug, built.argv, deps.project.dir, { ...built.env, FRAY_UI_THREAD: slug, [PERM_DIR_ENV]: permRequestDir(deps.project) })
       } catch (err) {
         if (err instanceof tmux.TmuxSpawnError && err.identity) {
           try {
@@ -910,7 +931,7 @@ export function createDispatcher(deps: DispatchDeps): Dispatcher {
           model: settings.model,
           effort: settings.effort,
           prompt,
-          extraSystemPrompt: [scratchpadOrientation(sessionId), adoption].join("\n\n"),
+          extraSystemPrompt: [scratchpadOrientation(sessionId), frayConfigBlock(deps.project.dir), adoption].filter(Boolean).join("\n\n"),
           runtimeGate,
         })
       } catch {
@@ -950,7 +971,7 @@ export function createDispatcher(deps: DispatchDeps): Dispatcher {
             slug,
             built!.argv,
             deps.project.dir,
-            { ...built!.env, FRAY_UI_THREAD: slug },
+            { ...built!.env, FRAY_UI_THREAD: slug, [PERM_DIR_ENV]: permRequestDir(deps.project) },
             {
               adoptionAttemptToken: attemptToken,
               onCreated: (identity) => {

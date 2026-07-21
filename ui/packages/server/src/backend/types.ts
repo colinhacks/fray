@@ -60,6 +60,7 @@ export interface NormalizedTail {
   // manual /permissions change.
   permissionModeAt?: string
   lastActivityAt?: string
+  lastAssistantAt?: string // ISO8601 of the agent's OWN last output (rest time; excludes sub-agent/system bumps)
   lastAssistant?: string
   aiTitle?: string
   lastUserAt?: string
@@ -88,7 +89,8 @@ export interface FoldState {
   permissionMode?: PermissionMode // latest concrete backend-observed permission/sandbox mode
   permissionModeAt?: string // timestamp of the latest timestamped permission profile event
   permissionModeRevision?: number // increments for every profile record, even when the value repeats
-  lastActivityAt?: string // ISO8601 of the latest timestamped event
+  lastActivityAt?: string // ISO8601 of the latest timestamped event (ANY line, incl. sub-agent/system)
+  lastAssistantAt?: string // ISO8601 of the agent's OWN last output — the rest-time key (see NormalizedTail)
   lastAssistant?: string // ~200-char preview of the latest assistant text
   aiTitle?: string // the backend's own session auto-title (latest non-empty wins)
   // A backend may carry one in-band auto-title candidate on its first finalized response. Recording

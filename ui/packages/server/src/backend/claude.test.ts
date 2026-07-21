@@ -79,13 +79,11 @@ test("createClaudeBackend: buildSpawn pins the session id + prompt and clears in
   assert.deepEqual(env, {
     CLAUDE_CODE_SUBAGENT_MODEL: "",
     CLAUDE_CODE_EFFORT_LEVEL: "",
-    ANTHROPIC_API_KEY: "",
-    ANTHROPIC_AUTH_TOKEN: "",
   })
   assert.deepEqual(prewrite, [])
 })
 
-test("createClaudeBackend sanitizes both spawn and resume without replacing Claude config", () => {
+test("createClaudeBackend sanitizes both spawn and resume without replacing Claude auth/config", () => {
   const backend = createClaudeBackend({ logDir: "/logs", claudeBin: "claude" })
   const spawned = backend.buildSpawn({ sessionId: "profile-env-spawn", cwd: "/cwd", prompt: "P", workerContract: "", permissionMode: "auto", model: "opus", effort: "high" })
   const resumed = backend.buildResume({ sessionId: "profile-env-resume", cwd: "/cwd", message: "M", workerContract: "", permissionMode: "auto", model: "opus", effort: "high" })
@@ -93,10 +91,8 @@ test("createClaudeBackend sanitizes both spawn and resume without replacing Clau
     assert.deepEqual(built.env, {
       CLAUDE_CODE_SUBAGENT_MODEL: "",
       CLAUDE_CODE_EFFORT_LEVEL: "",
-      ANTHROPIC_API_KEY: "",
-      ANTHROPIC_AUTH_TOKEN: "",
     })
-    assert.equal("CLAUDE_CONFIG_DIR" in built.env, false, "config discovery is left to the inherited environment")
+    assert.equal("CLAUDE_CONFIG_DIR" in built.env, false, "only the two profile override variables are replaced")
   }
 })
 
@@ -112,29 +108,6 @@ test("Claude worker profile sanitization reaches the tmux launch environment", (
   assert.ok(launch.includes("CLAUDE_CODE_SUBAGENT_MODEL="))
   assert.ok(launch.includes("CLAUDE_CODE_EFFORT_LEVEL="))
   assert.equal(launch.some((entry) => entry.startsWith("CLAUDE_CONFIG_DIR=")), false)
-})
-
-// An inherited ANTHROPIC_API_KEY makes Claude Code open a blocking "Detected a custom API key"
-// prompt that no worker pane can answer, so the session boots to a hang with no transcript. tmux
-// cannot UNSET a variable, so the launch must carry an explicit empty `-e` entry to shadow whatever
-// the (long-lived, environment-inheriting) tmux server holds.
-test("Claude worker launch blanks inherited Anthropic API credentials so boot never hits the key prompt", () => {
-  const backend = createClaudeBackend({ logDir: "/logs", claudeBin: "claude" })
-  const built = backend.buildSpawn({ sessionId: "api-key-env", cwd: "/clean-home/project", prompt: "P", workerContract: "", permissionMode: "auto" })
-  const calls: string[][] = []
-  spawnWithRunner("api-key-env", built.argv, "/clean-home/project", built.env, {}, (argv) => {
-    calls.push([...argv])
-    return calls.length === 1 ? "%1\t123\t456\n" : ""
-  })
-  const launch = calls[0] ?? []
-  for (const key of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]) {
-    assert.ok(launch.includes(`${key}=`), `${key} is shadowed with an empty tmux env entry`)
-    assert.equal(
-      launch.some((entry) => entry.startsWith(`${key}=`) && entry !== `${key}=`),
-      false,
-      `${key} never carries an inherited value into the pane`,
-    )
-  }
 })
 
 test("createClaudeBackend: buildResume produces `-r <sessionId> <message>` and coerces plan mode to auto", () => {

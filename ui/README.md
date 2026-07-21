@@ -147,6 +147,21 @@ default** to clear your overrides back to the shipped defaults. Settings also ca
 permission mode, model, effort, and a desktop-notifications toggle (which requests browser
 permission and only fires when the Fray tab or window is hidden).
 
+## `FRAY.md` — a repo's own worker norms
+
+The dispatch preamble is per-**operator** state that lives in the UI's database. For norms that should
+travel **with the repo** and be shared by the whole team, drop a **`FRAY.md`** at the project root.
+When present, its contents are injected into every dispatched worker's system prompt (dispatch, adopt,
+and resume, on both the Claude and Codex backends) under a header stating that they **override fray's
+built-in worker defaults** wherever they conflict. Fray's worker contract is deliberately
+defer-by-default: its engineering-process guidance (review depth, git/PR conventions, the quality bar)
+is a default for when the project is silent, and `FRAY.md` is how a project speaks. Use it to say
+things like "our gates are `pnpm check`", "skip the independent adversarial review on small UI diffs —
+implementer self-review plus a browser screenshot is enough", or "push to a branch + PR, never merge
+your own". The fray-mechanical contract (signal fences, scratchpad, the browser runtime gate) is not
+overridable. Keep it concise — it's read fresh on every spawn and bounded to stay within the
+system-prompt budget.
+
 ## The cc-worker plugin
 
 Every agent fray-ui spawns loads the [`cc-worker`](../cc-worker/) Claude Code plugin

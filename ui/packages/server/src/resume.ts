@@ -6,7 +6,7 @@ import {
   type PermissionMode as PermissionModeValue,
   type Settings,
 } from "@fray-ui/shared"
-import type { Project } from "./project.ts"
+import { PERM_DIR_ENV, permRequestDir, type Project } from "./project.ts"
 import type {
   ProfileChangeExpectation,
   ProfileHandoffBinding,
@@ -24,6 +24,7 @@ import {
   effectivePermissionMode,
   workerPluginDir,
   scratchpadOrientation,
+  frayConfigBlock,
   loadWorkerPrompt,
 } from "./dispatch.ts"
 import * as tmux from "./tmux.ts"
@@ -146,7 +147,7 @@ function spawnPinnedSession(
 ): PaneIdentity | void {
   const backend = deps.backendFor?.(row.backend)
   const nativeSessionId = row.agent_session_id ?? row.session_id
-  const extraSystemPrompt = scratchpadOrientation(row.session_id, row.plan_path, backend?.kind)
+  const extraSystemPrompt = [scratchpadOrientation(row.session_id, row.plan_path, backend?.kind), frayConfigBlock(deps.project.dir)].filter(Boolean).join("\n\n")
   // The runtimeGate toggle must survive resume/wake/reattach: rebuild the SAME gated worker contract
   // dispatch produced and re-set the env the session-seed hook reads — otherwise an opted-out project
   // would silently get the RUNTIME RELEASE GATE forced back on the moment its worker respawns.
@@ -181,6 +182,7 @@ function spawnPinnedSession(
   return tx.spawn(row.slug, built.argv, deps.project.dir, {
     ...built.env,
     FRAY_UI_THREAD: row.slug,
+    [PERM_DIR_ENV]: permRequestDir(deps.project),
     ...(profileHandoffToken ? { [tmux.PROFILE_HANDOFF_ENV]: profileHandoffToken } : {}),
   }, options)
 }

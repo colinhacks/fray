@@ -13,13 +13,20 @@ export type ProsePart =
   | { kind: "image"; path: string }
   | { kind: "file"; path: string }
 
+// Path characters: any non-whitespace/non-backtick, plus a literal space when NOT followed by "/".
+// Paths with spaces are real and common — macOS screenshots ("Screen Shot … at 1.23.45 PM.png"),
+// home/project dirs like "My Project" — and used to fall through to dead mono text / raw draft text.
+// A space immediately before a "/" stays forbidden so a line holding TWO paths ("/a.png /b.png")
+// remains prose instead of gluing into one bogus path. (Trade-off, accepted: a prose line that
+// starts with "/" and ends in an allowed extension now promotes.)
+const PATH_CHARS = String.raw`(?:[^\s\`]|[ ](?!/))+`
 // Absolute path ending in an INLINE-renderable raster extension (see ATTACHMENT_IMAGE_EXTENSIONS —
 // these mirror the server's /local-image content-type map, which is why svg is NOT here: svg is a
 // document chip, not an inline image). The whole (trimmed) line, optional surrounding backticks.
-const IMAGE_LINE = /^\s*`?(\/[^\s`]+\.(?:png|jpe?g|gif|webp))`?\s*$/i
+const IMAGE_LINE = new RegExp(String.raw`^\s*\`?(/${PATH_CHARS}\.(?:png|jpe?g|gif|webp))\`?\s*$`, "i")
 // The same shape for a non-image safe-tier document (pdf/svg/text/code/…), built from the shared
 // allowlist so the two never drift. Matched only when the line is NOT already an image line.
-const DOC_LINE = new RegExp(`^\\s*\`?(\\/[^\\s\`]+\\.(?:${ATTACHMENT_DOC_EXTENSIONS.join("|")}))\`?\\s*$`, "i")
+const DOC_LINE = new RegExp(String.raw`^\s*\`?(/${PATH_CHARS}\.(?:${ATTACHMENT_DOC_EXTENSIONS.join("|")}))\`?\s*$`, "i")
 // A fenced-code delimiter line: ``` or ~~~ (3+), optionally indented, optionally with an info string.
 // Toggling on each such line keeps a standalone absolute path that lives INSIDE a code block (an agent
 // pasting `ls`/`git`/`tree` output is common) as ordinary code, instead of ripping it into a chip and

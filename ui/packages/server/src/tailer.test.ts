@@ -6,7 +6,7 @@ import { join } from "node:path"
 import { createStorage, type Storage, type SessionRow } from "./storage.ts"
 import { Bus } from "./bus.ts"
 import type { ServerEvent } from "@fray-ui/shared"
-import type { Project } from "./project.ts"
+import { permMarkerPath, type Project } from "./project.ts"
 import { parseLine, applyRecord, applyEvent, computeTurn, newTailState, createTailer, matchesPermPrompt, hasQuestionBlock, isRealUserMessage, parseSignalFence, FOREIGN_FRESH_MS } from "./tailer.ts"
 import type { AgentBackend, NormalizedEvent } from "./backend/types.ts"
 import { createClaudeBackend } from "./backend/claude.ts"
@@ -351,9 +351,83 @@ test("applyRecord: a shell CLEARS on terminal notification and does NOT retain (
   assert.equal(s.retiredSubAgents.size, 0, "shells don't retain — nothing to drill into")
 })
 
+test("applyRecord: a manual TaskStop clears a background Bash shell (the phantom-row leak fix)", () => {
+  const s = newTailState("t", "s", "/x")
+  applyRecord(s, bashBg("toolu_sh", "Boot isolated stack", "npx tsx scripts/adhoc-stack.mjs"))
+  applyRecord(s, resultText("toolu_sh", "Command running in background with ID: ba3y11c3t. Output is being written to: /tmp/tasks/ba3y11c3t.output. You will be notified when it completes."))
+  assert.equal(s.subAgents.get("toolu_sh")?.taskId, "ba3y11c3t", "the runtime task id is captured from the launch ack")
+  // TaskStop references the RUNTIME task id, which carries no tool_use id — the signal the board used to miss.
+  applyRecord(s, taskStopResult("ba3y11c3t"))
+  assert.equal(s.subAgents.size, 0, "a TaskStop retires the shell it killed")
+  assert.equal(s.retiredSubAgents.size, 0, "shells are display-only — nothing to retain")
+})
+
+test("applyRecord: a manual TaskStop clears a Monitor (task-id parsed from the real '(task <id>' ack)", () => {
+  const s = newTailState("t", "s", "/x")
+  applyRecord(s, monitorUse("toolu_mon", "Watch PR checks", "gh pr checks 443 --watch"))
+  applyRecord(s, resultText("toolu_mon", "Monitor started (task b1ew0iy19, persistent — runs until TaskStop or session end). You will be notified on each event."))
+  assert.equal(s.subAgents.get("toolu_mon")?.taskId, "b1ew0iy19")
+  applyRecord(s, taskStopResult("b1ew0iy19", "gh pr checks 443 --watch"))
+  assert.equal(s.subAgents.size, 0)
+})
+
+test("applyRecord: a manual TaskStop RETAINS an Agent for drawer review with status 'killed'", () => {
+  const s = newTailState("t", "s", "/x")
+  applyRecord(s, dispatch("toolu_ag", "review the diff"))
+  applyRecord(s, launch("toolu_ag", "/tmp/tasks/abc.output")) // ack carries "agentId: abc123"
+  assert.equal(s.subAgents.get("toolu_ag")?.taskId, "abc123", "the agentId doubles as the TaskStop handle")
+  applyRecord(s, taskStopResult("abc123", "agent"))
+  assert.equal(s.subAgents.size, 0)
+  assert.equal(s.retiredSubAgents.size, 1, "an agent stays drillable after a manual stop")
+  assert.equal(s.retiredSubAgents.get("toolu_ag")?.status, "killed")
+})
+
+test("applyRecord: a completion notification lacking <tool-use-id> resolves by the captured <task-id>", () => {
+  const s = newTailState("t", "s", "/x")
+  applyRecord(s, bashBg("toolu_sh", "Watch CI", "gh run watch"))
+  applyRecord(s, resultText("toolu_sh", "Command running in background with ID: bxyz9. Output is being written to: /tmp/tasks/bxyz9.output."))
+  applyRecord(s, taskNotificationByTaskId("bxyz9", "completed"))
+  assert.equal(s.subAgents.size, 0, "task-id is a valid fallback correlation key when tool-use-id is absent")
+})
+
+test("applyRecord: a TaskStop that did NOT confirm success never retires a live op", () => {
+  const s = newTailState("t", "s", "/x")
+  applyRecord(s, bashBg("toolu_sh", "Watch CI", "gh run watch"))
+  applyRecord(s, resultText("toolu_sh", "Command running in background with ID: bfail1. Output is being written to: /tmp/tasks/bfail1.output."))
+  // A failed/no-op stop: the result carries a task_id but no "Successfully stopped task" confirmation.
+  applyRecord(s, resultText("toolu_stop", JSON.stringify({ error: "No running task with id bfail1", task_id: "bfail1" })))
+  assert.equal(s.subAgents.size, 1, "an unconfirmed stop must leave the live op untouched")
+})
+
+test("applyRecord: a TaskStop for an UNRELATED task id leaves every tracked op alone", () => {
+  const s = newTailState("t", "s", "/x")
+  applyRecord(s, bashBg("toolu_sh", "Watch CI", "gh run watch"))
+  applyRecord(s, resultText("toolu_sh", "Command running in background with ID: bmine1. Output is being written to: /tmp/tasks/bmine1.output."))
+  applyRecord(s, taskStopResult("bother2")) // stops some other session's task
+  assert.equal(s.subAgents.size, 1, "only the op whose captured task id matches is retired")
+})
+
 // A tool_result user record with arbitrary text for a given tool_use id (ack/report shapes below).
 function resultText(id: string, text: string) {
   return { type: "user", timestamp: "2026-07-01T00:00:02.000Z", message: { content: [{ type: "tool_result", tool_use_id: id, content: [{ type: "text", text }] }] } }
+}
+// A TaskStop tool_result — the REAL structured shape (content is a JSON STRING carrying `task_id` and
+// the "Successfully stopped task:" confirmation). This is the terminal signal for a manually-killed op.
+function taskStopResult(taskId: string, command = "gh run watch") {
+  return {
+    type: "user",
+    timestamp: "2026-07-01T00:00:08.000Z",
+    message: { content: [{ type: "tool_result", tool_use_id: "toolu_stop", content: JSON.stringify({ message: `Successfully stopped task: ${taskId} (${command})`, task_id: taskId, task_type: "local_bash", command }) }] },
+  }
+}
+// A completion notification that OMITS <tool-use-id> (some emitters do) — only the runtime <task-id>.
+function taskNotificationByTaskId(taskId: string, status: string) {
+  return {
+    type: "queue-operation",
+    operation: "enqueue",
+    timestamp: "2026-07-01T00:00:09.000Z",
+    content: `<task-notification>\n<task-id>${taskId}</task-id>\n<status>${status}</status>\n<summary>done</summary>\n</task-notification>`,
+  }
 }
 
 test("applyRecord: a shell's REAL launch ack ('Command running in background…') keeps it tracked + resolves its output path", () => {
@@ -549,6 +623,40 @@ test("tailer: a dead pane clears its background shells — a shell cannot outliv
   const before = h.changes.n
   t.tick()
   assert.deepEqual(t.get("t")?.bgShells, [], "a dead pane owns no live background shells")
+  assert.ok(h.changes.n > before, "the shell vanishing marks the board dirty")
+})
+
+test("tailer: a manual TaskStop clears a live background shell from the board view (real read→fold→view)", () => {
+  // End-to-end through createTailer (file → parseLine → applyRecord → bgShellViews), the pipeline that
+  // produced the phantom pulsing row: a shell TaskStop'd instead of allowed to exit had NO terminal
+  // signal the tailer recognized, so bgShells reported it live until the pane died.
+  const h = harness()
+  h.storage.upsertSession(row())
+  const shellLine = JSON.stringify(bashBg("toolu_sh", "Boot isolated stack", "npx tsx scripts/adhoc-stack.mjs"))
+  const ackLine = JSON.stringify(resultText("toolu_sh", "Command running in background with ID: ba3y11c3t. Output is being written to: /tmp/tasks/ba3y11c3t.output. You will be notified when it completes."))
+  fixture(h.logDir, "sid", [IN_FLIGHT, shellLine, ackLine])
+  const shellMtime = Date.parse("2026-07-01T00:00:02.000Z")
+  const t = createTailer({
+    project: { cwdSlug: "x" } as Project,
+    storage: h.storage,
+    bus: h.bus,
+    onChange: () => h.changes.n++,
+    now: () => h.clock.ms,
+    paneDead: () => h.dead.v, // pane STAYS ALIVE — the stop, not pane death, must clear the row
+    capturePane: () => h.pane.text,
+    sessionLogDir: h.logDir,
+    mtimeMs: () => shellMtime,
+  })
+
+  h.clock.ms = Date.parse("2026-07-01T00:01:00.000Z")
+  t.tick()
+  assert.deepEqual(t.get("t")?.bgShells, [{ label: "Boot isolated stack", startedAt: "2026-07-01T00:00:01.000Z", state: "running" }])
+
+  // The worker TaskStops the shell (pane still alive). Its structured result is the terminal signal.
+  appendFileSync(join(h.logDir, "sid.jsonl"), JSON.stringify(taskStopResult("ba3y11c3t", "npx tsx scripts/adhoc-stack.mjs")) + "\n")
+  const before = h.changes.n
+  t.tick()
+  assert.deepEqual(t.get("t")?.bgShells, [], "a manual TaskStop clears the live shell — no phantom pulsing row")
   assert.ok(h.changes.n > before, "the shell vanishing marks the board dirty")
 })
 
@@ -870,7 +978,7 @@ function harness(): Harness {
   return { storage, bus, events, logDir: dir, changes: { n: 0 }, clock: { ms: 1000 }, dead: { v: false }, pane: { text: "", reads: 0 } }
 }
 
-function makeTailer(h: Harness) {
+function makeTailer(h: Harness, over: Partial<Parameters<typeof createTailer>[0]> = {}) {
   return createTailer({
     project: { cwdSlug: "x" } as Project,
     storage: h.storage,
@@ -883,6 +991,7 @@ function makeTailer(h: Harness) {
       return h.pane.text
     },
     sessionLogDir: h.logDir,
+    ...over,
   })
 }
 
@@ -906,6 +1015,109 @@ test("tailer: primes an already-finished transcript WITHOUT a turn-done notify",
   assert.equal(tele?.lastAssistant, "all done")
   assert.equal(tele?.lastActivityAt, "2026-07-01T00:00:02.000Z")
   assert.equal(tele?.aiTitle, "x") // ai-title sidecar surfaces through telemetry
+})
+
+// ---- PermissionRequest marker (structured perm-blocked signal; primary over the pane regex) ----
+
+// An in-flight turn: user "go" then an unresolved Bash tool_use. lastActivityAt = the tool_use at
+// 00:00:01. A worker parked on a permission prompt writes no further records, so a marker stamped
+// AFTER that (00:00:05) is an active block; one stamped before it is already superseded.
+const permMarker = (at: string, over: Record<string, unknown> = {}) => ({ slug: "t", tool: "Bash", promptId: "p1", permissionMode: "default", at, ...over })
+
+test("tailer: a fresh PermissionRequest marker sets permPrompt immediately (no quiet-gate delay)", () => {
+  const h = harness()
+  h.storage.upsertSession(row())
+  fixture(h.logDir, "sid", [IN_FLIGHT, TOOL]) // in-flight, unresolved tool_use
+  // Only 0.5s since the last record — the pane-sniff fallback would be gated out (needs 4s quiet); the
+  // marker must still fire, and WITHOUT any pane capture.
+  h.clock.ms = Date.parse("2026-07-01T00:00:01.500Z")
+  const t = makeTailer(h, { readPermMarker: () => permMarker("2026-07-01T00:00:05.000Z") })
+  t.tick()
+  assert.equal(t.get("t")?.turn, "in-flight")
+  assert.equal(t.get("t")?.permPrompt, true, "the structured marker blocks the thread on the human")
+  assert.equal(h.pane.reads, 0, "the precise marker needs no pane capture")
+})
+
+test("tailer: a marker older than the last transcript activity is superseded (request resolved)", () => {
+  const h = harness()
+  h.storage.upsertSession(row())
+  fixture(h.logDir, "sid", [IN_FLIGHT, TOOL])
+  h.clock.ms = Date.parse("2026-07-01T00:00:01.500Z")
+  const t = makeTailer(h, { readPermMarker: () => permMarker("2026-07-01T00:00:00.500Z") })
+  t.tick()
+  assert.equal(t.get("t")?.permPrompt, false, "a marker behind the transcript is a resolved request")
+})
+
+test("tailer: an idle turn never consults the marker (a real block is always mid-tool_use)", () => {
+  const h = harness()
+  h.storage.upsertSession(row())
+  fixture(h.logDir, "sid", [IN_FLIGHT, TOOL, DONE]) // turn ended
+  let reads = 0
+  const t = makeTailer(h, { readPermMarker: () => { reads++; return permMarker("2026-07-01T00:00:09.000Z") } })
+  t.tick()
+  assert.equal(t.get("t")?.turn, "idle")
+  assert.equal(t.get("t")?.permPrompt, false)
+  assert.equal(reads, 0, "an idle turn short-circuits before the marker read")
+})
+
+test("tailer: a codex row never consults the Claude marker", () => {
+  const h = harness()
+  h.storage.upsertSession(row())
+  h.storage.setBackend("t", "codex") // the shared upsert never writes backend; use the dedicated setter
+  fixture(h.logDir, "sid", [IN_FLIGHT, TOOL])
+  h.clock.ms = Date.parse("2026-07-01T00:00:01.500Z")
+  let reads = 0
+  const t = makeTailer(h, { readPermMarker: () => { reads++; return permMarker("2026-07-01T00:00:05.000Z") }, capturePane: () => "" })
+  t.tick()
+  assert.equal(reads, 0, "codex owns native input detection; the Claude marker is skipped")
+})
+
+test("tailer: no marker falls back to the pane-sniff regex exactly as before", () => {
+  const h = harness()
+  h.storage.upsertSession(row())
+  fixture(h.logDir, "sid", [IN_FLIGHT, TOOL])
+  h.pane.text = PANE_PERM_BASH
+  h.clock.ms = Date.parse("2026-07-01T00:00:10.000Z") // >4s quiet → fallback capture runs
+  const t = makeTailer(h, { readPermMarker: () => undefined })
+  t.tick()
+  assert.ok(h.pane.reads > 0, "with no marker the fallback still captures the pane")
+  assert.equal(t.get("t")?.permPrompt, true, "the regex fallback still detects a real modal")
+})
+
+// A marker written BEFORE this generation's spawn is stale — a worker killed while blocked, then
+// resumed, must not flash Needs-you off the prior block's marker while the resume boots.
+test("tailer: a marker predating the current spawn is stale (resume of a killed-while-blocked thread)", () => {
+  const h = harness()
+  h.storage.upsertSession(row({ spawned_at: "2026-07-01T00:00:03.000Z" })) // resumed at :03
+  fixture(h.logDir, "sid", [IN_FLIGHT, TOOL]) // replayed old transcript, lastActivity :01
+  h.clock.ms = Date.parse("2026-07-01T00:00:03.500Z")
+  const t = makeTailer(h, { readPermMarker: () => permMarker("2026-07-01T00:00:02.000Z") }) // prior gen
+  t.tick()
+  assert.equal(t.get("t")?.permPrompt, false, "a pre-spawn marker belongs to an already-ended block")
+})
+
+// Exercises the REAL defaultReadPermMarker + isPermMarker (no injected reader) over a marker file on
+// disk at the project stateDir — the exact production read path the hook writes to.
+test("tailer: the default reader round-trips a real on-disk marker (blocked → superseded)", () => {
+  const h = harness()
+  const stateDir = tmp("fray-state-")
+  mkdirSync(join(stateDir, "perm-requests"), { recursive: true })
+  const project = { cwdSlug: "x", stateDir } as Project
+  h.storage.upsertSession(row())
+  fixture(h.logDir, "sid", [IN_FLIGHT, TOOL]) // in-flight, lastActivity :01
+  writeFileSync(permMarkerPath(project, "t"), JSON.stringify(permMarker("2026-07-01T00:00:05.000Z")))
+  h.clock.ms = Date.parse("2026-07-01T00:00:01.500Z")
+  // No readPermMarker injected → the real defaultReadPermMarker reads the file above.
+  const t = makeTailer(h, { project })
+  t.tick()
+  assert.equal(t.get("t")?.permPrompt, true, "the real reader surfaces the on-disk marker")
+
+  // Resolution appends a record AFTER the marker (:09 > :05) → superseded. Same IN_FLIGHT/TOOL prefix
+  // keeps the tailer's byte offset valid; the new trailing line is the only thing consumed.
+  const resolved = JSON.stringify({ type: "assistant", timestamp: "2026-07-01T00:00:09.000Z", message: { stop_reason: "end_turn", content: [{ type: "text", text: "done" }] } })
+  writeFileSync(join(h.logDir, "sid.jsonl"), [IN_FLIGHT, TOOL, resolved].map((l) => l + "\n").join(""))
+  t.tick()
+  assert.equal(t.get("t")?.permPrompt, false, "a transcript record after the marker supersedes it")
 })
 
 test("tailer: finalized adoption capture is atomic and never falls through to a same-name pane", () => {

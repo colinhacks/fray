@@ -7,6 +7,10 @@ export type ComposerKeyboardEvent = {
   // React's synthetic KeyboardEvent omits this DOM field from its type, though its native event
   // exposes it. Undefined is safely treated as not composing.
   isComposing?: boolean
+  // Deprecated DOM field, but it is the only reliable IME signal on WebKit: Safari can deliver the
+  // Enter that CONFIRMS an IME candidate with isComposing=false and keyCode=229, which would submit
+  // the message mid-composition without this guard. Chromium/Firefox set isComposing correctly.
+  keyCode?: number
 }
 
 /**
@@ -17,6 +21,7 @@ export function shouldSubmitComposerEnter(event: ComposerKeyboardEvent, canSubmi
   return canSubmit
     && event.key === "Enter"
     && !event.isComposing
+    && event.keyCode !== 229
     && !event.altKey
     && !event.ctrlKey
     && !event.metaKey

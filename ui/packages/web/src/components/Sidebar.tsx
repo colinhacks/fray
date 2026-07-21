@@ -356,6 +356,10 @@ function SubAgentRows({ t }: { t: ThreadView }) {
       {subs.map((s) => (
         <button
           key={s.id}
+          // Marks this row as a drill-in for its parent thread: an open ThreadSheet for t.id sees
+          // the pointer-down land here and skips its outside-pointer self-dismiss, so the child
+          // sheet STACKS over the parent instead of replacing it (see ThreadSheet).
+          data-subagent-parent={t.id}
           onClick={() => pushSubAgentDrawer(t.id, s.id, { label: s.label, subagentType: s.subagentType, startedAt: s.startedAt })}
           className="group/sub flex min-w-0 items-center gap-2 rounded-md py-0.5 pl-[26px] pr-1.5 text-left transition-colors hover:bg-white/[0.04]"
           title={s.subagentType ? `[${s.subagentType}] ${s.label}` : s.label}

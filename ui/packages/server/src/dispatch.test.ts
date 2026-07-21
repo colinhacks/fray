@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, dirname } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
-import { buildClaudeCommand, loadWorkerPrompt, composePrompt, resolveWorkerPluginDir, scratchpadOrientation, scratchpadContent, workerPluginDir } from "./dispatch.ts"
+import { buildClaudeCommand, loadWorkerPrompt, composePrompt, resolveWorkerPluginDir, scratchpadOrientation, scratchpadContent, workerPluginDir, frayConfigBlock } from "./dispatch.ts"
 
 // ---- Backend-aware worker contract (worker-contract-backend-aware) ----
 // loadWorkerPrompt(kind) delegates to buildWorkerPrompt in workerPrompt.ts (a single compiled-in TS
@@ -48,6 +48,63 @@ test("Claude worker surfaces share the canonical per-session scratchpad path", (
   assert.match(SESSION_SEED, /\.fray\/threads\/.*scratch\.md/)
   assert.match(WORKER_SKILL, /\.fray\/threads\/<session-id>\/scratch\.md/)
   assert.doesNotMatch(SESSION_SEED + WORKER_SKILL, /\.fray\/scratch\//)
+})
+
+// ---- FRAY.md project-config injection (defer-to-project-norms) ----
+// A repo-committed FRAY.md at the project root is injected into the worker SYSTEM prompt under an
+// "overrides fray defaults" header, so a project's own norms win over fray's built-in defaults.
+test("frayConfigBlock: absent FRAY.md injects nothing", () => {
+  const dir = mkdtempSync(join(tmpdir(), "fray-md-absent-"))
+  assert.equal(frayConfigBlock(dir), "")
+})
+
+test("frayConfigBlock: empty/whitespace FRAY.md injects nothing", () => {
+  const dir = mkdtempSync(join(tmpdir(), "fray-md-empty-"))
+  writeFileSync(join(dir, "FRAY.md"), "\n  \n")
+  assert.equal(frayConfigBlock(dir), "")
+})
+
+test("frayConfigBlock: present FRAY.md is wrapped in an overrides-fray-defaults header", () => {
+  const dir = mkdtempSync(join(tmpdir(), "fray-md-present-"))
+  const body = "## Our norms\n- Gates: `pnpm check`\n- Skip adversarial review on small UI diffs."
+  writeFileSync(join(dir, "FRAY.md"), body + "\n")
+  const block = frayConfigBlock(dir)
+  assert.match(block, /PROJECT FRAY CONFIG \(from this repo's FRAY\.md\)/)
+  // Header is scoped to PROCESS defaults and explicitly does NOT relax the fray-mechanical contract —
+  // so a FRAY.md can't contradict the "Defer" section's non-negotiable browser/signal gates.
+  assert.match(block, /OVERRIDE the fray worker PROCESS defaults above/)
+  assert.match(block, /do NOT relax the fray-mechanical contract/)
+  assert.ok(block.includes(body), "the FRAY.md body must be present verbatim")
+})
+
+test("frayConfigBlock: an over-cap FRAY.md content is clipped with a truncation marker", () => {
+  const dir = mkdtempSync(join(tmpdir(), "fray-md-clip-"))
+  writeFileSync(join(dir, "FRAY.md"), "x".repeat(50_000)) // > 12k chars, < 64KB → read then clipped
+  const block = frayConfigBlock(dir)
+  assert.match(block, /\[FRAY\.md truncated\]/)
+  assert.ok(block.length < 20_000, "the injected block must stay within the system-prompt budget")
+})
+
+test("frayConfigBlock: a runaway (>64KB) FRAY.md is rejected unread, not slurped", () => {
+  const dir = mkdtempSync(join(tmpdir(), "fray-md-runaway-"))
+  writeFileSync(join(dir, "FRAY.md"), "x".repeat(200_000)) // exceeds the read-size guard
+  assert.equal(frayConfigBlock(dir), "")
+})
+
+test("frayConfigBlock: a non-regular FRAY.md (a directory) injects nothing", () => {
+  const dir = mkdtempSync(join(tmpdir(), "fray-md-dir-"))
+  mkdirSync(join(dir, "FRAY.md"))
+  assert.equal(frayConfigBlock(dir), "")
+})
+
+test("frayConfigBlock composes AFTER the worker contract (override position) in the system prompt", () => {
+  const dir = mkdtempSync(join(tmpdir(), "fray-md-order-"))
+  writeFileSync(join(dir, "FRAY.md"), "PROJECT-NORM-SENTINEL")
+  const sessionId = "fray-md-order"
+  const system = [loadWorkerPrompt("claude"), scratchpadOrientation(sessionId, null, "claude"), frayConfigBlock(dir)]
+    .filter(Boolean)
+    .join("\n\n")
+  assert.ok(system.indexOf("PROJECT-NORM-SENTINEL") > system.indexOf("Defer to the project's own norms"))
 })
 
 test("artifact worker resolver finds runtime/cc-worker through pnpm's nested module store", () => {
@@ -206,6 +263,11 @@ test("end-state contract: bare rest queues, done checks, awaiting parks human/ti
     assert.match(c, /(?:question|permission)[\s\S]{0,100}higher.priority/i)
     assert.match(c, /checked success card[^\n]*queue/)
     assert.match(c, /until the human (?:explicitly )?(?:A|a)rchives? it/)
+    // done is gated on COMPLETED work (uncommitted is fine); a pre-fix bug/issue investigation never
+    // earns it, while a commissioned research/audit effort's finished report does (done-requires-completed-work)
+    assert.match(c, /COMPLETED\s+the effort's real work/)
+    assert.match(c, /investigat(?:ed|ing|ion)[\s\S]{0,300}NOT `?done`?/i)
+    assert.match(c, /research or audit EFFORT[\s\S]{0,200}earns `done`/)
     assert.match(c, /awaiting[\s\S]{0,140}(?:human|timestamp)/i)
     assert.match(c, /(?:CI|automatable)[\s\S]{0,180}(?:stay active|active wait|live operation)/i)
   }
@@ -214,7 +276,8 @@ test("end-state contract: bare rest queues, done checks, awaiting parks human/ti
   assert.doesNotMatch(WORKER_SKILL, /only excuses you from the queue/)
   assert.doesNotMatch(WORKER_SKILL, /The fence excuses you/)
   assert.doesNotMatch(SESSION_SEED, /```done \/ ```awaiting excuse/)
-  assert.match(SESSION_SEED, /```done queues a checked completion until Archive; ```awaiting parks only a human:\/timer: gate/)
+  assert.match(SESSION_SEED, /```done queues a checked completion until Archive \(completed work only[^)]*\); ```awaiting parks only a human:\/timer: gate/)
+  assert.match(SESSION_SEED, /real work is COMPLETE/)
 })
 
 test("session-seed is a SLIM runtime pointer, not a fourth full contract copy", () => {

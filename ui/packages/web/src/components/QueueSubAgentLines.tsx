@@ -18,6 +18,9 @@ export function QueueSubAgentLines({ slug, subAgents }: { slug: string; subAgent
           <button
             key={agent.id ?? `${agent.startedAt}-${index}`}
             type="button"
+            // Drill-in marker: keeps an open ThreadSheet for `slug` from self-dismissing on this
+            // pointer-down, so the child transcript stacks over its parent (see ThreadSheet).
+            data-subagent-parent={slug}
             disabled={!open}
             onClick={open}
             title={open ? "Open sub-agent transcript" : undefined}

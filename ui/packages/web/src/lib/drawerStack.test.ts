@@ -14,17 +14,60 @@ function resetStore(): void {
   store.view = "todos"
 }
 
-test("opening the same logical drawer twice reuses and raises one entry", () => {
+// No drawer components are mounted in this environment, so closeDrawersById's animated path has no
+// registered closers and displaced layers are removed synchronously — the policy's end state is
+// directly observable.
+function shape() {
+  return store.drawers.map(({ kind, slug, subId }) => ({ kind, slug, subId }))
+}
+
+test("a lateral thread open replaces the previous drawer (one drawer at a time)", () => {
   resetStore()
   pushDrawer("thread", "one")
-  const id = store.drawers[0]?.id
   pushDrawer("thread", "two")
-  pushDrawer("thread", "one")
+  assert.deepEqual(shape(), [{ kind: "thread", slug: "two", subId: undefined }])
+})
 
-  assert.deepEqual(store.drawers.map(({ id: currentId, kind, slug }) => ({ id: currentId, kind, slug })), [
-    { id: store.drawers.find((drawer) => drawer.slug === "two")?.id, kind: "thread", slug: "two" },
-    { id, kind: "thread", slug: "one" },
+test("a sub-agent stacks over its open parent; a sibling sub-agent swaps in place", () => {
+  resetStore()
+  pushDrawer("thread", "parent")
+  pushSubAgentDrawer("parent", "tool-a", { label: "child a" })
+  assert.deepEqual(shape(), [
+    { kind: "thread", slug: "parent", subId: undefined },
+    { kind: "subagent", slug: "parent", subId: "tool-a" },
   ])
+
+  pushSubAgentDrawer("parent", "tool-b", { label: "child b" })
+  assert.deepEqual(shape(), [
+    { kind: "thread", slug: "parent", subId: undefined },
+    { kind: "subagent", slug: "parent", subId: "tool-b" },
+  ])
+})
+
+test("a sub-agent opened without its parent on the stack replaces everything", () => {
+  resetStore()
+  pushDrawer("thread", "other")
+  pushSubAgentDrawer("parent", "tool-a", { label: "child a" })
+  assert.deepEqual(shape(), [{ kind: "subagent", slug: "parent", subId: "tool-a" }])
+
+  // Sibling sub-agents with no parent layer swap too — the reported bug: they used to pile up.
+  pushSubAgentDrawer("parent", "tool-b", { label: "child b" })
+  assert.deepEqual(shape(), [{ kind: "subagent", slug: "parent", subId: "tool-b" }])
+})
+
+test("a thread's own doc and sub-agent stack as one family; a plan replaces it all", () => {
+  resetStore()
+  pushDrawer("thread", "same")
+  pushDrawer("doc", "same")
+  pushSubAgentDrawer("same", "tool-1", { label: "child" })
+  assert.deepEqual(shape(), [
+    { kind: "thread", slug: "same", subId: undefined },
+    { kind: "doc", slug: "same", subId: undefined },
+    { kind: "subagent", slug: "same", subId: "tool-1" },
+  ])
+
+  pushPlanDrawer(".fray/plans/same.md", "Plan")
+  assert.deepEqual(shape(), [{ kind: "plan", slug: ".fray/plans/same.md", subId: undefined }])
 })
 
 test("rapid open during exit cancels removal of the same layer", () => {
@@ -42,29 +85,27 @@ test("rapid open during exit cancels removal of the same layer", () => {
   assert.equal(store.drawers[0]?.closing, undefined)
 })
 
-test("different drawer identities still stack, including the same slug across kinds", () => {
-  resetStore()
-  pushDrawer("thread", "same")
-  pushDrawer("doc", "same")
-  pushPlanDrawer(".fray/plans/same.md", "Plan")
-  pushSubAgentDrawer("same", "tool-1", { label: "child" })
-
-  assert.deepEqual(store.drawers.map(({ kind, slug, path, subId }) => ({ kind, slug, path, subId })), [
-    { kind: "thread", slug: "same", path: undefined, subId: undefined },
-    { kind: "doc", slug: "same", path: undefined, subId: undefined },
-    { kind: "plan", slug: ".fray/plans/same.md", path: ".fray/plans/same.md", subId: undefined },
-    { kind: "subagent", slug: "same", path: undefined, subId: "tool-1" },
-  ])
-})
-
-test("reopening an already open plan or subagent does not duplicate it", () => {
+test("reopening an already open plan or sub-agent reuses its entry", () => {
   resetStore()
   pushPlanDrawer(".fray/plans/a.md", "A")
   pushPlanDrawer(".fray/plans/a.md", "A renamed")
+  assert.equal(store.drawers.length, 1)
+  assert.equal(store.drawers[0]?.label, "A renamed")
+
+  resetStore()
+  pushDrawer("thread", "parent")
   pushSubAgentDrawer("parent", "tool-1", { label: "child" })
   pushSubAgentDrawer("parent", "tool-1", { label: "child renamed" })
-
   assert.equal(store.drawers.length, 2)
-  assert.equal(store.drawers[0]?.label, "A renamed")
   assert.equal(store.drawers[1]?.label, "child renamed")
+})
+
+test("re-clicking the open parent thread closes the child stacked over it", () => {
+  resetStore()
+  pushDrawer("thread", "parent")
+  const parentId = store.drawers[0]?.id
+  pushSubAgentDrawer("parent", "tool-a", { label: "child a" })
+  pushDrawer("thread", "parent")
+  assert.deepEqual(shape(), [{ kind: "thread", slug: "parent", subId: undefined }])
+  assert.equal(store.drawers[0]?.id, parentId)
 })

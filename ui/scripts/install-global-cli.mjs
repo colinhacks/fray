@@ -17,7 +17,7 @@ import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const MARKER = "# fray-dev-source-launcher:v3";
+const MARKER = "# fray-dev-source-launcher:v4";
 const args = new Set(process.argv.slice(2));
 const knownArgs = new Set(["--uninstall", "--check", "--force", "--help"]);
 for (const arg of process.argv.slice(2)) {
@@ -48,7 +48,14 @@ const launcher = realpathSync(
   fileURLToPath(new URL("../packages/cli/src/index.ts", import.meta.url))
 );
 const quote = (value) => `'${value.replaceAll("'", `"'"'`)}'`;
-const body = `#!/bin/sh\n${MARKER}\nexec env FRAY_SOURCE_COMMAND=${quote(command)} nub ${quote(launcher)} "$@"\n`;
+// Drop inherited Anthropic API credentials at the launcher boundary. A project's .env often carries
+// ANTHROPIC_API_KEY, and this dev launcher is routinely started from a shell where that .env has been
+// loaded (e.g. `dotenv -e .env -- fray-dev`). If the key reaches fray it flows into the long-lived
+// per-project tmux server — which inherits its first client's env and outlives that shell — so every
+// worker pane inherits it and hangs on Claude Code's blocking "Detected a custom API key" prompt.
+// `env -u` truly unsets (a tmux `-e` entry could only shadow), keeping dev workers on the developer's
+// logged-in subscription. Production auth is untouched.
+const body = `#!/bin/sh\n${MARKER}\nexec env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN FRAY_SOURCE_COMMAND=${quote(command)} nub ${quote(launcher)} "$@"\n`;
 
 function isOwned(path) {
   try {

@@ -1,7 +1,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import type { ThreadView } from "@fray-ui/shared"
-import { needsAction, queued, queuePriority, orderQueue, partitionActive, sectionOf, sectionThreads, isHeld, sessionIndicatorKind, titleIsProvisional, displayTitle, SPINNING_UP_TITLE, UNTITLED_THREAD_TITLE } from "./groups.ts"
+import { needsAction, queued, queuePriority, orderQueue, partitionActive, sectionOf, sectionThreads, isHeld, sessionIndicatorKind, titleIsProvisional, displayTitle, lastActiveLabelAt, SPINNING_UP_TITLE, UNTITLED_THREAD_TITLE } from "./groups.ts"
 
 // Minimal ThreadView fixture — the same shape board-delta.test.ts uses, defaulting to a live/active
 // thread; each case overrides only the fields under test.
@@ -171,17 +171,31 @@ test("orderQueue: hard attention leads; FIFO (oldest-waiting first) and id order
   assert.deepEqual(queue.map((item) => item.id), ["hard-older", "hard-a", "hard-b", "done-new", "rest-newer"])
 })
 
-test("orderQueue: AT-REST rows key on last-active (rest time), matching the row's label; direction flips it", () => {
-  // Equal lastUserAt; the row that came to REST later is more recently active (its lastActivityAt is
-  // when it landed its final message). "Last active" is exactly that clock, so the order now agrees
-  // with the visible label. FIFO (default) leads with the longest-waiting (earlier-rested) row.
+test("orderQueue: AT-REST rows key on REST TIME (lastAssistantAt), not lastActivityAt; direction flips it", () => {
+  // The row that came to REST later (later lastAssistantAt = its final assistant output) is more
+  // recently active. Ordering keys on this, NOT lastActivityAt — even though a much-later lastActivityAt
+  // (a background sub-agent's completion notification) is present, it must NOT move the row. FIFO
+  // (default) leads with the longest-since-rested (earlier-rested) row.
   const rows = () => [
-    thread({ id: "rested-later", lastUserAt: "2026-07-14T12:00:00.000Z", lastActivityAt: "2026-07-14T12:05:00.000Z" }),
-    thread({ id: "rested-earlier", lastUserAt: "2026-07-14T12:00:00.000Z", lastActivityAt: "2026-07-14T12:01:00.000Z" }),
+    thread({ id: "rested-later", lastUserAt: "2026-07-14T12:00:00.000Z", lastAssistantAt: "2026-07-14T12:05:00.000Z", lastActivityAt: "2026-07-14T13:00:00.000Z" }),
+    thread({ id: "rested-earlier", lastUserAt: "2026-07-14T12:00:00.000Z", lastAssistantAt: "2026-07-14T12:01:00.000Z", lastActivityAt: "2026-07-14T13:30:00.000Z" }),
   ]
   assert.deepEqual(orderQueue(rows()).map((item) => item.id), ["rested-earlier", "rested-later"])
-  // LIFO surfaces the most recently active first.
+  // LIFO surfaces the most recently rested first.
   assert.deepEqual(orderQueue(rows(), "lifo").map((item) => item.id), ["rested-later", "rested-earlier"])
+})
+
+test("orderQueue: a background sub-agent completing (lastActivityAt bump) does NOT reorder an at-rest row", () => {
+  // The exact regression: a completed sub-agent posts a promptSource:system record that bumps the
+  // parent's lastActivityAt but NOT its lastAssistantAt (rest time). Since ordering keys on rest time,
+  // the parent's position is invariant to that child motion. Equal rest times ⇒ id tiebreak holds
+  // no matter how recent the child-driven lastActivityAt is.
+  const rows = (childActivity: string) => [
+    thread({ id: "bravo", lastAssistantAt: "2026-07-14T12:00:00.000Z", lastActivityAt: childActivity }),
+    thread({ id: "alpha", lastAssistantAt: "2026-07-14T12:00:00.000Z", lastActivityAt: childActivity }),
+  ]
+  assert.deepEqual(orderQueue(rows("2026-07-14T12:00:01.000Z")).map((item) => item.id), ["alpha", "bravo"])
+  assert.deepEqual(orderQueue(rows("2026-07-14T18:00:00.000Z")).map((item) => item.id), ["alpha", "bravo"])
 })
 
 test("orderQueue: high-frequency agent activity on a RUNNING row cannot oscillate order (churn guard)", () => {
@@ -194,6 +208,25 @@ test("orderQueue: high-frequency agent activity on a RUNNING row cannot oscillat
   ]
   assert.deepEqual(orderQueue(rows("2026-07-14T12:00:01.000Z")).map((item) => item.id), ["alpha", "bravo"])
   assert.deepEqual(orderQueue(rows("2026-07-14T12:09:00.000Z")).map((item) => item.id), ["alpha", "bravo"])
+})
+
+test("lastActiveLabelAt: at-rest shows REST time, running shows live activity, sub-agent bump ignored at rest", () => {
+  // At rest → the agent's own rest time (lastAssistantAt), NOT the later lastActivityAt a completed
+  // sub-agent bumped. So the label reads "when the agent rested", never a spurious "just now".
+  assert.equal(
+    lastActiveLabelAt(thread({ runtime: "turn-idle", lastAssistantAt: "2026-07-14T12:00:00.000Z", lastActivityAt: "2026-07-14T13:00:00.000Z" })),
+    "2026-07-14T12:00:00.000Z",
+  )
+  // Running → live activity (a running row IS active now), matching the spinner.
+  assert.equal(
+    lastActiveLabelAt(thread({ runtime: "running", lastAssistantAt: "2026-07-14T12:00:00.000Z", lastActivityAt: "2026-07-14T13:00:00.000Z" })),
+    "2026-07-14T13:00:00.000Z",
+  )
+  // At rest with no recorded rest instant → falls back to lastActivityAt, then spawn.
+  assert.equal(
+    lastActiveLabelAt(thread({ runtime: "turn-idle", lastAssistantAt: undefined, lastActivityAt: "2026-07-14T11:00:00.000Z" })),
+    "2026-07-14T11:00:00.000Z",
+  )
 })
 
 // ---- sidebar sections: session-first partition ----

@@ -126,6 +126,24 @@ test("joinComposerValue with no paths is the prose verbatim; empty prose yields 
   assert.equal(joinComposerValue("hi", ["/tmp/a.png"]), "hi\n/tmp/a.png")
 })
 
+// Paths with spaces are real — macOS screenshots, "My Project" dirs — and must chip/promote like any
+// other path. But a space directly before "/" is a boundary between TWO paths, which stays prose.
+test("paths containing spaces peel into chips and promote in the transcript", () => {
+  const spaced = "/Users/x/Screenshots/Screen Shot 2026-07-21 at 1.23.45 PM.png"
+  const { prose, attachments } = splitComposerValue(`look\n${spaced}`)
+  assert.equal(prose, "look")
+  assert.deepEqual(attachments, [{ path: spaced, kind: "image" }])
+  assert.deepEqual(splitProseAttachments(spaced), [{ kind: "image", path: spaced }])
+  const doc = "/Users/x/My Project/design notes.md"
+  assert.deepEqual(splitComposerValue(doc).attachments, [{ path: doc, kind: "file" }])
+})
+
+test("two paths on one line stay prose (space before a slash is a path boundary)", () => {
+  const line = "/tmp/a.png /tmp/b.png"
+  assert.deepEqual(splitComposerValue(line).attachments, [])
+  assert.deepEqual(splitProseAttachments(line), [{ kind: "md", text: line }])
+})
+
 // The composer re-derives the textarea from join(split(...)) on EVERY keystroke while chips exist, so
 // any prose normalization eats the character just typed. Regression: trailing spaces vanished as the
 // user typed once a file was attached (join used to trimEnd the prose).

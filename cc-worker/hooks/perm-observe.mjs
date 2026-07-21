@@ -19,7 +19,7 @@
 //
 // GATE: inert unless FRAY_UI_THREAD (the slug) AND FRAY_PERM_DIR (the marker dir the server scans) are
 // both set. FAIL OPEN on any error — a broken observer must never halt or alter a worker.
-import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { readFileSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 
 const slug = process.env.FRAY_UI_THREAD;
@@ -43,7 +43,6 @@ try {
   const dest = join(dir, `${slug}.json`);
   const tmp = `${dest}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(marker));
-  const { renameSync } = await import('node:fs');
   renameSync(tmp, dest);
 } catch {
   // fail open — the request proceeds regardless

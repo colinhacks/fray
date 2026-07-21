@@ -268,7 +268,13 @@ export const ThreadView = z.object({
   archived: z.boolean(), // user hid the row from the nav; respawn/resume un-archives
   lastAssistant: z.string().optional(), // trimmed preview of last assistant text
   spawnedAt: z.string().optional(), // ISO8601
-  lastActivityAt: z.string().optional(), // ISO8601, from jsonl tail
+  lastActivityAt: z.string().optional(), // ISO8601, from jsonl tail — ANY record (incl. sub-agent/system)
+  // ISO8601 of the agent's OWN last output (Claude: last assistant record; Codex: turn-end/final text).
+  // This is the "rest time" — when the thread's own turn last came to rest — and UNLIKE lastActivityAt
+  // it is NOT bumped by a background sub-agent's completion notification (a promptSource:system record).
+  // The queue/rested-band order key and the at-rest "Last active" label both key off this. Optional so
+  // old snapshots parse; the client falls back to lastActivityAt/spawnedAt when absent.
+  lastAssistantAt: z.string().optional(),
   aiTitle: z.string().optional(), // Claude's own auto-generated session title (latest ai-title record)
   // True when `title` is a machine-guessed dispatch slug (title_auto=1), NOT a real name — the display
   // then shows a "Spinning up a thread…" placeholder instead of the guess until aiTitle lands. Optional
