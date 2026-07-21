@@ -1,7 +1,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import type { ThreadView } from "@fray-ui/shared"
-import { needsAction, queued, queuePriority, orderQueue, partitionActive, sectionOf, sectionThreads, isHeld, sessionIndicatorKind, titleIsProvisional, displayTitle, lastActiveLabelAt, SPINNING_UP_TITLE, UNTITLED_THREAD_TITLE } from "./groups.ts"
+import { needsAction, queued, orderQueue, partitionActive, sectionOf, sectionThreads, isHeld, sessionIndicatorKind, titleIsProvisional, displayTitle, lastActiveLabelAt, SPINNING_UP_TITLE, UNTITLED_THREAD_TITLE } from "./groups.ts"
 
 // Minimal ThreadView fixture — the same shape board-delta.test.ts uses, defaulting to a live/active
 // thread; each case overrides only the fields under test.
@@ -145,30 +145,24 @@ test("queued: pre-restart snapshot (no kind/needsYou) degrades to an empty queue
   assert.equal(queued(thread({})), false)
 })
 
-test("queuePriority: only unresolved asks, prompts, permissions, and crashes outrank passive handoffs", () => {
-  assert.equal(queuePriority(thread({ actionableInteraction: true })), 0)
-  assert.equal(queuePriority(thread({ pendingAsk: { questions: [] } })), 0)
-  assert.equal(queuePriority(thread({ nativeInputRequired: { kind: "permission", title: "Permission required" } })), 0)
-  assert.equal(queuePriority(thread({ pendingQuestion: true })), 0)
-  assert.equal(queuePriority(thread({ runtime: "perm-prompt" })), 0)
-  assert.equal(queuePriority(thread({ crashed: true })), 0)
-  assert.equal(queuePriority(thread({ status: "needs-human", humanBlocked: true })), 0)
-  assert.equal(queuePriority(thread({ pendingInteraction: true, actionableInteraction: false })), 1, "answered provider delivery remains readable, not actionable")
-  assert.equal(queuePriority(thread({ lastFence: { kind: "done", body: "shipped", hints: [] } })), 1)
-  assert.equal(queuePriority(thread()), 1)
-})
-
-test("orderQueue: hard attention leads; FIFO (oldest-waiting first) and id order each band", () => {
-  const queue = orderQueue([
-    thread({ id: "done-new", lastUserAt: "2026-07-13T12:00:00.000Z", lastFence: { kind: "done", body: "shipped", hints: [] } }),
-    thread({ id: "hard-b", lastUserAt: "2026-07-11T12:00:00.000Z", pendingQuestion: true }),
-    thread({ id: "rest-newer", lastUserAt: "2026-07-14T12:00:00.000Z" }),
-    thread({ id: "hard-a", lastUserAt: "2026-07-11T12:00:00.000Z", actionableInteraction: true }),
-    thread({ id: "hard-older", lastUserAt: "2026-07-10T12:00:00.000Z", crashed: true }),
-  ])
-  // Hard band FIFO (oldest first): hard-older (07-10) leads; hard-a/hard-b share 07-11 so id breaks the
-  // tie (a<b). Rest band FIFO: done-new (07-13) before rest-newer (07-14). Bands never interleave.
-  assert.deepEqual(queue.map((item) => item.id), ["hard-older", "hard-a", "hard-b", "done-new", "rest-newer"])
+test("orderQueue: NO priority band — one strict time order across attention + passive alike", () => {
+  // The hidden hard-attention band is gone (maintainer 2026-07-21: "too confusing"). Order is
+  // last-active alone; kind (crash/question vs done/rest) never lifts a card into a separate tier.
+  // The timestamps deliberately INTERLEAVE attention and passive rows so BOTH directions differ from
+  // the old banded order — proving band removal, not just re-proving FIFO:
+  //   crash-newest 07-14 (hard) · done-newer 07-13 (passive) · question-older 07-11 (hard) · rest-oldest 07-10 (passive)
+  // Old banded FIFO would be [question-older, crash-newest, rest-oldest, done-newer]; old banded LIFO
+  // [crash-newest, question-older, done-newer, rest-oldest]. Both differ from the strict orders below.
+  const rows = () => [
+    thread({ id: "crash-newest", lastUserAt: "2026-07-14T12:00:00.000Z", crashed: true }),
+    thread({ id: "done-newer", lastUserAt: "2026-07-13T12:00:00.000Z", lastFence: { kind: "done", body: "shipped", hints: [] } }),
+    thread({ id: "question-older", lastUserAt: "2026-07-11T12:00:00.000Z", pendingQuestion: true }),
+    thread({ id: "rest-oldest", lastUserAt: "2026-07-10T12:00:00.000Z" }),
+  ]
+  // FIFO oldest-first: the fresh CRASH sinks to the BOTTOM under an older done card — the accepted tradeoff.
+  assert.deepEqual(orderQueue(rows()).map((item) => item.id), ["rest-oldest", "question-older", "done-newer", "crash-newest"])
+  // LIFO newest-first: a newer DONE card outranks an older question — impossible under the old band.
+  assert.deepEqual(orderQueue(rows(), "lifo").map((item) => item.id), ["crash-newest", "done-newer", "question-older", "rest-oldest"])
 })
 
 test("orderQueue: AT-REST rows key on REST TIME (lastAssistantAt), not lastActivityAt; direction flips it", () => {
