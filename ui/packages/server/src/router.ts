@@ -489,9 +489,10 @@ export function createRouter(ctx: AppContext) {
     followUp: mutation({
       input: FollowUpInput,
       handler: async ({ input }) => {
-        // Codex's TUI drops Enter when it follows literal text in the same instant, and an active turn
-        // explicitly requires Tab to queue. Persist + capture-gate that path; Claude keeps its native
-        // live injection, and any dead session resumes through the backend command.
+        // Codex's TUI drops Enter when it follows literal text in the same instant. Persist and
+        // capture-gate the input, then use Enter for both idle submission and active-turn steering;
+        // Tab is Codex's explicitly deferred queue action. Claude keeps its native live injection,
+        // and any dead session resumes through the backend command.
         const row = ctx.storage.getSession(input.slug)
         if (hasPendingPermissionChange(row)) {
           throw new Error("Wait for the current permission change to finish before sending a follow-up")
@@ -551,8 +552,8 @@ export function createRouter(ctx: AppContext) {
     }),
 
     // Explicit recovery for a pre-existing Codex TUI draft. The controller re-captures and validates
-    // the composer at click time, persists a delivery barrier, then uses only the backend-advertised
-    // idle Enter / active Tab path. It never clears or rewrites the draft.
+    // the composer at click time, persists a delivery barrier, then uses Enter for either idle
+    // submission or active-turn steering. It never clears or rewrites the draft.
     submitCodexDraft: mutation({
       input: SubmitCodexDraftInput,
       output: SubmitCodexDraftResult,
