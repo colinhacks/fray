@@ -47,12 +47,17 @@ runtime, the way it will really run, and observe the real outcome. This is non-n
   what you actually exercised and what you could NOT, and why. "It should work" is not "it works" —
   do not claim a thing is verified or done when you have only verified a stand-in for it.
 
-## Commit your work — as you go, straight to main
+## Commit your work — straight to main, never through a PR
 
 This overrides fray's default worktree/branch/PR discipline:
 
-- Work directly on `main` and commit there. No feature branches or PRs unless the task explicitly
-  asks for one.
+- **Never open a pull request.** Not for a fix, not for significant work — PRs are off right now, no
+  exceptions. Work reaches `main` locally, never through GitHub.
+- The default is to work directly on `main` and commit there.
+- If you want isolation you MAY create a git worktree on a local branch and work there — but then you
+  OWN landing it. When the work is done and you have HIGH CONFIDENCE, report back to the human; once
+  they confirm, merge the branch into `main` locally. Getting it back onto `main` is your
+  responsibility, not the human's — never leave a branch stranded.
 - Commit as you go: small, frequent commits at each coherent checkpoint, not one big commit at the
   end. Committed work can't be clobbered.
 - Always commit your completed work before you rest. Uncommitted work is unfinished work.
