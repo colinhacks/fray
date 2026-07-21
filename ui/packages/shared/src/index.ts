@@ -479,6 +479,23 @@ export const AccountLogoutResult = z.object({
   detail: z.string().max(200).optional(),
 })
 export type AccountLogoutResult = z.infer<typeof AccountLogoutResult>
+// Slice B login utility: start/inspect/cancel the restricted `claude auth login` terminal. The
+// attempt id is slug-shaped so it can ride the hardened /term/<slug> transport; it is server-issued
+// and opaque — the client never constructs one.
+export const AccountLoginStartInput = z.object({ backend: z.enum(["claude", "codex"]) }).strict()
+export type AccountLoginStartInput = z.infer<typeof AccountLoginStartInput>
+export const AccountLoginStartResult = z.object({ attemptId: ThreadSlug })
+export type AccountLoginStartResult = z.infer<typeof AccountLoginStartResult>
+export const AccountLoginStatusInput = z.object({ attemptId: ThreadSlug }).strict()
+export type AccountLoginStatusInput = z.infer<typeof AccountLoginStatusInput>
+// `auth` is the live credential re-read; the client treats state:"exited" + auth:"authed" as a
+// completed sign-in. The NEXT real provider request remains the validity proof (an expired token
+// also reads "authed" here — the runtime 401 classifier covers that).
+export const AccountLoginStatusResult = z.object({
+  state: z.enum(["running", "exited", "unknown"]),
+  auth: ProviderAuth,
+})
+export type AccountLoginStatusResult = z.infer<typeof AccountLoginStatusResult>
 export type AuthSnapshot = z.infer<typeof AuthSnapshot>
 
 // ---- Settings ----

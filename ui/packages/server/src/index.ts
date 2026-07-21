@@ -362,6 +362,7 @@ export async function startServer(opts: StartOptions = {}): Promise<StartedServe
   const cleanupTerminal = createRetryableCleanup(async () => { await terminal?.close() })
   const cleanupAppSocket = createRetryableCleanup(async () => { await appSocket?.close() })
   const cleanupTailer = createRetryableCleanup(() => ctx?.tailer.stop())
+  const cleanupLoginUtility = createRetryableCleanup(() => ctx?.loginUtility.stop())
   const cleanupPermission = createRetryableCleanup(() => ctx?.permissionController.stop())
   const cleanupProfile = createRetryableCleanup(() => ctx?.profileController?.stop())
   const cleanupSubscriptions = createRetryableCleanup(() => ctx?.stopSubscriptions())
@@ -394,6 +395,8 @@ export async function startServer(opts: StartOptions = {}): Promise<StartedServe
         run: cleanupAppSocket,
       },
       { name: "tailer producer", run: cleanupTailer },
+      // Kill any live login-attempt pane so OAuth bytes never outlive the server.
+      { name: "login utility", run: cleanupLoginUtility },
       { name: "permission producer", run: cleanupPermission },
       { name: "profile producer", run: cleanupProfile },
       { name: "context subscriptions", run: cleanupSubscriptions },
@@ -532,6 +535,10 @@ export async function startServer(opts: StartOptions = {}): Promise<StartedServe
       "terminal transport",
       () => runtime.createTerminal({
         resolveAttach: (slug) => {
+          // A live login-utility attempt (slug-shaped opaque id, no registry row) attaches to its
+          // restricted `claude auth login` session; everything else requires a registered thread.
+          const util = ctx!.loginUtility.attachArgs(slug)
+          if (util) return util
           const row = ctx!.storage.getSession(slug)
           if (!row) return null
           return resolveThreadAttach(ctx!.storage, row)

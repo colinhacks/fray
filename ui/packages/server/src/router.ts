@@ -23,6 +23,10 @@ import {
   AuthSnapshot,
   AccountLogoutInput,
   AccountLogoutResult,
+  AccountLoginStartInput,
+  AccountLoginStartResult,
+  AccountLoginStatusInput,
+  AccountLoginStatusResult,
   RenameThreadInput,
   AiRenameThreadInput,
   AiRenameThreadResult,
@@ -960,6 +964,37 @@ export function createRouter(ctx: AppContext) {
           claudeBin: ctx.claudeBin,
           liveThreads: liveThreadsForBackend(snapshot.threads, input.backend),
         })
+      },
+    }),
+
+    // Slice B login utility: the sign-in modal's PRIMARY action. Starts (or re-attaches to) the one
+    // live `claude auth login` tmux session, addressed by a server-issued slug-shaped attempt id the
+    // browser then attaches to over the existing hardened /term transport.
+    accountLoginStart: mutation({
+      input: AccountLoginStartInput,
+      output: AccountLoginStartResult,
+      handler: async ({ input }) => ctx.loginUtility.start(input.backend),
+    }),
+
+    accountLoginStatus: query({
+      input: AccountLoginStatusInput,
+      output: AccountLoginStatusResult,
+      handler: async ({ input }) => {
+        const { state, backend } = ctx.loginUtility.status(input.attemptId)
+        const auth = await readAuthSnapshot()
+        // The login CLI finished → the pane is spent; tear it down eagerly so the OAuth bytes don't
+        // linger in a dead pane. Cancel is idempotent.
+        if (state === "exited") ctx.loginUtility.cancel(input.attemptId)
+        return { state, auth: auth[backend ?? "claude"] }
+      },
+    }),
+
+    accountLoginCancel: mutation({
+      input: AccountLoginStatusInput,
+      output: z.object({}),
+      handler: async ({ input }) => {
+        ctx.loginUtility.cancel(input.attemptId)
+        return {}
       },
     }),
 

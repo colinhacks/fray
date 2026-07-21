@@ -18,6 +18,7 @@ import {
 import { createClaudeBackend } from "./backend/claude.ts"
 import { createCodexBackend } from "./backend/codex.ts"
 import { readClaudeAuthStatusCli, readCodexAuthState } from "./backend/auth-status.ts"
+import { createLoginUtility, type LoginUtility } from "./login-utility.ts"
 import type { AgentBackend } from "./backend/types.ts"
 import { detectGithub, type GithubDetection } from "./github.ts"
 import * as tmux from "./tmux.ts"
@@ -134,6 +135,9 @@ export interface AppContext {
   // The dispatch Claude executable (tests use a stand-in). The account logout action runs the SAME
   // binary so sign-out targets the credential the workers actually use.
   claudeBin?: string
+  // Slice B account utility: the restricted short-lived `claude auth login` terminal behind the
+  // sign-in modal's primary action. Attempts ride the /term transport via slug-shaped opaque ids.
+  loginUtility: LoginUtility
 }
 
 export interface ContextOptions {
@@ -515,5 +519,6 @@ function createContextUnchecked(opts: ContextOptions, resources: PartialContextR
     setSettings: (s) => setSettings(storage, s),
     resetSettings: () => resetSettings(storage),
     claudeBin: opts.claudeBin,
+    loginUtility: createLoginUtility({ claudeBin: opts.claudeBin, cwd: project.dir }),
   }
 }

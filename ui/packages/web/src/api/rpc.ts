@@ -32,6 +32,10 @@ import type {
   AuthSnapshot,
   AccountLogoutInput,
   AccountLogoutResult,
+  AccountLoginStartInput,
+  AccountLoginStartResult,
+  AccountLoginStatusInput,
+  AccountLoginStatusResult,
   DispatchPreferences,
   SetDispatchPreferenceInput,
   ListInteractionsInput,
@@ -127,6 +131,10 @@ export interface Api {
   // overloaded "unavailable" — reports only whether a credential exists. Never rejects.
   authStatus(): Promise<AuthSnapshot>
   accountLogout(input: AccountLogoutInput): Promise<AccountLogoutResult>
+  // Slice B login utility: start/attach/inspect/cancel the restricted `claude auth login` terminal.
+  accountLoginStart(input: AccountLoginStartInput): Promise<AccountLoginStartResult>
+  accountLoginStatus(input: AccountLoginStatusInput): Promise<AccountLoginStatusResult>
+  accountLoginCancel(input: AccountLoginStatusInput): Promise<Record<string, never>>
   settingsGet(): Promise<Settings>
   settingsSet(input: Settings): Promise<void>
   settingsReset(): Promise<Settings>
@@ -189,6 +197,9 @@ const PROCEDURES: Record<keyof Api, ProcType> = {
   quota: "query",
   authStatus: "query",
   accountLogout: "mutation",
+  accountLoginStart: "mutation",
+  accountLoginStatus: "query",
+  accountLoginCancel: "mutation",
   settingsGet: "query",
   settingsSet: "mutation",
   settingsReset: "mutation",
