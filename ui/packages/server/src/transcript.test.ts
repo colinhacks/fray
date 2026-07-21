@@ -7,6 +7,7 @@ import { GITHUB_DISPATCH_UI_BOUNDARY } from "@fray-ui/shared"
 import {
   githubDispatchDisplayText,
   pageProjectedTranscript,
+  projectClaudeTranscript,
   parseTranscript,
   readEarlierThreadTranscriptPage,
   readLatestThreadTranscriptPage,
@@ -966,4 +967,19 @@ test("pagination cursor survives restart-like replay and concurrent append, but 
   } finally {
     h.cleanup()
   }
+})
+
+test("a synthetic provider AUTH-error record renders NO assistant bubble (the recovery card is its only surface)", () => {
+  const raw = [
+    JSON.stringify({ type: "user", timestamp: "2026-07-21T00:00:00.000Z", message: { content: [{ type: "text", text: "Say hello." }] } }),
+    JSON.stringify({ type: "assistant", isApiErrorMessage: true, timestamp: "2026-07-21T00:00:01.000Z", message: { model: "<synthetic>", content: [{ type: "text", text: "Please run /login · API Error: 401 Invalid authentication credentials" }] } }),
+  ].join("\n")
+  const messages = projectClaudeTranscript(raw)
+  assert.equal(messages.some((m) => /Please run \/login/.test(m.text)), false, "the 401 line must not masquerade as a chat message")
+  assert.equal(messages.filter((m) => m.role === "user").length, 1, "the user's message still renders")
+  // A NON-auth API error keeps its bubble — no recovery card replaces it.
+  const overloaded = [
+    JSON.stringify({ type: "assistant", isApiErrorMessage: true, timestamp: "2026-07-21T00:00:02.000Z", message: { model: "<synthetic>", content: [{ type: "text", text: "API Error: 529 Overloaded" }] } }),
+  ].join("\n")
+  assert.equal(projectClaudeTranscript(overloaded).some((m) => /529 Overloaded/.test(m.text)), true)
 })

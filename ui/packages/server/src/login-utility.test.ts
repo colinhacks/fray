@@ -91,3 +91,18 @@ test("cancel and stop tear the tmux session down; teardown is idempotent", () =>
   h.utility.stop()
   assert.ok(h.killed.includes(again.attemptId))
 })
+
+test("boot-time sweep kills orphaned fray-login-* sessions and nothing else", () => {
+  const killed: string[] = []
+  createLoginUtility({
+    claudeBin: "/stub/claude",
+    cwd: "/project",
+    spawn: () => ({ paneId: "%1", panePid: 1, sessionCreated: 1 }),
+    ensureServer: () => {},
+    killSession: (slug) => void killed.push(slug),
+    hasSession: () => false,
+    lookupPane: () => ({ kind: "unknown" }),
+    listSessions: () => ["fray-login-deadbeefdeadbeef", "fray-real-thread", "fray-login-0123456789abcdef", "unrelated"],
+  })
+  assert.deepEqual(killed, ["login-deadbeefdeadbeef", "login-0123456789abcdef"])
+})

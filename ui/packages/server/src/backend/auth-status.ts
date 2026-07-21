@@ -160,9 +160,22 @@ export async function readClaudeAuthStatusCli(opts?: {
 
 // The per-provider auth snapshot the new-thread gate reads. Never throws — each provider degrades to
 // "unknown" independently, and the gate fails open on "unknown".
-export async function readAuthSnapshot(): Promise<AuthSnapshot> {
+//
+// Claude uses TWO detectors that must not disagree into a dead-end: the fast local reader
+// (file/keychain) answers most calls, but its positive "signed-out" is CONFIRMED against the CLI
+// (`claude auth status --json` — the signal the dispatch preflight trusts) before it is reported.
+// A credential stored somewhere the local reader doesn't cover would otherwise trap the user in the
+// sign-in modal ("Still signed out" / "didn't complete") while a real dispatch would succeed. The
+// CLI shell-out only happens on the signed-out path, so signed-in users never pay for it.
+export async function readAuthSnapshot(opts?: { claudeBin?: string }): Promise<AuthSnapshot> {
   const [claude, codex] = await Promise.all([
-    readClaudeAuthState().catch((): ProviderAuth => "unknown"),
+    readClaudeAuthState()
+      .then(async (local): Promise<ProviderAuth> => {
+        if (local !== "signed-out") return local
+        const cli = await readClaudeAuthStatusCli({ claudeBin: opts?.claudeBin })
+        return cli === "authed" ? "authed" : local
+      })
+      .catch((): ProviderAuth => "unknown"),
     Promise.resolve().then(() => readCodexAuthState()).catch((): ProviderAuth => "unknown"),
   ])
   return { claude, codex }

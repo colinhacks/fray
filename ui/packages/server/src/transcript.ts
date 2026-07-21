@@ -15,6 +15,7 @@ import type { Storage } from "./storage.ts"
 import type { AgentBackend, NormalizedEvent } from "./backend/types.ts"
 import { CODEX_FIRST_FINAL_TITLE_TRANSPORT, CODEX_LEGACY_FIRST_FINAL_TITLE_TRANSPORT, parseCodexLine, createCodexBackend, extractCodexFrayTitle } from "./backend/codex.ts"
 import { discoverTranscriptId, DISCOVERY_GRACE_MS } from "./discover.ts"
+import { isClaudeAuthErrorText } from "./tailer.ts"
 import { redactCredentialStructure, redactCredentialSyntax } from "./credential-redaction.ts"
 
 // Parse a session JSONL into a renderable conversation — mechanically, no AI. Same defensive
@@ -258,6 +259,18 @@ export function projectClaudeTranscript(raw: string, identityPrefix = "claude"):
     if (rec.type === "assistant") {
       const msg = rec.message
       if (!msg || !Array.isArray(msg.content)) continue
+      // A synthetic provider AUTH-error record (isApiErrorMessage + the 401/login text) is app
+      // state, not something the model said: its ONLY surface is the trusted recovery card driven by
+      // ThreadView.providerFault. Rendering it as an assistant bubble was the exact dead-end the
+      // claude-auth plan removes ("Please run /login" as a chat message). Other API errors
+      // (overloaded, rate-limit) keep their bubble — no card replaces them.
+      if (rec.isApiErrorMessage === true) {
+        const errText = msg.content
+          .filter((b: Raw) => b?.type === "text" && typeof b.text === "string")
+          .map((b: Raw) => b.text)
+          .join("\n")
+        if (isClaudeAuthErrorText(errText)) continue
+      }
       const id = typeof msg.id === "string" ? msg.id : null
       // Never merge into an EVENT line (a "Thought for Ns" emitted from this same turn's thinking
       // record sits at the tail with role:"assistant") — an event is punctuation, not a message body.

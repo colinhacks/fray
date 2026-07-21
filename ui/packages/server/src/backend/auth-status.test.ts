@@ -3,7 +3,7 @@ import assert from "node:assert/strict"
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
-import { parseClaudeAuthStatusJson, readClaudeAuthState, readClaudeAuthStatusCli, readCodexAuthState } from "./auth-status.ts"
+import { parseClaudeAuthStatusJson, readAuthSnapshot, readClaudeAuthState, readClaudeAuthStatusCli, readCodexAuthState } from "./auth-status.ts"
 
 // Codex reads env keys BEFORE the file, so a file-based test must run with those keys cleared or an
 // ambient OPENAI_API_KEY in the dev shell would mask the file logic. Clears + restores around fn.
@@ -161,4 +161,31 @@ test("parseClaudeAuthStatusJson: strict positive-signal parsing", () => {
   assert.equal(parseClaudeAuthStatusJson(`not json`), undefined)
   assert.equal(parseClaudeAuthStatusJson(``), undefined)
   assert.equal(parseClaudeAuthStatusJson(`prefix {"loggedIn": false} suffix`), false)
+})
+
+// M2 (review): the two Claude detectors must not disagree into a dead-end — a positive local
+// "signed-out" is confirmed against the CLI, and a CLI "authed" wins (credential stored somewhere
+// the file/keychain reader doesn't cover).
+test("readAuthSnapshot: CLI overrides a local signed-out; local verdict stands when CLI agrees or is unknown", async () => {
+  const savedConfig = process.env.CLAUDE_CONFIG_DIR
+  const savedKeychain = process.env.FRAY_KEYCHAIN_DISABLED
+  try {
+    await withTmpAsync(async (dir) => {
+      process.env.CLAUDE_CONFIG_DIR = dir // empty → local reader: signed-out
+      process.env.FRAY_KEYCHAIN_DISABLED = "1"
+      await withStub(`echo '{"loggedIn": true}'`, async (bin) => {
+        assert.equal((await readAuthSnapshot({ claudeBin: bin })).claude, "authed")
+      })
+      await withStub(`echo '{"loggedIn": false}'; exit 1`, async (bin) => {
+        assert.equal((await readAuthSnapshot({ claudeBin: bin })).claude, "signed-out")
+      })
+      // CLI unavailable → the positive local signed-out stands (never silently unknown).
+      assert.equal((await readAuthSnapshot({ claudeBin: "/nonexistent/claude-absent" })).claude, "signed-out")
+    })
+  } finally {
+    if (savedConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = savedConfig
+    if (savedKeychain === undefined) delete process.env.FRAY_KEYCHAIN_DISABLED
+    else process.env.FRAY_KEYCHAIN_DISABLED = savedKeychain
+  }
 })

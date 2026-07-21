@@ -75,6 +75,15 @@ export function SignInModal({
   function abandonAttempt() {
     if (attempt && !settledRef.current) void rpc.accountLoginCancel({ attemptId: attempt }).catch(() => {})
   }
+  // Unmount (thread switch, drawer close, route change) is also abandonment — without this, only the
+  // explicit Cancel/close paths tear the pane down and a navigation leaks it until the server-side
+  // lifetime timer. Refs, not state, so the cleanup sees the final values.
+  const abandonRef = useRef<{ attempt: string | null; settled: boolean }>({ attempt: null, settled: false })
+  abandonRef.current = { attempt, settled: settledRef.current }
+  useEffect(() => () => {
+    const { attempt: liveAttempt, settled } = abandonRef.current
+    if (liveAttempt && !settled) void rpc.accountLoginCancel({ attemptId: liveAttempt }).catch(() => {})
+  }, [])
 
   async function copyCommand() {
     try {

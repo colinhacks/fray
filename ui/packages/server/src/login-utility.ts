@@ -58,14 +58,28 @@ export function createLoginUtility(deps: {
   killSession?: typeof tmux.killSession
   hasSession?: typeof tmux.hasSession
   lookupPane?: typeof tmux.lookupAdoptionPane
+  listSessions?: typeof tmux.listSessions
 }): LoginUtility {
   const spawn = deps.spawn ?? tmux.spawn
   const ensureServer = deps.ensureServer ?? tmux.ensureServer
   const killSession = deps.killSession ?? tmux.killSession
   const hasSession = deps.hasSession ?? tmux.hasSession
   const lookupPane = deps.lookupPane ?? tmux.lookupAdoptionPane
+  const listSessions = deps.listSessions ?? tmux.listSessions
   const lifetimeMs = deps.lifetimeMs ?? ATTEMPT_LIFETIME_MS
   const attempts = new Map<string, LiveAttempt>()
+
+  // Boot-time orphan sweep: attempts live only in this process's memory, so a crash (no clean
+  // shutdown) can strand a remain-on-exit `fray-login-*` pane holding OAuth bytes in its scrollback.
+  // No attempt can legitimately be live when this utility is constructed — kill every leftover.
+  for (const name of listSessions()) {
+    if (!name.startsWith("fray-login-")) continue
+    try {
+      killSession(name.slice("fray-".length))
+    } catch {
+      // Best-effort: an unkillable leftover degrades to the tmux server's own lifetime.
+    }
+  }
 
   function loginArgv(backend: Backend): string[] {
     return backend === "codex" ? [deps.codexBin ?? "codex", "login"] : [deps.claudeBin ?? "claude", "auth", "login"]

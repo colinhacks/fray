@@ -86,18 +86,12 @@ import { providerResumeCommand } from "./external-terminal.ts"
 
 const SlugInput = z.object({ slug: ThreadSlug }).strict()
 
-const CLAUDE_GITHUB_PERMISSIONS = new Set(["auto", "default", "acceptEdits", "bypassPermissions"])
-const CODEX_GITHUB_PERMISSIONS = new Set(["default", "plan", "bypassPermissions"])
-
 // GitHub is a delayed confirmation flow, so validate its captured tuple again at the final server
-// boundary. This intentionally rejects cross-provider permission values and stale model/effort pairs;
-// neither is normalized, clamped, or replaced with Settings defaults.
+// boundary. This intentionally rejects stale model/effort pairs; neither is normalized, clamped, or
+// replaced with Settings defaults. Permission is NOT part of the tuple: dispatch stamps the fixed
+// non-interactive mode server-side (WORKER_DISPATCH_PERMISSION).
 export function validateGithubDispatchProfile(input: z.infer<typeof GithubBatchInput>): void {
   validateThreadProfile(input.backend, input.model, input.effort)
-  const permissions = input.backend === "codex" ? CODEX_GITHUB_PERMISSIONS : CLAUDE_GITHUB_PERMISSIONS
-  if (!permissions.has(input.permissionMode)) {
-    throw new Error(`Unsupported ${input.backend} permission mode: ${input.permissionMode}`)
-  }
 }
 
 export function githubDispatcherRequest(
@@ -113,7 +107,6 @@ export function githubDispatcherRequest(
       backend: input.backend,
       model: input.model,
       effort: input.effort,
-      permissionMode: input.permissionMode,
     },
     options: { backend: input.backend },
   }
@@ -948,7 +941,7 @@ export function createRouter(ctx: AppContext) {
     // on a network blip. Never throws — degrades to per-provider "unknown", on which the gate fails open.
     authStatus: query({
       output: AuthSnapshot,
-      handler: async () => readAuthSnapshot(),
+      handler: async () => readAuthSnapshot({ claudeBin: ctx.claudeBin }),
     }),
 
     // Typed provider account action behind the `/logout` alias + confirm dialog (claude-auth plan).
@@ -981,7 +974,7 @@ export function createRouter(ctx: AppContext) {
       output: AccountLoginStatusResult,
       handler: async ({ input }) => {
         const { state, backend } = ctx.loginUtility.status(input.attemptId)
-        const auth = await readAuthSnapshot()
+        const auth = await readAuthSnapshot({ claudeBin: ctx.claudeBin })
         // The login CLI finished → the pane is spent; tear it down eagerly so the OAuth bytes don't
         // linger in a dead pane. Cancel is idempotent.
         if (state === "exited") ctx.loginUtility.cancel(input.attemptId)

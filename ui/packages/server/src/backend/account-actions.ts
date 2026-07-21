@@ -38,7 +38,7 @@ export async function runProviderLogout(opts: {
   liveThreads: number
 }): Promise<AccountLogoutResult> {
   if (opts.liveThreads > 0) {
-    return { status: "blocked", activeThreads: opts.liveThreads, auth: (await readAuthSnapshot())[opts.backend] }
+    return { status: "blocked", activeThreads: opts.liveThreads, auth: (await readAuthSnapshot({ claudeBin: opts.claudeBin }))[opts.backend] }
   }
   const bin = opts.backend === "codex" ? (opts.codexBin ?? "codex") : (opts.claudeBin ?? "claude")
   const args = opts.backend === "codex" ? ["logout"] : ["auth", "logout"]
@@ -52,7 +52,7 @@ export async function runProviderLogout(opts: {
   }
   // The credential state AFTER the attempt is the truth the UI needs — a "failed" logout that still
   // cleared the credential (or was already signed out) should read as signed out.
-  const auth = (await readAuthSnapshot())[opts.backend]
+  const auth = (await readAuthSnapshot({ claudeBin: opts.claudeBin }))[opts.backend]
   if (failure && auth !== "signed-out") return { status: "failed", detail: failure, auth }
   return { status: "done", auth }
 }
