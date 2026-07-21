@@ -203,43 +203,23 @@ export function orderByInteraction(threads: readonly ThreadView[]): ThreadView[]
   })
 }
 
-// Queue cards have two deliberately small priority bands. A concrete unresolved request or failure
-// comes before an ordinary bare-rest/done handoff, even when that passive handoff was touched more
-// recently. Within a band, the queue orders FIFO (see orderQueue) so the human cycles through all
-// waiting work instead of re-triaging whatever rested most recently.
-// `pendingInteraction` is intentionally absent: a response still awaiting provider acknowledgement
-// remains readable, but only `actionableInteraction` means the human still owes a decision.
-export type QueuePriority = 0 | 1
-
-export function queuePriority(t: ThreadView): QueuePriority {
-  const hardAttention = Boolean(
-    t.actionableInteraction ||
-      t.pendingAsk ||
-      t.nativeInputRequired ||
-      t.pendingQuestion ||
-      t.runtime === "perm-prompt" ||
-      t.crashed ||
-      t.humanBlocked ||
-      t.status === "needs-human",
-  )
-  return hardAttention ? 0 : 1
-}
-
-// Within each priority band, order by DIRECTION (a per-browser view preference — see lib/prefs.ts):
+// The queue is a SINGLE strictly time-ordered list — no priority band. Every waiting card orders by
+// DIRECTION (a per-browser view preference — see lib/prefs.ts) alone, so the visible "oldest first"
+// rule is literally true across every card, attention and passive alike (maintainer 2026-07-21:
+// removed the hidden hard-attention band — "too confusing"; a fresh crash/permission-prompt no longer
+// floats above an older done card):
 //   • FIFO (default): the thread gone LONGEST without activity surfaces first (oldest lastActiveAt =
 //     ascending), so answering it sends it to the BACK of the line and the next-oldest rises — the
 //     human cycles through every waiting item instead of endlessly re-triaging whatever rested most
 //     recently (maintainer 2026-07-15: "first in first out is a better system… you are not constantly
 //     cycling through all of the tasks").
 //   • LIFO: the most-recently-active first (descending) — the older last-in-first-out feel.
-// The hard-attention band always leads regardless. lastActiveAt keys off when an AT-REST thread came
-// to rest (matching its "Last active" label) and off the stable user-interaction time for a running
-// row, so agent tool churn never reorders a card. id-tiebroken for a stable order among equal-age rows.
+// lastActiveAt keys off when an AT-REST thread came to rest (matching its "Last active" label) and off
+// the stable user-interaction time for a running row, so agent tool churn never reorders a card.
+// id-tiebroken for a stable order among equal-age rows.
 export function orderQueue(threads: readonly ThreadView[], direction: QueueDirection = "fifo"): ThreadView[] {
   const dir = direction === "lifo" ? -1 : 1
   return [...threads].sort((a, b) => {
-    const priority = queuePriority(a) - queuePriority(b)
-    if (priority !== 0) return priority
     const age = (lastActiveAt(a) - lastActiveAt(b)) * dir
     return age !== 0 ? age : a.id.localeCompare(b.id)
   })
