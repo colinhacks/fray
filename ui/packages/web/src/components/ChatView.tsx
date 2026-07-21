@@ -3,7 +3,7 @@ import { useSnapshot } from "valtio"
 import * as RadixTabs from "@radix-ui/react-tabs"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useVirtualizer } from "@tanstack/react-virtual"
-import { AlertTriangle, ArrowDown, ArrowUpRight, Check, ChevronRight, Clock, FileText, HelpCircle, KeyRound, ListChecks, Loader2, ShieldCheck, Sparkles, X } from "lucide-react"
+import { AlertTriangle, ArrowDown, ArrowLeft, ArrowUpRight, Check, ChevronRight, Clock, FileText, HelpCircle, KeyRound, ListChecks, Loader2, ShieldCheck, Sparkles, X } from "lucide-react"
 import type { AwaitingHint, NativeInputRequired as NativeInputRequiredData, PendingAsk, ThreadView as ThreadViewData, TranscriptEdit, TranscriptMessage, TranscriptToolCall } from "@fray-ui/shared"
 import { isValidAwaitingTimer } from "@fray-ui/shared"
 import { store, threadBySlug, pushDrawer, pushSubAgentDrawer, showToast } from "../store.ts"
@@ -70,7 +70,7 @@ export const ThreadSlugContext = createContext<string | null>(null)
 // scratchpad doc (a session thread's compaction-proof working memory — read-only).
 export type ThreadTab = "chat" | "scratch"
 
-export function ThreadView({ slug, tab, onTab, onStatusApplied, onClose, virtualized = false }: { slug: string; tab: ThreadTab; onTab: (t: ThreadTab) => void; onStatusApplied?: () => void; onClose?: () => void; virtualized?: boolean }) {
+export function ThreadView({ slug, tab, onTab, onStatusApplied, onClose, virtualized = false, showReturnToQueue = false }: { slug: string; tab: ThreadTab; onTab: (t: ThreadTab) => void; onStatusApplied?: () => void; onClose?: () => void; virtualized?: boolean; showReturnToQueue?: boolean }) {
   const board = useBoard()
   const thread = threadBySlug(board, slug)
   return (
@@ -80,7 +80,7 @@ export function ThreadView({ slug, tab, onTab, onStatusApplied, onClose, virtual
       activationMode="automatic"
       className="flex-1 min-h-0 flex flex-col"
     >
-      <ThreadHeader slug={slug} tab={tab} onStatusApplied={onStatusApplied} onClose={onClose} />
+      <ThreadHeader slug={slug} tab={tab} onStatusApplied={onStatusApplied} onClose={onClose} showReturnToQueue={showReturnToQueue} />
       {tab === "scratch" ? (
         <RadixTabs.Content value="scratch" className="flex-1 min-h-0 flex flex-col outline-none">
         <InteractionStack
@@ -193,7 +193,16 @@ function ChatView({ slug, onTab, virtualized }: { slug: string; onTab: (t: Threa
       data-drawer-scroll-ready={q.isPending ? "false" : "true"}
       className="flex-1 min-h-0 flex flex-col overflow-hidden outline-none"
     >
-      <div ref={transcriptRef} data-drawer-transcript-scroll data-standalone-transcript={virtualized || undefined} className="relative min-h-0 flex-1 overflow-y-auto">
+      <div
+        ref={transcriptRef}
+        data-drawer-transcript-scroll
+        data-standalone-transcript={virtualized || undefined}
+        tabIndex={virtualized ? 0 : undefined}
+        role={virtualized ? "region" : undefined}
+        aria-label={virtualized ? "Thread conversation" : undefined}
+        aria-busy={virtualized && loadingEarlier ? true : undefined}
+        className="relative min-h-0 flex-1 overflow-y-auto outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-fg/60"
+      >
       {virtualized && count > 0 ? (
         <VirtualizedThreadTranscript
           slug={slug}
@@ -664,7 +673,9 @@ function VirtualizedThreadTranscript({
                 ) : loadingEarlier ? (
                   <span className="flex items-center gap-2"><Loader2 size={12} className="animate-spin" /> Loading earlier messages…</span>
                 ) : (
-                  <span>Scroll up to load earlier messages</span>
+                  <button type="button" onClick={requestEarlier} className="rounded-md px-2 py-1 outline-none hover:bg-panel-2 hover:text-fg focus-visible:ring-1 focus-visible:ring-fg/60">
+                    Load earlier messages
+                  </button>
                 )}
               </div>
             ) : row.kind === "message" ? (
@@ -718,7 +729,7 @@ function VirtualizedThreadTranscript({
 // non-lifecycle HeaderActions. Snooze and Archive stay in the persistent thread footer. The tab is CONTROLLED
 // (tab/onTab) so the drawer drives its own copy. Owned sessions expose a command-copy icon; foreign
 // rows do not. The Doc tab appears only when the thread has a provisioned scratchpad.
-export function ThreadHeader({ slug, tab, onStatusApplied, onClose }: { slug: string; tab: ThreadTab; onStatusApplied?: () => void; onClose?: () => void }) {
+export function ThreadHeader({ slug, tab, onStatusApplied, onClose, showReturnToQueue = false }: { slug: string; tab: ThreadTab; onStatusApplied?: () => void; onClose?: () => void; showReturnToQueue?: boolean }) {
   const board = useBoard()
   const thread = threadBySlug(board, slug)
   const markComplete = useMutation({ mutationFn: () => rpc.markComplete({ slug }) })
@@ -796,7 +807,20 @@ export function ThreadHeader({ slug, tab, onStatusApplied, onClose }: { slug: st
       className={THREAD_HEADER_CLASS}
     >
       <div className={THREAD_HEADER_TITLE_CLASS}>
-        <div className="min-w-0 leading-tight">
+        <div className="flex min-w-0 items-center gap-1.5">
+          {showReturnToQueue && (
+            <Tooltip label="Return to queue">
+              <a
+                href="/"
+                aria-label="Return to queue"
+                data-standalone-return
+                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted outline-none transition-colors hover:bg-panel-2 hover:text-fg focus-visible:ring-1 focus-visible:ring-fg/60"
+              >
+                <ArrowLeft size={14} />
+              </a>
+            </Tooltip>
+          )}
+          <div className="min-w-0 flex-1 leading-tight">
           {/* Keep the title's display wrapper content-sized. Long names still truncate inside the
               remaining header width, but short names do not claim the whole row as a click target. */}
           <div className="flex min-w-0 items-center gap-1">
@@ -863,6 +887,7 @@ export function ThreadHeader({ slug, tab, onStatusApplied, onClose }: { slug: st
             )}
           </div>
           <LastActive at={lastActiveLabelAt(thread)} fallbackAt={thread.spawnedAt} className="mt-0.5 block truncate text-[11px] leading-tight text-muted/75" />
+          </div>
         </div>
       </div>
       {/* At constrained drawer widths, controls get their own deliberate row. This keeps the

@@ -87,7 +87,7 @@ export function StandaloneThreadPage({ slug }: { slug: string }) {
               </a>
             </div>
           ) : (
-            <ThreadView slug={slug} tab={effectiveTab} onTab={setTab} virtualized />
+            <ThreadView slug={slug} tab={effectiveTab} onTab={setTab} virtualized showReturnToQueue />
           )}
         </main>
         <Toaster />
