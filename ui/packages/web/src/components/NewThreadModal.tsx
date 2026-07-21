@@ -2,12 +2,13 @@ import * as RadixDialog from "@radix-ui/react-dialog"
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import { useSnapshot } from "valtio"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import type { DispatchInput, SetDispatchPreferenceInput } from "@fray-ui/shared"
+import type { Backend, DispatchInput, SetDispatchPreferenceInput } from "@fray-ui/shared"
 import { rpc } from "../api/rpc.ts"
 import { showToast, store } from "../store.ts"
 import { Composer } from "./Composer.tsx"
 import { GithubTrigger } from "./GithubTrigger.tsx"
 import { ProfileGridSelector } from "./ProfileGridSelector.tsx"
+import { SignInModal } from "./SignInModal.tsx"
 import { Select } from "./ui/Select.tsx"
 import {
   PERMISSION_COLOR,
@@ -50,6 +51,15 @@ export function DispatchForm({
   const promptKey = draftKey.dispatch(projectDir, planPath)
   const submittedDraftRef = useRef("")
   const [pendingDispatch, setPendingDispatch] = useState<string | null>(null)
+
+  // Per-provider LOCAL credential presence, polled so the submit gate has a fresh value without a
+  // round-trip on every keystroke. The gate blocks ONLY on a positive "signed-out" (fails open on
+  // "unknown"/loading/error), so a stale or missing snapshot can never trap a logged-in user.
+  const authStatus = useQuery({ queryKey: ["authStatus"], queryFn: () => rpc.authStatus(), staleTime: 30_000 })
+  // When submit is gated, the built dispatch is stashed here and the sign-in modal opens for this
+  // backend; a successful re-check runs the stashed dispatch unchanged.
+  const [signInFor, setSignInFor] = useState<Backend | null>(null)
+  const gatedInputRef = useRef<DispatchInput | null>(null)
 
   const preference = useMutation({
     mutationFn: (update: SetDispatchPreferenceInput) => rpc.dispatchPreferenceSet(update),
@@ -101,6 +111,16 @@ export function DispatchForm({
     preference.mutate(update)
   }
 
+  // Fire the dispatch and do the one-shot UI bookkeeping (optimistic toast + prompt clear). Called both
+  // on a clean submit and after the sign-in gate is cleared, so the prompt is only cleared once the
+  // thread is actually being started — a gated submit leaves the draft intact.
+  function runDispatch(input: DispatchInput) {
+    submittedDraftRef.current = prompt
+    clearPrompt()
+    setPendingDispatch(input.prompt)
+    dispatch.mutate(input)
+  }
+
   function submit() {
     if (!prompt.trim() || !resolved) return
     if (!resolved.modelAvailable) {
@@ -111,14 +131,8 @@ export function DispatchForm({
       showToast("Saved reasoning level is unavailable for this model — choose another level")
       return
     }
-    const submittedPrompt = prompt.trim()
-    // Dispatch has no transcript slug yet, so its immediate optimistic representation is the
-    // starting-thread toast. Crucially the controlled prompt clears in this same event turn.
-    submittedDraftRef.current = prompt
-    clearPrompt()
-    setPendingDispatch(submittedPrompt)
-    dispatch.mutate({
-      prompt: submittedPrompt,
+    const input: DispatchInput = {
+      prompt: prompt.trim(),
       // For codex the stored permissionMode is mapped to the sandbox-facing value shown in the
       // readout, so the dispatch carries exactly what the user sees (the server's codexSandbox then
       // maps it to `-s`). Model and effort were already validated against the hydrated catalogue.
@@ -127,7 +141,15 @@ export function DispatchForm({
       backend: resolved.backend,
       effort: resolved.effort as DispatchInput["effort"],
       ...(planPath ? { planPath } : {}),
-    })
+    }
+    // Auth gate: block ONLY on a positive "signed-out" for this dispatch's backend. Loading/unknown/
+    // authed all fall through (fail open) so a flaky or slow read never blocks a logged-in user.
+    if (authStatus.data?.[resolved.backend] === "signed-out") {
+      gatedInputRef.current = input
+      setSignInFor(resolved.backend)
+      return
+    }
+    runDispatch(input)
   }
 
   // The profile/permission readouts live INSIDE the box, along its bottom edge — petite caps,
@@ -215,6 +237,18 @@ export function DispatchForm({
           </div>
           <p className="mt-1 line-clamp-2 whitespace-pre-wrap text-[12px] leading-relaxed text-fg">{pendingDispatch}</p>
         </div>
+      )}
+      {signInFor && (
+        <SignInModal
+          backend={signInFor}
+          onClose={() => setSignInFor(null)}
+          onAuthed={() => {
+            const input = gatedInputRef.current
+            gatedInputRef.current = null
+            setSignInFor(null)
+            if (input) runDispatch(input)
+          }}
+        />
       )}
     </div>
   )

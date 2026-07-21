@@ -20,6 +20,7 @@ import {
   TranscriptEarlierInput,
   CodexModel,
   QuotaSnapshot,
+  AuthSnapshot,
   RenameThreadInput,
   AiRenameThreadInput,
   AiRenameThreadResult,
@@ -65,6 +66,7 @@ import { ghInstalled, ghAuthed, ghRepo, listItems, hydrateIssue, hydratePr, rend
 import { slugify, resolveSlug, resolveLegacyThreadFile } from "./dispatch.ts"
 import { readCodexModels } from "./backend/codex-models.ts"
 import { readQuota } from "./quota.ts"
+import { readAuthSnapshot } from "./backend/auth-status.ts"
 import { threadProfileOptions, validateThreadProfile } from "./backend/thread-profiles.ts"
 import * as tmux from "./tmux.ts"
 import { adoptionRuntimeBinding } from "./adoption-recovery.ts"
@@ -931,6 +933,15 @@ export function createRouter(ctx: AppContext) {
     quota: query({
       output: QuotaSnapshot,
       handler: async () => readQuota(),
+    }),
+
+    // Per-provider LOCAL credential presence for the new-thread dispatch gate. Distinct from `quota`
+    // (whose "unavailable" is overloaded with transient endpoint failures): this reports only whether a
+    // credential exists, so a dispatch can be blocked on a genuine "signed-out" without false-blocking
+    // on a network blip. Never throws — degrades to per-provider "unknown", on which the gate fails open.
+    authStatus: query({
+      output: AuthSnapshot,
+      handler: async () => readAuthSnapshot(),
     }),
 
     settingsGet: query({

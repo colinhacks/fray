@@ -29,6 +29,7 @@ import type {
   GithubBatchResult,
   CodexModel,
   QuotaSnapshot,
+  AuthSnapshot,
   DispatchPreferences,
   SetDispatchPreferenceInput,
   ListInteractionsInput,
@@ -120,6 +121,9 @@ export interface Api {
   // from rollout JSONL; Claude best-effort via its undocumented OAuth usage endpoint. Never rejects —
   // each provider degrades to "unavailable".
   quota(): Promise<QuotaSnapshot>
+  // Per-provider LOCAL credential presence for the new-thread dispatch gate. Distinct from quota's
+  // overloaded "unavailable" — reports only whether a credential exists. Never rejects.
+  authStatus(): Promise<AuthSnapshot>
   settingsGet(): Promise<Settings>
   settingsSet(input: Settings): Promise<void>
   settingsReset(): Promise<Settings>
@@ -180,6 +184,7 @@ const PROCEDURES: Record<keyof Api, ProcType> = {
   aiRenameThread: "mutation",
   codexModels: "query",
   quota: "query",
+  authStatus: "query",
   settingsGet: "query",
   settingsSet: "mutation",
   settingsReset: "mutation",
