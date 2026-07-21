@@ -11,7 +11,10 @@ test("collapsed tool counts and thought events share one metadata-label rhythm",
   assert.ok(toolClass, "collapsed tool-count button must consume the shared metadata-label class")
   assert.doesNotMatch(toolClass, /(?:text-\[|leading-|text-muted\/)/, "tool-count button must not override the shared type rhythm")
   assert.match(source, /className=\{TRANSCRIPT_META_LABEL_CLASS\}>\{text\}<\/div>/)
-  assert.match(source, /<ChevronRight[^>]*className=\{`relative -top-px shrink-0 transition-transform/)
+  // No vertical nudge on the toggle chevrons: the 12px icon's ink center already lands on the
+  // petite-caps optical center; `-top-px` rode visibly high (2 device px on retina).
+  assert.match(source, /<ChevronRight[^>]*className=\{`shrink-0 transition-transform/)
+  assert.doesNotMatch(source, /<ChevronRight[^>]*-top-px/)
 })
 
 test("codex reasoning toggle is a peer of the other metadata labels", () => {

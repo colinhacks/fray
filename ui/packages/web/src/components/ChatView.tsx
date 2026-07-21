@@ -770,7 +770,8 @@ function ToolCalls({ tools, dense }: { tools: CollapsedTool[]; dense?: boolean }
       >
         {/* Label stays "N tool calls" in BOTH states — the rotating chevron alone signals open/closed. */}
         <span className="tabular-nums">{total} tool calls</span>
-        <ChevronRight aria-hidden="true" size={12} className={`relative -top-px shrink-0 transition-transform ${expanded ? "rotate-90" : ""}`} />
+        {/* No vertical nudge: the 12px icon's ink center already sits on the petite-caps optical center. */}
+        <ChevronRight aria-hidden="true" size={12} className={`shrink-0 transition-transform ${expanded ? "rotate-90" : ""}`} />
       </button>,
     )
   }
@@ -2283,7 +2284,7 @@ function ReasoningBlock({ text, durationMs }: { text: string; durationMs?: numbe
         className={`${TRANSCRIPT_META_LABEL_CLASS} flex items-center gap-1 self-start rounded outline-none transition-colors hover:text-fg focus-visible:ring-1 focus-visible:ring-fg/60`}
       >
         <span>{label}</span>
-        <ChevronRight aria-hidden="true" size={12} className={`relative -top-px shrink-0 transition-transform ${open ? "rotate-90" : ""}`} />
+        <ChevronRight aria-hidden="true" size={12} className={`shrink-0 transition-transform ${open ? "rotate-90" : ""}`} />
       </button>
       {open && (
         <div id={bodyId} className="fray-reasoning mt-1.5 ml-[5px] border-l border-border/70 pl-3">
