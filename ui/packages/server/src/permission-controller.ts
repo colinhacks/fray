@@ -35,7 +35,7 @@ export interface PermissionTerminal {
 
 export interface PermissionController {
   request(slug: string, requested: PermissionModeValue): Promise<{ effect: "applied" | "next-resume" }>
-  queueFollowUp(slug: string, message: string, deliveryId?: string): void
+  queueFollowUp(slug: string, message: string, deliveryId?: string, expectedSessionId?: string): void
   submitExistingDraft(slug: string): { effect: "submitted" }
   prepareCodexDraftReplacement(slug: string): { queuedMessage: string }
   clearAmbiguousCodexInput(slug: string): { effect: "cleared" }
@@ -431,8 +431,11 @@ export function createPermissionController(deps: PermissionControllerDeps): Perm
     })
   }
 
-  function queueFollowUp(slug: string, message: string, deliveryId?: string): void {
+  function queueFollowUp(slug: string, message: string, deliveryId?: string, expectedSessionId?: string): void {
     let row = deps.storage.getSession(slug)
+    if (expectedSessionId && row?.session_id !== expectedSessionId) {
+      throw new Error("This thread was replaced before queued input could take control")
+    }
     if (!row || row.backend !== "codex" || runtimeState(row) !== "live") {
       throw new Error(`live Codex session ${slug} is not available`)
     }

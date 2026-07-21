@@ -25,6 +25,20 @@ function toolLine(name: string, input: unknown): string {
   })
 }
 
+test("Claude transcript messages retain each signal fence's exact historical generation", () => {
+  const fence = "```awaiting\ngithub-review: owner/repo#9\nReview.\n```"
+  const raw = [
+    { type: "assistant", timestamp: "2026-07-01T00:00:01.000Z", message: { id: "a1", stop_reason: "end_turn", content: [{ type: "text", text: fence }] } },
+    { type: "user", timestamp: "2026-07-01T00:00:02.000Z", message: { content: "Keep waiting." } },
+    { type: "assistant", timestamp: "2026-07-01T00:00:03.000Z", message: { id: "a2", stop_reason: "end_turn", content: [{ type: "text", text: fence }] } },
+  ].map((record) => JSON.stringify(record)).join("\n")
+  const signals = projectClaudeTranscript(raw).filter((message) => message.role === "assistant")
+  assert.deepEqual(signals.map((message) => message.signalAt), [
+    "2026-07-01T00:00:01.000Z",
+    "2026-07-01T00:00:03.000Z",
+  ])
+})
+
 const githubTask = `THREAD: investigate-cli-cli-326
 
 Investigate this issue and make recommendations

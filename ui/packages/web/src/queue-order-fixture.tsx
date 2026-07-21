@@ -17,7 +17,7 @@ const DAY = 24 * 60 * MIN
 
 type Seed = { id: string; title: string; at: number; extra: Partial<ThreadViewModel> }
 const SEEDS: Seed[] = [
-  { id: "oldest-done", title: "① Oldest · done handoff · 5d ago", at: 5 * DAY, extra: { runtime: "turn-idle", lastFence: { kind: "done", body: "Shipped the fix.", hints: [] } } },
+  { id: "oldest-done", title: "① Oldest · done handoff · 5d ago", at: 5 * DAY, extra: { runtime: "turn-idle", lastFence: { kind: "done", body: "Shipped the fix." } } },
   { id: "middle-question", title: "② Middle · question · 3d ago", at: 3 * DAY, extra: { runtime: "turn-idle", pendingQuestion: true } },
   { id: "newest-crash", title: "③ Newest · CRASH · 40m ago", at: 40 * MIN, extra: { runtime: "exited", crashed: true } },
 ]

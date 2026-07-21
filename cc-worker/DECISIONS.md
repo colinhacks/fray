@@ -386,24 +386,25 @@ the seed hook NAMES that concrete path to the worker, so dispatch must keep pinn
 scope (not editable here), but it now CONTRADICTS the v2 WORKER_PROMPT and must be rewritten to the
 fence/scratchpad model (or dropped) by the dispatch owner. Flagged to server-core.
 
-## 2026-07-12: awaiting reversal — park only human/timestamp gates; keep automation active
+## 2026-07-21: awaiting is a single opt-in PR-review or timer wait
 
-The v2 rule above made `awaiting` a broad machine-wait bucket. In practice workers emitted a fence
-for CI, bots, releases, and merge progression, then returned with no process actually owning the
-next transition. The rail's hourglass therefore implied a watcher that often did not exist. The
-contract is now narrower:
+The broad machine-wait bucket produced cards whose mixed metadata looked like several watchers and
+made it unclear what the operator was consenting to. The contract is now narrow and explicit:
 
-- `awaiting` is a deliberate PARK for either `human: <actor + exact external review/approval>` or
-  `timer: <ISO-8601 instant>`. The dashboard operator's own decision remains `question`.
+- One `awaiting` fence proposes exactly one wait: `github-review: owner/repo#NUMBER` for new non-bot
+  human activity on an external PR, or `timer: <ISO-8601 instant>` for one scheduled recheck. The
+  prose names the human and exact review/action. The dashboard operator's own decision remains
+  `question`.
+- A proposal remains in Queue and does nothing until the operator confirms its card. Confirmation
+  durably arms that exact final-message generation and moves it to Held. A later follow-up or fence
+  invalidates the registration.
 - CI, automated review, releases/deploys, merge queues, and already-authorized merge progression
   stay ACTIVE. Claude workers use a background `Bash` one-shot or `Monitor`; Codex workers keep a
   blocking exec session alive and poll it. Their completion/event re-invokes the worker.
-- `pr:` / `ci:` / `session:` continue to parse so old transcripts do not break. The existing PR/CI
-  waker remains a compatibility bridge, but workers must not create new waits with those hints.
-  `timer:` remains the durable scheduler path across process/session restart. `human:` is descriptive
-  and intentionally not auto-fired.
+- No `human:`, `pr:`, `ci:`, or `session:` hint is recognized. Multiple recognized hints also fail
+  closed as visible prose, with no confirmation action or scheduler registration.
 - Every follow-up clears the old fence. “Back to awaiting” requires a fresh check: re-emit a current
-  human/timer fence, or re-arm automation and remain active.
+  single review/timer proposal, or re-arm automation and remain active.
 
 Claude Code 2.1.207 was audited before teaching this. fray-ui does not pass `--tools`,
 `--allowedTools`, or `--disallowedTools`, and its helper profiles only select model/effort, so wait

@@ -38,7 +38,7 @@ test("thread lifecycle controls have one footer home independent of queue/done p
     snooze: true,
     archive: true,
   })
-  assert.deepEqual(threadLifecycleAvailability(thread({ lastFence: { kind: "done", body: "Shipped", hints: [] } })), {
+  assert.deepEqual(threadLifecycleAvailability(thread({ lastFence: { kind: "done", body: "Shipped" } })), {
     footer: true,
     snooze: true,
     archive: true,

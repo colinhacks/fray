@@ -19,56 +19,72 @@ test("a done fence with surrounding prose", () => {
   const text = "Shipped the fix.\n\n```done\nMerged PR and cleaned up the branch.\n```\n\nAnything else?"
   assert.deepEqual(splitFenceBlocks(text), [
     { kind: "prose", text: "Shipped the fix.\n\n" },
-    { kind: "fence", fenceKind: "done", body: "Merged PR and cleaned up the branch.", hints: [] },
+    { kind: "fence", fenceKind: "done", body: "Merged PR and cleaned up the branch." },
     { kind: "prose", text: "\n\nAnything else?" },
   ])
 })
 
-test("an awaiting fence: current human/github-review/timer hint lines parse with the prose", () => {
-  const text = "```awaiting\nWaiting on a named maintainer at a scheduled checkpoint.\nhuman: Alice must approve fork CI\ngithub-review: owner/repo#12\ntimer: 2026-07-15T17:00:00Z\n```"
+test("an awaiting fence parses one review hint with its prose", () => {
+  const text = "```awaiting\ngithub-review: owner/repo#12\nAlice must review the PR.\n```"
   assert.deepEqual(splitFenceBlocks(text), [
     {
       kind: "fence",
       fenceKind: "awaiting",
-      body: "Waiting on a named maintainer at a scheduled checkpoint.",
-      hints: [
-        { kind: "human", value: "Alice must approve fork CI" },
-        { kind: "github-review", value: "owner/repo#12" },
-        { kind: "timer", value: "2026-07-15T17:00:00Z" },
-      ],
+      body: "Alice must review the PR.",
+      hint: { kind: "github-review", value: "owner/repo#12" },
     },
   ])
 })
 
-test("awaiting hint kinds are case-insensitive; current and legacy kinds remain readable", () => {
-  const { hints, body } = parseFenceBody("Human: Alice approves\nTimer: 2026-07-15T17:00:00Z\nPR: p\nCI: c\nSession: sub-123\nprose tail", "awaiting")
-  assert.deepEqual(hints, [
-    { kind: "human", value: "Alice approves" },
-    { kind: "timer", value: "2026-07-15T17:00:00Z" },
-    { kind: "pr", value: "p" },
-    { kind: "ci", value: "c" },
-    { kind: "session", value: "sub-123" },
-  ])
+test("awaiting hint kind is case-insensitive", () => {
+  const { hint, body } = parseFenceBody("Timer: 2026-07-15T17:00:00Z\nprose tail", "awaiting")
+  assert.deepEqual(hint, { kind: "timer", value: "2026-07-15T17:00:00Z" })
   assert.equal(body, "prose tail")
 })
 
-test("a done fence never carries hints — hint-looking lines stay in the body", () => {
-  const { hints, body } = parseFenceBody("all set\npr: owner/repo#7", "done")
-  assert.deepEqual(hints, [])
-  assert.equal(body, "all set\npr: owner/repo#7")
+test("a done fence never carries a hint — hint-looking lines stay in the body", () => {
+  const { hint, body } = parseFenceBody("all set\ntimer: 2026-07-15T17:00:00Z", "done")
+  assert.equal(hint, undefined)
+  assert.equal(body, "all set\ntimer: 2026-07-15T17:00:00Z")
 })
 
-test("an awaiting fence with no hints → empty hints, whole body prose", () => {
+test("multiple supported hints are visible prose and non-signaling", () => {
+  const raw = "github-review: owner/repo#7\ntimer: 2026-07-15T17:00:00Z\nChoose one."
+  const parsed = parseFenceBody(raw, "awaiting")
+  assert.equal(parsed.hint, undefined)
+  assert.equal(parsed.body, raw)
+})
+
+test("a malformed supported hint is visible prose and non-signaling", () => {
+  const raw = "timer: 10m\nUse a real ISO instant."
+  const parsed = parseFenceBody(raw, "awaiting")
+  assert.equal(parsed.hint, undefined)
+  assert.equal(parsed.body, raw)
+
+  const impossible = "timer: 2099-02-31T08:45:00Z\nThis date does not exist."
+  const invalidCalendar = parseFenceBody(impossible, "awaiting")
+  assert.equal(invalidCalendar.hint, undefined)
+  assert.equal(invalidCalendar.body, impossible)
+})
+
+test("removed hint names remain visible prose", () => {
+  const raw = "human: Alice\npr: owner/repo#7\nci: build\nsession: sub-123"
+  const { hint, body } = parseFenceBody(raw, "awaiting")
+  assert.equal(hint, undefined)
+  assert.equal(body, raw)
+})
+
+test("an awaiting fence with no hint keeps its whole body as prose", () => {
   const segs = splitFenceBlocks("```awaiting\nJust waiting a bit.\n```")
-  assert.deepEqual(segs, [{ kind: "fence", fenceKind: "awaiting", body: "Just waiting a bit.", hints: [] }])
+  assert.deepEqual(segs, [{ kind: "fence", fenceKind: "awaiting", body: "Just waiting a bit." }])
 })
 
 test("multiple fences in order", () => {
   const text = "```awaiting\nhold\ntimer: 10m\n```\nlater\n```done\nfinished\n```"
   assert.deepEqual(splitFenceBlocks(text), [
-    { kind: "fence", fenceKind: "awaiting", body: "hold", hints: [{ kind: "timer", value: "10m" }] },
+    { kind: "fence", fenceKind: "awaiting", body: "hold\ntimer: 10m" },
     { kind: "prose", text: "\nlater\n" },
-    { kind: "fence", fenceKind: "done", body: "finished", hints: [] },
+    { kind: "fence", fenceKind: "done", body: "finished" },
   ])
 })
 
@@ -92,8 +108,8 @@ test("unterminated fence degrades to plain prose (no fence segment)", () => {
 })
 
 test("CRLF line endings are handled", () => {
-  const segs = splitFenceBlocks("```awaiting\r\nhold on\r\nci: build 9\r\n```")
-  assert.deepEqual(segs, [{ kind: "fence", fenceKind: "awaiting", body: "hold on", hints: [{ kind: "ci", value: "build 9" }] }])
+  const segs = splitFenceBlocks("```awaiting\r\nhold on\r\ngithub-review: owner/repo#9\r\n```")
+  assert.deepEqual(segs, [{ kind: "fence", fenceKind: "awaiting", body: "hold on", hint: { kind: "github-review", value: "owner/repo#9" } }])
 })
 
 test("hasFence detects done and awaiting, ignores question/plain", () => {
@@ -105,5 +121,5 @@ test("hasFence detects done and awaiting, ignores question/plain", () => {
 
 test("an empty done body is allowed (body may be '')", () => {
   const segs = splitFenceBlocks("```done\n\n```")
-  assert.deepEqual(segs, [{ kind: "fence", fenceKind: "done", body: "", hints: [] }])
+  assert.deepEqual(segs, [{ kind: "fence", fenceKind: "done", body: "" }])
 })

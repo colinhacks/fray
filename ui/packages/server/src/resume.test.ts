@@ -208,7 +208,21 @@ test("resumeThread un-archives a bumped LIVE archived thread (Inactive → Activ
   assert.equal(sectionOf(threadIn(board.refresh(), slug)), "inactive")
 
   const tmux = fakeTmux(true)
-  resumeThread({ project: fakeProject("/tmp"), storage, board, getSettings: () => settings, tmux }, slug, "get back to work")
+  assert.throws(
+    () => resumeThread(
+      { project: fakeProject("/tmp"), storage, board, getSettings: () => settings, tmux },
+      slug,
+      "stale follow-up",
+      "replaced-session",
+    ),
+    /thread was replaced/,
+  )
+  resumeThread(
+    { project: fakeProject("/tmp"), storage, board, getSettings: () => settings, tmux },
+    slug,
+    "get back to work",
+    `sid-${slug}`,
+  )
 
   // The bump reached the live session as an inject…
   assert.deepEqual(tmux.keyed, ["get back to work"])

@@ -182,8 +182,9 @@ the exact head SHA: `ACTION_REQUIRED` fork gates are pending, not green. The rev
 on new non-bot activity after its baseline. Neither script exposes GitHub credentials or detaches a
 process; cancelling the worker cancels its monitor, and restarting launches a new owned monitor.
 
-Fray UI's server scheduler remains the durable fallback for wall-clock `timer:` and external-human
-`human:` + `github-review:` gates. It is not a substitute for an active CI monitor or evidence that
+Fray UI's server scheduler owns operator-confirmed, one-per-fence wall-clock `timer:` and external-human
+PR `github-review:` waits. The fence prose names the reviewer and requested action; no second metadata
+hint is paired with it. This scheduler is not a substitute for an active CI monitor or evidence that
 the full CI matrix passed.
 
 Codex keeps the selected monitor in one persistent `exec_command` / `write_stdin` session. A routed

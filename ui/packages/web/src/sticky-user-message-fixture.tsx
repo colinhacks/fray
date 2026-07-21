@@ -137,7 +137,7 @@ function Fixture() {
   if (surface === "fence") {
     return (
       <div className="mx-auto mt-10 w-[min(680px,calc(100%-32px))]">
-        <FenceCard fenceKind="done" body={fenceBody} hints={[]} />
+        <FenceCard fenceKind="done" body={fenceBody} />
       </div>
     )
   }

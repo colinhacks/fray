@@ -517,7 +517,17 @@ function expectedPaneIdentityCondition(expected: PaneIdentity, requireLive = tru
 
 const EXACT_ACTION_OK = "FRAY_EXACT_ACTION_OK_9A74D2"
 const EXACT_ACTION_MISS = "FRAY_EXACT_ACTION_MISS_9A74D2"
-const INPUT_SETTLE_COMMAND = "/bin/sleep 0.25"
+let inputSettleCommand = "/bin/sleep 0.25"
+
+// A deterministic race-test seam: the child transport can hold the tmux queue at the exact
+// paste/key boundary until its parent replaces the pane. Production never calls this, and the
+// deliberately narrow absolute-path grammar cannot inject shell syntax into run-shell.
+export function setInputSettleGateForTests(gatePath: string): void {
+  if (!isAbsolute(gatePath) || !/^[A-Za-z0-9_./-]+$/.test(gatePath) || !gatePath.includes("fray-tmux-settle-")) {
+    throw new Error("invalid tmux settle test gate")
+  }
+  inputSettleCommand = `/bin/sh -c "while [ ! -e ${gatePath} ]; do /bin/sleep 0.01; done"`
+}
 
 // Codex can read a pasted block and an immediately adjacent key as one input burst, leaving the
 // text in its composer even though tmux accepted both commands. A blocking run-shell remains part
@@ -535,7 +545,7 @@ function sendTextWithKeyToPane(
   const buffer = `${bufferPrefix}-${randomUUID()}`
   const complete = `send-keys -t ${paneId} ${key} ; display-message -p ${EXACT_ACTION_OK}`
   const afterSettle = `if-shell -t ${paneId} -F '${condition}' '${complete}' 'display-message -p ${EXACT_ACTION_MISS}'`
-  const authorized = `paste-buffer -p -b ${buffer} -t ${paneId} ; run-shell '${INPUT_SETTLE_COMMAND}' ; ${afterSettle}`
+  const authorized = `paste-buffer -p -b ${buffer} -t ${paneId} ; run-shell '${inputSettleCommand}' ; ${afterSettle}`
   try {
     const out = execFileSync("tmux", [
       "-L", socketName,

@@ -265,9 +265,10 @@ test("loadWorkerPrompt: the backend-AGNOSTIC core is present in BOTH contracts",
     assert.match(c, /## Git discipline/)
     assert.match(c, /## Quality bar/)
     assert.match(c, /## The stop criterion/)
-    assert.match(c, /human: <actor \+ exact review\/approval>/) // current awaiting grammar
+    assert.match(c, /github-review: owner\/repo#NUMBER/) // current awaiting grammar
     assert.match(c, /timer: <ISO-8601 instant>/)
-    assert.match(c, /`pr:` \/ `ci:` \/ `session:` remain/) // legacy readability is explicit
+    assert.match(c, /Do not emit `human:`, `pr:`, `ci:`, or `session:` hints; they are not recognized/)
+    assert.match(c, /fence does not arm itself/i)
     assert.match(c, /## Agent completion invariant/)
     assert.match(c, /let it run to its terminal return/)
     assert.match(c, /partially applied edits, tests, and owned processes/)
@@ -281,18 +282,19 @@ test("awaiting re-entry: every worker-contract surface requires a fresh fence af
   // This is deliberately pinned across the shipped backend contracts (the single source — the former
   // fray:worker skill copy was deleted; session-seed is a slim pointer, see its own test). A
   // human turn clears lastFence in the tailer, so merely saying "already parked" cannot restore the
-  // state: the worker must make a fresh decision, then repeat a current human/timer fence or re-arm
+  // state: the worker must make a fresh decision, then repeat a current review/timer fence or re-arm
   // the active backend wait for an automatable condition.
   for (const c of [loadWorkerPrompt("claude"), loadWorkerPrompt("codex")]) {
     assert.match(c, /back to awaiting/)
     assert.match(c, /already parked/)
     assert.match(c, /re-emit/)
-    assert.match(c, /human:[^\n]*timer:/)
+    assert.match(c, /exactly one current `github-review:` or `timer:` hint/)
+    assert.match(c, /confirm the new card again/)
     assert.match(c, /automatable[\s\S]{0,100}(?:arm|re-arm)/i)
   }
 })
 
-test("end-state contract: bare rest queues, done checks, awaiting parks human/timer only", () => {
+test("end-state contract: bare rest queues, done checks, and one confirmed awaiting wait parks", () => {
   for (const c of [loadWorkerPrompt("claude"), loadWorkerPrompt("codex")]) {
     assert.match(c, /bare rest[^\n]*(?:ordinary handoff|queues)/i)
     assert.match(c, /(?:enters|enter)[\s\S]{0,80}queue/i)
@@ -304,12 +306,13 @@ test("end-state contract: bare rest queues, done checks, awaiting parks human/ti
     assert.match(c, /COMPLETED\s+the effort's real work/)
     assert.match(c, /investigat(?:ed|ing|ion)[\s\S]{0,300}NOT `?done`?/i)
     assert.match(c, /research or audit EFFORT[\s\S]{0,200}earns `done`/)
-    assert.match(c, /awaiting[\s\S]{0,140}(?:human|timestamp)/i)
+    assert.match(c, /awaiting[\s\S]{0,180}(?:PR|timestamp)/i)
+    assert.match(c, /Confirm watcher[\s\S]{0,40}Confirm snooze/)
     assert.match(c, /(?:CI|automatable)[\s\S]{0,180}(?:stay active|active wait|live operation)/i)
   }
   assert.doesNotMatch(SESSION_SEED, /BARE REST[^\n]*quiet/i)
   assert.doesNotMatch(SESSION_SEED, /```done \/ ```awaiting excuse/)
-  assert.match(SESSION_SEED, /```done queues a checked completion until Archive \(completed work only[^)]*\); ```awaiting parks only a human:\/timer: gate/)
+  assert.match(SESSION_SEED, /```done queues a checked completion until Archive \(completed work only[^)]*\); ```awaiting proposes one opt-in github-review:\/timer: wait that the operator must confirm/)
   assert.match(SESSION_SEED, /real work is COMPLETE/)
 })
 

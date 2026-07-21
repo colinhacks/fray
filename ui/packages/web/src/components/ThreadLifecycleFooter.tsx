@@ -59,9 +59,13 @@ export function StateButton({
   const [pending, setPending] = useState(false)
   const [confirmOpen, setConfirmOpen] = useState(false)
   const complete = (terminateLive: boolean) => {
+    if (!thread.sessionId) {
+      showToast("This session changed; refresh before marking it done")
+      return
+    }
     setPending(true)
     rpc
-      .completeThread({ slug: thread.id, terminateLive })
+      .completeThread({ slug: thread.id, sessionId: thread.sessionId, terminateLive })
       .then((result) => {
         if (result.needsConfirmation) {
           setConfirmOpen(true)
