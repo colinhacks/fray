@@ -9,7 +9,7 @@ import "./styles.css"
 // sets in production:
 //   • the done card's white "Mark as done" button (completeThread; ?mode=executing → needsConfirmation
 //     → the End-session dialog path)
-//   • the awaiting card's white confirm-park button, one per parkable kind (timer → "Confirm snooze"
+//   • the awaiting card's compact confirm-park button, one per parkable kind (timer → "Confirm snooze"
 //     to the exact instant; github-review → "Confirm watcher"; human → "Confirm snooze"). Each applies
 //     a user snooze via setThreadSnooze.
 // RPC is mocked like completion-lifecycle-fixture so nothing real is hit.
@@ -62,10 +62,10 @@ const timerIso = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString()
 
 const cards: { slug: string; label: string; fence: "done" | "awaiting"; body: string; hints: AwaitingHint[] }[] = [
   { slug: "card-done", label: "done", fence: "done", body: "Shipped the change.", hints: [] },
-  { slug: "card-timer", label: "awaiting · timer", fence: "awaiting", body: "Parked until the checkpoint.", hints: [{ kind: "timer", value: timerIso }] },
-  { slug: "card-review", label: "awaiting · github-review", fence: "awaiting", body: "Waiting on PR review.", hints: [{ kind: "github-review", value: "owner/repo#42" }] },
-  { slug: "card-human", label: "awaiting · human", fence: "awaiting", body: "Waiting for Alice to sign off.", hints: [{ kind: "human", value: "Alice to approve the API shape" }] },
-  { slug: "card-legacy", label: "awaiting · legacy ci (no button)", fence: "awaiting", body: "Legacy machine wait — no parkable hint.", hints: [{ kind: "ci", value: "owner/repo#7" }] },
+  { slug: "card-timer", label: "timer snooze", fence: "awaiting", body: "Park until the checkpoint.", hints: [{ kind: "timer", value: timerIso }] },
+  { slug: "card-review", label: "GitHub review watcher", fence: "awaiting", body: "The implementation is ready for review.", hints: [{ kind: "github-review", value: "owner/repo#42" }] },
+  { slug: "card-human", label: "human approval", fence: "awaiting", body: "The API shape needs approval.", hints: [{ kind: "human", value: "Alice to approve the API shape" }] },
+  { slug: "card-legacy", label: "legacy CI (no button)", fence: "awaiting", body: "The legacy build is still running.", hints: [{ kind: "ci", value: "owner/repo#7" }] },
 ]
 
 // The QUEUE path: the queue card renders the fence through <Message dense> inside a ThreadSlugContext,
@@ -73,7 +73,7 @@ const cards: { slug: string; label: string; fence: "done" | "awaiting"; body: st
 // shows in the queue too. Each renders a real assistant message whose text IS the fence block.
 const queueCards: { slug: string; label: string; text: string }[] = [
   { slug: "queue-done", label: "done", text: "Shipped it.\n\n```done\nAll green.\n```" },
-  { slug: "queue-timer", label: "awaiting · timer", text: "```awaiting\nParked.\ntimer: " + timerIso + "\n```" },
+  { slug: "queue-timer", label: "timer snooze", text: "```awaiting\nPark until the checkpoint.\ntimer: " + timerIso + "\n```" },
 ]
 
 // A queue thread with a LIVE sub-agent dispatch — proves that, now the queue card provides

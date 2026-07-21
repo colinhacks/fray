@@ -45,6 +45,10 @@ function fixture(name: string): QuotaSnapshot | undefined {
       }
     case "claude-unavailable":
       return { claude: { status: "unavailable", windows: [], detail: "Not logged in to Claude" }, codex: codexOk }
+    case "claude-endpoint-down":
+      // The authed-but-endpoint-failing case (the user-reported "Usage endpoint unreachable"): the chip
+      // is signed in yet has no window data, so the popover shows the failure detail + the recheck spinner.
+      return { claude: { status: "unavailable", windows: [], detail: "Usage endpoint unreachable" }, codex: codexOk }
     case "codex-real":
       // REAL Codex quota from the local rollout tail, with Claude stubbed unavailable so QA never
       // live-calls the undocumented Claude endpoint. Proves the clean Codex path end-to-end in the UI.

@@ -1,7 +1,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { parseCodexQuotaFromRollout } from "./codex-quota.ts"
-import { parseClaudeUsage, tokenFromCredentialsJson } from "./claude-quota.ts"
+import { parseClaudeUsage, tokenFromCredentialsJson, readClaudeQuota } from "./claude-quota.ts"
 
 // ---- Codex rollout parsing ----
 
@@ -114,4 +114,89 @@ test("claude creds: garbage / empty / no token → undefined, never throws", () 
   assert.equal(tokenFromCredentialsJson("null"), undefined)
   assert.equal(tokenFromCredentialsJson(JSON.stringify({ claudeAiOauth: { accessToken: "" } })), undefined)
   assert.equal(tokenFromCredentialsJson(JSON.stringify({ other: 1 })), undefined)
+})
+
+// ---- Quota memo: outcome-based TTL (the "recheck actually re-hits" fix) ----
+// readClaudeQuota memoizes per configDir; a FLAT 3-min cache used to strand a transient failure for
+// minutes, so a chip stuck on "Usage endpoint unreachable" ignored every recheck. These drive the real
+// function through injected clock/fetch/token seams (no network, no credential store) and assert the
+// cache clears — or holds — for the RIGHT duration per outcome. Each test uses a unique configDir so the
+// module-global memo never bleeds across tests.
+
+const okBody = { five_hour: { utilization: 20, reset_at: "2030-01-01T00:00:00Z" } }
+// A fetch stub that counts calls and yields a scripted status/body each time. The call counter is a
+// LIVE getter (Object.defineProperty, not Object.assign — the latter would copy the getter's value once
+// and freeze it at 0).
+function countingFetch(steps: Array<{ status: number; body?: unknown } | "throw">) {
+  let calls = 0
+  const impl = (async () => {
+    const step = steps[Math.min(calls, steps.length - 1)]!
+    calls++
+    if (step === "throw") throw new Error("network down")
+    return { ok: step.status >= 200 && step.status < 300, status: step.status, json: async () => step.body ?? {} }
+  }) as unknown as typeof fetch
+  Object.defineProperty(impl, "calls", { get: () => calls })
+  return impl as typeof fetch & { readonly calls: number }
+}
+const withToken = async () => "tok-test"
+let dirN = 0
+const freshDir = () => `/nonexistent-fray-quota-test-${++dirN}`
+
+test("quota memo: a transient failure clears within FAIL_TTL so the next read re-hits (not stranded 3 min)", async () => {
+  const dir = freshDir()
+  const fetchImpl = countingFetch(["throw", { status: 200, body: okBody }])
+  const first = await readClaudeQuota(dir, { now: () => 0, fetchImpl, readToken: withToken })
+  assert.equal(first.status, "unavailable")
+  assert.equal(first.detail, "Usage endpoint unreachable")
+  assert.equal(fetchImpl.calls, 1)
+  // Within the 10s failure window → served from cache, endpoint NOT re-hit.
+  const cached = await readClaudeQuota(dir, { now: () => 5_000, fetchImpl, readToken: withToken })
+  assert.equal(cached.status, "unavailable")
+  assert.equal(fetchImpl.calls, 1)
+  // Past the failure window → live re-hit, and it recovers to a healthy read.
+  const recovered = await readClaudeQuota(dir, { now: () => 11_000, fetchImpl, readToken: withToken })
+  assert.equal(recovered.status, "ok")
+  assert.equal(fetchImpl.calls, 2)
+})
+
+test("quota memo: a healthy read is cached generously (1 min) but DOES expire (~3 min), not forever", async () => {
+  const dir = freshDir()
+  const fetchImpl = countingFetch([{ status: 200, body: okBody }])
+  const first = await readClaudeQuota(dir, { now: () => 0, fetchImpl, readToken: withToken })
+  assert.equal(first.status, "ok")
+  const oneMinLater = await readClaudeQuota(dir, { now: () => 60_000, fetchImpl, readToken: withToken })
+  assert.equal(oneMinLater.status, "ok")
+  assert.equal(fetchImpl.calls, 1) // still cached at 1 min (< 3 min OK TTL)
+  // Past the 3-min OK TTL → live re-hit. Asserting the EXPIRY (not just that it holds) guards against
+  // an OK_TTL accidentally set too high / infinite, which the "still cached" check alone would pass.
+  const past = await readClaudeQuota(dir, { now: () => 181_000, fetchImpl, readToken: withToken })
+  assert.equal(past.status, "ok")
+  assert.equal(fetchImpl.calls, 2)
+})
+
+test("quota memo: a 429 backs off ~1 min — longer than a plain failure, shorter than the old 3 min", async () => {
+  const dir = freshDir()
+  const fetchImpl = countingFetch([{ status: 429 }, { status: 200, body: okBody }])
+  const limited = await readClaudeQuota(dir, { now: () => 0, fetchImpl, readToken: withToken })
+  assert.equal(limited.detail, "Usage endpoint 429")
+  // At 30s the 429 is still cached — a recheck must NOT hammer the endpoint back into the wall.
+  await readClaudeQuota(dir, { now: () => 30_000, fetchImpl, readToken: withToken })
+  assert.equal(fetchImpl.calls, 1)
+  // Past ~1 min it re-hits (and would have stayed stranded under the old flat 3-min cache).
+  const recovered = await readClaudeQuota(dir, { now: () => 61_000, fetchImpl, readToken: withToken })
+  assert.equal(recovered.status, "ok")
+  assert.equal(fetchImpl.calls, 2)
+})
+
+test("quota memo: not-logged-in clears fast so a fresh sign-in recovers within a poll", async () => {
+  const dir = freshDir()
+  const fetchImpl = countingFetch([{ status: 200, body: okBody }])
+  let token: string | undefined = undefined
+  const readToken = async () => token
+  const out = await readClaudeQuota(dir, { now: () => 0, fetchImpl, readToken })
+  assert.equal(out.detail, "Not logged in to Claude")
+  assert.equal(fetchImpl.calls, 0) // no token → endpoint never called
+  token = "tok-now-present"
+  const after = await readClaudeQuota(dir, { now: () => 11_000, fetchImpl, readToken })
+  assert.equal(after.status, "ok")
 })

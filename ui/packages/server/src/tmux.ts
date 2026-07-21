@@ -216,7 +216,7 @@ export function sendTextToCompatibleLegacyWorker(worker: CompatibleLegacyWorker,
     const out = execFileSync("tmux", ["-L", worker.socket,
       "load-buffer", "-b", buffer, "-", ";",
       "if-shell", "-t", worker.paneId, "-F", compatibleLegacyCondition(worker),
-      `paste-buffer -b ${buffer} -t ${worker.paneId} ; send-keys -t ${worker.paneId} Enter ; display-message -p ${EXACT_ACTION_OK}`,
+      `paste-buffer -p -b ${buffer} -t ${worker.paneId} ; send-keys -t ${worker.paneId} Enter ; display-message -p ${EXACT_ACTION_OK}`,
       `display-message -p ${EXACT_ACTION_MISS}`, ";", "delete-buffer", "-b", buffer],
     { input: text, encoding: "utf8", stdio: ["pipe", "pipe", "ignore"] })
     return out.trimEnd().endsWith(EXACT_ACTION_OK)
@@ -507,8 +507,55 @@ function expectedAdoptionCondition(expected: ExpectedAdoptionPane, requireLive =
   return requireLive ? `#{&&:#{==:#{pane_dead},0},${owner}}` : owner
 }
 
+function expectedPaneIdentityCondition(expected: PaneIdentity, requireLive = true): string | null {
+  if (!/^%\d+$/.test(expected.paneId) ||
+      !Number.isSafeInteger(expected.panePid) ||
+      !Number.isSafeInteger(expected.sessionCreated)) return null
+  const owner = `#{&&:#{==:#{pane_id},${expected.paneId}},#{&&:#{==:#{pane_pid},${expected.panePid}},#{==:#{session_created},${expected.sessionCreated}}}}`
+  return requireLive ? `#{&&:#{==:#{pane_dead},0},${owner}}` : owner
+}
+
 const EXACT_ACTION_OK = "FRAY_EXACT_ACTION_OK_9A74D2"
 const EXACT_ACTION_MISS = "FRAY_EXACT_ACTION_MISS_9A74D2"
+const INPUT_SETTLE_COMMAND = "/bin/sleep 0.25"
+
+// Codex can read a pasted block and an immediately adjacent key as one input burst, leaving the
+// text in its composer even though tmux accepted both commands. A blocking run-shell remains part
+// of this one tmux server queue but gives the TUI one event-loop boundary to finish the paste. The
+// immutable pane condition is checked before the paste and again before the delayed key, so a pane
+// replacement during that boundary cannot receive either half under a reused name/id.
+function sendTextWithKeyToPane(
+  socketName: string,
+  paneId: string,
+  condition: string,
+  bufferPrefix: string,
+  text: string,
+  key: "Enter" | "Tab",
+): boolean {
+  const buffer = `${bufferPrefix}-${randomUUID()}`
+  const complete = `send-keys -t ${paneId} ${key} ; display-message -p ${EXACT_ACTION_OK}`
+  const afterSettle = `if-shell -t ${paneId} -F '${condition}' '${complete}' 'display-message -p ${EXACT_ACTION_MISS}'`
+  const authorized = `paste-buffer -p -b ${buffer} -t ${paneId} ; run-shell '${INPUT_SETTLE_COMMAND}' ; ${afterSettle}`
+  try {
+    const out = execFileSync("tmux", [
+      "-L", socketName,
+      "load-buffer", "-b", buffer, "-",
+      ";",
+      "if-shell", "-t", paneId, "-F", condition,
+      authorized,
+      `display-message -p ${EXACT_ACTION_MISS}`,
+      ";",
+      "delete-buffer", "-b", buffer,
+    ], {
+      input: text,
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "ignore"],
+    })
+    return out.trimEnd().endsWith(EXACT_ACTION_OK)
+  } catch {
+    return false
+  }
+}
 
 function exactPaneAction(expected: ExpectedAdoptionPane, command: string, onMiss = ""): boolean {
   const condition = expectedAdoptionCondition(expected)
@@ -569,7 +616,7 @@ export function sendTextToExpectedAdoptionPane(
       "load-buffer", "-b", buffer, "-",
       ";",
       "if-shell", "-t", expected.pane_id, "-F", condition,
-      `paste-buffer -b ${buffer} -t ${expected.pane_id}${submit ? ` ; send-keys -t ${expected.pane_id} Enter` : ""} ; display-message -p ${EXACT_ACTION_OK}`,
+      `paste-buffer -p -b ${buffer} -t ${expected.pane_id}${submit ? ` ; send-keys -t ${expected.pane_id} Enter` : ""} ; display-message -p ${EXACT_ACTION_OK}`,
       `display-message -p ${EXACT_ACTION_MISS}`,
       ";",
       "delete-buffer", "-b", buffer,
@@ -584,6 +631,16 @@ export function sendTextToExpectedAdoptionPane(
     // the server either rejected it before authorization or finishes the queued cleanup itself.
     return false
   }
+}
+
+export function sendTextWithKeyToExpectedAdoptionPane(
+  expected: ExpectedAdoptionPane,
+  text: string,
+  key: "Enter" | "Tab",
+): boolean {
+  const condition = expectedAdoptionCondition(expected)
+  if (!condition || expected.pane_id === null) return false
+  return sendTextWithKeyToPane(socket, expected.pane_id, condition, "fray-exact", text, key)
 }
 
 export function sendKeyToExpectedAdoptionPane(
@@ -952,15 +1009,25 @@ export function sendLiteral(slug: string, text: string): void {
   tmux("send-keys", "-t", tmuxSessionName(slug), "-l", text)
 }
 
+export function sendTextWithKey(slug: string, text: string, key: "Enter" | "Tab"): boolean {
+  const identity = paneIdentity(slug)
+  if (!identity) return false
+  const condition = expectedPaneIdentityCondition(identity)
+  if (!condition) return false
+  return sendTextWithKeyToPane(socket, identity.paneId, condition, "fray-input", text, key)
+}
+
 export function sendKey(slug: string, key: "Enter" | "Tab" | "Up" | "Down" | "Escape"): void {
   tmux("send-keys", "-t", tmuxSessionName(slug), key)
 }
 
 // Multiline-safe injection: stage the text in a tmux paste-buffer (load-buffer from stdin,
-// so newlines/quotes survive untouched), paste it, then Enter. -d deletes the buffer after.
+// so newlines/quotes survive untouched), request bracketed-paste framing, then send a distinct Enter.
+// Without -p, an active Claude turn can treat the first embedded newline as submit and queue only the
+// first line (for example, `Answers:`) while silently losing the rest of the logical follow-up.
 export function pasteText(slug: string, text: string): void {
   const name = tmuxSessionName(slug)
   execFileSync("tmux", ["-L", socket, "load-buffer", "-"], { input: text })
-  tmux("paste-buffer", "-t", name, "-d")
+  tmux("paste-buffer", "-p", "-t", name, "-d")
   tmux("send-keys", "-t", name, "Enter")
 }
