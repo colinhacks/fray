@@ -92,6 +92,26 @@ function captureScrollTarget(removingSlug: string): string | null {
   return null
 }
 
+// THE one owner of the document's overflow-anchor suspension. TWO machineries in this file suspend
+// Chrome's native scroll anchoring around a deliberate viewport correction (the dismissal landing in
+// TodosView, the load-earlier anchor dance in QueueCard); if each captured the prior style value with
+// its own ref, one could catch the other's "none" as the value to restore and leave anchoring off
+// document-wide for the rest of the session. Reference-counted instead: the FIRST suspend captures the
+// real prior policy, the LAST release restores it. Every suspend must be paired with exactly one release.
+let anchorSuspendCount = 0
+let anchorPrevPolicy = ""
+function suspendNativeAnchoring(): void {
+  if (anchorSuspendCount++ === 0) {
+    anchorPrevPolicy = document.documentElement.style.overflowAnchor
+    document.documentElement.style.overflowAnchor = "none"
+  }
+}
+function resumeNativeAnchoring(): void {
+  if (anchorSuspendCount > 0 && --anchorSuspendCount === 0) {
+    document.documentElement.style.overflowAnchor = anchorPrevPolicy
+  }
+}
+
 // Keyboard: a card's inputs are ordinary DOM focus — click in to type, Esc blurs, Enter submits (the
 // composer's own handlers). The old focus-machine step-in/arrow-walk was deleted with the mouse-only
 // sidebar. The header buttons are mouse-driven (always visible atop each card).
@@ -253,11 +273,9 @@ export function TodosView() {
         if (leavingRef.current.has(slug)) {
           const target = captureScrollTarget(slug)
           pinRef.current = target ? { kind: "top", slug: target } : null
-          console.debug("[queue-debug] finalize user-initiated", slug, "target:", target)
         } else {
           const pin = captureNeighborPin(slug)
           pinRef.current = pin ? { kind: "hold", ...pin } : null
-          console.debug("[queue-debug] finalize board-departed", slug, "pin:", JSON.stringify(pin))
         }
         goneRef.current.add(slug) // exclude from render → unmount, regardless of whether the board dropped it
         armedRef.current.delete(slug)
@@ -311,7 +329,6 @@ export function TodosView() {
   //     dance in QueueCard below.
   useLayoutEffect(() => {
     const pin = pinRef.current
-    console.debug("[queue-debug] exit effect, pin:", JSON.stringify(pin))
     if (!pin) return
     pinRef.current = null
     const el = document.querySelector<HTMLElement>(`[data-queue-card="${CSS.escape(pin.slug)}"]`)
@@ -321,8 +338,7 @@ export function TodosView() {
       if (Math.abs(delta) > 0.5) window.scrollBy({ top: delta, left: 0, behavior: "auto" })
       return
     }
-    const prevAnchor = document.documentElement.style.overflowAnchor
-    document.documentElement.style.overflowAnchor = "none"
+    suspendNativeAnchoring()
     const land = () => {
       const targetY = queueCardTargetY(pin.slug)
       if (targetY !== null && Math.abs(window.scrollY - targetY) > 0.5) window.scrollTo({ top: targetY, left: 0, behavior: "auto" })
@@ -332,7 +348,7 @@ export function TodosView() {
       land()
       requestAnimationFrame(() => {
         land()
-        document.documentElement.style.overflowAnchor = prevAnchor
+        resumeNativeAnchoring()
       })
     })
   }, [exitTick])
@@ -571,7 +587,9 @@ const QueueCard = memo(function QueueCard({ thread, leaving, onResolve }: { thre
   const headerRef = useRef<HTMLDivElement>(null)
   const [headerH, setHeaderH] = useState(0)
   const pendingViewportAnchor = useRef<{ anchor: TranscriptViewportAnchor; targetStartId: string } | null>(null)
-  const nativeOverflowAnchor = useRef<string | null>(null)
+  // True while THIS card holds one suspension of the shared native-anchoring owner (see
+  // suspendNativeAnchoring at module top) for its load-earlier viewport-anchor dance.
+  const anchoringHeld = useRef(false)
   const anchorSettlementScheduled = useRef(false)
   const transcriptKeyRef = useRef<string | null>(null)
   const queryClient = useQueryClient()
@@ -715,9 +733,9 @@ const QueueCard = memo(function QueueCard({ thread, leaving, onResolve }: { thre
         correct()
         pendingViewportAnchor.current = null
         anchorSettlementScheduled.current = false
-        if (nativeOverflowAnchor.current !== null) {
-          document.documentElement.style.overflowAnchor = nativeOverflowAnchor.current
-          nativeOverflowAnchor.current = null
+        if (anchoringHeld.current) {
+          anchoringHeld.current = false
+          resumeNativeAnchoring()
         }
       })
     })
@@ -739,25 +757,25 @@ const QueueCard = memo(function QueueCard({ thread, leaving, onResolve }: { thre
     setIntermediateExpanded(false)
     pendingViewportAnchor.current = null
     anchorSettlementScheduled.current = false
-    if (nativeOverflowAnchor.current !== null) {
-      document.documentElement.style.overflowAnchor = nativeOverflowAnchor.current
-      nativeOverflowAnchor.current = null
+    if (anchoringHeld.current) {
+      anchoringHeld.current = false
+      resumeNativeAnchoring()
     }
   }, [q.data?.transcriptKey])
 
   useEffect(() => () => {
-    if (nativeOverflowAnchor.current !== null) {
-      document.documentElement.style.overflowAnchor = nativeOverflowAnchor.current
-      nativeOverflowAnchor.current = null
+    if (anchoringHeld.current) {
+      anchoringHeld.current = false
+      resumeNativeAnchoring()
     }
   }, [])
 
   const armViewportAnchor = (targetStartId: string | undefined) => {
     const anchor = captureTranscriptViewportAnchor(messageListRef.current)
     if (!targetStartId || !anchor) return
-    if (nativeOverflowAnchor.current === null) {
-      nativeOverflowAnchor.current = document.documentElement.style.overflowAnchor
-      document.documentElement.style.overflowAnchor = "none"
+    if (!anchoringHeld.current) {
+      anchoringHeld.current = true
+      suspendNativeAnchoring()
     }
     pendingViewportAnchor.current = { anchor, targetStartId }
   }
