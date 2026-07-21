@@ -216,7 +216,7 @@ export function sendTextToCompatibleLegacyWorker(worker: CompatibleLegacyWorker,
     const out = execFileSync("tmux", ["-L", worker.socket,
       "load-buffer", "-b", buffer, "-", ";",
       "if-shell", "-t", worker.paneId, "-F", compatibleLegacyCondition(worker),
-      `paste-buffer -b ${buffer} -t ${worker.paneId} ; send-keys -t ${worker.paneId} Enter ; display-message -p ${EXACT_ACTION_OK}`,
+      `paste-buffer -p -b ${buffer} -t ${worker.paneId} ; send-keys -t ${worker.paneId} Enter ; display-message -p ${EXACT_ACTION_OK}`,
       `display-message -p ${EXACT_ACTION_MISS}`, ";", "delete-buffer", "-b", buffer],
     { input: text, encoding: "utf8", stdio: ["pipe", "pipe", "ignore"] })
     return out.trimEnd().endsWith(EXACT_ACTION_OK)
@@ -535,7 +535,7 @@ function sendTextWithKeyToPane(
   const buffer = `${bufferPrefix}-${randomUUID()}`
   const complete = `send-keys -t ${paneId} ${key} ; display-message -p ${EXACT_ACTION_OK}`
   const afterSettle = `if-shell -t ${paneId} -F '${condition}' '${complete}' 'display-message -p ${EXACT_ACTION_MISS}'`
-  const authorized = `paste-buffer -b ${buffer} -t ${paneId} ; run-shell '${INPUT_SETTLE_COMMAND}' ; ${afterSettle}`
+  const authorized = `paste-buffer -p -b ${buffer} -t ${paneId} ; run-shell '${INPUT_SETTLE_COMMAND}' ; ${afterSettle}`
   try {
     const out = execFileSync("tmux", [
       "-L", socketName,
@@ -616,7 +616,7 @@ export function sendTextToExpectedAdoptionPane(
       "load-buffer", "-b", buffer, "-",
       ";",
       "if-shell", "-t", expected.pane_id, "-F", condition,
-      `paste-buffer -b ${buffer} -t ${expected.pane_id}${submit ? ` ; send-keys -t ${expected.pane_id} Enter` : ""} ; display-message -p ${EXACT_ACTION_OK}`,
+      `paste-buffer -p -b ${buffer} -t ${expected.pane_id}${submit ? ` ; send-keys -t ${expected.pane_id} Enter` : ""} ; display-message -p ${EXACT_ACTION_OK}`,
       `display-message -p ${EXACT_ACTION_MISS}`,
       ";",
       "delete-buffer", "-b", buffer,
@@ -1022,10 +1022,12 @@ export function sendKey(slug: string, key: "Enter" | "Tab" | "Up" | "Down" | "Es
 }
 
 // Multiline-safe injection: stage the text in a tmux paste-buffer (load-buffer from stdin,
-// so newlines/quotes survive untouched), paste it, then Enter. -d deletes the buffer after.
+// so newlines/quotes survive untouched), request bracketed-paste framing, then send a distinct Enter.
+// Without -p, an active Claude turn can treat the first embedded newline as submit and queue only the
+// first line (for example, `Answers:`) while silently losing the rest of the logical follow-up.
 export function pasteText(slug: string, text: string): void {
   const name = tmuxSessionName(slug)
   execFileSync("tmux", ["-L", socket, "load-buffer", "-"], { input: text })
-  tmux("paste-buffer", "-t", name, "-d")
+  tmux("paste-buffer", "-p", "-t", name, "-d")
   tmux("send-keys", "-t", name, "Enter")
 }

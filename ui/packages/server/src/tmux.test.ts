@@ -20,6 +20,7 @@ import {
   findExpectedAdoptionPane,
   captureExpectedAdoptionPane,
   crossSocketLiveOwner,
+  sendTextToCompatibleLegacyWorker,
   sendTextWithKey,
   sendTextWithKeyToExpectedAdoptionPane,
   sendTextToExpectedAdoptionPane,
@@ -29,6 +30,7 @@ import {
   socketName,
   spawn,
   spawnWithRunner,
+  pasteText,
   TmuxSpawnError,
 } from "./tmux.ts"
 
@@ -40,6 +42,105 @@ const tmuxAvailable = (() => {
     return false
   }
 })()
+
+const bracketedPasteConsumer = [
+  "process.stdin.setRawMode(true)",
+  "process.stdin.resume()",
+  "let input = Buffer.alloc(0)",
+  "process.stdout.write('\\u001b[?2004hREADY\\n')",
+  "process.stdin.on('data', chunk => {",
+  "  input = Buffer.concat([input, chunk])",
+  "  if (input.includes(Buffer.from('\\u001b[201~'))) process.stdout.write('\\nINPUT:' + input.toString('hex') + '\\n')",
+  "})",
+].join(";\n")
+
+async function waitForBracketedPaste(target: string, activeSocket = socketName()): Promise<void> {
+  const readyBy = Date.now() + 2_000
+  while (Date.now() < readyBy) {
+    const flag = execFileSync("tmux", ["-L", activeSocket, "display-message", "-p", "-t", target, "#{bracket_paste_flag}"], { encoding: "utf8" }).trim()
+    if (flag === "1") return
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  assert.fail("the test consumer did not enable bracketed-paste mode")
+}
+
+async function captureBracketedInput(target: string, message: string, activeSocket = socketName()): Promise<string> {
+  const expected = Buffer.from(`\u001b[200~${message.replaceAll("\n", "\r")}\u001b[201~`).toString("hex")
+  const deliveredBy = Date.now() + 2_000
+  let pane = ""
+  while (Date.now() < deliveredBy) {
+    pane = execFileSync("tmux", ["-L", activeSocket, "capture-pane", "-p", "-t", target], { encoding: "utf8" })
+    if (pane.includes(`INPUT:${expected}`)) return pane
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  assert.fail(`the bracketed payload was not delivered; pane: ${pane}`)
+}
+
+test("pasteText keeps a multiline follow-up inside one bracketed-paste payload", { skip: !tmuxAvailable }, async () => {
+  const originalSocket = socketName()
+  const slug = `bracketed-paste-${process.pid}`
+  setSocket(`fray-bracketed-paste-test-${process.pid}`)
+  try {
+    spawn(slug, [process.execPath, "-e", bracketedPasteConsumer], process.cwd())
+
+    const target = tmuxSessionName(slug)
+    await waitForBracketedPaste(target)
+
+    const message = "Answers:\n2. A. Leave it to your normal release flow"
+    pasteText(slug, message)
+    await captureBracketedInput(target, message)
+  } finally {
+    killSession(slug)
+    setSocket(originalSocket)
+  }
+})
+
+test("exact adopted-pane sends keep multiline follow-ups inside bracketed-paste framing", { skip: !tmuxAvailable }, async () => {
+  const originalSocket = socketName()
+  const slug = `bracketed-adoption-${process.pid}`
+  const token = randomUUID()
+  setSocket(`fray-bracketed-adoption-test-${process.pid}`)
+  try {
+    const exact = spawn(slug, [process.execPath, "-e", bracketedPasteConsumer], process.cwd(), undefined, {
+      adoptionAttemptToken: token,
+    })
+    await waitForBracketedPaste(exact.paneId)
+
+    const message = "Answers:\n2. A. Leave it to your normal release flow"
+    assert.equal(sendTextToExpectedAdoptionPane({
+      attempt_token: token,
+      pane_id: exact.paneId,
+      pane_pid: exact.panePid,
+      session_created: exact.sessionCreated,
+    }, message, true), true)
+    await captureBracketedInput(exact.paneId, message)
+  } finally {
+    killSession(slug)
+    setSocket(originalSocket)
+  }
+})
+
+test("compatible legacy sends keep multiline follow-ups inside bracketed-paste framing", { skip: !tmuxAvailable }, async () => {
+  const originalSocket = socketName()
+  const slug = `bracketed-legacy-${process.pid}`
+  setSocket(`fray-bracketed-legacy-test-${process.pid}`)
+  try {
+    const exact = spawn(slug, [process.execPath, "-e", bracketedPasteConsumer], process.cwd())
+    await waitForBracketedPaste(exact.paneId)
+
+    const message = "Answers:\n2. A. Leave it to your normal release flow"
+    assert.equal(sendTextToCompatibleLegacyWorker({
+      socket: socketName(),
+      paneId: exact.paneId,
+      panePid: exact.panePid,
+      sessionCreated: exact.sessionCreated,
+    }, message), true)
+    await captureBracketedInput(exact.paneId, message)
+  } finally {
+    killSession(slug)
+    setSocket(originalSocket)
+  }
+})
 
 test("deriveSocket: per-project socket name from the stable project id", () => {
   // UUIDs retain all 128 bits; the historical first-eight mapping could collide.
