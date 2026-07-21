@@ -436,6 +436,59 @@ test("deriveNeedsYou: crash net — pane EXITED while the turn was in-flight que
   assert.equal(deriveNeedsYou(row({ seen_at: LATER }), tele({ turn: "idle", lastActivityAt: T0 }), "exited"), true)
 })
 
+test("deriveNeedsYou: an EXITED parent surfaces even when a SUB-AGENT still reads 'running' (crash mid-background-work)", () => {
+  // A sub-agent cannot outlive its parent pane. A crashed/slept worker that rested on a sub-agent leaves
+  // it "running" in telemetry (subAgentViews has no paneDead guard, unlike bgShellViews) until it goes
+  // stale — or forever if its output file never resolved. The dead parent MUST still surface. This once
+  // silently dangled: hasLiveBackgroundWork buried the exited row instead of queuing it (found 2026-07-21).
+  const childRunning = tele({ subAgents: [{ label: "c", startedAt: T0, state: "running", id: "a1" }], lastActivityAt: LATER })
+  assert.equal(deriveNeedsYou(row({ seen_at: LATER }), childRunning, "exited"), true, "dead parent w/ 'running' sub-agent surfaces")
+  // Regression guard for the live case: a LIVE parent (turn-idle) resting on a running child stays held.
+  assert.equal(deriveNeedsYou(row({ seen_at: T0 }), childRunning, "turn-idle"), false)
+  // A dead parent whose child has already gone STALE also surfaces — via bare rest, not the bgwork arm
+  // (stale ≠ "running", so hasLiveBackgroundWork never buries it and it is not counted as live work).
+  const childStale = tele({ subAgents: [{ label: "c", startedAt: T0, state: "stale", id: "a1" }], lastActivityAt: LATER })
+  assert.equal(deriveNeedsYou(row({ seen_at: LATER }), childStale, "exited"), true, "dead parent w/ stale child surfaces via bare rest")
+})
+
+test("board: an EXITED parent resting on a 'running' sub-agent surfaces as a stalled crash, not buried", async () => {
+  // End-to-end through board assembly: a dead pane (no tmux → runtime 'exited') whose telemetry still
+  // reports a running sub-agent must enter Queue (needsYou) AND card as a crash/stall (crashed), so the
+  // human sees it instead of it silently dangling under stale child liveness.
+  const dir = mkdtempSync(join(tmpdir(), "fray-board-crash-bgwork-"))
+  const project: Project = { dir, id: "board-crash-bgwork", name: "fixture", label: "fixture", stateDir: dir, cwdSlug: "fixture" }
+  const storage = createStorage(join(dir, "ui.db"))
+  storage.upsertSession(row({ slug: "dead-parent", tmux_name: "fray-dead-parent", seen_at: LATER }))
+  // Sibling with an already-STALE child: it must still surface, but as a bare rest, NOT a stalled crash.
+  storage.upsertSession(row({ slug: "dead-parent-stale", tmux_name: "fray-dead-parent-stale", seen_at: LATER }))
+  const tailer = {
+    get: (slug: string) => tele({
+      turn: "idle",
+      subAgents: [{ label: "child", startedAt: T0, state: slug === "dead-parent-stale" ? "stale" : "running", id: "a1" }],
+      lastActivityAt: LATER,
+    }),
+    foreignIds: () => [],
+    subAgent: () => undefined,
+    forget: () => {},
+    start: () => {},
+    stop: () => {},
+    tick: () => {},
+  } satisfies Tailer
+  const board = createBoard(project, storage, new Bus(), tailer, "crash-bgwork-boot")
+  try {
+    const snap = await board.snapshot()
+    const running = snap.threads.find((candidate) => candidate.id === "dead-parent")!
+    assert.equal(running.runtime, "exited", "no live pane derives to exited")
+    assert.equal(running.needsYou, true, "the dead parent surfaces instead of being buried by stale child liveness")
+    assert.equal(running.crashed, true, "a running sub-agent on a dead pane cards as a stall, not a bare rest")
+    const stale = snap.threads.find((candidate) => candidate.id === "dead-parent-stale")!
+    assert.equal(stale.needsYou, true, "a dead parent whose child went stale still surfaces")
+    assert.equal(stale.crashed, false, "but a stale child is not live work, so it cards as bare rest")
+  } finally {
+    board.stop()
+  }
+})
+
 test("deriveNeedsYou: manual snooze suppresses every queue reason until its exact deadline", () => {
   const now = Date.parse("2026-07-13T12:00:00.000Z")
   const snoozed = row({ snoozed_until: "2026-07-14T12:00:00.000Z" })
