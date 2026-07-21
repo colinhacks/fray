@@ -5,12 +5,18 @@ import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { readClaudeAuthState, readCodexAuthState } from "./auth-status.ts"
 
+// Codex reads env keys BEFORE the file, so a file-based test must run with those keys cleared or an
+// ambient OPENAI_API_KEY in the dev shell would mask the file logic. Clears + restores around fn.
+const CODEX_ENV_KEYS = ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"]
 function withTmp(fn: (dir: string) => void): void {
+  const saved = CODEX_ENV_KEYS.map((k) => [k, process.env[k]] as const)
+  for (const k of CODEX_ENV_KEYS) delete process.env[k]
   const dir = mkdtempSync(join(tmpdir(), "fray-auth-"))
   try {
     fn(dir)
   } finally {
     rmSync(dir, { recursive: true, force: true })
+    for (const [k, v] of saved) if (v === undefined) delete process.env[k]; else process.env[k] = v
   }
 }
 
@@ -47,6 +53,14 @@ test("codex: unparseable auth.json → unknown (fail open, never signed-out)", (
   withTmp((dir) => {
     writeFileSync(join(dir, "auth.json"), "{ not valid json")
     assert.equal(readCodexAuthState(dir), "unknown")
+  })
+})
+
+test("codex: env key present with no auth.json → authed (fray forwards OPENAI_API_KEY et al.)", () => {
+  withTmp((dir) => {
+    process.env.OPENAI_API_KEY = "sk-env"
+    // No auth.json in dir — env auth must still read as authed, not signed-out.
+    assert.equal(readCodexAuthState(dir), "authed")
   })
 })
 
