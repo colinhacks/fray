@@ -1,15 +1,15 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, dirname } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { buildClaudeCommand, loadWorkerPrompt, composePrompt, resolveWorkerPluginDir, scratchpadOrientation, scratchpadContent, workerPluginDir } from "./dispatch.ts"
 
 // ---- Backend-aware worker contract (worker-contract-backend-aware) ----
-// loadWorkerPrompt(kind) fills the `{{FRAY_*}}` markers in ui/WORKER_PROMPT.md (the shared
-// agnostic CORE) from WORKER_PROMPT.<kind>.md. The CLAUDE fill must reproduce the pre-split contract
-// BYTE-FOR-BYTE (the regression bar); the CODEX fill swaps the Claude-Code-only guidance for codex's.
+// loadWorkerPrompt(kind) delegates to buildWorkerPrompt in workerPrompt.ts (a single compiled-in TS
+// source, no runtime markdown/marker fill). The CLAUDE output must still reproduce the pre-split
+// contract BYTE-FOR-BYTE (the regression bar); the CODEX output has its own golden.
 
 const here = dirname(fileURLToPath(import.meta.url))
 // The FROZEN pre-split claude contract body (the exact string a claude dispatch got before the split).
@@ -18,30 +18,12 @@ const here = dirname(fileURLToPath(import.meta.url))
 // The markdown loader trims the contract body; normalize the fixture's conventional POSIX newline
 // before making the byte-for-byte comparison of the actual prompt content.
 const CLAUDE_GOLDEN = readFileSync(join(here, "WORKER_PROMPT.claude.golden.txt"), "utf8").trimEnd()
+const CODEX_GOLDEN = readFileSync(join(here, "WORKER_PROMPT.codex.golden.txt"), "utf8").trimEnd()
 const WORKER_SKILL = readFileSync(join(here, "../../../../cc-worker/skills/worker/SKILL.md"), "utf8")
 const SESSION_SEED = readFileSync(join(here, "../../../../cc-worker/hooks/session-seed.mjs"), "utf8")
 
 test("loadWorkerPrompt: default kind is claude", () => {
   assert.equal(loadWorkerPrompt(), loadWorkerPrompt("claude"))
-})
-
-test("loadWorkerPrompt resolves the verified bundled prompt closure", () => {
-  const prompts = mkdtempSync(join(tmpdir(), "fray-bundled-prompts-"))
-  const previous = process.env.FRAY_WORKER_PROMPT_DIR
-  try {
-    for (const name of ["WORKER_PROMPT.md", "WORKER_PROMPT.claude.md", "WORKER_PROMPT.codex.md"])
-      copyFileSync(join(here, "..", "..", "..", name), join(prompts, name))
-    process.env.FRAY_WORKER_PROMPT_DIR = prompts
-    for (const kind of ["claude", "codex"] as const) {
-      const prompt = loadWorkerPrompt(kind)
-      assert.ok(prompt.length > 1_000)
-      assert.doesNotMatch(prompt, /\{\{FRAY_/)
-    }
-  } finally {
-    if (previous === undefined) delete process.env.FRAY_WORKER_PROMPT_DIR
-    else process.env.FRAY_WORKER_PROMPT_DIR = previous
-    rmSync(prompts, { recursive: true, force: true })
-  }
 })
 
 test("Claude dispatch supplies the discovered worker plugin via --plugin-dir", () => {
@@ -82,6 +64,10 @@ test("artifact worker resolver finds runtime/cc-worker through pnpm's nested mod
 
 test("loadWorkerPrompt(claude) is BYTE-IDENTICAL to the pre-split contract (the regression bar)", () => {
   assert.equal(loadWorkerPrompt("claude"), CLAUDE_GOLDEN)
+})
+
+test("loadWorkerPrompt(codex) is BYTE-IDENTICAL to its golden (regenerate on deliberate codex edits)", () => {
+  assert.equal(loadWorkerPrompt("codex"), CODEX_GOLDEN)
 })
 
 test("loadWorkerPrompt: no unresolved {{FRAY_*}} markers survive in either backend's contract", () => {

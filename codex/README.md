@@ -138,6 +138,11 @@ question path. The only exception is an explicit user instruction naming the int
 
 ## Browser QA and helper-process hygiene
 
+The plugin bundles the official `chrome-devtools-mcp` server for browser QA. Each Codex session gets
+an isolated Chrome profile, page-ID routing keeps concurrent agents on their owned targets, and usage
+statistics are disabled. Install or update the plugin and start a new thread before expecting the MCP
+tools in the active inventory.
+
 For any delegated task that launches a browser, agent-browser session, Chrome DevTools MCP, or helper
 process, Fray requires a minimum, uniquely named owned session/server—normally one reused for desktop
 and narrow/mobile checks. The worker must close its exact session/server through a `finally`, trap, or

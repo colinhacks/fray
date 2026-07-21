@@ -32,7 +32,6 @@ try {
     throw new Error("stable artifact launch is missing FRAY_STABLE_WEB_DIST")
   if (stableWebDist) {
     const required = [
-      ["FRAY_WORKER_PROMPT_DIR", process.env.FRAY_WORKER_PROMPT_DIR, "WORKER_PROMPT.md"],
       ["FRAY_SCRIPTS_DIR", process.env.FRAY_SCRIPTS_DIR, "index.mjs"],
       ["FRAY_WORKER_PLUGIN_DIR", process.env.FRAY_WORKER_PLUGIN_DIR, ".claude-plugin/plugin.json"],
     ] as const

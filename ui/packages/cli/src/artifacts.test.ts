@@ -94,9 +94,6 @@ function fixture(root: string, content: string): string {
   writeFileSync(join(dir, "runtime", "cc", "scripts", "fray", "agent-bindings.mjs"), "bindings");
   writeFileSync(join(dir, "runtime", "cc", "scripts", "fray", "index.mjs"), "index");
   writeFileSync(join(dir, "runtime", "cc", "scripts", "fray", "thread-update.mjs"), "update");
-  writeFileSync(join(dir, "runtime", "prompts", "WORKER_PROMPT.md"), "prompt");
-  writeFileSync(join(dir, "runtime", "prompts", "WORKER_PROMPT.claude.md"), "claude");
-  writeFileSync(join(dir, "runtime", "prompts", "WORKER_PROMPT.codex.md"), "codex");
   const manifest = {
       version: 1,
       digest: "",
@@ -120,9 +117,6 @@ function fixture(root: string, content: string): string {
         "cc/scripts/fray/agent-bindings.mjs": hash("bindings"),
         "cc/scripts/fray/index.mjs": hash("index"),
         "cc/scripts/fray/thread-update.mjs": hash("update"),
-        "prompts/WORKER_PROMPT.md": hash("prompt"),
-        "prompts/WORKER_PROMPT.claude.md": hash("claude"),
-        "prompts/WORKER_PROMPT.codex.md": hash("codex"),
       },
     };
   manifest.digest = fixtureDigest(manifest);
@@ -564,8 +558,6 @@ test("a real Nub/esbuild artifact boots its WebSocket-capable server and loads i
     assert.ok(artifact.manifest.dependencyCell, "runtime binds an immutable dependency cell");
     const modules = join(artifact.runtimeDir, "node_modules");
     assert.equal(resolve(dirname(modules), readlinkSync(modules)), join(root, "cells", artifact.manifest.dependencyCell!, "node_modules"));
-    for (const prompt of ["WORKER_PROMPT.md", "WORKER_PROMPT.claude.md", "WORKER_PROMPT.codex.md"])
-      assert.equal(existsSync(join(artifact.runtimeDir, "prompts", prompt)), true);
     const projectId = randomUUID();
     const canonicalRoot = realpathSync(root);
     const target = {
@@ -587,7 +579,6 @@ test("a real Nub/esbuild artifact boots its WebSocket-capable server and loads i
           FRAY_DEV_PORT: String(port),
           FRAY_STABLE_ARTIFACT: artifact.digest,
           FRAY_STABLE_WEB_DIST: artifact.webDir,
-          FRAY_WORKER_PROMPT_DIR: join(artifact.runtimeDir, "prompts"),
           FRAY_SCRIPTS_DIR: join(artifact.runtimeDir, "cc", "scripts", "fray"),
           FRAY_WORKER_PLUGIN_DIR: join(artifact.runtimeDir, "cc-worker"),
         },

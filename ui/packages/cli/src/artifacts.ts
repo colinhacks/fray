@@ -273,23 +273,14 @@ const WORKER_PLUGIN_REQUIRED_FILES = [
   "cc/scripts/fray/thread-update.mjs",
 ] as const;
 
-const RUNTIME_PROMPT_REQUIRED_FILES = [
-  "prompts/WORKER_PROMPT.md",
-  "prompts/WORKER_PROMPT.claude.md",
-  "prompts/WORKER_PROMPT.codex.md",
-] as const;
-
+// The worker contract used to ship as markdown under runtime/prompts/ and get read at dispatch time;
+// it is now compiled into the server bundle (workerPrompt.ts), so a promoted artifact carries no
+// prompt closure. Old artifacts that still list prompts/ files remain valid (extra runtimeFiles are
+// harmless); nothing reads them.
 function assertWorkerPluginClosure(root: string): void {
   for (const file of WORKER_PLUGIN_REQUIRED_FILES) {
     if (!existsSync(join(root, file)))
       throw new Error(`Fray worker plugin closure is missing ${file}`);
-  }
-}
-
-function assertRuntimePromptClosure(root: string): void {
-  for (const file of RUNTIME_PROMPT_REQUIRED_FILES) {
-    if (!existsSync(join(root, file)))
-      throw new Error(`Fray runtime prompt closure is missing ${file}`);
   }
 }
 
@@ -870,15 +861,7 @@ export function buildFrayArtifact(
       recursive: true,
       preserveTimestamps: true,
     });
-    const promptSource = ["WORKER_PROMPT.md", "WORKER_PROMPT.claude.md", "WORKER_PROMPT.codex.md"];
-    for (const prompt of promptSource) {
-      const from = join(source, prompt);
-      if (!existsSync(from)) throw new Error(`Fray worker prompt is missing ${prompt}`);
-      mkdirSync(join(staging, "runtime", "prompts"), { recursive: true, mode: 0o700 });
-      copyFileSync(from, join(staging, "runtime", "prompts", prompt));
-    }
     assertWorkerPluginClosure(join(staging, "runtime"));
-    assertRuntimePromptClosure(join(staging, "runtime"));
     cpSync(webSource, join(staging, "web"), {
       recursive: true,
       preserveTimestamps: true,
@@ -946,7 +929,6 @@ export function readFrayArtifact(
   if (!validArtifactManifest(manifest, digest) ||
     (manifest.version === 2 && !manifest.dependencyCell) ||
     !WORKER_PLUGIN_REQUIRED_FILES.every((file) => manifest.runtimeFiles[file]) ||
-    !RUNTIME_PROMPT_REQUIRED_FILES.every((file) => manifest.runtimeFiles[file]) ||
     !existsSync(join(dir, "web")) ||
     !existsSync(join(dir, "runtime", "src", "index.js"))
   ) {
@@ -959,7 +941,6 @@ export function readFrayArtifact(
     throw new Error(`Fray artifact ${digest} failed root digest validation (calculated ${calculated})`);
   try {
     assertWorkerPluginClosure(join(dir, "runtime"));
-    assertRuntimePromptClosure(join(dir, "runtime"));
     const cell = manifest.dependencyCell
       ? readFrayDependencyCell(manifest.dependencyCell, root)
       : undefined;

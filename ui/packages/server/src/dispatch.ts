@@ -262,7 +262,7 @@ export function loadWorkerPrompt(kind: BackendKind = "claude", runtimeGate = tru
 
 // The first USER message a dispatched agent receives: scratchpad orientation + custom instructions +
 // task. Session-first (2026-07-09) — the old thread-ownership contract is REPLACED by scratchpad
-// orientation (a new dispatch owns no .fray file). The fixed worker prompt (WORKER_PROMPT.md) and the
+// orientation (a new dispatch owns no .fray file). The fixed worker prompt (workerPrompt.ts) and the
 // same scratchpad line at SYSTEM level travel via --append-system-prompt (see buildClaudeCommand) so
 // they survive compaction and re-apply on resume; this composes the visible-message half.
 export function composePrompt(sessionId: string, prompt: string, customInstructions: string, kind: BackendKind = "claude"): string {
@@ -345,7 +345,7 @@ export function buildClaudeCommand(opts: {
   prompt: string
   claudeBin?: string
   pluginDir?: string
-  // Injectable for tests; defaults to the shipped WORKER_PROMPT.md ("" disables the append).
+  // Injectable for tests; defaults to the compiled-in worker contract ("" disables the append).
   workerPrompt?: string
   // Extra spawn-specific system-prompt text appended AFTER the worker norms (e.g. the adoption
   // orientation) — system-level so the visible transcript carries only the human's own words.

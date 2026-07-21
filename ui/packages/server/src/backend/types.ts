@@ -131,7 +131,7 @@ export interface SpawnOpts {
   sessionId: string // claude: pinned via --session-id. codex: advisory (id is discovered post-spawn)
   cwd: string
   prompt: string // the composed first user message (task + orientation)
-  workerContract: string // WORKER_PROMPT.md norms — injected at system level per backend
+  workerContract: string // workerPrompt.ts norms — injected at system level per backend
   extraSystemPrompt?: string // scratchpad/plan orientation
   permissionMode: PermissionMode
   model?: string

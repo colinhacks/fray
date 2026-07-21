@@ -1,6 +1,6 @@
 {
   "name": "fray-codex",
-  "version": "0.5.0+codex.20260714224845",
+  "version": "0.5.0+codex.20260720223152",
   "description": "Explicit, prompt-first orchestration with model-routed Codex subagents.",
   "author": {
     "name": "Colin McDonnell",
@@ -16,6 +16,7 @@
     "model-routing"
   ],
   "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Fray for Codex",
     "shortDescription": "Explicitly orchestrate concurrent Codex workstreams.",

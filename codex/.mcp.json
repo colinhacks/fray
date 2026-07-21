@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "chrome-devtools": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "chrome-devtools-mcp@latest",
+        "--experimentalPageIdRouting",
+        "--isolated",
+        "--no-usage-statistics"
+      ],
+      "startup_timeout_sec": 120
+    }
+  }
+}

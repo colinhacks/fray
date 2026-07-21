@@ -4,7 +4,7 @@ import type { Storage } from "./storage.ts"
 const SETTINGS_KEY = "settings"
 
 // dispatchPreamble is the USER's custom per-project instructions, appended after the fixed
-// worker system prompt (ui/WORKER_PROMPT.md, loaded in dispatch.ts — not configurable here).
+// worker system prompt (workerPrompt.ts, injected by dispatch.ts — not configurable here).
 const DEFAULT_PREAMBLE = ""
 
 export const defaultSettings = (): Settings => ({
