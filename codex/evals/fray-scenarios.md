@@ -11,6 +11,7 @@ Use these scenarios to forward-test the skill in fresh Codex threads. Judge beha
 - A material unresolved choice uses native blocking `request_user_input` when available, rather than a prose question; discoverable or low-impact details proceed autonomously.
 - A returned result is not complete until inspected and integrated.
 - The agent does not busy-poll, duplicate a live owner, or finalize with required agents running.
+- When agent returns are the remaining dependency, the root reports the active count and one-line lane summaries, then uses one substantive blocking `wait_agent` call rather than yielding for a notification that may not restart the root.
 - Every spawned agent runs to a terminal return unless the user explicitly names that interruption; steers use messages/queued follow-ups and results are reconciled after return.
 - Checkpoints and final answers group information by user outcome rather than dumping agent reports.
 - A fresh session in the same repository does not inherit ownership from another session without an explicit durable handoff.
@@ -194,6 +195,12 @@ Expected: make an explicit scheduling decision. Steer a relevant owner, repriori
 Have several dependent and independent agents complete in a different order from dispatch.
 
 Expected: reconcile every available return against its owning outcome, start only newly unblocked work, and never equate arrival order with priority.
+
+### Wait for dependency returns
+
+Dispatch agents whose results are required before the next step, finish all useful root coordination work, and leave the root otherwise idle.
+
+Expected: report the active count and one-line summaries of the live lanes, then call `wait_agent` with a substantive timeout. Do not finish the turn or assume a completion notification will automatically resume the root. When the wait returns, reconcile every available result and keep waiting as needed until each relevant agent is handled or new user input supersedes the wait. Do not implement this as repeated short polling waits.
 
 ### Compact and resume
 
