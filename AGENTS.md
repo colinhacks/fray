@@ -18,6 +18,18 @@ Every Word (write "Confirm snooze", "Mark as done", "Fix queue focus" — not "C
 Done", "Fix Queue Focus"). Acronyms (PR, CI, API) keep their established casing. When an agent titles a
 thread, the same rule applies.
 
+# Git workflow: land directly on main, no PR ceremony
+
+Work in THIS repo lands directly on `main` — commit to it (or fast-forward a short-lived local branch
+into it) and push. Do NOT open a GitHub PR for your own changes and do NOT do the work from an isolated
+worktree by default; the general worker contract's "open a PR / branch in a worktree" discipline is for
+the OTHER repos fray-ui orchestrates, and this convention overrides it here. Keep commits small and
+focused, run the repo's gates before pushing, and self-review (plus an independent review for anything
+non-trivial) still applies — just skip the PR. Reserve a branch + PR only when a human explicitly asks
+for one, or when a change is genuinely too risky to sit on `main` unreviewed. If `main`'s working tree
+holds someone else's uncommitted work, don't merge/rebase/checkout over it — surface that and let the
+human land it.
+
 # Agent completion invariant
 
 Once spawned, an agent runs to its terminal return. Do not interrupt or cut off an active agent to
