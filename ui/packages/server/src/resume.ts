@@ -181,7 +181,6 @@ function spawnPinnedSession(
   return tx.spawn(row.slug, built.argv, deps.project.dir, {
     ...built.env,
     FRAY_UI_THREAD: row.slug,
-    FRAY_WORKER_RUNTIME_GATE: runtimeGate ? "on" : "off",
     ...(profileHandoffToken ? { [tmux.PROFILE_HANDOFF_ENV]: profileHandoffToken } : {}),
   }, options)
 }

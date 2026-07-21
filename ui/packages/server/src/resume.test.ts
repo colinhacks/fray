@@ -1429,9 +1429,8 @@ test("resumeThread threads the runtimeGate setting into the respawned worker pro
       spawn: (_slug, cmd, _cwd, env) => { capturedCmd = cmd; capturedEnv = (env ?? {}) as Record<string, string> },
     }
     resumeThread({ project: fakeProject("/tmp"), storage, board, getSettings: () => ({ ...settings, runtimeGate }), tmux }, slug, "resume")
-    // The env the session-seed compaction re-injection reads mirrors the setting.
-    assert.equal(capturedEnv.FRAY_WORKER_RUNTIME_GATE, runtimeGate ? "on" : "off")
-    // The system prompt written for this respawn (a file referenced in argv) matches the toggle.
+    // The system prompt written for this respawn (a file referenced in argv) matches the toggle
+    // (the runtime gate now lives ONLY in the system prompt, no longer duplicated via env/hook).
     const i = capturedCmd.indexOf("--append-system-prompt-file")
     assert.ok(i >= 0, "resume argv writes a system-prompt file")
     const prompt = readFileSync(capturedCmd[i + 1], "utf8")

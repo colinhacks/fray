@@ -699,7 +699,7 @@ export function createDispatcher(deps: DispatchDeps): Dispatcher {
       ensureServer()
       try {
         writePrewrites(built)
-        spawn(slug, built.argv, deps.project.dir, { ...built.env, FRAY_UI_THREAD: slug, FRAY_WORKER_RUNTIME_GATE: runtimeGate ? "on" : "off" })
+        spawn(slug, built.argv, deps.project.dir, { ...built.env, FRAY_UI_THREAD: slug })
       } catch (err) {
         if (err instanceof tmux.TmuxSpawnError && err.identity) {
           try {
@@ -950,7 +950,7 @@ export function createDispatcher(deps: DispatchDeps): Dispatcher {
             slug,
             built!.argv,
             deps.project.dir,
-            { ...built!.env, FRAY_UI_THREAD: slug, FRAY_WORKER_RUNTIME_GATE: runtimeGate ? "on" : "off" },
+            { ...built!.env, FRAY_UI_THREAD: slug },
             {
               adoptionAttemptToken: attemptToken,
               onCreated: (identity) => {

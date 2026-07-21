@@ -185,11 +185,12 @@ test("loadWorkerPrompt: the backend-AGNOSTIC core is present in BOTH contracts",
 })
 
 test("awaiting re-entry: every worker-contract surface requires a fresh fence after a follow-up", () => {
-  // This is deliberately pinned across the shipped backend contracts AND the cc-worker mirrors. A
+  // This is deliberately pinned across the shipped backend contracts AND the on-demand fray:worker skill
+  // (session-seed is a slim pointer now — see its own test). A
   // human turn clears lastFence in the tailer, so merely saying "already parked" cannot restore the
   // state: the worker must make a fresh decision, then repeat a current human/timer fence or re-arm
   // the active backend wait for an automatable condition.
-  for (const c of [loadWorkerPrompt("claude"), loadWorkerPrompt("codex"), WORKER_SKILL, SESSION_SEED]) {
+  for (const c of [loadWorkerPrompt("claude"), loadWorkerPrompt("codex"), WORKER_SKILL]) {
     assert.match(c, /back to awaiting/)
     assert.match(c, /already parked/)
     assert.match(c, /re-emit/)
@@ -199,7 +200,7 @@ test("awaiting re-entry: every worker-contract surface requires a fresh fence af
 })
 
 test("end-state contract: bare rest queues, done checks, awaiting parks human/timer only", () => {
-  for (const c of [loadWorkerPrompt("claude"), loadWorkerPrompt("codex"), WORKER_SKILL, SESSION_SEED]) {
+  for (const c of [loadWorkerPrompt("claude"), loadWorkerPrompt("codex"), WORKER_SKILL]) {
     assert.match(c, /bare rest[^\n]*(?:ordinary handoff|queues)/i)
     assert.match(c, /(?:enters|enter)[\s\S]{0,80}queue/i)
     assert.match(c, /(?:question|permission)[\s\S]{0,100}higher.priority/i)
@@ -216,12 +217,26 @@ test("end-state contract: bare rest queues, done checks, awaiting parks human/ti
   assert.match(SESSION_SEED, /```done queues a checked completion until Archive; ```awaiting parks only a human:\/timer: gate/)
 })
 
+test("session-seed is a SLIM runtime pointer, not a fourth full contract copy", () => {
+  // The full contract lives ONCE in the system prompt (loadWorkerPrompt) plus the on-demand fray:worker
+  // skill. The SessionStart hook only re-grounds: it points at the system prompt, carries the runtime
+  // scratchpad path + a signal-at-rest anchor, and must NOT re-duplicate the gate / re-entry drill /
+  // browser-QA checklist (that duplication is exactly what drifted and what this slim removes).
+  assert.match(SESSION_SEED, /lives in your SYSTEM PROMPT/i)
+  assert.match(SESSION_SEED, /Load the `fray:worker` skill for the full contract/)
+  assert.match(SESSION_SEED, /\.fray\/threads\/.*scratch\.md/)
+  for (const fence of [/```done/, /```awaiting/, /```question/]) assert.match(SESSION_SEED, fence)
+  assert.doesNotMatch(SESSION_SEED, /RUNTIME RELEASE GATE:/)
+  assert.doesNotMatch(SESSION_SEED, /never build a bespoke screenshot tool/)
+  assert.doesNotMatch(SESSION_SEED, /back to awaiting/)
+})
+
 test("runtime release gate: every worker surface carries the generalized, any-repo gate contract", () => {
   // The gate is REPO-AGNOSTIC now (not fray-ui's own stack) and settings-toggled; when present it must
   // read the same across all four delivery surfaces. loadWorkerPrompt defaults runtimeGate=on. Whitespace
   // is normalized so a phrase wrapped across a newline in WORKER_PROMPT.md still matches the single-line
   // session-seed/skill copies.
-  for (const raw of [loadWorkerPrompt("claude"), loadWorkerPrompt("codex"), WORKER_SKILL, SESSION_SEED]) {
+  for (const raw of [loadWorkerPrompt("claude"), loadWorkerPrompt("codex"), WORKER_SKILL]) {
     const c = raw.replace(/\s+/g, " ")
     assert.match(c, /INCOMPLETE/)
     assert.match(c, /whatever repo you are working in/i)
@@ -267,7 +282,7 @@ test("runtime release gate: the settings toggle includes or excises the whole mo
 })
 
 test("visual-evidence handoffs: provider contracts keep embeds safe, useful, and interpretable", () => {
-  for (const c of [loadWorkerPrompt("claude"), loadWorkerPrompt("codex"), WORKER_SKILL, SESSION_SEED]) {
+  for (const c of [loadWorkerPrompt("claude"), loadWorkerPrompt("codex"), WORKER_SKILL]) {
     assert.match(c, /meaningful alt text/i)
     assert.match(c, /eligible workspace[\s\S]{0,80}allowlisted image files/i)
     assert.match(c, /outside that safe boundary[\s\S]{0,80}non-navigable/i)
