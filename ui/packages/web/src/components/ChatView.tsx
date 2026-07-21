@@ -3,7 +3,7 @@ import { useSnapshot } from "valtio"
 import * as RadixTabs from "@radix-ui/react-tabs"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useVirtualizer } from "@tanstack/react-virtual"
-import { AlertTriangle, ArrowDown, ArrowLeft, ArrowUpRight, Check, ChevronRight, Clock, FileText, HelpCircle, KeyRound, ListChecks, Loader2, ShieldCheck, Sparkles, X } from "lucide-react"
+import { AlertTriangle, ArrowDown, ArrowLeft, ArrowUpRight, Check, ChevronRight, FileText, HelpCircle, KeyRound, ListChecks, Loader2, ShieldCheck, Sparkles, X } from "lucide-react"
 import type { AwaitingHint, NativeInputRequired as NativeInputRequiredData, PendingAsk, ThreadView as ThreadViewData, TranscriptEdit, TranscriptMessage, TranscriptToolCall } from "@fray-ui/shared"
 import { isValidAwaitingTimer } from "@fray-ui/shared"
 import { store, threadBySlug, pushDrawer, pushSubAgentDrawer, showToast } from "../store.ts"
@@ -20,7 +20,8 @@ import { useLiveAnswering, type LiveAnswering } from "../lib/answering.ts"
 import { useLocalFileCodeLinks } from "../lib/localFileCode.ts"
 import { shouldSubmitComposerEnter } from "../lib/composerKeyboard.ts"
 import { messagePresentationText } from "../lib/messagePresentation.ts"
-import { formatSnoozedUntil, snoozePresetInstant, formatSnoozeWake } from "../lib/snooze.ts"
+import { snoozePresetInstant, formatSnoozeWake } from "../lib/snooze.ts"
+import { awaitingHintSentence, awaitingPresentationLine } from "../lib/awaitingPresentation.ts"
 import { prefs } from "../lib/prefs.ts"
 import { canAdoptThread } from "../lib/adoption.ts"
 import { THREAD_TITLE_MAX_LENGTH, aiRenameAvailability, manualThreadTitleSeed, threadTitleToCommit } from "../lib/threadTitle.ts"
@@ -2321,10 +2322,13 @@ export function QuestionBlockCard({
 
 // A SIGNAL fence rendered as a card in place of the raw ```done / ```awaiting block (the fence
 // language IS the state; the body is the message). `done` → a compact presentation-only success card;
-// its thread's Archive lives in the stable lifecycle footer. `awaiting` → a quiet parked-wait card:
-// body prose plus parsed hint chips (human/timer, with legacy pr/ci/session support).
+// its thread's Archive lives in the stable lifecycle footer. `awaiting` → one compact handoff row:
+// body prose plus one plain-English action summary (with legacy pr/ci/session support).
 export function FenceCard({ fenceKind, body, hints, wrap }: { fenceKind: FenceKind; body: string; hints: AwaitingHint[]; wrap?: boolean }) {
   const html = useMemo(() => (body ? mdToHtml(body) : ""), [body])
+  const awaitingHint = awaitingHintSentence(hints)
+  const awaitingLine = awaitingPresentationLine(body, awaitingHint)
+  const awaitingHtml = useMemo(() => mdInlineToHtml(awaitingLine), [awaitingLine])
   // The owning thread's slug — set by the thread view AND the queue card — so the confirm button
   // resolves its thread and renders on both surfaces (null in a sub-agent's own transcript → no button).
   const slug = useContext(ThreadSlugContext)
@@ -2369,26 +2373,11 @@ export function FenceCard({ fenceKind, body, hints, wrap }: { fenceKind: FenceKi
     )
   }
   return (
-    <div className="rounded-lg border border-border-strong bg-panel-2 px-4 py-3">
-      <div className="mb-1.5 flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-muted/70">
-        <Clock size={12} className="shrink-0" /> Awaiting
-      </div>
-      {html && <div className={`md-body${wrap ? ` ${QUEUE_WRAP}` : ""}`} dangerouslySetInnerHTML={{ __html: html }} />}
-      {hints.length > 0 && (
-        <div className="mt-2 flex flex-wrap gap-1.5">
-          {hints.map((h, i) => {
-            const timerLabel = h.kind === "timer" ? formatSnoozedUntil(h.value) : null
-            return (
-            <span key={i} className="flex min-w-0 items-center gap-1 rounded-md border border-border bg-panel px-2 py-0.5 text-[11px] text-fg/80">
-              {/* petite-caps sit on the baseline → ~1px low under items-center (see styles.css); lift the
-                  label onto the value's optical midline so "ci"/"pr" and the ref read on one line. */}
-              <span className="petite-caps relative -top-px text-[9.5px] text-muted/60">{h.kind}</span>
-              <span className={h.kind === "timer" ? "min-w-0 break-words" : "font-mono-keep"}>{timerLabel ?? (h.kind === "timer" ? "Schedule unavailable" : h.value)}</span>
-            </span>
-            )
-          })}
-        </div>
-      )}
+    <div className="flex min-w-0 items-stretch rounded-lg border border-border-strong bg-panel-2">
+      <div
+        className={`md-inline min-w-0 flex-1 content-center px-3 py-2 text-[12px] leading-5 text-fg/85${wrap ? ` ${QUEUE_WRAP}` : ""}`}
+        dangerouslySetInnerHTML={{ __html: awaitingHtml }}
+      />
       {canAct && fenceThread && <AwaitingParkButton thread={fenceThread} hints={hints} />}
     </div>
   )
@@ -2432,7 +2421,7 @@ function AwaitingParkButton({ thread, hints }: { thread: ThreadViewData; hints: 
       .finally(() => setBusy(false))
   }
   return (
-    <div className="mt-3">
+    <div className="flex shrink-0 items-center justify-end border-l border-border px-2 py-1.5">
       <button
         type="button"
         onClick={apply}
@@ -2440,9 +2429,9 @@ function AwaitingParkButton({ thread, hints }: { thread: ThreadViewData; hints: 
         aria-label={action.label}
         title={action.label}
         onMouseDown={(e) => e.preventDefault()}
-        className="flex items-center gap-1.5 rounded-md bg-fg px-2.5 py-1 text-[12px] font-medium text-bg outline-none transition-opacity hover:opacity-90 focus-visible:ring-1 focus-visible:ring-fg/60 disabled:opacity-45"
+        className="flex items-center gap-1.5 whitespace-nowrap rounded-md border border-border bg-panel px-2 py-1 text-[11px] font-medium text-fg/85 outline-none transition-colors hover:border-border-strong hover:bg-panel-2 hover:text-fg focus-visible:ring-1 focus-visible:ring-fg/60 disabled:opacity-45"
       >
-        {busy ? <Loader2 size={12} className="animate-spin" /> : <Clock size={12} />}
+        {busy && <Loader2 size={11} className="animate-spin" />}
         {action.label}
       </button>
     </div>
