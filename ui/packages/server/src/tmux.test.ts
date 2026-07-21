@@ -19,9 +19,9 @@ import {
   findPaneIdentity,
   findExpectedAdoptionPane,
   captureExpectedAdoptionPane,
-  captureExpectedAdoptionPaneWithCursor,
-  capturePaneEscapedWithCursor,
   crossSocketLiveOwner,
+  sendTextWithKey,
+  sendTextWithKeyToExpectedAdoptionPane,
   sendTextToExpectedAdoptionPane,
   expectedAdoptionAttachArgs,
   isExpectedAdoptionPaneLiveAnywhereCached,
@@ -146,8 +146,6 @@ test("new-session atomically exposes the adoption token with its exact pane gene
     )
     const bySlug = lookupAdoptionPane(slug)
     const byToken = findAdoptionPane(token)
-    const capture = capturePaneEscapedWithCursor(slug)
-    assert.ok(capture && Number.isInteger(capture.cursorY), "cursor-aware capture returns pane text and its cursor row")
     assert.equal(bySlug.kind, "found")
     assert.equal(byToken.kind, "found")
     if (bySlug.kind === "found" && byToken.kind === "found") {
@@ -214,10 +212,7 @@ test("exact adoption control is atomic, survives rename, and never contacts a re
     assert.equal(findExpectedAdoptionPane(expected).kind, "found", "global token + tuple still find the renamed owner")
     assert.equal(isExpectedAdoptionPaneLiveAnywhereCached(expected), true)
     assert.equal(captureExpectedAdoptionPane(expected).kind, "captured")
-    const cursorCapture = captureExpectedAdoptionPaneWithCursor(expected)
-    assert.equal(cursorCapture.kind, "captured")
-    if (cursorCapture.kind === "captured") assert.ok(Number.isInteger(cursorCapture.cursorY))
-    assert.equal(sendTextToExpectedAdoptionPane(expected, "hello-owner", true), true)
+    assert.equal(sendTextWithKeyToExpectedAdoptionPane(expected, "hello-owner", "Enter"), true)
 
     const competitor = spawn(
       slug,
@@ -306,7 +301,7 @@ test("token + full tuple teardown is one atomic authorization, including dead pa
   }
 })
 
-test("exact text send leaves no secret-bearing tmux buffer on success, mismatch, or server error", { skip: !tmuxAvailable }, () => {
+test("atomic text-and-key sends leave no secret-bearing tmux buffer on success, mismatch, or server error", { skip: !tmuxAvailable }, () => {
   const originalSocket = socketName()
   const slug = `exact-buffer-${process.pid}`
   const token = randomUUID()
@@ -345,8 +340,17 @@ test("exact text send leaves no secret-bearing tmux buffer on success, mismatch,
     assert.doesNotMatch(buffers(), /fray-exact-/)
     assert.doesNotMatch(buffers(), new RegExp(secret))
 
+    assert.equal(sendTextWithKeyToExpectedAdoptionPane(expected, secret, "Tab"), true)
+    assert.doesNotMatch(buffers(), /fray-exact-/)
+    assert.doesNotMatch(buffers(), new RegExp(secret))
+
+    assert.equal(sendTextWithKeyToExpectedAdoptionPane({ ...expected, attempt_token: randomUUID() }, secret, "Enter"), false)
+    assert.doesNotMatch(buffers(), /fray-exact-/)
+    assert.doesNotMatch(buffers(), new RegExp(secret))
+
     killSession(slug)
     assert.equal(sendTextToExpectedAdoptionPane(expected, secret, false), false)
+    assert.equal(sendTextWithKeyToExpectedAdoptionPane(expected, secret, "Enter"), false)
     assert.doesNotMatch(buffers(), /fray-exact-/)
     assert.doesNotMatch(buffers(), new RegExp(secret))
   } finally {
@@ -355,7 +359,53 @@ test("exact text send leaves no secret-bearing tmux buffer on success, mismatch,
   }
 })
 
-test("SIGKILL during exact text transport cannot strand its private tmux buffer", { skip: !tmuxAvailable }, async () => {
+test("local atomic text-and-key send pastes the complete multiline payload and cleans its private buffer", { skip: !tmuxAvailable }, async () => {
+  const originalSocket = socketName()
+  const slug = `local-atomic-send-${process.pid}`
+  const secret = `FRAY_LOCAL_BUFFER_SECRET_${randomUUID()}`
+  setSocket(`fray-local-atomic-send-test-${process.pid}`)
+  const buffers = (): string => {
+    try {
+      return execFileSync("tmux", ["-L", socketName(), "list-buffers", "-F", "#{buffer_name}\t#{buffer_sample}"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+    } catch {
+      return ""
+    }
+  }
+  try {
+    spawn(
+      slug,
+      [process.execPath, "-e", "process.stdin.on('data', d => process.stdout.write('LOCAL:' + JSON.stringify(d.toString())))"],
+      process.cwd(),
+    )
+    const payload = `${secret} first paragraph\n\nsecond paragraph`
+    assert.equal(sendTextWithKey(slug, payload, "Enter"), true)
+    assert.doesNotMatch(buffers(), /fray-input-/)
+    assert.doesNotMatch(buffers(), new RegExp(secret))
+
+    let pane = ""
+    const deadline = Date.now() + 2_000
+    while (Date.now() < deadline) {
+      pane = execFileSync("tmux", ["-L", socketName(), "capture-pane", "-p", "-t", tmuxSessionName(slug)], { encoding: "utf8" })
+      if (pane.includes(secret) && pane.includes("second paragraph")) break
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    assert.match(pane, new RegExp(secret))
+    assert.match(pane, /second paragraph/)
+
+    killSession(slug)
+    assert.equal(sendTextWithKey(slug, secret, "Enter"), false)
+    assert.doesNotMatch(buffers(), /fray-input-/)
+    assert.doesNotMatch(buffers(), new RegExp(secret))
+  } finally {
+    killSession(slug)
+    setSocket(originalSocket)
+  }
+})
+
+test("SIGKILL during exact atomic text-and-key transport cannot strand its private tmux buffer", { skip: !tmuxAvailable }, async () => {
   const originalSocket = socketName()
   const slug = `exact-buffer-kill-${process.pid}`
   const token = randomUUID()
@@ -373,13 +423,13 @@ test("SIGKILL during exact text transport cannot strand its private tmux buffer"
     }
     const moduleUrl = new URL("./tmux.ts", import.meta.url).href
     const child = spawnChild(process.execPath, ["--input-type=module", "-e", `
-      import { setSocket, sendTextToExpectedAdoptionPane } from ${JSON.stringify(moduleUrl)};
+      import { setSocket, sendTextWithKeyToExpectedAdoptionPane } from ${JSON.stringify(moduleUrl)};
       setSocket(${JSON.stringify(testSocket)});
       process.stdout.write("FRAY_SEND_READY\\n");
-      sendTextToExpectedAdoptionPane(
+      sendTextWithKeyToExpectedAdoptionPane(
         ${JSON.stringify(expected)},
         "FRAY_SIGKILL_BUFFER_SECRET_" + "x".repeat(32 * 1024 * 1024),
-        false,
+        "Enter",
       );
     `], { stdio: ["ignore", "pipe", "pipe"] })
     await new Promise<void>((resolve, reject) => {

@@ -20,13 +20,13 @@ export interface PermissionTerminal {
   paneIdentity?(slug: string): tmux.PaneIdentity | null
   capturePane(slug: string): string
   capturePaneEscaped(slug: string): string
-  capturePaneEscapedWithCursor?(slug: string): tmux.PaneTextCapture | null
   sendLiteral(slug: string, text: string): void
+  sendTextWithKey?(slug: string, text: string, key: "Enter" | "Tab"): boolean
   sendKey(slug: string, key: "Enter" | "Tab" | "Up" | "Down" | "Escape"): void
   findExpectedAdoptionPane?(expected: tmux.ExpectedAdoptionPane): tmux.AdoptionPaneLookup
   captureExpectedAdoptionPane?(expected: tmux.ExpectedAdoptionPane, escaped?: boolean): tmux.ExactPaneCapture
-  captureExpectedAdoptionPaneWithCursor?(expected: tmux.ExpectedAdoptionPane): tmux.ExactPaneCursorCapture
   sendTextToExpectedAdoptionPane?(expected: tmux.ExpectedAdoptionPane, text: string, submit: boolean): boolean
+  sendTextWithKeyToExpectedAdoptionPane?(expected: tmux.ExpectedAdoptionPane, text: string, key: "Enter" | "Tab"): boolean
   sendKeyToExpectedAdoptionPane?(
     expected: tmux.ExpectedAdoptionPane,
     key: "Enter" | "Tab" | "Up" | "Down" | "Escape",
@@ -145,11 +145,36 @@ type CodexComposerCapture =
   | { kind: "unavailable" }
 
 const codexDimAnsi = /\x1b\[(?:\d+;)*2(?:;\d+)*m/
+const codexModelFooter = /^(?:gpt-[\w.-]+|o\d[\w.-]*)(?:\s+(?:low|medium|high|xhigh|max|ultra|default))?\s+·\s+\S+/i
+
+function isCodexDimFooter(line: string): boolean {
+  const plain = stripAnsi(line).trim()
+  return codexDimAnsi.test(line) && (
+    /^tab to queue message\b/i.test(plain) ||
+    /^\d+%\s+context left\b/i.test(plain)
+  )
+}
+
+function isCodexStyledModelFooter(line: string): boolean {
+  return /\x1b\[/.test(line) && codexModelFooter.test(stripAnsi(line).trim())
+}
+
+function codexQueueHint(escapedPane: string): boolean {
+  const lines = escapedPane.split("\n")
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!/\x1b\[(?:0;)?1m›\x1b\[0m/.test(lines[i])) continue
+    return lines.slice(i + 1).some((line) => {
+      const plain = stripAnsi(line).trimStart()
+      return codexDimAnsi.test(line) && plain.startsWith("tab to queue message")
+    })
+  }
+  return false
+}
 
 // Capture only Codex's LAST bold composer prompt. Keeping the visual rows lets the durable-input
 // controller distinguish content from Codex's own width-dependent line breaks without treating an
 // arbitrary difference inside a row as equivalent.
-function captureCodexComposer(escapedPane: string, cursorY?: number): CodexComposerCapture {
+function captureCodexComposer(escapedPane: string): CodexComposerCapture {
   const lines = escapedPane.split("\n")
   for (let i = lines.length - 1; i >= 0; i--) {
     // Codex emits both SGR `1` and the equivalent reset-plus-bold `0;1` across redraws.
@@ -159,14 +184,14 @@ function captureCodexComposer(escapedPane: string, cursorY?: number): CodexCompo
     const raw = lines[i].slice(marker.index + marker[0].length)
     if (/^\s*\x1b\[2m/.test(raw)) return { kind: "empty" }
     const parts = [stripAnsi(raw).trim()]
-    const cursorBound = Number.isInteger(cursorY) && cursorY! >= i && cursorY! < lines.length
-      ? cursorY!
-      : undefined
-    for (let j = i + 1; j < lines.length && (cursorBound === undefined || j <= cursorBound); j++) {
+    for (let j = i + 1; j < lines.length; j++) {
       const part = stripAnsi(lines[j]).trim()
       if (!part) {
-        if (cursorBound === undefined) break
-        continue
+        const footer = lines.slice(j + 1).filter((line) => stripAnsi(line).trim())
+        if (!footer.every((line) => isCodexDimFooter(line) || isCodexStyledModelFooter(line))) {
+          return { kind: "unavailable" }
+        }
+        break
       }
       parts.push(part)
     }
@@ -175,20 +200,16 @@ function captureCodexComposer(escapedPane: string, cursorY?: number): CodexCompo
       parts,
       // The phrase can occur in transcript history or in the user's draft. Trust only Codex's dim
       // footer after this (last) composer marker, never a global plain-text match.
-      queueHint: lines.slice(i + 1).some((line) => {
-        const plain = stripAnsi(line).trimStart()
-        return codexDimAnsi.test(line) && plain.startsWith("tab to queue message")
-      }),
+      queueHint: codexQueueHint(escapedPane),
     }
   }
   return { kind: "unavailable" }
 }
 
 // Inspect only Codex's bold composer prompt. Empty suggestions are dim; real typed text is not.
-// Cursor-aware captures retain every visual row through the live composer cursor; legacy captures
-// stop at the first blank and therefore fail closed for multi-paragraph drafts.
-export function inspectCodexComposer(escapedPane: string, cursorY?: number): CodexComposerState {
-  const captured = captureCodexComposer(escapedPane, cursorY)
+// Plain text after a paragraph gap is ambiguous with Codex's unstyled footer, so it fails closed.
+export function inspectCodexComposer(escapedPane: string): CodexComposerState {
+  const captured = captureCodexComposer(escapedPane)
   if (captured.kind !== "typed") return captured
   const { parts, queueHint } = captured
     // Codex reflows a draft to the pane width. Ordinary continuation rows break at whitespace, but
@@ -213,8 +234,8 @@ export function inspectCodexComposer(escapedPane: string, cursorY?: number): Cod
 // soft row break. Every boundary may represent either zero characters (a token split) or one
 // normalized whitespace character (a word/newline break); differences anywhere INSIDE a row still
 // fail closed. The position-set DP is linear in practice and cannot explode as 2^rows.
-export function codexComposerMatches(escapedPane: string, expected: string, cursorY?: number): boolean {
-  const captured = captureCodexComposer(escapedPane, cursorY)
+export function codexComposerMatches(escapedPane: string, expected: string): boolean {
+  const captured = captureCodexComposer(escapedPane)
   if (captured.kind !== "typed" || captured.parts.length === 0) return false
   const target = normalizedInput(expected)
   const parts = captured.parts.map(normalizedInput)
@@ -299,13 +320,13 @@ export function createPermissionController(deps: PermissionControllerDeps): Perm
     isLive: tmux.isLive,
     capturePane: tmux.capturePane,
     capturePaneEscaped: tmux.capturePaneEscaped,
-    capturePaneEscapedWithCursor: tmux.capturePaneEscapedWithCursor,
     sendLiteral: tmux.sendLiteral,
+    sendTextWithKey: tmux.sendTextWithKey,
     sendKey: tmux.sendKey,
     findExpectedAdoptionPane: tmux.findExpectedAdoptionPane,
     captureExpectedAdoptionPane: tmux.captureExpectedAdoptionPane,
-    captureExpectedAdoptionPaneWithCursor: tmux.captureExpectedAdoptionPaneWithCursor,
     sendTextToExpectedAdoptionPane: tmux.sendTextToExpectedAdoptionPane,
+    sendTextWithKeyToExpectedAdoptionPane: tmux.sendTextWithKeyToExpectedAdoptionPane,
     sendKeyToExpectedAdoptionPane: tmux.sendKeyToExpectedAdoptionPane,
   }
   const now = deps.now ?? Date.now
@@ -334,29 +355,14 @@ export function createPermissionController(deps: PermissionControllerDeps): Perm
     return captured?.kind === "captured" ? captured.text : undefined
   }
 
-  function captureCodexOwned(row: SessionRow): { text: string; cursorY?: number } | undefined {
-    const binding = adoptionRuntimeBinding(deps.storage, row)
-    if (binding.kind === "conflict") return undefined
-    if (binding.kind === "unbound") {
-      if (!terminal.isLive(row.slug)) return undefined
-      const captured = terminal.capturePaneEscapedWithCursor?.(row.slug)
-      return captured ?? { text: terminal.capturePaneEscaped(row.slug) }
-    }
-    const captured = terminal.captureExpectedAdoptionPaneWithCursor?.(binding.claim)
-    if (captured?.kind === "captured") return captured
-    const fallback = terminal.captureExpectedAdoptionPane?.(binding.claim, true)
-    return fallback?.kind === "captured" ? { text: fallback.text } : undefined
-  }
-
-  function sendLiteralOwned(row: SessionRow, text: string): boolean {
+  function sendTextWithKeyOwned(row: SessionRow, text: string, key: "Enter" | "Tab"): boolean {
     const binding = adoptionRuntimeBinding(deps.storage, row)
     if (binding.kind === "conflict") return false
     if (binding.kind === "bound") {
-      return terminal.sendTextToExpectedAdoptionPane?.(binding.claim, text, false) === true
+      return terminal.sendTextWithKeyToExpectedAdoptionPane?.(binding.claim, text, key) === true
     }
     if (!terminal.isLive(row.slug)) return false
-    terminal.sendLiteral(row.slug, text)
-    return true
+    return terminal.sendTextWithKey?.(row.slug, text, key) === true
   }
 
   function sendKeyOwned(
@@ -473,13 +479,12 @@ export function createPermissionController(deps: PermissionControllerDeps): Perm
       throw new Error("Durable Codex input state is invalid; clear or repair it before submitting the draft")
     }
     row = ownCodexInput(row)
-    const captured = captureCodexOwned(row)
-    const escaped = captured?.text ?? ""
+    const escaped = captureOwned(row, true) ?? ""
     const pane = stripAnsi(escaped || captureOwned(row, false) || "")
     if (pane.includes("Press enter to confirm or esc to go back")) {
       throw new Error("Codex is showing a modal; resolve it in Terminal before submitting the draft")
     }
-    const composer = inspectCodexComposer(escaped, captured?.cursorY)
+    const composer = inspectCodexComposer(escaped)
     if (composer.kind !== "typed" || !composer.text) throw new Error("No nonempty Codex terminal draft is available to submit")
 
     const tele = deps.tailer.get(slug)
@@ -524,8 +529,8 @@ export function createPermissionController(deps: PermissionControllerDeps): Perm
     if (!queued || queued.state !== "pending" || queued.source === "existing-draft") {
       throw new Error("No pending Codex follow-up is available for terminal replacement")
     }
-    const captured = captureCodexOwned(row)
-    const composer = inspectCodexComposer(captured?.text ?? "", captured?.cursorY)
+    const escaped = captureOwned(row, true) ?? ""
+    const composer = inspectCodexComposer(escaped)
     if (composer.kind !== "typed" || !composer.text) {
       throw new Error("The existing Codex terminal draft changed; refresh and inspect Terminal before replacing it")
     }
@@ -694,9 +699,8 @@ export function createPermissionController(deps: PermissionControllerDeps): Perm
       failRequest(slug, "Wait for the queued Codex input to finish before changing permissions")
     }
 
-    const codexCapture = row.backend === "codex" ? captureCodexOwned(row) : undefined
     const composer = row.backend === "codex"
-      ? inspectCodexComposer(codexCapture?.text ?? "", codexCapture?.cursorY)
+      ? inspectCodexComposer(captureOwned(row, true) ?? "")
       : inspectClaudeComposer(captureOwned(row, false) ?? "")
     if (composer.kind === "typed") {
       failRequest(slug, `Permission change blocked: submit or clear the existing ${row.backend === "codex" ? "Codex" : "Claude"} terminal draft`)
@@ -816,7 +820,8 @@ export function createPermissionController(deps: PermissionControllerDeps): Perm
   }
 
   // Returns true while a queued input owns or is waiting for the composer; a permission reattach must
-  // stay behind it. Literal text and the submit key intentionally happen on separate ticks.
+  // stay behind it. New input is pasted and submitted by one tmux command queue after its durable
+  // barrier is written, so Fray never has to rediscover its own multiline draft from screen text.
   function tickInput(slug: string): boolean {
     let row = deps.storage.getSession(slug)
     if (!row) return false
@@ -880,17 +885,27 @@ export function createPermissionController(deps: PermissionControllerDeps): Perm
     }
     if (item.state === "submitted") return true
 
-    const captured = captureCodexOwned(row)
-    const escaped = captured?.text ?? ""
-    const composer = inspectCodexComposer(escaped, captured?.cursorY)
+    const escaped = captureOwned(row, true) ?? ""
+    const composer = inspectCodexComposer(escaped)
     if (composer.kind === "empty") {
+      const tele = deps.tailer.get(slug)
+      const key = codexQueueHint(escaped) ? "Tab" : tele?.turn === "idle" ? "Enter" : undefined
+      if (!key) {
+        setError(slug, "Queued Codex message is waiting for an idle or queueable composer")
+        return true
+      }
+      // Persist the barrier before one tmux command queue pastes the complete message and submits it.
+      // Fray never leaves its own draft behind for a later content-based guess.
+      item.state = "submitted"
+      item.submittedAt = new Date(now()).toISOString()
+      writeQueue(slug, queue, row)
       setError(slug, null)
-      if (!sendLiteralOwned(row, item.text)) {
-        setError(slug, "Queued Codex message was not staged because the worker identity changed")
+      if (!sendTextWithKeyOwned(row, item.text, key)) {
+        setError(slug, "Queued Codex submission could not be confirmed; Fray will not retry it automatically")
       }
       return true
     }
-    if (composer.kind === "typed" && codexComposerMatches(escaped, item.text, captured?.cursorY)) {
+    if (composer.kind === "typed" && codexComposerMatches(escaped, item.text)) {
       const tele = deps.tailer.get(slug)
       const key = composer.queueHint ? "Tab" : tele?.turn === "idle" ? "Enter" : undefined
       if (!key) {
@@ -912,7 +927,7 @@ export function createPermissionController(deps: PermissionControllerDeps): Perm
       setError(slug, "Queued message blocked: submit or clear the existing Codex terminal draft")
       return true
     }
-    setError(slug, "Queued message blocked by the current Codex modal; resolve it in Terminal")
+    setError(slug, "Queued message blocked by an ambiguous Codex composer or modal; resolve it in Terminal")
     return true
   }
 

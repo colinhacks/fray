@@ -427,37 +427,6 @@ export function capturePaneEscaped(slug: string): string {
   }
 }
 
-const CURSOR_CAPTURE_PREFIX = "FRAY_CURSOR_Y_9A74D2:"
-
-export interface PaneTextCapture {
-  text: string
-  cursorY: number
-}
-
-function parseCursorCapture(out: string, prefix = CURSOR_CAPTURE_PREFIX): PaneTextCapture | null {
-  const newline = out.indexOf("\n")
-  if (newline < 0 || !out.startsWith(prefix)) return null
-  const cursorY = Number(out.slice(prefix.length, newline))
-  return Number.isInteger(cursorY) && cursorY >= 0
-    ? { text: out.slice(newline + 1), cursorY }
-    : null
-}
-
-// Capture the visible escaped pane and cursor row in one tmux command queue. Codex's composer text
-// and footer are visually identical in some releases; the cursor row is the out-of-band boundary
-// that lets the input controller retain intentional blank-line-separated draft paragraphs.
-export function capturePaneEscapedWithCursor(slug: string): PaneTextCapture | null {
-  const name = tmuxSessionName(slug)
-  try {
-    return parseCursorCapture(tmux(
-      "display-message", "-p", "-t", name, `${CURSOR_CAPTURE_PREFIX}#{cursor_y}`,
-      ";", "capture-pane", "-p", "-e", "-t", name,
-    ))
-  } catch {
-    return null
-  }
-}
-
 export interface PaneIdentity {
   paneId: string
   panePid: number
@@ -560,10 +529,6 @@ export type ExactPaneCapture =
   | { kind: "captured"; text: string }
   | { kind: "unavailable" }
 
-export type ExactPaneCursorCapture =
-  | ({ kind: "captured" } & PaneTextCapture)
-  | { kind: "unavailable" }
-
 // Check token + full tuple and capture in one tmux server command. A pane replacement cannot slip
 // between authorization and capture, and a renamed exact owner remains addressable by pane id.
 export function captureExpectedAdoptionPane(
@@ -582,27 +547,6 @@ export function captureExpectedAdoptionPane(
     return out.startsWith(prefix)
       ? { kind: "captured", text: out.slice(prefix.length) }
       : { kind: "unavailable" }
-  } catch {
-    return { kind: "unavailable" }
-  }
-}
-
-// The token + immutable pane tuple and the cursor-aware capture are evaluated by one tmux server
-// command. A renamed adopted worker therefore gets the same composer boundary proof as a local one.
-export function captureExpectedAdoptionPaneWithCursor(
-  expected: ExpectedAdoptionPane,
-): ExactPaneCursorCapture {
-  const condition = expectedAdoptionCondition(expected)
-  if (!condition || expected.pane_id === null) return { kind: "unavailable" }
-  try {
-    const header = `${EXACT_ACTION_OK}:${CURSOR_CAPTURE_PREFIX}`
-    const out = tmux(
-      "if-shell", "-t", expected.pane_id, "-F", condition,
-      `display-message -p '${header}#{cursor_y}' ; capture-pane -p -e -t ${expected.pane_id}`,
-      `display-message -p ${EXACT_ACTION_MISS}`,
-    )
-    const captured = parseCursorCapture(out, header)
-    return captured ? { kind: "captured", ...captured } : { kind: "unavailable" }
   } catch {
     return { kind: "unavailable" }
   }
@@ -638,6 +582,35 @@ export function sendTextToExpectedAdoptionPane(
   } catch {
     // A single tmux client submitted the complete server-side queue. Never retry an ambiguous paste:
     // the server either rejected it before authorization or finishes the queued cleanup itself.
+    return false
+  }
+}
+
+export function sendTextWithKeyToExpectedAdoptionPane(
+  expected: ExpectedAdoptionPane,
+  text: string,
+  key: "Enter" | "Tab",
+): boolean {
+  const condition = expectedAdoptionCondition(expected)
+  if (!condition || expected.pane_id === null) return false
+  const buffer = `fray-exact-${randomUUID()}`
+  try {
+    const out = execFileSync("tmux", [
+      "-L", socket,
+      "load-buffer", "-b", buffer, "-",
+      ";",
+      "if-shell", "-t", expected.pane_id, "-F", condition,
+      `paste-buffer -b ${buffer} -t ${expected.pane_id} ; send-keys -t ${expected.pane_id} ${key} ; display-message -p ${EXACT_ACTION_OK}`,
+      `display-message -p ${EXACT_ACTION_MISS}`,
+      ";",
+      "delete-buffer", "-b", buffer,
+    ], {
+      input: text,
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "ignore"],
+    })
+    return out.trimEnd().endsWith(EXACT_ACTION_OK)
+  } catch {
     return false
   }
 }
@@ -1006,6 +979,32 @@ export function sendKeys(slug: string, text: string): void {
 // pane before using these; unlike sendKeys, these never guess that a literal string is a user prompt.
 export function sendLiteral(slug: string, text: string): void {
   tmux("send-keys", "-t", tmuxSessionName(slug), "-l", text)
+}
+
+export function sendTextWithKey(slug: string, text: string, key: "Enter" | "Tab"): boolean {
+  const name = tmuxSessionName(slug)
+  const buffer = `fray-input-${randomUUID()}`
+  try {
+    const out = execFileSync("tmux", [
+      "-L", socket,
+      "load-buffer", "-b", buffer, "-",
+      ";",
+      "paste-buffer", "-b", buffer, "-t", name,
+      ";",
+      "send-keys", "-t", name, key,
+      ";",
+      "display-message", "-p", EXACT_ACTION_OK,
+      ";",
+      "delete-buffer", "-b", buffer,
+    ], {
+      input: text,
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "ignore"],
+    })
+    return out.trimEnd().endsWith(EXACT_ACTION_OK)
+  } catch {
+    return false
+  }
 }
 
 export function sendKey(slug: string, key: "Enter" | "Tab" | "Up" | "Down" | "Escape"): void {
