@@ -20,10 +20,12 @@ export interface PermissionTerminal {
   paneIdentity?(slug: string): tmux.PaneIdentity | null
   capturePane(slug: string): string
   capturePaneEscaped(slug: string): string
+  capturePaneEscapedWithCursor?(slug: string): tmux.PaneTextCapture | null
   sendLiteral(slug: string, text: string): void
   sendKey(slug: string, key: "Enter" | "Tab" | "Up" | "Down" | "Escape"): void
   findExpectedAdoptionPane?(expected: tmux.ExpectedAdoptionPane): tmux.AdoptionPaneLookup
   captureExpectedAdoptionPane?(expected: tmux.ExpectedAdoptionPane, escaped?: boolean): tmux.ExactPaneCapture
+  captureExpectedAdoptionPaneWithCursor?(expected: tmux.ExpectedAdoptionPane): tmux.ExactPaneCursorCapture
   sendTextToExpectedAdoptionPane?(expected: tmux.ExpectedAdoptionPane, text: string, submit: boolean): boolean
   sendKeyToExpectedAdoptionPane?(
     expected: tmux.ExpectedAdoptionPane,
@@ -142,10 +144,12 @@ type CodexComposerCapture =
   | { kind: "typed"; parts: string[]; queueHint: boolean }
   | { kind: "unavailable" }
 
+const codexDimAnsi = /\x1b\[(?:\d+;)*2(?:;\d+)*m/
+
 // Capture only Codex's LAST bold composer prompt. Keeping the visual rows lets the durable-input
 // controller distinguish content from Codex's own width-dependent line breaks without treating an
 // arbitrary difference inside a row as equivalent.
-function captureCodexComposer(escapedPane: string): CodexComposerCapture {
+function captureCodexComposer(escapedPane: string, cursorY?: number): CodexComposerCapture {
   const lines = escapedPane.split("\n")
   for (let i = lines.length - 1; i >= 0; i--) {
     // Codex emits both SGR `1` and the equivalent reset-plus-bold `0;1` across redraws.
@@ -155,10 +159,15 @@ function captureCodexComposer(escapedPane: string): CodexComposerCapture {
     const raw = lines[i].slice(marker.index + marker[0].length)
     if (/^\s*\x1b\[2m/.test(raw)) return { kind: "empty" }
     const parts = [stripAnsi(raw).trim()]
-    for (let j = i + 1; j < lines.length; j++) {
+    const cursorBound = Number.isInteger(cursorY) && cursorY! >= i && cursorY! < lines.length
+      ? cursorY!
+      : undefined
+    for (let j = i + 1; j < lines.length && (cursorBound === undefined || j <= cursorBound); j++) {
       const part = stripAnsi(lines[j]).trim()
-      if (!part) break
-      if (part.includes("tab to queue message") || part.includes("context left")) break
+      if (!part) {
+        if (cursorBound === undefined) break
+        continue
+      }
       parts.push(part)
     }
     return {
@@ -168,17 +177,18 @@ function captureCodexComposer(escapedPane: string): CodexComposerCapture {
       // footer after this (last) composer marker, never a global plain-text match.
       queueHint: lines.slice(i + 1).some((line) => {
         const plain = stripAnsi(line).trimStart()
-        return /\x1b\[(?:\d+;)*2(?:;\d+)*m/.test(line) && plain.startsWith("tab to queue message")
+        return codexDimAnsi.test(line) && plain.startsWith("tab to queue message")
       }),
     }
   }
   return { kind: "unavailable" }
 }
 
-// Inspect only Codex's bold composer prompt. Empty suggestions are dim; real typed text is not. A
-// wrapped draft continues on indented rows until the blank line before the footer.
-export function inspectCodexComposer(escapedPane: string): CodexComposerState {
-  const captured = captureCodexComposer(escapedPane)
+// Inspect only Codex's bold composer prompt. Empty suggestions are dim; real typed text is not.
+// Cursor-aware captures retain every visual row through the live composer cursor; legacy captures
+// stop at the first blank and therefore fail closed for multi-paragraph drafts.
+export function inspectCodexComposer(escapedPane: string, cursorY?: number): CodexComposerState {
+  const captured = captureCodexComposer(escapedPane, cursorY)
   if (captured.kind !== "typed") return captured
   const { parts, queueHint } = captured
     // Codex reflows a draft to the pane width. Ordinary continuation rows break at whitespace, but
@@ -203,8 +213,8 @@ export function inspectCodexComposer(escapedPane: string): CodexComposerState {
 // soft row break. Every boundary may represent either zero characters (a token split) or one
 // normalized whitespace character (a word/newline break); differences anywhere INSIDE a row still
 // fail closed. The position-set DP is linear in practice and cannot explode as 2^rows.
-export function codexComposerMatches(escapedPane: string, expected: string): boolean {
-  const captured = captureCodexComposer(escapedPane)
+export function codexComposerMatches(escapedPane: string, expected: string, cursorY?: number): boolean {
+  const captured = captureCodexComposer(escapedPane, cursorY)
   if (captured.kind !== "typed" || captured.parts.length === 0) return false
   const target = normalizedInput(expected)
   const parts = captured.parts.map(normalizedInput)
@@ -289,10 +299,12 @@ export function createPermissionController(deps: PermissionControllerDeps): Perm
     isLive: tmux.isLive,
     capturePane: tmux.capturePane,
     capturePaneEscaped: tmux.capturePaneEscaped,
+    capturePaneEscapedWithCursor: tmux.capturePaneEscapedWithCursor,
     sendLiteral: tmux.sendLiteral,
     sendKey: tmux.sendKey,
     findExpectedAdoptionPane: tmux.findExpectedAdoptionPane,
     captureExpectedAdoptionPane: tmux.captureExpectedAdoptionPane,
+    captureExpectedAdoptionPaneWithCursor: tmux.captureExpectedAdoptionPaneWithCursor,
     sendTextToExpectedAdoptionPane: tmux.sendTextToExpectedAdoptionPane,
     sendKeyToExpectedAdoptionPane: tmux.sendKeyToExpectedAdoptionPane,
   }
@@ -320,6 +332,20 @@ export function createPermissionController(deps: PermissionControllerDeps): Perm
     }
     const captured = terminal.captureExpectedAdoptionPane?.(binding.claim, escaped)
     return captured?.kind === "captured" ? captured.text : undefined
+  }
+
+  function captureCodexOwned(row: SessionRow): { text: string; cursorY?: number } | undefined {
+    const binding = adoptionRuntimeBinding(deps.storage, row)
+    if (binding.kind === "conflict") return undefined
+    if (binding.kind === "unbound") {
+      if (!terminal.isLive(row.slug)) return undefined
+      const captured = terminal.capturePaneEscapedWithCursor?.(row.slug)
+      return captured ?? { text: terminal.capturePaneEscaped(row.slug) }
+    }
+    const captured = terminal.captureExpectedAdoptionPaneWithCursor?.(binding.claim)
+    if (captured?.kind === "captured") return captured
+    const fallback = terminal.captureExpectedAdoptionPane?.(binding.claim, true)
+    return fallback?.kind === "captured" ? { text: fallback.text } : undefined
   }
 
   function sendLiteralOwned(row: SessionRow, text: string): boolean {
@@ -447,12 +473,13 @@ export function createPermissionController(deps: PermissionControllerDeps): Perm
       throw new Error("Durable Codex input state is invalid; clear or repair it before submitting the draft")
     }
     row = ownCodexInput(row)
-    const escaped = captureOwned(row, true) ?? ""
+    const captured = captureCodexOwned(row)
+    const escaped = captured?.text ?? ""
     const pane = stripAnsi(escaped || captureOwned(row, false) || "")
     if (pane.includes("Press enter to confirm or esc to go back")) {
       throw new Error("Codex is showing a modal; resolve it in Terminal before submitting the draft")
     }
-    const composer = inspectCodexComposer(escaped)
+    const composer = inspectCodexComposer(escaped, captured?.cursorY)
     if (composer.kind !== "typed" || !composer.text) throw new Error("No nonempty Codex terminal draft is available to submit")
 
     const tele = deps.tailer.get(slug)
@@ -497,8 +524,8 @@ export function createPermissionController(deps: PermissionControllerDeps): Perm
     if (!queued || queued.state !== "pending" || queued.source === "existing-draft") {
       throw new Error("No pending Codex follow-up is available for terminal replacement")
     }
-    const escaped = captureOwned(row, true) ?? ""
-    const composer = inspectCodexComposer(escaped)
+    const captured = captureCodexOwned(row)
+    const composer = inspectCodexComposer(captured?.text ?? "", captured?.cursorY)
     if (composer.kind !== "typed" || !composer.text) {
       throw new Error("The existing Codex terminal draft changed; refresh and inspect Terminal before replacing it")
     }
@@ -667,8 +694,9 @@ export function createPermissionController(deps: PermissionControllerDeps): Perm
       failRequest(slug, "Wait for the queued Codex input to finish before changing permissions")
     }
 
+    const codexCapture = row.backend === "codex" ? captureCodexOwned(row) : undefined
     const composer = row.backend === "codex"
-      ? inspectCodexComposer(captureOwned(row, true) ?? "")
+      ? inspectCodexComposer(codexCapture?.text ?? "", codexCapture?.cursorY)
       : inspectClaudeComposer(captureOwned(row, false) ?? "")
     if (composer.kind === "typed") {
       failRequest(slug, `Permission change blocked: submit or clear the existing ${row.backend === "codex" ? "Codex" : "Claude"} terminal draft`)
@@ -852,8 +880,9 @@ export function createPermissionController(deps: PermissionControllerDeps): Perm
     }
     if (item.state === "submitted") return true
 
-    const escaped = captureOwned(row, true) ?? ""
-    const composer = inspectCodexComposer(escaped)
+    const captured = captureCodexOwned(row)
+    const escaped = captured?.text ?? ""
+    const composer = inspectCodexComposer(escaped, captured?.cursorY)
     if (composer.kind === "empty") {
       setError(slug, null)
       if (!sendLiteralOwned(row, item.text)) {
@@ -861,7 +890,7 @@ export function createPermissionController(deps: PermissionControllerDeps): Perm
       }
       return true
     }
-    if (composer.kind === "typed" && codexComposerMatches(escaped, item.text)) {
+    if (composer.kind === "typed" && codexComposerMatches(escaped, item.text, captured?.cursorY)) {
       const tele = deps.tailer.get(slug)
       const key = composer.queueHint ? "Tab" : tele?.turn === "idle" ? "Enter" : undefined
       if (!key) {

@@ -19,6 +19,8 @@ import {
   findPaneIdentity,
   findExpectedAdoptionPane,
   captureExpectedAdoptionPane,
+  captureExpectedAdoptionPaneWithCursor,
+  capturePaneEscapedWithCursor,
   crossSocketLiveOwner,
   sendTextToExpectedAdoptionPane,
   expectedAdoptionAttachArgs,
@@ -144,6 +146,8 @@ test("new-session atomically exposes the adoption token with its exact pane gene
     )
     const bySlug = lookupAdoptionPane(slug)
     const byToken = findAdoptionPane(token)
+    const capture = capturePaneEscapedWithCursor(slug)
+    assert.ok(capture && Number.isInteger(capture.cursorY), "cursor-aware capture returns pane text and its cursor row")
     assert.equal(bySlug.kind, "found")
     assert.equal(byToken.kind, "found")
     if (bySlug.kind === "found" && byToken.kind === "found") {
@@ -210,6 +214,9 @@ test("exact adoption control is atomic, survives rename, and never contacts a re
     assert.equal(findExpectedAdoptionPane(expected).kind, "found", "global token + tuple still find the renamed owner")
     assert.equal(isExpectedAdoptionPaneLiveAnywhereCached(expected), true)
     assert.equal(captureExpectedAdoptionPane(expected).kind, "captured")
+    const cursorCapture = captureExpectedAdoptionPaneWithCursor(expected)
+    assert.equal(cursorCapture.kind, "captured")
+    if (cursorCapture.kind === "captured") assert.ok(Number.isInteger(cursorCapture.cursorY))
     assert.equal(sendTextToExpectedAdoptionPane(expected, "hello-owner", true), true)
 
     const competitor = spawn(

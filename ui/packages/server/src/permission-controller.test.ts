@@ -44,6 +44,7 @@ function harness(storageOverride?: Storage) {
   }
   let pane = ""
   let escaped = ""
+  let cursorY: number | undefined
   let live = true
   let clock = 1_000
   let onTailerTick = () => {}
@@ -54,6 +55,7 @@ function harness(storageOverride?: Storage) {
     isLive: () => live,
     capturePane: () => pane,
     capturePaneEscaped: () => escaped,
+    capturePaneEscapedWithCursor: () => cursorY === undefined ? null : { text: escaped, cursorY },
     sendLiteral: (_slug, text) => sent.push(`literal:${text}`),
     sendKey: (slug, key) => {
       keyQueueSnapshots.push(storage.getSession(slug)?.codex_input_queue)
@@ -88,9 +90,10 @@ function harness(storageOverride?: Storage) {
     controller,
     sent,
     reattached,
-    setPane(plain: string, withEscapes = plain) {
+    setPane(plain: string, withEscapes = plain, nextCursorY?: number) {
       pane = plain
       escaped = withEscapes
+      cursorY = nextCursorY
     },
     setTelemetry(next: SessionTelemetry | undefined) {
       telemetry = next
@@ -153,6 +156,64 @@ test("composer inspection matches the exact wrapped nonempty Nub pane and the di
     inspectCodexComposer("\u001b[1m›\u001b[0m Compare alpha -\n  beta before proceeding."),
     { kind: "typed", text: "Compare alpha - beta before proceeding.", queueHint: false },
     "a standalone punctuation hyphen preserves the real following space",
+  )
+  const multiParagraphDraft =
+    "\u001b[0;1m›\u001b[0m Do not keep legacy code around.\n\n  Implement this all fully.\n\n  gpt-5.6-sol xhigh · ~/project · Context 71% used"
+  assert.deepEqual(inspectCodexComposer(multiParagraphDraft, 2), {
+    kind: "typed",
+    text: "Do not keep legacy code around. Implement this all fully.",
+    queueHint: false,
+  })
+  assert.equal(
+    codexComposerMatches(multiParagraphDraft, "Do not keep legacy code around.\n\nImplement this all fully.", 2),
+    true,
+    "interior paragraph gaps remain part of the draft while the native footer is excluded",
+  )
+  assert.equal(
+    codexComposerMatches(multiParagraphDraft, "Do not keep legacy code around.\n\nImplement this all fully."),
+    false,
+    "a legacy capture without cursor provenance fails closed at the first paragraph gap",
+  )
+  const footerLikeDraft =
+    "\u001b[0;1m›\u001b[0m Explain this phrase.\n\n  tab to queue message is user-authored.\n\n  gpt-5.6-sol xhigh\n\n  gpt-5.6-sol xhigh · ~/project · Context 71% used"
+  assert.equal(
+    codexComposerMatches(
+      footerLikeDraft,
+      "Explain this phrase.\n\ntab to queue message is user-authored.\n\ngpt-5.6-sol xhigh",
+      4,
+    ),
+    true,
+    "footer-like user paragraphs through the cursor remain part of the draft",
+  )
+  const modelLikeFinalParagraph = "\u001b[0;1m›\u001b[0m SAFE\n\n  gpt-5.6-sol xhigh"
+  assert.deepEqual(inspectCodexComposer(modelLikeFinalParagraph, 2), {
+    kind: "typed",
+    text: "SAFE gpt-5.6-sol xhigh",
+    queueHint: false,
+  })
+  assert.equal(
+    codexComposerMatches(modelLikeFinalParagraph, "SAFE", 2),
+    false,
+    "a final model-looking user paragraph cannot be discarded and auto-submitted",
+  )
+  const cursorBoundedFooter =
+    "\u001b[0;1m›\u001b[0m Keep the exact draft.\n\n  \u001b[38;2;246;226;183mgpt-5.6-sol xhigh\u001b[2m\u001b[39m · ~/project\u001b[0m\n  \u001b[2mtab to queue message\u001b[0m"
+  assert.deepEqual(inspectCodexComposer(cursorBoundedFooter, 0), {
+    kind: "typed",
+    text: "Keep the exact draft.",
+    queueHint: true,
+  })
+  assert.equal(
+    codexComposerMatches(cursorBoundedFooter, "Keep the exact draft.", 0),
+    true,
+    "rows below the composer cursor are excluded without inferring from their content",
+  )
+  const ambiguousWrappedFooter =
+    "\u001b[0;1m›\u001b[0m SAFE\n\n  gpt-5.6-sol xhigh · ~/project\n  \u001b[2mtab to queue message\u001b[0m"
+  assert.equal(
+    codexComposerMatches(ambiguousWrappedFooter, "SAFE", 2),
+    false,
+    "a following native hint cannot prove that a preceding plain model-shaped paragraph is footer chrome",
   )
 })
 
@@ -643,7 +704,7 @@ test("durable live Codex follow-up separates typing from idle Enter and clears o
   assert.equal(JSON.parse(h.storage.getSession("idle-input")?.codex_input_queue ?? "[]")[0].state, "pending")
 
   h.sent.length = 0
-  h.setPane("", "\u001b[1m›\u001b[0m Reply exactly IDLE_OK.\n\n  gpt-5.6-sol")
+  h.setPane("", "\u001b[1m›\u001b[0m Reply exactly IDLE_OK.\n\n  gpt-5.6-sol xhigh · ~/project · Context 71% used")
   h.controller.tick()
   assert.deepEqual(h.sent, ["key:Enter"])
   assert.equal(JSON.parse(h.storage.getSession("idle-input")?.codex_input_queue ?? "[]")[0].state, "submitted")
@@ -660,6 +721,41 @@ test("durable live Codex follow-up separates typing from idle Enter and clears o
   })
   h.controller.tick()
   assert.equal(h.storage.getSession("idle-input")?.codex_input_queue, null)
+})
+
+test("an identical two-paragraph Codex draft is submitted instead of blocking its queued follow-up", () => {
+  const h = harness()
+  const slug = "multi-paragraph-input"
+  const message = "Do not keep legacy code around.\n\nImplement this all fully."
+  h.storage.upsertSession(row(slug))
+  h.storage.setBackend(slug, "codex")
+  h.setTelemetry({ turn: "idle", permPrompt: false, subAgents: [], bgShells: [], pendingQuestion: false })
+  h.setPane(
+    "",
+    "\u001b[0;1m›\u001b[0m Do not keep legacy code around.\n\n  Implement this all fully.\n\n  gpt-5.6-sol xhigh · ~/project · Context 71% used",
+    2,
+  )
+
+  h.controller.queueFollowUp(slug, message)
+
+  assert.deepEqual(h.sent, ["key:Enter"])
+  assert.equal(h.storage.getSession(slug)?.control_error, null)
+  assert.equal(JSON.parse(h.storage.getSession(slug)?.codex_input_queue ?? "[]")[0].state, "submitted")
+})
+
+test("a cursor-bounded footer-like final paragraph cannot auto-submit only its queued prefix", () => {
+  const h = harness()
+  const slug = "footer-like-user-text"
+  h.storage.upsertSession(row(slug))
+  h.storage.setBackend(slug, "codex")
+  h.setTelemetry({ turn: "idle", permPrompt: false, subAgents: [], bgShells: [], pendingQuestion: false })
+  h.setPane("", "\u001b[0;1m›\u001b[0m SAFE\n\n  gpt-5.6-sol xhigh · ~/project · Context 71% used", 2)
+
+  h.controller.queueFollowUp(slug, "SAFE")
+
+  assert.deepEqual(h.sent, [])
+  assert.match(h.storage.getSession(slug)?.control_error ?? "", /existing Codex terminal draft/)
+  assert.equal(JSON.parse(h.storage.getSession(slug)?.codex_input_queue ?? "[]")[0].state, "pending")
 })
 
 test("a scheduler delivery id makes durable Codex wake enqueue idempotent", () => {
@@ -738,7 +834,7 @@ test("identical consecutive follow-ups each require their own post-submission ro
 
   h.setNow(1_000)
   h.controller.queueFollowUp("duplicate-input", "SAME")
-  h.setPane("", "\u001b[1m›\u001b[0m SAME\n\n  gpt-5.6-sol")
+  h.setPane("", "\u001b[1m›\u001b[0m SAME\n\n  gpt-5.6-sol xhigh · ~/project · Context 71% used")
   h.setNow(1_050)
   h.controller.queueFollowUp("duplicate-input", "SAME")
   assert.deepEqual(h.sent, ["literal:SAME", "key:Enter"])
@@ -760,7 +856,7 @@ test("identical consecutive follow-ups each require their own post-submission ro
   h.setPane("", emptyComposer)
   h.setNow(1_300)
   h.controller.tick()
-  h.setPane("", "\u001b[1m›\u001b[0m SAME\n\n  gpt-5.6-sol")
+  h.setPane("", "\u001b[1m›\u001b[0m SAME\n\n  gpt-5.6-sol xhigh · ~/project · Context 71% used")
   h.setNow(1_400)
   h.controller.tick()
   queue = JSON.parse(h.storage.getSession("duplicate-input")?.codex_input_queue ?? "[]")
