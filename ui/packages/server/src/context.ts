@@ -131,6 +131,9 @@ export interface AppContext {
   // githubStatus handler falls back to a live detect during that ~30ms window). Kept OUT of the board
   // snapshot deliberately — no gh shell-out on every board delta.
   github?: GithubDetection
+  // The dispatch Claude executable (tests use a stand-in). The account logout action runs the SAME
+  // binary so sign-out targets the credential the workers actually use.
+  claudeBin?: string
 }
 
 export interface ContextOptions {
@@ -511,5 +514,6 @@ function createContextUnchecked(opts: ContextOptions, resources: PartialContextR
     getSettings: () => getSettings(storage),
     setSettings: (s) => setSettings(storage, s),
     resetSettings: () => resetSettings(storage),
+    claudeBin: opts.claudeBin,
   }
 }

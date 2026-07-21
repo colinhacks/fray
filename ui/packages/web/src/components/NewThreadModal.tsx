@@ -8,7 +8,7 @@ import { showToast, store } from "../store.ts"
 import { Composer } from "./Composer.tsx"
 import { GithubTrigger } from "./GithubTrigger.tsx"
 import { ProfileGridSelector } from "./ProfileGridSelector.tsx"
-import { SignInModal } from "./SignInModal.tsx"
+import { LogoutConfirmModal, SignInModal } from "./SignInModal.tsx"
 import {
   applyDispatchPreferenceUpdate,
   dispatchProfileGroups,
@@ -17,6 +17,7 @@ import {
 import { captureDispatchProfile } from "../lib/githubDispatch.ts"
 import { handleDialogEscape } from "../lib/selectOverlay.ts"
 import { draftKey, draftStore, useDraft, useProjectDir } from "../lib/drafts.ts"
+import { parseAccountAlias } from "../lib/signIn.ts"
 import { PROMPT_CONTROL_TYPOGRAPHY_CLASS } from "../lib/promptControlTypography.ts"
 
 // THE dispatch prompt box — composer + quiet selects row — shared by every surface that can start a
@@ -54,6 +55,7 @@ export function DispatchForm({
   // When submit is gated, the built dispatch is stashed here and the sign-in modal opens for this
   // backend; a successful re-check runs the stashed dispatch unchanged.
   const [signInFor, setSignInFor] = useState<Backend | null>(null)
+  const [logoutFor, setLogoutFor] = useState<Backend | null>(null)
   const gatedInputRef = useRef<DispatchInput | null>(null)
 
   const preference = useMutation({
@@ -128,6 +130,19 @@ export function DispatchForm({
 
   function submit() {
     if (!prompt.trim() || !resolved) return
+    // `/login` and `/logout` are fray-owned aliases for the typed provider account actions — they
+    // invoke the sign-in / sign-out flow for the SELECTED backend and never become prompt text.
+    const alias = parseAccountAlias(prompt)
+    if (alias) {
+      clearPrompt()
+      if (alias === "login") {
+        gatedInputRef.current = null // nothing to dispatch after sign-in — this is a pure account action
+        setSignInFor(resolved.backend)
+      } else {
+        setLogoutFor(resolved.backend)
+      }
+      return
+    }
     if (!resolved.modelAvailable) {
       showToast("Saved model is unavailable — choose a model before starting the thread")
       return
@@ -155,9 +170,9 @@ export function DispatchForm({
     runDispatch(input)
   }
 
-  // The profile/permission readouts live INSIDE the box, along its bottom edge — petite caps,
-  // very quiet. Not dropdowns at rest: plain values (mode color-coded like Claude Code's
-  // permission palette); hover materializes the border, click opens the menu.
+  // The profile readout lives INSIDE the box, along its bottom edge — petite caps, very quiet.
+  // Not a dropdown at rest: a plain value; hover materializes the border, click opens the menu.
+  // There is no permission control: dispatch permission is fixed server-side.
   //
   // useMemo (measured in the render-perf profile): the footer used to be rebuilt inline on every
   // render, so each prompt KEYSTROKE re-rendered every picker tree — ~222 component renders per
@@ -239,6 +254,7 @@ export function DispatchForm({
           }}
         />
       )}
+      {logoutFor && <LogoutConfirmModal backend={logoutFor} onClose={() => setLogoutFor(null)} />}
     </div>
   )
 }

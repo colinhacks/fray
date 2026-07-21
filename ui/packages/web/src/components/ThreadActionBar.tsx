@@ -1,9 +1,12 @@
-import type { ReactNode } from "react"
+import { useState, type ReactNode } from "react"
 import { useSnapshot } from "valtio"
+import type { Backend } from "@fray-ui/shared"
 import { store } from "../store.ts"
 import { useThreadComposerControls } from "../hooks/useThreadComposerControls.tsx"
 import { Composer } from "./Composer.tsx"
+import { LogoutConfirmModal, SignInModal } from "./SignInModal.tsx"
 import { draftKey, draftStore, useDraft, useProjectDir } from "../lib/drafts.ts"
+import { parseAccountAlias } from "../lib/signIn.ts"
 import { useEagerFollowUp } from "../lib/eagerComposerSubmission.ts"
 
 // The bar under the chat/terminal is now JUST the follow-up composer — the Done button and the
@@ -18,10 +21,23 @@ export function ThreadActionBar({ slug, ops }: { slug: string; onTerminal?: () =
   const [message, setMessage, clearMessage] = useDraft(key)
   const controls = useThreadComposerControls(slug)
   const followUp = useEagerFollowUp(slug)
+  const [signInFor, setSignInFor] = useState<Backend | null>(null)
+  const [logoutFor, setLogoutFor] = useState<Backend | null>(null)
 
   function send() {
     const m = message.trim()
     if (!m) return
+    // `/login` / `/logout` are fray-owned account actions for THIS thread's backend — invoked
+    // locally, never delivered to the worker as a prompt (a leading slash is not a stable provider
+    // command transport across the live-paste vs dead-resume lifecycles).
+    const alias = parseAccountAlias(m)
+    if (alias) {
+      clearMessage()
+      const backend: Backend = thread?.backend === "codex" ? "codex" : "claude"
+      if (alias === "login") setSignInFor(backend)
+      else setLogoutFor(backend)
+      return
+    }
     followUp.submit(m, {
       onOptimistic: clearMessage,
       // Never clobber a newer draft typed while the request was in flight.
@@ -54,6 +70,8 @@ export function ThreadActionBar({ slug, ops }: { slug: string; onTerminal?: () =
       />
       {controls.status}
       {ops}
+      {signInFor && <SignInModal backend={signInFor} onClose={() => setSignInFor(null)} onAuthed={() => setSignInFor(null)} />}
+      {logoutFor && <LogoutConfirmModal backend={logoutFor} onClose={() => setLogoutFor(null)} />}
     </div>
   )
 }

@@ -21,6 +21,8 @@ import {
   CodexModel,
   QuotaSnapshot,
   AuthSnapshot,
+  AccountLogoutInput,
+  AccountLogoutResult,
   RenameThreadInput,
   AiRenameThreadInput,
   AiRenameThreadResult,
@@ -67,6 +69,7 @@ import { slugify, resolveSlug, resolveLegacyThreadFile } from "./dispatch.ts"
 import { readCodexModels } from "./backend/codex-models.ts"
 import { readQuota } from "./quota.ts"
 import { readAuthSnapshot } from "./backend/auth-status.ts"
+import { liveThreadsForBackend, runProviderLogout } from "./backend/account-actions.ts"
 import { threadProfileOptions, validateThreadProfile } from "./backend/thread-profiles.ts"
 import * as tmux from "./tmux.ts"
 import { adoptionRuntimeBinding } from "./adoption-recovery.ts"
@@ -942,6 +945,22 @@ export function createRouter(ctx: AppContext) {
     authStatus: query({
       output: AuthSnapshot,
       handler: async () => readAuthSnapshot(),
+    }),
+
+    // Typed provider account action behind the `/logout` alias + confirm dialog (claude-auth plan).
+    // Refuses to race a live turn for that provider (account state is process-global), then runs the
+    // exact provider CLI argv without a shell and reports the post-attempt credential state.
+    accountLogout: mutation({
+      input: AccountLogoutInput,
+      output: AccountLogoutResult,
+      handler: async ({ input }) => {
+        const snapshot = await ctx.board.snapshot()
+        return runProviderLogout({
+          backend: input.backend,
+          claudeBin: ctx.claudeBin,
+          liveThreads: liveThreadsForBackend(snapshot.threads, input.backend),
+        })
+      },
     }),
 
     settingsGet: query({

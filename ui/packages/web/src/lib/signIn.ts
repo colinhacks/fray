@@ -14,3 +14,16 @@ export const PROVIDER_LABEL: Record<Backend, string> = {
   claude: "Claude",
   codex: "Codex",
 }
+
+// `/login` and `/logout` are FRAY-OWNED aliases for the typed provider account actions — they are
+// intercepted at the composer submit boundary and NEVER sent to a thread as prompt text (a leading
+// slash is not a stable provider command transport: live input is pasted into a TUI while a dead
+// session resumes with the text as a positional prompt). Only the complete, exact input counts;
+// "/login please" or any other "/word" remains an ordinary prompt — fray does not confiscate syntax
+// it cannot prove is a command.
+export function parseAccountAlias(text: string): "login" | "logout" | null {
+  const t = text.trim()
+  if (t === "/login") return "login"
+  if (t === "/logout") return "logout"
+  return null
+}

@@ -466,6 +466,19 @@ export const AuthSnapshot = z.object({
   claude: ProviderAuth,
   codex: ProviderAuth,
 })
+export const AccountLogoutInput = z.object({ backend: z.enum(["claude", "codex"]) }).strict()
+export type AccountLogoutInput = z.infer<typeof AccountLogoutInput>
+// Result of the typed provider logout action. "blocked" = refused because the provider had live
+// turns (account state is process-global; changing it mid-request produces ambiguous failures);
+// "failed" = the CLI errored AND the credential still reads present. `auth` is the post-attempt
+// credential state so the client can refresh its snapshot without another round-trip.
+export const AccountLogoutResult = z.object({
+  status: z.enum(["done", "blocked", "failed"]),
+  auth: ProviderAuth,
+  activeThreads: z.number().int().positive().optional(),
+  detail: z.string().max(200).optional(),
+})
+export type AccountLogoutResult = z.infer<typeof AccountLogoutResult>
 export type AuthSnapshot = z.infer<typeof AuthSnapshot>
 
 // ---- Settings ----

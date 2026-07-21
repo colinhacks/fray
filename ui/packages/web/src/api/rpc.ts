@@ -30,6 +30,8 @@ import type {
   CodexModel,
   QuotaSnapshot,
   AuthSnapshot,
+  AccountLogoutInput,
+  AccountLogoutResult,
   DispatchPreferences,
   SetDispatchPreferenceInput,
   ListInteractionsInput,
@@ -124,6 +126,7 @@ export interface Api {
   // Per-provider LOCAL credential presence for the new-thread dispatch gate. Distinct from quota's
   // overloaded "unavailable" — reports only whether a credential exists. Never rejects.
   authStatus(): Promise<AuthSnapshot>
+  accountLogout(input: AccountLogoutInput): Promise<AccountLogoutResult>
   settingsGet(): Promise<Settings>
   settingsSet(input: Settings): Promise<void>
   settingsReset(): Promise<Settings>
@@ -185,6 +188,7 @@ const PROCEDURES: Record<keyof Api, ProcType> = {
   codexModels: "query",
   quota: "query",
   authStatus: "query",
+  accountLogout: "mutation",
   settingsGet: "query",
   settingsSet: "mutation",
   settingsReset: "mutation",
