@@ -135,7 +135,9 @@ function codexSpawnThreadMcpFlags(mcp?: SpawnThreadMcp): string[] {
   if (!mcp) return []
   const toml = (v: string) => v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
   return [
-    "-c", "mcp_servers.fray_spawn.command=node",
+    // Absolute node path (process.execPath), not bare "node" — the worker's PATH may not include node,
+    // and a missing MCP-server binary means the tool silently never loads. Quoted TOML basic string.
+    "-c", `mcp_servers.fray_spawn.command="${toml(process.execPath)}"`,
     "-c", `mcp_servers.fray_spawn.args=["${toml(mcp.scriptPath)}"]`,
     "-c", `mcp_servers.fray_spawn.env={FRAY_STATE_DIR="${toml(mcp.stateDir)}"}`,
   ]

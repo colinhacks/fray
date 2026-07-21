@@ -68,7 +68,7 @@ test("codex spawn/resume inject the spawn-thread MCP server as additive -c overr
   for (const [label, argv] of [["spawn", spawn], ["resume", resume]] as const) {
     // Each -c flag is its own argv pair; find the mcp_servers assignments (execvp passes them literally).
     const cVals = argv.map((a, i) => (a === "-c" ? argv[i + 1] : null)).filter(Boolean) as string[]
-    assert.ok(cVals.includes("mcp_servers.fray_spawn.command=node"), `${label}: command flag`)
+    assert.ok(cVals.includes(`mcp_servers.fray_spawn.command="${process.execPath}"`), `${label}: command flag`)
     // Path with a space stays a valid TOML basic string inside the array value.
     assert.ok(cVals.includes('mcp_servers.fray_spawn.args=["/abs/plug in/bin/spawn-thread-mcp.mjs"]'), `${label}: args flag`)
     assert.ok(cVals.includes('mcp_servers.fray_spawn.env={FRAY_STATE_DIR="/home/.fray/projects/pid"}'), `${label}: env flag`)

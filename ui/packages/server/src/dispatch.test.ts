@@ -52,7 +52,7 @@ test("Claude dispatch mounts the spawn-thread MCP server + pre-approves its tool
   assert.ok(cfgRaw, "argv must carry an inline --mcp-config")
   const cfg = JSON.parse(cfgRaw)
   assert.deepEqual(cfg.mcpServers.fray_spawn, {
-    command: "node",
+    command: process.execPath, // absolute node path, not bare "node" (worker PATH-independence)
     args: ["/abs/plugin/bin/spawn-thread-mcp.mjs"],
     env: { FRAY_STATE_DIR: "/home/.fray/projects/pid" },
   })

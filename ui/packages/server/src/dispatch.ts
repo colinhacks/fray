@@ -403,7 +403,11 @@ export function resolveSpawnThreadMcp(
 function claudeSpawnThreadMcpFlags(mcp?: SpawnThreadMcp): string[] {
   if (!mcp) return []
   const config = JSON.stringify({
-    mcpServers: { fray_spawn: { command: "node", args: [mcp.scriptPath], env: { FRAY_STATE_DIR: mcp.stateDir } } },
+    // command is the ABSOLUTE node path (process.execPath — the node running the fray server), NOT bare
+    // "node": Claude spawns the MCP-server process itself, and a worker's PATH varies by launch context
+    // (a GUI-launched tmux, a login-shell difference) — if `node` isn't on it, the MCP server never
+    // starts and the tool silently never appears in the worker. An absolute path removes that dependency.
+    mcpServers: { fray_spawn: { command: process.execPath, args: [mcp.scriptPath], env: { FRAY_STATE_DIR: mcp.stateDir } } },
   })
   return ["--mcp-config", config, "--allowedTools", "mcp__fray_spawn__spawn_fray_thread"]
 }
