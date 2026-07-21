@@ -4,7 +4,6 @@ import { mkdtempSync, writeFileSync, symlinkSync, existsSync, readFileSync } fro
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createApp, resolveLocalImage, type AppOptions } from "./app.ts"
-import { trustedLocalFileRoots } from "./project.ts"
 import type { AppContext } from "./context.ts"
 
 // A 1x1 PNG's leading bytes are enough — the route serves the bytes verbatim, it doesn't decode.
@@ -287,9 +286,9 @@ function fixtures() {
   return { root, img }
 }
 
-test("allowed: absolute png under a trusted root → 200 with content-type", () => {
-  const { root, img } = fixtures()
-  const r = resolveLocalImage(img, [root])
+test("allowed: absolute png → 200 with content-type", () => {
+  const { img } = fixtures()
+  const r = resolveLocalImage(img)
   assert.equal(r.status, 200)
   if (r.status === 200) {
     assert.equal(r.contentType, "image/png")
@@ -297,72 +296,60 @@ test("allowed: absolute png under a trusted root → 200 with content-type", () 
   }
 })
 
-test("blocked: path outside every root → 403", () => {
-  const { root, img } = fixtures()
-  assert.equal(resolveLocalImage(img, ["/some/other/root"]).status, 403)
+test("unconfined: an image ANYWHERE on disk renders → 200 (no trusted-root gate)", () => {
+  // The proxy deliberately renders any readable local image, not just workspace/tmp ones — a
+  // screenshot under ~/Desktop, /var/folders, wherever. This is the behavior the maintainer asked for.
+  const outside = mkdtempSync(join(tmpdir(), "fray-anywhere-"))
+  const img = join(outside, "anywhere.png")
+  writeFileSync(img, PNG)
+  assert.equal(resolveLocalImage(img).status, 200)
 })
 
-test("blocked: /etc/passwd → 403 (outside roots, and not an image ext → 400 first)", () => {
-  const { root } = fixtures()
-  // wrong extension is rejected before the root check
-  assert.equal(resolveLocalImage("/etc/passwd", [root]).status, 400)
+test("non-image path → 400 (wrong extension, e.g. /etc/passwd)", () => {
+  assert.equal(resolveLocalImage("/etc/passwd").status, 400)
 })
 
-test("blocked: relative path → 400", () => {
-  const { root } = fixtures()
-  assert.equal(resolveLocalImage("shot.png", [root]).status, 400)
+test("relative path → 400", () => {
+  assert.equal(resolveLocalImage("shot.png").status, 400)
 })
 
-test("blocked: non-image extension → 400", () => {
+test("non-image extension → 400", () => {
   const { root } = fixtures()
   const txt = join(root, "note.txt")
   writeFileSync(txt, "hi")
-  assert.equal(resolveLocalImage(txt, [root]).status, 400)
+  assert.equal(resolveLocalImage(txt).status, 400)
 })
 
 test("missing file → 404", () => {
   const { root } = fixtures()
-  assert.equal(resolveLocalImage(join(root, "nope.png"), [root]).status, 404)
-})
-
-test("trustedLocalFileRoots trusts BOTH temp trees so an agent scratchpad under /tmp serves", () => {
-  const roots = trustedLocalFileRoots({ dir: "/nonexistent-project", stateDir: "/nonexistent-state" })
-  assert.ok(roots.includes("/tmp"), "the shared /tmp tree is a trusted root (covers /tmp/claude-<uid>/… scratchpads)")
-  // A Claude-Code-scratchpad-shaped path (…/claude-<uid>/<project>/<session>/scratchpad/shot.png) under the
-  // shared temp tree — not under os.tmpdir() (/var/folders on macOS) — must now serve, since /tmp is trusted.
-  const scratch = mkdtempSync(join("/tmp", "claude-501-scratch-"))
-  const img = join(scratch, "shot.png")
-  writeFileSync(img, PNG)
-  assert.equal(resolveLocalImage(img, roots).status, 200)
+  assert.equal(resolveLocalImage(join(root, "nope.png")).status, 404)
 })
 
 test("/local-image route serves an agent screenshot under /tmp end-to-end", async () => {
   const port = 49_233
   const app = originTestApp(port)
-  // A Claude-Code-scratchpad-shaped screenshot under the shared temp tree — the exact case that used to
-  // 403 before /tmp joined the trusted roots. Driven through the REAL route (Hono + trustedLocalFileRoots).
+  // A Claude-Code-scratchpad-shaped screenshot under the shared temp tree, driven through the REAL route.
   const scratch = mkdtempSync(join("/tmp", "claude-501-worker-"))
   const shot = join(scratch, "summary-dark-crop.png")
   writeFileSync(shot, PNG)
   const served = await app.request(`http://127.0.0.1:${port}/local-image?path=${encodeURIComponent(shot)}`, {
     headers: { host: `127.0.0.1:${port}`, "sec-fetch-site": "same-origin" },
   })
-  assert.equal(served.status, 200, "worker screenshot under /tmp now serves")
+  assert.equal(served.status, 200, "worker screenshot serves")
   assert.equal(served.headers.get("content-type"), "image/png")
   assert.deepEqual(Buffer.from(await served.arrayBuffer()), PNG)
-  // The gate still gates outside the trusted roots — covered by the resolveLocalImage unit + symlink tests.
 })
 
-test("symlink escaping the root is resolved and blocked → 403", () => {
-  const { root, img } = fixtures()
+test("symlink to a real image resolves and renders → 200; a dangling symlink → 404", () => {
+  const { root } = fixtures()
   const outside = mkdtempSync(join(tmpdir(), "fray-out-"))
   writeFileSync(join(outside, "real.png"), PNG)
   const link = join(root, "link.png")
   symlinkSync(join(outside, "real.png"), link)
-  // link sits inside root, but its realpath is under `outside` — must be blocked when only root is trusted
-  assert.equal(resolveLocalImage(link, [root]).status, 403)
-  // and allowed when the real target's root is trusted
-  assert.equal(resolveLocalImage(link, [root, outside]).status, 200)
+  assert.equal(resolveLocalImage(link).status, 200) // realpath resolves to a real image → served
+  const dangling = join(root, "dangling.png")
+  symlinkSync(join(outside, "gone.png"), dangling)
+  assert.equal(resolveLocalImage(dangling).status, 404) // realpath throws on a dangling link → clean 404
 })
 
 test("/attach accepts the safe tier, rejects office/extensionless/oversized, and writes a sanitized name", async () => {

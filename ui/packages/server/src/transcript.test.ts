@@ -420,6 +420,31 @@ test("a short gap before a thinking block emits no event", () => {
   assert.equal(msgs.filter((m) => m.kind === "event").length, 0)
 })
 
+test("a thinking-only record opening a NEW turn does not glue that turn onto the previous one", () => {
+  // The interleave "wall of text" trap: turn A (text + tool) is out's tail, a tool_result sits between,
+  // then turn B opens with a THINKING-ONLY record (short gap → no event line). A thinking-only record
+  // renders nothing, so it must NOT claim the merge anchor for its new id — otherwise B's text+tools
+  // fold into A's bubble (tool calls under the wrong turn, texts coalesced into one wall).
+  const asstMulti = (mid: string, ts: string, blocks: unknown[]) =>
+    JSON.stringify({ type: "assistant", timestamp: ts, message: { id: mid, content: blocks } })
+  const msgs = parseTranscript([
+    asstMulti("mA", "2026-07-01T00:00:00.000Z", [
+      { type: "text", text: "Answer A." },
+      { type: "tool_use", id: "tu-a", name: "Read", input: { file_path: "/a" } },
+    ]),
+    JSON.stringify({ type: "user", timestamp: "2026-07-01T00:00:01.000Z", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu-a", content: "ok" }] } }),
+    thinkRec("2026-07-01T00:00:03.000Z", "mB"), // short gap → no event; the trap record
+    asstMulti("mB", "2026-07-01T00:00:04.000Z", [
+      { type: "text", text: "Answer B." },
+      { type: "tool_use", id: "tu-b", name: "Read", input: { file_path: "/b" } },
+    ]),
+  ].join("\n"))
+  const assistant = msgs.filter((m) => m.role === "assistant" && m.kind === undefined)
+  assert.equal(assistant.length, 2, "A and B are TWO separate assistant messages, not glued into one")
+  assert.ok(assistant[0].text.includes("Answer A") && !assistant[0].text.includes("Answer B"), "A's bubble holds only A")
+  assert.ok(assistant[1].text.includes("Answer B") && !assistant[1].text.includes("Answer A"), "B's bubble holds only B")
+})
+
 // ---- ordered parts (block-order fidelity) ----
 const asstBlock = (mid: string, block: unknown) => JSON.stringify({ type: "assistant", timestamp: "2026-07-01T00:00:00.000Z", message: { id: mid, content: [block] } })
 

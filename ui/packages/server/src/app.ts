@@ -2,12 +2,11 @@ import { Hono } from "hono"
 import { cors } from "hono/cors"
 import { streamSSE } from "hono/streaming"
 import { mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs"
-import { isAbsolute, extname, join, sep } from "node:path"
+import { isAbsolute, extname, join } from "node:path"
 import { randomUUID } from "node:crypto"
 import { mountRouter } from "@fray-ui/rpc/server"
 import { DEFAULT_PORT, ATTACHMENT_MAX_BASE64_CHARS, attachmentExtension, isAllowedAttachmentName, type ServerEvent } from "@fray-ui/shared"
 import { createRouter } from "./router.ts"
-import { trustedLocalFileRoots } from "./project.ts"
 import type { AppContext } from "./context.ts"
 import { allowedLocalCorsOrigin, isTrustedLocalHttpRequest } from "./local-origin.ts"
 
@@ -23,26 +22,17 @@ const IMAGE_CONTENT_TYPE: Record<string, string> = {
   ".webp": "image/webp",
 }
 
-// True when `real` is `root` itself or nested beneath it. Compares realpath-resolved, separator-
-// terminated prefixes so "/a/bc" doesn't count as inside "/a/b".
-function isUnder(real: string, root: string): boolean {
-  let rootReal: string
-  try {
-    rootReal = realpathSync(root)
-  } catch {
-    return false // root doesn't exist (e.g. no ~/Screenshots) — can't be a container
-  }
-  return real === rootReal || real.startsWith(rootReal.endsWith(sep) ? rootReal : rootReal + sep)
-}
-
 export type LocalImageResult =
-  | { status: 400 | 403 | 404 }
+  | { status: 400 | 404 }
   | { status: 200; contentType: string; body: Buffer }
 
-// Resolve + gate a local image request. Pure (roots injected) so it's unit-testable without an app:
-// absolute path → whitelisted image extension → symlink-resolved real path under a trusted root →
-// existing regular file. Any failed gate returns a status-only result; never reads outside the roots.
-export function resolveLocalImage(rawPath: string | undefined, roots: string[]): LocalImageResult {
+// Resolve a local image request. Deliberately UNCONFINED — no trusted-root allowlist: the proxy renders
+// ANY readable local image the requester names (a screenshot anywhere on disk, not just under the
+// workspace/tmp). This is safe to widen: the route is loopback-only (the app-wide origin gate), the
+// extension allowlist keeps it to image bytes, realpath+isFile reject non-files and dangling/looping
+// symlinks, and the bytes render in the viewer's OWN browser where sanitized markdown can't read them
+// back — so it adds no exfiltration path. Any failed check returns a status-only result.
+export function resolveLocalImage(rawPath: string | undefined): LocalImageResult {
   if (!rawPath || !isAbsolute(rawPath)) return { status: 400 }
 
   const ext = extname(rawPath).toLowerCase()
@@ -51,12 +41,10 @@ export function resolveLocalImage(rawPath: string | undefined, roots: string[]):
 
   let real: string
   try {
-    real = realpathSync(rawPath) // resolves symlinks so a link can't smuggle a path outside the roots
+    real = realpathSync(rawPath) // resolve symlinks; a dangling/looping link is a clean 404
   } catch {
     return { status: 404 }
   }
-
-  if (!roots.some((root) => isUnder(real, root))) return { status: 403 }
 
   try {
     if (!statSync(real).isFile()) return { status: 404 }
@@ -149,7 +137,7 @@ export function createApp(ctx: AppContext, options: AppOptions = {}) {
   })
 
   app.get("/local-image", (c) => {
-    const r = resolveLocalImage(c.req.query("path"), trustedLocalFileRoots(ctx.project))
+    const r = resolveLocalImage(c.req.query("path"))
     if (r.status !== 200) return c.text(String(r.status), r.status)
     // Copy into a plain Uint8Array<ArrayBuffer> — Hono's body type rejects Node's Buffer union.
     return c.body(Uint8Array.from(r.body), 200, { "content-type": r.contentType, "cache-control": "private, max-age=60" })

@@ -292,8 +292,14 @@ export function projectClaudeTranscript(raw: string, identityPrefix = "claude"):
         }
         // thinking blocks are deliberately not rendered
       }
-      if (!target && (m.text || m.tools.length)) out.push(m)
-      lastAssistantId = id
+      const rendered = Boolean(m.text) || m.tools.length > 0
+      if (!target && rendered) out.push(m)
+      // Only claim the merge anchor when this record actually became — or extended — out's tail. A
+      // record that rendered NOTHING (a thinking-only record, ubiquitous with extended thinking) must
+      // NOT advance the anchor to its own id: out's tail is still the PREVIOUS turn, so the next
+      // same-id record would fold into that stale tail and glue two turns' text+tools into one bubble
+      // (the interleave "wall of text" — tool calls landing under an earlier turn, texts coalesced).
+      if (target || rendered) lastAssistantId = id
       deliveredDedupe = null // the turn moved on; the delivered-message dedupe window only spans the very next record
       continue
     }
