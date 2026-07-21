@@ -29,9 +29,15 @@ const OAUTH_BETA = "oauth-2025-04-20"
 // The endpoint rate-limits callers without a claude-code User-Agent; a plausible recent version is
 // enough (it gates by product, not exact version).
 const USER_AGENT = "claude-code/2.0.0"
-// Undocumented endpoint — cache generously so a 60s UI poll can't hammer it. 3 min is the community
-// floor observed to avoid persistent 429s.
-const TTL_MS = 3 * 60_000
+// Undocumented endpoint that 429s aggressively, so the memo TTL is chosen by OUTCOME rather than a flat
+// interval. A HEALTHY read is cached generously (a 60s UI poll must not hammer it — the original intent).
+// But a FAILURE must NOT be cached that long: the chip's recheck (opening its popover forces a fresh
+// quota read; an unavailable read also degraded-polls at 15s) would just replay a stale "unreachable" for
+// minutes, so a transient blip would look permanent. A rate-limit still backs off (the endpoint asked us
+// to), but every OTHER failure clears within one degraded poll so the very next read re-hits live.
+const OK_TTL_MS = 3 * 60_000 // healthy: cache generously (the community 429-avoidance floor)
+const RATE_LIMIT_TTL_MS = 60_000 // 429/529: respect the backoff, but recover in a minute, not three
+const FAIL_TTL_MS = 10_000 // unreachable/timeout/5xx/malformed/not-logged-in: recover within one 15s poll
 
 function claudeConfigDir(): string {
   const override = process.env.CLAUDE_CONFIG_DIR
@@ -116,24 +122,38 @@ export function parseClaudeUsage(body: unknown, planType?: string): ProviderQuot
   return { status: "ok", planType, windows }
 }
 
-const memo = new Map<string, { at: number; quota: ProviderQuota }>()
+const memo = new Map<string, { at: number; ttl: number; quota: ProviderQuota }>()
+
+// Injectable seams so the memo's outcome→TTL recovery behavior is unit-testable without the live
+// network or a real credential store. All default to the real implementations.
+export interface ClaudeQuotaDeps {
+  now?: () => number
+  fetchImpl?: typeof fetch
+  readToken?: (configDir: string) => Promise<string | undefined>
+}
 
 // The Claude provider quota (RPC-facing). Reads the OAuth token, calls the usage endpoint with the
-// required headers, and degrades to "unavailable" on any error. Cached ≥3 min. Never throws.
-export async function readClaudeQuota(configDir = claudeConfigDir()): Promise<ProviderQuota> {
-  const now = Date.now()
+// required headers, and degrades to "unavailable" on any error — never throws. The result is memoized,
+// but for a duration that depends on the OUTCOME (see the TTL constants): a healthy read sticks for
+// minutes, a rate-limit backs off, and any other failure clears fast so a recheck actually re-hits.
+export async function readClaudeQuota(configDir = claudeConfigDir(), deps: ClaudeQuotaDeps = {}): Promise<ProviderQuota> {
+  const now = (deps.now ?? Date.now)()
+  const doFetch = deps.fetchImpl ?? fetch
+  const readToken = deps.readToken ?? readAccessToken
   const hit = memo.get(configDir)
-  if (hit && now - hit.at < TTL_MS) return hit.quota
+  if (hit && now - hit.at < hit.ttl) return hit.quota
   let quota: ProviderQuota
+  // Default to the short failure TTL; only a healthy read or a rate-limit widens it below.
+  let ttl = FAIL_TTL_MS
   try {
-    const token = await readAccessToken(configDir)
+    const token = await readToken(configDir)
     if (!token) {
       quota = { status: "unavailable", windows: [], detail: "Not logged in to Claude" }
     } else {
       // Hard 5s timeout: the endpoint is unstable/rate-limited, and readQuota awaits this alongside the
       // clean Codex read — an un-bounded stall would hold the whole quota RPC open (undici's default
       // header timeout is minutes). AbortSignal.timeout throws on fire → caught below → "unavailable".
-      const res = await fetch(USAGE_URL, {
+      const res = await doFetch(USAGE_URL, {
         headers: {
           Authorization: `Bearer ${token}`,
           "anthropic-beta": OAUTH_BETA,
@@ -144,15 +164,19 @@ export async function readClaudeQuota(configDir = claudeConfigDir()): Promise<Pr
       })
       if (!res.ok) {
         quota = { status: "unavailable", windows: [], detail: `Usage endpoint ${res.status}` }
+        // 429 (rate limited) / 529 (overloaded) are the endpoint telling us to slow down — back off
+        // longer than a plain failure so a recheck can't hammer it back into the same wall.
+        if (res.status === 429 || res.status === 529) ttl = RATE_LIMIT_TTL_MS
       } else {
         const body = (await res.json()) as Record<string, unknown>
         const planType = typeof body.plan_type === "string" ? body.plan_type : undefined
         quota = parseClaudeUsage(body, planType)
+        if (quota.status === "ok") ttl = OK_TTL_MS
       }
     }
   } catch {
     quota = { status: "unavailable", windows: [], detail: "Usage endpoint unreachable" }
   }
-  memo.set(configDir, { at: now, quota })
+  memo.set(configDir, { at: now, ttl, quota })
   return quota
 }
