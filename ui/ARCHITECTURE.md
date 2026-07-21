@@ -85,7 +85,7 @@ plugin (`../cc-worker/`). The full plan: `../plans/standalone-ui.md`.
   clock/dashed-circle machine-waits, faint · idle); a petite-caps PLAN tag marks a doc with a
   `## Plan` section (derived `hasPlan`). ENTIRELY MOUSE-DRIVEN — no arrow-walk, no chevron, no focus
   machine (all deleted): a row click opens the thread's drawer (chat; the fray DOC composite for a
-  never-spawned thread — `store.openThread`), and the remaining keyboard is ⌘K/⌘N/⌘I + Esc
+  never-spawned thread — `store.openThread`), and the remaining keyboard is ⌘K/⌘I + Esc
   unwinding overlays then drawers. A ZERO-thread board (brand-new user) hides the sidebar entirely
   and centers the dispatch prompt as the whole screen.
 

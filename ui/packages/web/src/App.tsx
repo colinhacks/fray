@@ -2,7 +2,7 @@ import { useEffect, useRef } from "react"
 import { useSnapshot } from "valtio"
 import { useQuery } from "@tanstack/react-query"
 import { Settings as SettingsIcon } from "lucide-react"
-import { closeGithubPicker, store, seedBoard, threadBySlug, pushDrawer, topDrawer, topThreadSlug, openNewThread, showToast } from "./store.ts"
+import { closeGithubPicker, store, seedBoard, threadBySlug, pushDrawer, topDrawer, topThreadSlug, showToast } from "./store.ts"
 import { useBoard } from "./hooks.ts"
 import { displayTitle } from "./groups.ts"
 import { closeSettingsAnimated, closeDrawerAnimated } from "./lib/overlays.ts"
@@ -159,7 +159,11 @@ export function App() {
 
   // THE KEYBOARD MODEL (post-machine): the sidebar is mouse-driven and text surfaces own their own
   // keys, so the app-level keyboard reduces to global chords + Esc unwinding:
-  //   ⌘K palette · ⌘N new-thread modal · ⌘I fray-doc drawer for the topmost open thread
+  //   ⌘K palette (its "New thread" item opens the modal) · ⌘I fray-doc drawer for the topmost thread
+  //   NOTE: no ⌘N binding. ⌘N is the BROWSER's new-window shortcut — reserved, and ours to leave
+  //   alone. Hijacking it either loses to the browser outright (a plain tab never delivers the event)
+  //   or, in a standalone/PWA window, steals a system shortcut the user expects. New-thread keeps
+  //   three doors that cost us nothing: ⌘K → "New thread", the sidebar pill, and the visible composer.
   //   Esc — overlays first (palette/modal/settings), then the drawer stack topmost-first
   //   Enter submits in a composer; Shift/Option-Enter newline (Composer's own handler)
   // (The xstate focus machine — nav selection, arrow-walk, chevron, step-in/out, focus registry — was
@@ -176,9 +180,6 @@ export function App() {
         if (key === "k") {
           e.preventDefault()
           store.showPalette = !store.showPalette
-        } else if (key === "n") {
-          e.preventDefault()
-          openNewThread() // ⌘N opens the anywhere-modal (there is no Home view)
         } else if (key === "i") {
           // ⌘I: fray document for the topmost open thread (stacks another layer / pops its own).
           const top = topDrawer()
@@ -269,7 +270,8 @@ export function App() {
         />
       </div>
       {/* (The old fixed "New thread" pill moved INTO the sidebar's top — one entry point, same modal
-          flow; ⌘N and the always-visible dispatch box remain the other doors.) */}
+          flow; the ⌘K palette's "New thread" item and the always-visible dispatch box are the
+          other doors — deliberately NOT ⌘N, which belongs to the browser.) */}
       <div className="fixed top-3 right-3 z-20 flex items-center gap-0.5">
         <RestartFrayButton />
         <button
