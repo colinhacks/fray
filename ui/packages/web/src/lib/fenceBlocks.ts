@@ -5,7 +5,7 @@
 // body, then a closing ``` line. Pure string logic, no DOM — unit-testable.
 //
 // The signal fence LANGUAGE is the state: `done` = a presentation-only success card (thread lifecycle
-// actions live in a stable footer), `awaiting` = a parked human/timer card with hint chips. Distinct
+// actions live in a stable footer), `awaiting` = a compact parked human/timer handoff. Distinct
 // from ```question blocks (their own machinery in questionBlocks.ts) — those never match here.
 
 import type { AwaitingHint } from "@fray-ui/shared"
