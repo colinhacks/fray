@@ -18,6 +18,13 @@ Every Word (write "Confirm snooze", "Mark as done", "Fix queue focus" — not "C
 Done", "Fix Queue Focus"). Acronyms (PR, CI, API) keep their established casing. When an agent titles a
 thread, the same rule applies.
 
+# "Shipped" means merged into the primary branch
+
+Never describe a created, opened, or pushed PR as "shipped." An open PR is implemented, pushed,
+ready for review, or awaiting merge. Use "shipped" only after the change has actually been merged
+into the repository's primary branch. This applies to progress updates, final handoffs, and signal-card
+bullets.
+
 # Project-local skills and tools are shared across agents
 
 Any project-local skill or tool lives in ONE agent-neutral copy that every agent configuration
