@@ -234,6 +234,7 @@ test("an idle queued follow-up is pasted and submitted by one terminal operation
 
 test("native queued-follow-up ownership requires Codex's local label and the exact queued text", () => {
   assert.equal(codexNativeQueuedInputMatches("Queued follow-ups\n  KEEP_PENDING\n\n›", "KEEP_PENDING"), true)
+  assert.equal(codexNativeQueuedInputMatches("Queued follow-up inputs\n  ↳ KEEP_PENDING\n\n›", "KEEP_PENDING"), true)
   assert.equal(
     codexNativeQueuedInputMatches(`Queued follow-ups (1)\n${Array.from({ length: 18 }, (_, i) => `  wrapped row ${i + 1}`).join("\n")}\n  LONG_TAIL\n›`, "wrapped row 1 wrapped row 2 wrapped row 3 wrapped row 4 wrapped row 5 wrapped row 6 wrapped row 7 wrapped row 8 wrapped row 9 wrapped row 10 wrapped row 11 wrapped row 12 wrapped row 13 wrapped row 14 wrapped row 15 wrapped row 16 wrapped row 17 wrapped row 18 LONG_TAIL"),
     true,
@@ -769,7 +770,7 @@ test("a scheduler delivery id makes durable Codex wake enqueue idempotent", () =
   )
 })
 
-test("an active Codex composer uses its verified Tab queue hint, never Enter", () => {
+test("an active Codex composer uses Enter to steer instead of Tab to defer", () => {
   const h = harness()
   h.storage.upsertSession(row("active-input"))
   h.storage.setBackend("active-input", "codex")
@@ -778,8 +779,27 @@ test("an active Codex composer uses its verified Tab queue hint, never Enter", (
     "\u001b[1m›\u001b[0m \u001b[2mAdd a follow-up\u001b[0m\n\n  \u001b[2mtab to queue message\u001b[0m",
   )
   h.controller.queueFollowUp("active-input", "ACTIVE_FOLLOWUP exact text")
-  assert.deepEqual(h.sent, ["atomic:Tab:ACTIVE_FOLLOWUP exact text"])
-  assert.equal(JSON.parse(h.keyQueueSnapshots.at(-1) ?? "[]")[0].state, "submitted", "barrier is durable before Tab")
+  assert.deepEqual(h.sent, ["atomic:Enter:ACTIVE_FOLLOWUP exact text"])
+  assert.equal(JSON.parse(h.keyQueueSnapshots.at(-1) ?? "[]")[0].state, "submitted", "barrier is durable before Enter")
+})
+
+test("current Codex steers an empty active composer without the legacy Tab footer", () => {
+  const h = harness()
+  h.storage.upsertSession(row("active-input-no-footer"))
+  h.storage.setBackend("active-input-no-footer", "codex")
+  h.setTelemetry({
+    turn: "in-flight",
+    permPrompt: false,
+    subAgents: [],
+    bgShells: [],
+    pendingQuestion: false,
+  })
+  h.setPane("", emptyComposer)
+
+  h.controller.queueFollowUp("active-input-no-footer", "CURRENT_ACTIVE_STEER")
+
+  assert.deepEqual(h.sent, ["atomic:Enter:CURRENT_ACTIVE_STEER"])
+  assert.equal(JSON.parse(h.keyQueueSnapshots.at(-1) ?? "[]")[0].state, "submitted")
 })
 
 test("a queued follow-up waits behind a native tool modal and resumes only after the human clears it", () => {
@@ -795,7 +815,8 @@ test("a queued follow-up waits behind a native tool modal and resumes only after
     pendingQuestion: false,
   })
   h.setPane(
-    "Field 1/1\nAllow GitHub to create a Git blob?\n› 1. Allow\n  2. Allow for this session\n  3. Always allow\n  4. Cancel\nenter to submit | esc to cancel",
+    "",
+    "\u001b[1m›\u001b[0m \u001b[2mAdd a follow-up\u001b[0m\n\nField 1/1\nAllow GitHub to create a Git blob?\nEnter to submit",
   )
 
   h.controller.queueFollowUp("modal-input", "continue after the approval")
@@ -935,13 +956,13 @@ test("explicit idle recovery submits the verified existing draft first, confirms
   assert.deepEqual(h.sent, ["atomic:Enter:queued after recovery"])
 })
 
-test("explicit active recovery uses only Codex's advertised Tab queue control", () => {
+test("explicit active recovery uses Enter to steer the existing draft", () => {
   const h = harness()
   h.storage.upsertSession(row("recover-active"))
   h.storage.setBackend("recover-active", "codex")
   h.setPane("", `${liveNubDraft}\n  \u001b[2mtab to queue message\u001b[0m`)
   assert.deepEqual(h.controller.submitExistingDraft("recover-active"), { effect: "submitted" })
-  assert.deepEqual(h.sent, ["key:Tab"])
+  assert.deepEqual(h.sent, ["key:Enter"])
 })
 
 test("draft recovery fails closed on a modal or ambiguous running composer and cannot double-submit", () => {
@@ -953,7 +974,8 @@ test("draft recovery fails closed on a modal or ambiguous running composer and c
   assert.deepEqual(h.sent, [])
 
   h.setPane("", liveNubDraft)
-  assert.throws(() => h.controller.submitExistingDraft("recover-guard"), /neither idle nor advertising/)
+  h.setTelemetry(undefined)
+  assert.throws(() => h.controller.submitExistingDraft("recover-guard"), /readiness could not be confirmed/)
   h.setTelemetry({ turn: "idle", permPrompt: false, subAgents: [], bgShells: [], pendingQuestion: false })
   h.controller.submitExistingDraft("recover-guard")
   assert.throws(() => h.controller.submitExistingDraft("recover-guard"), /already submitted/)

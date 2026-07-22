@@ -89,8 +89,9 @@ export interface QueuedInput {
   enqueuedAt: string
   state: "pending" | "submitted"
   submittedAt?: string
-  // Positive native Codex ownership observed after Tab, before JSONL emits user_message. This is
-  // durable because the native block may scroll away while Codex continues its turn.
+  // Positive native Codex ownership observed for an already-queued input before JSONL emits
+  // user_message. Kept durable so queues created by an earlier Fray process can drain safely even
+  // after their native block scrolls away.
   providerQueuedAt?: string
   source?: "existing-draft"
   match?: "normalized"
@@ -255,17 +256,18 @@ export function codexComposerMatches(escapedPane: string, expected: string): boo
   return positions.has(target.length)
 }
 
-// After Tab, Codex can visibly own a queued follow-up before JSONL emits a user_message. Require
-// both its native label and the exact text in its bounded local section; history text alone is never
-// enough proof to suppress the fail-closed path. A queued message can span many visual rows, so the
-// block ends only at the next Codex composer marker (with a defensive line cap), never after an
-// arbitrary handful of wrapped lines.
+// Codex can visibly own a queued follow-up before JSONL emits a user_message. Require both its native
+// label and the exact text in its bounded local section; history text alone is never enough proof to
+// suppress the fail-closed path. This recognizes queues created by an earlier Fray process while new
+// browser follow-ups use Enter to steer the active turn. A queued message can span many visual rows,
+// so the block ends only at the next Codex composer marker (with a defensive line cap), never after
+// an arbitrary handful of wrapped lines.
 export function codexNativeQueuedInputMatches(escapedPane: string, expected: string): boolean {
   const expectedText = normalizedInput(expected)
   if (!expectedText) return false
   const lines = escapedPane.split("\n").map((line) => normalizedInput(stripAnsi(line)))
   for (let i = 0; i < lines.length; i++) {
-    if (!/^queued follow-?ups?(?:\s*\(\d+\)|\s*:\s*)?$/i.test(lines[i])) continue
+    if (!/^queued follow-?up(?: inputs?|s?)(?:\s*\(\d+\)|\s*:\s*)?$/i.test(lines[i])) continue
     const block: string[] = []
     for (const line of lines.slice(i + 1, i + 241)) {
       if (/^›(?:\s|$)/u.test(line)) break
@@ -491,8 +493,11 @@ export function createPermissionController(deps: PermissionControllerDeps): Perm
     if (composer.kind !== "typed" || !composer.text) throw new Error("No nonempty Codex terminal draft is available to submit")
 
     const tele = deps.tailer.get(slug)
-    const key = composer.queueHint ? "Tab" : tele?.turn === "idle" ? "Enter" : undefined
-    if (!key) throw new Error("Codex is neither idle nor advertising its active-turn queue control")
+    if (tele?.permPrompt || tele?.pendingAsk || tele?.nativeInputRequired) {
+      throw new Error("Codex is showing a modal; resolve it in Terminal before submitting the draft")
+    }
+    const key = (composer.queueHint || tele?.turn === "idle" || tele?.turn === "in-flight") ? "Enter" : undefined
+    if (!key) throw new Error("Codex input readiness could not be confirmed")
 
     const queue = parseInputQueue(row.codex_input_queue)
     if (queue.some((item) => item.source === "existing-draft" && item.state === "submitted")) {
@@ -851,9 +856,10 @@ export function createPermissionController(deps: PermissionControllerDeps): Perm
       return queue.length > 0
     }
     if (item.state === "submitted" && item.submittedAt) {
-      // Persist provider ownership as soon as we can positively witness it. The TUI can later
-      // scroll this block out of capture while the queued message remains owned by Codex; looking
-      // only at the timeout capture would turn that successful handoff into a false failure.
+      // Persist provider ownership as soon as we can positively witness an input queued by an older
+      // Fray process. The TUI can later scroll this block out of capture while the message remains
+      // owned by Codex; looking only at the timeout capture would turn that handoff into a false
+      // failure during a rolling upgrade.
       if (!item.providerQueuedAt) {
         const escaped = captureOwned(row, true) ?? ""
         if (codexNativeQueuedInputMatches(escaped, item.text)) {
@@ -890,11 +896,15 @@ export function createPermissionController(deps: PermissionControllerDeps): Perm
 
     const escaped = captureOwned(row, true) ?? ""
     const composer = inspectCodexComposer(escaped)
+    const tele = deps.tailer.get(slug)
+    if (tele?.permPrompt || tele?.pendingAsk || tele?.nativeInputRequired) {
+      setError(slug, "Queued message blocked by an ambiguous Codex composer or modal; resolve it in Terminal")
+      return true
+    }
     if (composer.kind === "empty") {
-      const tele = deps.tailer.get(slug)
-      const key = codexQueueHint(escaped) ? "Tab" : tele?.turn === "idle" ? "Enter" : undefined
+      const key = (codexQueueHint(escaped) || tele?.turn === "idle" || tele?.turn === "in-flight") ? "Enter" : undefined
       if (!key) {
-        setError(slug, "Queued Codex message is waiting for an idle or queueable composer")
+        setError(slug, "Queued Codex message is waiting for an idle or steerable composer")
         return true
       }
       // Persist the barrier before one tmux command queue pastes the complete message and submits it.
@@ -909,10 +919,9 @@ export function createPermissionController(deps: PermissionControllerDeps): Perm
       return true
     }
     if (composer.kind === "typed" && codexComposerMatches(escaped, item.text)) {
-      const tele = deps.tailer.get(slug)
-      const key = composer.queueHint ? "Tab" : tele?.turn === "idle" ? "Enter" : undefined
+      const key = (composer.queueHint || tele?.turn === "idle" || tele?.turn === "in-flight") ? "Enter" : undefined
       if (!key) {
-        setError(slug, "Queued Codex message is waiting for an idle or queueable composer")
+        setError(slug, "Queued Codex message is waiting for an idle or steerable composer")
         return true
       }
       // Persist the submission barrier before sending the key. A crash in between can leave an item
