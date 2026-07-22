@@ -2414,19 +2414,20 @@ export function FenceCard({ fenceKind, body, hint, wrap, signalAt }: { fenceKind
   }
   return (
     <div data-awaiting-callout className="min-w-0 overflow-hidden rounded-lg border border-border-strong bg-panel-2">
-      <div data-awaiting-callout-body className={`flex min-w-0 items-start gap-2.5 px-3 py-2 text-[12px] leading-5 text-fg/80${wrap ? ` ${QUEUE_WRAP}` : ""}`}>
-        <Bell aria-hidden="true" size={13} className="mt-[3px] shrink-0 text-muted/65" />
-        <div className="min-w-0">
-          <strong className="md-inline font-semibold text-fg/90" dangerouslySetInnerHTML={{ __html: awaitingLeadHtml }} />
+      <div data-awaiting-callout-body className={`flex min-w-0 items-start gap-3 px-3 py-3${wrap ? ` ${QUEUE_WRAP}` : ""}`}>
+        <span className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-md border border-border bg-panel text-muted/70">
+          <Bell aria-hidden="true" size={12} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <strong className="md-inline block text-[12px] font-semibold leading-5 text-fg/90" dangerouslySetInnerHTML={{ __html: awaitingLeadHtml }} />
           {awaitingDescriptionHtml && (
-            <>
-              <span aria-hidden="true"> — </span>
+            <div className="mt-0.5 text-[12px] leading-[1.55] text-muted">
               <span className="md-inline" dangerouslySetInnerHTML={{ __html: awaitingDescriptionHtml }} />
-            </>
+            </div>
           )}
+          {canAct && fenceThread && <AwaitingConfirmControl thread={fenceThread} hint={hint} />}
         </div>
       </div>
-      {canAct && fenceThread && <AwaitingConfirmButton thread={fenceThread} hint={hint} />}
     </div>
   )
 }
@@ -2447,7 +2448,7 @@ function awaitingWaitAction(
   return null
 }
 
-function AwaitingConfirmButton({ thread, hint }: { thread: ThreadViewData; hint?: AwaitingHint }) {
+function AwaitingConfirmControl({ thread, hint }: { thread: ThreadViewData; hint?: AwaitingHint }) {
   const [busy, setBusy] = useState(false)
   // On the queue, confirming the park dismisses THIS card through the user-initiated auto-scroll exit
   // (like Snooze); null in the drawer, where the card just leaves the board.
@@ -2456,7 +2457,8 @@ function AwaitingConfirmButton({ thread, hint }: { thread: ThreadViewData; hint?
   if (!action) return null
   if (thread.awaitingWaitConfirmed) {
     return (
-      <div className="flex shrink-0 items-center justify-end border-l border-border px-3 py-1.5 text-[11px] font-medium text-muted/75">
+      <div data-awaiting-callout-status className="mt-2.5 inline-flex items-center gap-1.5 rounded-full border border-border bg-panel px-2 py-1 text-[11px] font-medium leading-4 text-muted/80">
+        <Check aria-hidden="true" size={11} className="shrink-0" />
         {action.activeLabel}
       </div>
     )
@@ -2478,7 +2480,7 @@ function AwaitingConfirmButton({ thread, hint }: { thread: ThreadViewData; hint?
       .finally(() => setBusy(false))
   }
   return (
-    <div data-awaiting-callout-footer className="flex items-center justify-end border-t border-border bg-panel px-2.5 py-1">
+    <div data-awaiting-callout-action className="mt-2.5 flex items-center">
       <button
         type="button"
         onClick={apply}
@@ -2486,9 +2488,9 @@ function AwaitingConfirmButton({ thread, hint }: { thread: ThreadViewData; hint?
         aria-label={action.label}
         title={action.label}
         onMouseDown={(e) => e.preventDefault()}
-        className="relative flex items-center gap-1 whitespace-nowrap rounded-md bg-fg px-2 py-0.5 text-[10px] font-medium leading-4 text-bg outline-none after:absolute after:-inset-0.5 after:content-[''] focus-visible:ring-1 focus-visible:ring-fg/60 disabled:cursor-wait disabled:opacity-100"
+        className="relative inline-flex min-h-7 items-center gap-1.5 whitespace-nowrap rounded-md border border-border-strong bg-panel px-2.5 py-1 text-[11px] font-medium leading-4 text-fg/85 shadow-sm shadow-black/15 outline-none transition-[color,background-color,border-color] after:absolute after:-inset-0.5 after:content-[''] hover:border-muted/50 hover:bg-elevated hover:text-fg focus-visible:ring-1 focus-visible:ring-fg/60 disabled:cursor-wait disabled:opacity-60"
       >
-        {busy && <Loader2 size={10} className="animate-spin" />}
+        {busy ? <Loader2 aria-hidden="true" size={11} className="animate-spin" /> : <Check aria-hidden="true" size={11} />}
         {action.label}
       </button>
     </div>

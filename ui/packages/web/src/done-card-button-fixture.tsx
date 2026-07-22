@@ -14,7 +14,8 @@ import "./styles.css"
 //     → the End-session dialog path)
 //   • the awaiting card's one opt-in action (timer → "Confirm snooze"; github-review → "Confirm
 //     watcher") and the post-confirmation states.
-// RPC is mocked like completion-lifecycle-fixture so nothing real is hit.
+// RPC is mocked like completion-lifecycle-fixture so nothing real is hit. The fixture HTML pins the
+// production-default sans setting because this isolated entry point does not run main.tsx's font bootstrap.
 const mode = new URLSearchParams(window.location.search).get("mode") === "executing" ? "executing" : "resting"
 const calloutsOnly = new URLSearchParams(window.location.search).get("callouts") === "1"
 const agentOnly = new URLSearchParams(window.location.search).get("agent") === "1"
