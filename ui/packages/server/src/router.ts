@@ -8,6 +8,7 @@ import {
   AdoptThreadResult,
   DispatchInput,
   FollowUpInput,
+  ConfirmAwaitingInput,
   SetThreadSnoozeInput,
   GithubStatus,
   GithubItem,
@@ -78,6 +79,7 @@ import { threadProfileOptions, validateThreadProfile } from "./backend/thread-pr
 import * as tmux from "./tmux.ts"
 import { adoptionRuntimeBinding } from "./adoption-recovery.ts"
 import { createClaudeRenameController } from "./rename-controller.ts"
+import { awaitingFenceIdentity, isActionableAwaitingHint } from "./awaiting.ts"
 import { getDispatchPreferences, setDispatchPreference } from "./dispatch-preferences.ts"
 import type { SessionRow, Storage } from "./storage.ts"
 import type { SessionTelemetry } from "./tailer.ts"
@@ -279,16 +281,31 @@ export function createRouter(ctx: AppContext) {
   const openRoots = openableFileRoots(ctx.project)
   const claudeRename = createClaudeRenameController({ storage: ctx.storage, tailer: ctx.tailer, board: ctx.board })
 
-  // An auto-titled registry row is session-first authority. A same-slug `.fray/<slug>.md` may have
-  // been planted independently and is never a readable or writable extension of that session.
+  // A registry row is session-first authority. A same-slug `.fray/<slug>.md` may have been planted
+  // independently and is never a readable or writable extension of that session.
   function isAutoTitledSession(slug: string): boolean {
     return ctx.storage.getSession(slug)?.title_auto === 1
   }
 
   function assertLegacyMutationAllowed(slug: string): void {
-    if (isAutoTitledSession(slug)) {
-      throw new Error("session-first auto-titled threads do not own a legacy thread file")
+    if (ctx.storage.getSession(slug)) {
+      throw new Error("session-first threads do not own a legacy thread file")
     }
+  }
+
+  function currentOwnedSession(slug: string, sessionId: string) {
+    const row = ctx.storage.getSession(slug)
+    if (!row || row.session_id !== sessionId) {
+      throw new Error("This thread was replaced; refresh before acting on its current session")
+    }
+    return row
+  }
+
+  function clearWaitForOwnedSession(slug: string, sessionId: string): void {
+    const row = ctx.storage.getSession(slug)
+    if (!row || row.session_id !== sessionId) return
+    ctx.storage.clearAwaitingWaitIfSession(slug, sessionId, row.runtime_generation ?? 0)
+    ctx.scheduler.waitChanged()
   }
 
   // Every interaction RPC re-derives the project from this server and binds the requested slug to the
@@ -492,7 +509,7 @@ export function createRouter(ctx: AppContext) {
         // Codex's TUI drops Enter when it follows literal text in the same instant, and an active turn
         // explicitly requires Tab to queue. Persist + capture-gate that path; Claude keeps its native
         // live injection, and any dead session resumes through the backend command.
-        const row = ctx.storage.getSession(input.slug)
+        const row = currentOwnedSession(input.slug, input.sessionId)
         if (hasPendingPermissionChange(row)) {
           throw new Error("Wait for the current permission change to finish before sending a follow-up")
         }
@@ -505,14 +522,19 @@ export function createRouter(ctx: AppContext) {
             ? tmux.findExpectedAdoptionPane(binding.claim).kind === "found"
             : tmux.isLive(input.slug)
           if (live) {
-            ctx.permissionController.queueFollowUp(input.slug, input.message, input.deliveryId)
-            ctx.storage.setSnoozedUntil(input.slug, null)
+            ctx.permissionController.queueFollowUp(input.slug, input.message, input.deliveryId, row.session_id)
+            clearWaitForOwnedSession(input.slug, input.sessionId)
             ctx.board.refresh()
             return
           }
         }
-        resumeThread({ project: ctx.project, storage: ctx.storage, board: ctx.board, getSettings: ctx.getSettings, backendFor: ctx.backendFor }, input.slug, input.message)
-        ctx.storage.setSnoozedUntil(input.slug, null)
+        resumeThread(
+          { project: ctx.project, storage: ctx.storage, board: ctx.board, getSettings: ctx.getSettings, backendFor: ctx.backendFor },
+          input.slug,
+          input.message,
+          row.session_id,
+        )
+        clearWaitForOwnedSession(input.slug, input.sessionId)
         ctx.board.refresh()
       },
     }),
@@ -592,6 +614,7 @@ export function createRouter(ctx: AppContext) {
     archiveThread: mutation({
       input: SlugInput,
       handler: async ({ input }) => {
+        assertLegacyMutationAllowed(input.slug)
         ctx.storage.setArchived(input.slug, true)
         const t = (await ctx.board.snapshot()).threads.find((x) => x.id === input.slug)
         if (!isAutoTitledSession(input.slug) && t && t.status !== "done" && t.status !== "dismissed") {
@@ -627,10 +650,13 @@ export function createRouter(ctx: AppContext) {
     // Reopen. This is the ONLY writer of state='archived' — the done fence itself mutates nothing
     // (maintainer-settled). Touches only ui.db; never the .fray legacy files.
     setThreadState: mutation({
-      input: z.object({ slug: ThreadSlug, state: z.enum(["open", "archived"]) }).strict(),
+      input: z.object({ slug: ThreadSlug, sessionId: z.string().min(1), state: z.enum(["open", "archived"]) }).strict(),
       handler: async ({ input }) => {
-        if (!ctx.storage.getSession(input.slug)) throw new Error(`no session registered for ${input.slug}`)
-        ctx.storage.setState(input.slug, input.state)
+        const row = currentOwnedSession(input.slug, input.sessionId)
+        if (!ctx.storage.setStateIfCurrent(input.slug, row.session_id, row.runtime_generation ?? 0, input.state)) {
+          throw new Error("This thread changed before its state could be updated")
+        }
+        ctx.scheduler.waitChanged()
         ctx.board.refresh() // storage-only change — overlay is enough
       },
     }),
@@ -638,11 +664,10 @@ export function createRouter(ctx: AppContext) {
     // “Mark as done” stops a resting provider shell and archives in one action. The server—not the
     // client—asks for confirmation only when current telemetry shows an executing/ambiguous turn.
     completeThread: mutation({
-      input: z.object({ slug: ThreadSlug, terminateLive: z.boolean().default(false) }).strict(),
+      input: z.object({ slug: ThreadSlug, sessionId: z.string().min(1), terminateLive: z.boolean().default(false) }).strict(),
       output: z.object({ needsConfirmation: z.boolean() }),
       handler: async ({ input }) => {
-        const row = ctx.storage.getSession(input.slug)
-        if (!row) throw new Error(`no session registered for ${input.slug}`)
+        const row = currentOwnedSession(input.slug, input.sessionId)
         const result = completeRegisteredThread(ctx.storage, row, input.terminateLive, tmux, ctx.tailer.get(input.slug))
         if (!result.needsConfirmation) ctx.board.refresh()
         return result
@@ -655,15 +680,60 @@ export function createRouter(ctx: AppContext) {
     setThreadSnooze: mutation({
       input: SetThreadSnoozeInput,
       handler: async ({ input }) => {
-        const row = ctx.storage.getSession(input.slug)
-        if (!row) throw new Error(`no session registered for ${input.slug}`)
+        const row = currentOwnedSession(input.slug, input.sessionId)
         const thread = (await ctx.board.snapshot()).threads.find((candidate) => candidate.id === input.slug)
         if (!thread || thread.kind !== "session" || thread.foreign) throw new Error(`thread ${input.slug} is not editable`)
         if (input.until !== null) {
           if (thread.state === "archived") throw new Error("Reopen this thread before snoozing it")
           if (Date.parse(input.until) <= Date.now()) throw new Error("Snooze time must be in the future")
         }
-        ctx.storage.setSnoozedUntil(input.slug, input.until)
+        // "Wake now" is also the cancellation path for a confirmed timer/review registration. Clearing
+        // only `snoozed_until` would leave a timer Held and still scheduled despite the user's action.
+        const generation = row.runtime_generation ?? 0
+        const changed = input.until === null
+          ? ctx.storage.clearAwaitingWaitIfSession(input.slug, row.session_id, generation)
+          : ctx.storage.setSnoozedUntilIfCurrent(input.slug, row.session_id, generation, input.until)
+        if (!changed) throw new Error("This thread changed before its snooze could be updated")
+        ctx.scheduler.waitChanged()
+        ctx.board.refresh()
+      },
+    }),
+
+    // An awaiting fence is only a proposal. Confirming binds one exact final-message generation to
+    // durable state; stale cards, malformed refs, elapsed timers, and in-flight workers fail closed.
+    confirmAwaiting: mutation({
+      input: ConfirmAwaitingInput,
+      handler: async ({ input }) => {
+        const row = currentOwnedSession(input.slug, input.sessionId)
+        const tele = ctx.tailer.get(input.slug)
+        const fence = tele?.lastFence
+        if (row.state === "archived" || row.archived === 1) {
+          throw new Error("Reopen this thread before confirming its wait")
+        }
+        if (tele?.turn !== "idle" || fence?.kind !== "awaiting" || !isActionableAwaitingHint(fence.hint)) {
+          throw new Error("This awaiting proposal is no longer current")
+        }
+        if (
+          !fence.at ||
+          !Number.isFinite(Date.parse(fence.at)) ||
+          fence.at !== input.fenceAt ||
+          fence.hint.kind !== input.hint.kind ||
+          fence.hint.value !== input.hint.value
+        ) {
+          throw new Error("This awaiting proposal changed before it could be confirmed")
+        }
+        const snoozedUntil = fence.hint.kind === "timer" ? fence.hint.value : null
+        if (snoozedUntil && Date.parse(snoozedUntil) <= Date.now()) {
+          throw new Error("This scheduled time has already passed")
+        }
+        const confirmedAt = new Date().toISOString()
+        const fenceId = awaitingFenceIdentity(input.hint, input.fenceAt)
+        if (!ctx.storage.confirmAwaitingWait(
+          input.slug, row.session_id, row.runtime_generation ?? 0, fenceId, confirmedAt, snoozedUntil,
+        )) {
+          throw new Error("This awaiting proposal changed before it could be confirmed")
+        }
+        ctx.scheduler.waitChanged(snoozedUntil ? Date.parse(snoozedUntil) : undefined)
         ctx.board.refresh()
       },
     }),

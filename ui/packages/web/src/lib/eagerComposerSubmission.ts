@@ -51,7 +51,9 @@ export function useEagerFollowUp(slug: string): {
 } {
   const queryClient = useQueryClient()
   const snap = useSnapshot(store)
-  const controlError = snap.board?.threads.find((thread) => thread.id === slug)?.controlError
+  const thread = snap.board?.threads.find((candidate) => candidate.id === slug)
+  const controlError = thread?.controlError
+  const sessionId = thread?.sessionId
   const [pending, setPending] = useState(false)
   // A controlled textarea normally makes a second Enter impossible because it becomes empty
   // synchronously. Keep the guard anyway for duplicate programmatic/click submissions and for a
@@ -75,7 +77,7 @@ export function useEagerFollowUp(slug: string): {
   const submit = useCallback((text: string, callbacks: EagerFollowUpCallbacks = {}) => {
     const message = text.trim()
     const deliveryId = newDeliveryId()
-    if (!message || inFlight.current.has(deliveryId)) return false
+    if (!message || !sessionId || inFlight.current.has(deliveryId)) return false
     inFlight.current.add(deliveryId)
     beginEagerSubmission({
       optimistic: () => {
@@ -83,7 +85,7 @@ export function useEagerFollowUp(slug: string): {
         appendQueuedMessage(queryClient, slug, message, { scrollToBottom: callbacks.scrollToBottom, deliveryId })
         rpc.markRead({ slug }).catch(() => {})
       },
-      request: () => rpc.followUp({ slug, message, deliveryId }),
+      request: () => rpc.followUp({ slug, sessionId, message, deliveryId }),
       success: () => {
         inFlight.current.delete(deliveryId)
         setPending(inFlight.current.size > 0)
@@ -103,7 +105,7 @@ export function useEagerFollowUp(slug: string): {
     })
     setPending(true)
     return true
-  }, [queryClient, slug])
+  }, [queryClient, sessionId, slug])
 
   return { submit, pending }
 }

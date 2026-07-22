@@ -19,6 +19,7 @@ import { effectivePermissionMode, resolveLegacyThreadFile } from "./dispatch.ts"
 import { ProducerStoppedError } from "./shutdown.ts"
 import { adoptionRuntimeBinding } from "./adoption-recovery.ts"
 import { listPlanFiles } from "./plan-files.ts"
+import { awaitingFenceIdentity, isActionableAwaitingHint } from "./awaiting.ts"
 
 // The read model is provenance-bound to the durable session registry. A session row exists only after
 // Fray UI dispatches or explicitly adopts a thread, so unrelated legacy `.fray/*.md` files and raw
@@ -123,15 +124,18 @@ function hasLiveBackgroundWork(tele: SessionTelemetry | undefined): boolean {
   )
 }
 
-// A declared wait excuses an idle thread only for a specific external-human/review gate or a valid
-// future scheduler instant. Legacy PR/CI/session hints, malformed/elapsed timers, and hintless fences
-// are agent-owned work; if the worker nevertheless comes to rest, the queue must surface that rest.
-function hasParkedExternalWait(tele: SessionTelemetry | undefined, nowMs: number): boolean {
-  if (tele?.lastFence?.kind !== "awaiting") return false
-  return tele.lastFence.hints.some((hint) =>
-    hint.kind === "human" ||
-    hint.kind === "github-review" ||
-    (hint.kind === "timer" && isValidAwaitingTimer(hint.value) && Date.parse(hint.value) > nowMs),
+export function hasConfirmedAwaitingWait(
+  row: Pick<SessionRow, "awaiting_fence_id" | "awaiting_confirmed_at">,
+  tele: SessionTelemetry | undefined,
+  nowMs: number,
+): boolean {
+  const fence = tele?.lastFence
+  const fenceAt = fence?.at
+  if (fence?.kind !== "awaiting" || !isActionableAwaitingHint(fence.hint) || !fenceAt) return false
+  if (fence.hint.kind === "timer" && Date.parse(fence.hint.value) <= nowMs) return false
+  return Boolean(
+    row.awaiting_confirmed_at &&
+    row.awaiting_fence_id === awaitingFenceIdentity(fence.hint, fenceAt),
   )
 }
 
@@ -183,7 +187,7 @@ export function deriveNeedsYou(
   // "running" background work is a crash mid-background-work; surface it rather than bury it on stale
   // child liveness (found 2026-07-21: such a thread silently dangled).
   if (runtime !== "exited" && hasLiveBackgroundWork(tele)) return false
-  if (hasParkedExternalWait(tele, nowMs)) return false
+  if (hasConfirmedAwaitingWait(row, tele, nowMs)) return false
   // A final ```done fence is a CHECKED completion handoff: show its success card in the queue until the
   // human explicitly Archives the thread. Like a question, merely viewing it does not resolve it. The
   // at-rest gate above prevents a stale fence from carding while a follow-up turn is still running.
@@ -311,6 +315,7 @@ function sessionThreadView(
   // sub-agents; it flips back to bare rest once the child's transcript goes stale.)
   const crashed = runtime === "exited" && (tele?.turn === "in-flight" || hasLiveBackgroundWork(tele))
   const snoozedUntil = futureSnooze(row, nowMs)
+  const awaitingWaitConfirmed = hasConfirmedAwaitingWait(row, tele, nowMs)
   const profile = resolveSessionProfile(row, tele)
   const permissionMode = resolveSessionPermission(row, tele)
   const permissionPending = resolvePendingPermission(row)
@@ -355,6 +360,7 @@ function sessionThreadView(
     planPath: row.plan_path ?? undefined,
     state,
     snoozedUntil,
+    awaitingWaitConfirmed,
     needsYou,
     crashed,
     pendingInteraction: interactionPresence.pending,

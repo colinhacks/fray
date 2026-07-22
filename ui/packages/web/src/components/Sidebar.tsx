@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react"
 import { useSnapshot } from "valtio"
-import { Check, ChevronRight, CircleDashed, Clock, Ellipsis, FileText, Github, Hourglass, Timer } from "lucide-react"
+import { Check, ChevronRight, CircleDashed, Clock, Ellipsis, FileText, Hourglass, Timer } from "lucide-react"
 import type { AwaitingHint, BoardSnapshot, PlanView, ThreadView } from "@fray-ui/shared"
 import { store, openThread, scrollToQueueCard, pushSubAgentDrawer, pushPlanDrawer, type ConnectionState } from "../store.ts"
 import { useBoard, asThreads } from "../hooks.ts"
@@ -272,12 +272,12 @@ export const ThreadRow = memo(function ThreadRow({
   // A thread awaiting its OWN live sub-agent/Monitor is not Held and stays fully active.
   const held = !legacy && isHeld(t)
   const dimLabel = !legacy && titleIsProvisional(t)
-  // An awaiting session row glosses its first machine-wait hint (e.g. "PR owner/repo#12").
+  // A confirmed awaiting session row glosses its single review/timer wait.
   const snoozedUntil = !legacy ? futureSnoozedUntil(t) : undefined
   const gloss = snoozedUntil
     ? `SNOOZED · ${formatSnoozeWake(snoozedUntil)}`
     : !legacy && t.lastFence?.kind === "awaiting"
-      ? hintGloss(t.lastFence.hints)
+      ? hintGloss(t.lastFence.hint)
       : null
   const hasSubtitle = Boolean(t.activity) || subLabel !== null || gloss !== null
   return (
@@ -421,17 +421,12 @@ function StatusChip({ status }: { status: string }) {
   )
 }
 
-// Format a parked-wait hint as a compact row subtitle. Current human/timer hints take precedence;
-// legacy PR/CI remain readable. A `session` hint is NOT glossed — its value is an internal id that reads as
-// leaked internals in the row subtitle (maintainer 2026-07-10: "what the fuck is that?! looks bad");
-// the CircleDashed indicator + its "Waiting on another session" tooltip already carry that state.
-// Null when there's no glossable hint.
-export function hintGloss(hints: readonly AwaitingHint[]): string | null {
-  const h = parkedAwaitingHint(hints) ?? hints.find((x) => x.kind === "pr" || x.kind === "ci")
+// Format an awaiting proposal as a compact row subtitle. Null when the single hint is invalid.
+export function hintGloss(hint: AwaitingHint | undefined): string | null {
+  const h = parkedAwaitingHint(hint)
   if (!h) return null
   if (h.kind === "timer") return formatSnoozedUntil(h.value) ?? "Timer schedule unavailable"
-  const label = h.kind === "pr" ? "PR" : h.kind === "ci" ? "CI" : h.kind === "human" ? "HUMAN" : h.kind === "github-review" ? "REVIEW" : h.kind
-  return `${label} ${h.value}`
+  return `Review ${h.value}`
 }
 
 // ── the indicator (one per row) ──────────────────────────────────────────────────────────────────
@@ -492,25 +487,16 @@ function sessionIndicatorFor(t: ThreadView): { node: ReactElement; tip: string |
     if (t.lastFence?.kind !== "awaiting") {
       return { node: <StatusBox><Hourglass size={9} className="text-muted/70" /></StatusBox>, tip: "Waiting until a scheduled check" }
     }
-    // Reserve the hourglass for intentional park states: a specific external human gate, a durable
-    // GitHub human-review cursor, or a VALID scheduled instant. Legacy/malformed waits stay readable
-    // but do not claim that a working wake is armed.
-    const parked = parkedAwaitingHint(t.lastFence.hints)?.kind
-    if (parked === "human") return { node: <StatusBox><Hourglass size={9} className="text-muted/70" /></StatusBox>, tip: "Waiting on a human review or approval" }
-    if (parked === "github-review") return { node: <StatusBox><Hourglass size={9} className="text-muted/70" /></StatusBox>, tip: "Watching for new non-bot human GitHub review activity" }
-    if (parked === "timer") return { node: <StatusBox><Hourglass size={9} className="text-muted/70" /></StatusBox>, tip: "Waiting until a scheduled check" }
-    const hk = t.lastFence.hints[0]?.kind
-    if (hk === "pr") return { node: <StatusBox><Github size={9} className="text-muted/70" /></StatusBox>, tip: "Legacy PR wait — active monitoring is not armed" }
-    if (hk === "ci") return { node: <StatusBox><Clock size={9} className="text-muted/70" /></StatusBox>, tip: "Legacy CI wait — active monitoring is not armed" }
-    if (hk === "session") return { node: <StatusBox><CircleDashed size={10} className="text-muted/70" /></StatusBox>, tip: "Waiting on another session" }
+    // Only a confirmed single review/timer registration claims an armed wait.
+    const parked = t.awaitingWaitConfirmed ? parkedAwaitingHint(t.lastFence.hint) : undefined
+    if (parked?.kind === "github-review") return { node: <StatusBox><Hourglass size={9} className="text-muted/70" /></StatusBox>, tip: "Watching for new non-bot human GitHub review activity" }
+    if (parked?.kind === "timer") return { node: <StatusBox><Hourglass size={9} className="text-muted/70" /></StatusBox>, tip: "Waiting until a scheduled check" }
     return { node: <StatusBox><Clock size={9} className="text-muted/70" /></StatusBox>, tip: "Waiting on a machine" }
   }
   // Bare at rest (no fence, no live sub, nothing pending) — a worker that came to rest WITHOUT
   // declaring done or a machine-wait. Read it as WAITING (maintainer 2026-07-10: a rested-not-done
   // thread "should be blocked or waiting", never a stark empty box and never a false check). We don't
-  // know the reason — the worker didn't fence — so: the clock, with NO hint gloss (vs an ```awaiting
-  // fence, which carries pr/ci hints AND dims + sinks the row). The honest fix is the worker emitting
-  // ` ```awaiting ` when it's blocked on a machine; until then this is our best-guess "paused/waiting".
+  // know the reason — the worker didn't fence — so use the quiet ellipsis with no hint gloss.
   return { node: <StatusBox><Ellipsis size={11} className="text-muted/70" /></StatusBox>, tip: "At rest" }
 }
 

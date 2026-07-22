@@ -117,13 +117,13 @@ node <this-skill-dir>/scripts/review-watch.mjs --repo OWNER/REPO --pr NUMBER
   such as `push` and `pull_request` both remain in that aggregate.
 - `review-watch` snapshots existing non-bot review/comment activity and exits only when it sees new
   human activity. A restarted monitor takes a new baseline, so it is an active watch rather than a
-  durable cursor. When running inside Fray UI, a genuine external-human handoff may additionally use
-  the Fray-owned `human:` + `github-review:` durable scheduler gate; a `timer:` is only a deliberate
-  wall-clock recheck fallback.
+  durable cursor. When running inside Fray UI, a genuine external-human PR-review handoff may instead
+  propose one Fray-owned `github-review:` wait; the prose names the reviewer and action. A `timer:` is
+  one separate deliberate wall-clock recheck proposal. The operator must confirm either card before
+  Fray arms it, and one `awaiting` fence never combines multiple hints.
 
-The Fray UI scheduler remains acceptable for its durable timer and `github-review` primitives and for
-legacy transcript compatibility. It is not the authoritative CI monitor for new work: the real CI
-monitor above owns the CI verdict and its lifecycle.
+The Fray UI scheduler owns only confirmed timer and `github-review` waits. It is not a CI monitor: the
+real CI monitor above owns the CI verdict and its lifecycle.
 
 Codex owns the selected monitor through one persistent `exec_command` / `write_stdin` session. A Luna
 child is optional only when the parent has real independent work that needs concurrent progress; it is

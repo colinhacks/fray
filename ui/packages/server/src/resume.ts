@@ -1362,9 +1362,12 @@ function resumeThreadOwned(deps: ResumeDeps, slug: string, message: string): voi
   deps.board.refresh() // storage-only change — overlay is enough
 }
 
-export function resumeThread(deps: ResumeDeps, slug: string, message: string): void {
+export function resumeThread(deps: ResumeDeps, slug: string, message: string, expectedSessionId?: string): void {
   const initial = deps.storage.getSession(slug)
   if (!initial) throw new Error(`no session registered for ${slug}`)
+  if (expectedSessionId && initial.session_id !== expectedSessionId) {
+    throw new Error("This thread was replaced before the follow-up could take control")
+  }
   // Preserve the specific, actionable errors from the inner path before trying the durable claim.
   // These checks are repeated after claiming; the SQLite CAS is still the actual race barrier.
   if (initial.permission_pending !== null && initial.permission_pending !== undefined) {

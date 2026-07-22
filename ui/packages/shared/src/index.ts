@@ -176,13 +176,11 @@ export type NativeInputRequired = z.infer<typeof NativeInputRequired>
 // verbs). Legacy .fray/<slug>.md rows survive read-only in a collapsed Legacy shelf. The queue
 // inversion: a thread at rest is awaiting the human UNLESS it excused itself with a signal fence.
 
-// A parked-wait hint parsed from `<kind>: <value>` lines in an ```awaiting fence body. `human`,
-// `github-review`, and `timer` are current; pr/ci/session remain readable for legacy transcripts and
-// wakers. A github-review hint is paired with `human:`: the latter names the exact external gate while
-// the former gives the durable scheduler a machine-readable PR cursor to watch for NEW non-bot human
-// review activity.
+// The single machine-readable wait proposed by an ```awaiting fence. External PR review activity and
+// a wall-clock instant are the only durable waits: CI, bots, releases, and merge progression remain
+// live worker-owned monitors. The operator must confirm this exact proposal before it is armed.
 export const AwaitingHint = z.object({
-  kind: z.enum(["human", "github-review", "timer", "pr", "ci", "session"]),
+  kind: z.enum(["github-review", "timer"]),
   value: z.string(),
 })
 export type AwaitingHint = z.infer<typeof AwaitingHint>
@@ -191,15 +189,37 @@ export type AwaitingHint = z.infer<typeof AwaitingHint>
 // dates (and the web previously hourglassed even completely invalid strings), while the worker contract
 // promises an ISO-8601 INSTANT. Accept seconds with optional fractional precision and either Z or an
 // explicit numeric offset, then let Date.parse reject impossible dates/offsets.
-const AWAITING_TIMER_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/
+const AWAITING_TIMER_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?(Z|([+-])(\d{2}):(\d{2}))$/
 export function isValidAwaitingTimer(value: string): boolean {
   const s = value.trim()
-  return AWAITING_TIMER_RE.test(s) && Number.isFinite(Date.parse(s))
+  const match = AWAITING_TIMER_RE.exec(s)
+  if (!match) return false
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText, , , , offsetHourText, offsetMinuteText] = match
+  const year = Number(yearText)
+  const month = Number(monthText)
+  const day = Number(dayText)
+  const hour = Number(hourText)
+  const minute = Number(minuteText)
+  const second = Number(secondText ?? "0")
+  const offsetHour = Number(offsetHourText ?? "0")
+  const offsetMinute = Number(offsetMinuteText ?? "0")
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)
+  const monthDays = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+  if (
+    month < 1 || month > 12 || day < 1 || day > monthDays[month - 1] ||
+    hour > 23 || minute > 59 || second > 59 || offsetHour > 23 || offsetMinute > 59
+  ) return false
+  return Number.isFinite(Date.parse(s))
+}
+
+const GITHUB_REVIEW_TARGET_RE = /^(?:https?:\/\/github\.com\/)?[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*?(?:\/pull\/|\/pulls\/|#)[1-9]\d*$/
+export function isValidGithubReviewTarget(value: string): boolean {
+  return GITHUB_REVIEW_TARGET_RE.test(value.trim())
 }
 
 // A user-chosen snooze is UI lifecycle state, not agent-authored transcript state. The browser
 // serializes local date/time input with Date#toISOString, so the wire/storage representation is one
-// unambiguous UTC instant. Keeping this stricter than the legacy awaiting-timer grammar avoids locale
+// unambiguous UTC instant. Keeping this stricter than the agent-authored timer grammar avoids locale
 // strings and offset-normalization surprises at the RPC boundary.
 export const SnoozeUntil = z.string().regex(
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
@@ -214,13 +234,15 @@ export type SnoozeUntil = z.infer<typeof SnoozeUntil>
 
 // The signal fence on a thread's FINAL assistant message — the fence language IS the state, the
 // body is the message. `done` = checked success card in the queue until the human Archives it (the
-// fence itself MUTATES NOTHING — maintainer-settled); `awaiting` = a parked human/timer wait.
-// Only excuses WHILE it is the final message — any newer activity clears it. ```question fences
-// keep their own machinery (pendingQuestion / questionBlocks) and are NOT an excusal.
+// fence itself MUTATES NOTHING — maintainer-settled); `awaiting` = one proposed PR-review or timer
+// wait, which remains in Queue until the operator confirms it. Only the exact confirmed final-message
+// generation excuses the thread; any newer top-level message clears it. ```question fences keep their
+// own machinery (pendingQuestion / questionBlocks) and are NOT an excusal.
 export const ThreadFence = z.object({
   kind: z.enum(["done", "awaiting"]),
-  body: z.string(), // fence body minus hint lines, capped server-side; may be ""
-  hints: z.array(AwaitingHint).default([]),
+  body: z.string(), // fence body minus its one valid hint line, capped server-side; may be ""
+  hint: AwaitingHint.optional(),
+  at: z.string().optional(), // exact final assistant-message generation that owns this signal
 })
 export type ThreadFence = z.infer<typeof ThreadFence>
 
@@ -325,6 +347,9 @@ export const ThreadView = z.object({
   snoozedUntil: SnoozeUntil.optional(),
   // The signal fence on the final assistant message, present only while the thread is excused by it.
   lastFence: ThreadFence.optional(),
+  // True only when the operator confirmed this exact final awaiting fence. A new final message changes
+  // the fence identity and makes any older confirmation inert until the new proposal is confirmed.
+  awaitingWaitConfirmed: z.boolean().optional(),
   // SERVER-DERIVED queue membership: explicit questions, checked/done handoffs, plus the process-level
   // blocks (perm-prompt / pendingAsk / crash) that a view can't clear. The client renders the
   // queue off this bit alone for session threads (legacy rows keep needsAction()).
@@ -630,6 +655,7 @@ export type AdoptThreadResult = z.infer<typeof AdoptThreadResult>
 
 export const FollowUpInput = z.object({
   slug: ThreadSlug,
+  sessionId: z.string().min(1),
   message: z.string().min(1),
   // Generated once before the optimistic clear so a transport replay can be idempotent.
   deliveryId: z.string().min(1).max(200).optional(),
@@ -638,10 +664,19 @@ export type FollowUpInput = z.infer<typeof FollowUpInput>
 
 export const SetThreadSnoozeInput = z.object({
   slug: ThreadSlug,
+  sessionId: z.string().min(1),
   // null is the explicit "wake now"/cancel operation; presets and custom local input send UTC.
   until: SnoozeUntil.nullable(),
 }).strict()
 export type SetThreadSnoozeInput = z.infer<typeof SetThreadSnoozeInput>
+
+export const ConfirmAwaitingInput = z.object({
+  slug: ThreadSlug,
+  sessionId: z.string().min(1),
+  fenceAt: z.string().datetime({ offset: true }),
+  hint: AwaitingHint,
+}).strict()
+export type ConfirmAwaitingInput = z.infer<typeof ConfirmAwaitingInput>
 
 // A human-authored display title for a registered session. Trimming happens at the RPC boundary so
 // storage never has to distinguish whitespace-only names from real intent; the web input mirrors the
@@ -958,6 +993,9 @@ export const TranscriptMessage = z.object({
   displayText: z.string().optional(),
   tools: z.array(TranscriptToolCall),
   at: z.string().optional(), // ISO8601
+  // Exact final-signal generation when this message owns the current done/awaiting fence. Historical
+  // fence cards remain renderable, but clients expose an action only when this equals lastFence.at.
+  signalAt: z.string().optional(),
   // Additive message variant. "event" is transcript PUNCTUATION emitted inline at the position a
   // sub-agent completion <task-notification> was seen (text like `Agent "…" finished — 35m`).
   // "reasoning" is a Codex model-reasoning SUMMARY (the plaintext `summary[]` of a rollout reasoning

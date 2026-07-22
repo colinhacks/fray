@@ -27,14 +27,19 @@ export function SnoozeButton({ thread, onSnoozed }: { thread: ThreadView; onSnoo
   const customInputId = useId()
   const customFormId = useId()
   const snoozedUntil = futureSnoozedUntil(thread)
+  const heldByConfirmedWait = thread.awaitingWaitConfirmed === true
   const selectedPreset = useSnapshot(prefs).snoozePreset
   const selectedLabel = snoozePresetLabel(selectedPreset)
   const minCustom = useMemo(() => localDateTimeInputValue(new Date(Date.now() + 60_000)), [customOpen])
 
   async function apply(until: string | null): Promise<void> {
+    if (!thread.sessionId) {
+      showToast("This session changed; refresh before snoozing")
+      return
+    }
     setBusy(true)
     try {
-      await rpc.setThreadSnooze({ slug: thread.id, until })
+      await rpc.setThreadSnooze({ slug: thread.id, sessionId: thread.sessionId, until })
       if (until) {
         showToast(`Snoozed · ${formatSnoozeWake(until)}`)
         onSnoozed?.()
@@ -78,13 +83,15 @@ export function SnoozeButton({ thread, onSnoozed }: { thread: ThreadView; onSnoo
         <button
           type="button"
           disabled={busy}
-          aria-label={snoozedUntil ? "Wake thread now" : `Snooze thread for ${selectedLabel.toLowerCase()}`}
-          title={snoozedUntil ? `Wake now · ${formatSnoozeWake(snoozedUntil)}` : `Snooze for ${selectedLabel.toLowerCase()}`}
-          onClick={() => void apply(snoozedUntil ? null : snoozePresetInstant(selectedPreset))}
+          aria-label={snoozedUntil || heldByConfirmedWait ? "Wake thread now" : `Snooze thread for ${selectedLabel.toLowerCase()}`}
+          title={snoozedUntil
+            ? `Wake now · ${formatSnoozeWake(snoozedUntil)}`
+            : heldByConfirmedWait ? "Wake now · cancel confirmed wait" : `Snooze for ${selectedLabel.toLowerCase()}`}
+          onClick={() => void apply(snoozedUntil || heldByConfirmedWait ? null : snoozePresetInstant(selectedPreset))}
           className="flex items-center gap-1.5 rounded-l-md px-2.5 py-1 text-[12px] font-medium text-fg/75 outline-none transition-colors hover:bg-panel-2 hover:text-fg focus-visible:ring-1 focus-visible:ring-fg/60 disabled:cursor-not-allowed disabled:opacity-45"
         >
           {busy && <Loader2 size={12} className="animate-spin" />}
-          {snoozedUntil ? "Wake now" : `Snooze ${selectedLabel}`}
+          {snoozedUntil || heldByConfirmedWait ? "Wake now" : `Snooze ${selectedLabel}`}
         </button>
         <span aria-hidden className="my-1 w-px bg-border" />
         <Menu>
@@ -110,7 +117,7 @@ export function SnoozeButton({ thread, onSnoozed }: { thread: ThreadView; onSnoo
             ))}
             <MenuSeparator />
             <MenuItem onSelect={openCustom}>Custom date &amp; time…</MenuItem>
-            {snoozedUntil && (
+            {(snoozedUntil || heldByConfirmedWait) && (
               <>
                 <MenuSeparator />
                 <MenuItem onSelect={() => void apply(null)}>Wake now</MenuItem>

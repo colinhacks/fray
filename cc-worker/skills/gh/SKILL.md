@@ -116,12 +116,12 @@ such as `push` and `pull_request` both contribute to the aggregate verdict.
   `TaskOutput` is deprecated. Do not fake waiting with `echo waiting` or sleep-only Bash calls.
 
 Both mechanisms are session-bound. If the next check deliberately belongs at a named wall-clock
-instant, park with a durable `timer:` fence. If a specific external human reviewer/approver is the
-only remaining gate, park with `human: <actor + exact action>`. For a GitHub PR, pair it with
-`github-review: OWNER/REPO#NUMBER`: fray-ui baselines current reviews/comments and wakes only on NEW
-non-bot human activity after the fence, durably across restarts. Otherwise optionally pair a timer for
-a scheduled recheck. The dashboard operator's own go/no-go remains a ` ```question ` block. `pr:` / `ci:` /
-`session:` awaiting hints are legacy compatibility only — do not emit them for new automated waits.
+instant, propose exactly one durable `timer:` fence. If a specific external human's review on a GitHub
+PR is the only remaining gate, put that actor and action in the prose and propose exactly one
+`github-review: OWNER/REPO#NUMBER` hint. Fray UI arms neither proposal until the operator confirms its
+card; a review confirmation baselines new non-bot human activity and a timer confirmation schedules
+the exact recheck. Never combine hints or emit `human:`, `pr:`, `ci:`, or `session:` metadata. The
+dashboard operator's own go/no-go remains a ` ```question ` block.
 
 ## Fitting gh work into your thread type
 

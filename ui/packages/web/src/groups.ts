@@ -251,10 +251,9 @@ export function foreignThreads(threads: readonly ThreadView[]): ThreadView[] {
 // row lands in exactly one of these; the Plans section is separate (from board.plans, not threads).
 //   • active           — open session work: running, needs-you, bare rest, done-fenced, OR owning a
 //                        live sub-agent/background shell/Monitor. Never dimmed as a band.
-//   • held             — open, AT REST behind ANY declared ```awaiting fence (or the canonical
-//                        blocked+timer status) AND no live background op. Its own DIMMED band between
-//                        Active and Inactive. The glyph and section share isHeld(), so a row can never
-//                        show a clock/hourglass while remaining in Active.
+//   • held             — open, AT REST behind one confirmed review/timer wait and no live background
+//                        op. Its own DIMMED band between Active and Inactive. The glyph and section
+//                        share isHeld(), so a row can never show an hourglass while remaining Active.
 //   • inactive         — state === "archived" (the only archiver is an explicit Archive / done-card button).
 //   • legacy           — kind !== "session": vestigial .fray-file rows, hidden entirely (null).
 // A FOREIGN session row (a maintainer terminal — no registry row, so no state/needsYou) is dropped
@@ -268,14 +267,6 @@ export const SECTION_ORDER: readonly SectionKey[] = ["active", "held", "inactive
 // an awaiting excusal needs (a mid-turn worker is still working, never awaiting).
 function atRest(t: ThreadView): boolean {
   return t.runtime === "turn-idle" || t.runtime === "exited"
-}
-
-// DECLARED PARK: at rest behind an ```awaiting fence — the thread ITSELF declared it is parked, not
-// still working. The current contract reserves this for a human gate/timer; legacy hints remain readable. The
-// RAW signal; the banding below refines it into external-vs-internal. NB: this requires the worker to
-// actually emit the fence — a thread that rests bare (prose only) reads as idle/waiting, not declared.
-function isDeclaredAwaiting(t: ThreadView): boolean {
-  return atRest(t) && t.lastFence?.kind === "awaiting"
 }
 
 // INTERNAL WORK: a thread with a LIVE sub-agent is awaiting its OWN dispatched child — not an external
@@ -295,16 +286,10 @@ function hasLiveOps(t: ThreadView): boolean {
   return hasLiveSubAgents(t) || hasLiveBackgroundOps(t)
 }
 
-// The wait kinds that truthfully earn the parked/hourglass presentation. A timer is only a park while
-// its valid scheduler instant is still in the future; malformed or elapsed timer prose must not
-// advertise a durable future wake. github-review is an external HUMAN gate with a durable GitHub
-// activity cursor. Legacy machine waits (pr/ci/session) intentionally do not qualify.
-export function parkedAwaitingHint(hints: readonly AwaitingHint[], nowMs = Date.now()): AwaitingHint | undefined {
-  return (
-    hints.find((h) => h.kind === "human") ??
-    hints.find((h) => h.kind === "github-review") ??
-    hints.find((h) => h.kind === "timer" && isValidAwaitingTimer(h.value) && Date.parse(h.value) > nowMs)
-  )
+export function parkedAwaitingHint(hint: AwaitingHint | undefined, nowMs = Date.now()): AwaitingHint | undefined {
+  if (hint?.kind === "github-review") return hint
+  if (hint?.kind === "timer" && isValidAwaitingTimer(hint.value) && Date.parse(hint.value) > nowMs) return hint
+  return undefined
 }
 
 export function futureSnoozedUntil(
@@ -315,12 +300,10 @@ export function futureSnoozedUntil(
   return Number.isFinite(at) && at > nowMs ? t.snoozedUntil : undefined
 }
 
-// HELD: one semantic predicate owns both classification and presentation. Only a specific external
-// human/review gate or a valid FUTURE timestamp belongs in the dimmed Held band. Legacy automated
-// waits (pr/ci/session), malformed/elapsed timers, and hintless fences stay Active so they cannot hide
-// work an agent should own through an in-band watcher. A canonical blocked+timer status remains a
-// compatibility path only when it carries the same explicit future ISO instant. A live child/Monitor
-// wins, and archived rows remain Inactive/done.
+// HELD: one semantic predicate owns both classification and presentation. Only a confirmed review
+// watcher, a confirmed future timer, or an explicit manual snooze belongs in the dimmed Held band.
+// Malformed, elapsed, hintless, and merely proposed waits stay Active. A live child/Monitor wins, and
+// archived rows remain Inactive/done.
 export function isHeld(t: ThreadView, nowMs = Date.now()): boolean {
   const userSnooze = futureSnoozedUntil(t, nowMs) !== undefined
   if (t.state === "archived" || hasLiveOps(t)) return false
@@ -329,18 +312,14 @@ export function isHeld(t: ThreadView, nowMs = Date.now()): boolean {
   // snooze merely parks their presentation until then. Mid-turn work keeps running in Active, while
   // a provider permission prompt is itself parked and may therefore move to Held.
   if (userSnooze) return t.runtime !== "running" && t.runtime !== "spawning"
-  // Without an explicit user snooze, higher-priority attention states render ?, !, or a native
-  // prompt—not a wait glyph—so a stale awaiting fence cannot demote them out of Queue.
+  // Without a confirmed wait, higher-priority attention states render ?, !, or the awaiting proposal
+  // card itself. A transcript fence alone never demotes the thread out of Queue.
   if (t.needsYou || t.pendingAsk || t.runtime === "perm-prompt") return false
   if (!atRest(t)) return false
-  const declaredWait = t.lastFence?.kind === "awaiting" && parkedAwaitingHint(t.lastFence.hints, nowMs) !== undefined
-  const timedStatus =
-    t.status === "blocked" &&
-    t.mechanism === "timer" &&
-    typeof t.revalidate === "string" &&
-    isValidAwaitingTimer(t.revalidate) &&
-    Date.parse(t.revalidate) > nowMs
-  return userSnooze || declaredWait || timedStatus
+  const declaredWait = t.awaitingWaitConfirmed === true &&
+    t.lastFence?.kind === "awaiting" &&
+    parkedAwaitingHint(t.lastFence.hint, nowMs) !== undefined
+  return declaredWait
 }
 
 // ACTIVELY RUNNING: a live session with work in flight — exactly the states the sidebar renders with a
@@ -396,9 +375,9 @@ export function sectionOf(t: ThreadView): SectionKey | null {
   // to Inactive only once it comes to rest still-archived. (A user BUMP un-archives it for good via
   // resume; this is the display safety net for a running-yet-archived session.)
   if (t.state === "archived" && !isActivelyRunning(t)) return "inactive"
-  // Only truthful human/future-timer waiters split into the labeled, dimmed Held band.
-  // Everything else open — running, needs-you, bare rest, done-fenced, awaiting-its-own-subs, or an
-  // awaiting `session`/hintless wait — is Active.
+  // Only confirmed review/future-timer waiters split into the labeled, dimmed Held band.
+  // Everything else open — running, needs-you, bare rest, done-fenced, awaiting-its-own-subs, or a
+  // hintless/invalid proposal — is Active.
   if (isHeld(t)) return "held"
   return "active"
 }

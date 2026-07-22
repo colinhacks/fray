@@ -1,6 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync } from "node:fs"
+import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { randomUUID } from "node:crypto"
@@ -428,6 +428,54 @@ test("manual snooze persists exactly across restart, expires atomically, and Arc
   s.setState("snoozed", "open")
   assert.equal(s.getSession("snoozed")?.snoozed_until, null, "Reopen never resurrects an old wake deadline")
   s.close()
+})
+
+test("awaiting confirmation is atomic, generation-fenced, durable, and cleared by lifecycle changes", () => {
+  const dir = mkdtempSync(join(tmpdir(), "fray-storage-awaiting-"))
+  const path = join(dir, "ui.db")
+  const timer = "2099-07-14T08:45:12.345Z"
+  let s = createStorage(path)
+  s.upsertSession(row({ slug: "awaiting", session_id: "session-a", state: "open" }))
+  const confirmedAt = "2026-07-14T08:00:00.000Z"
+  const reconfirmedAt = "2026-07-14T09:00:00.000Z"
+  assert.equal(s.confirmAwaitingWait("awaiting", "wrong-session", 0, "fence-a", confirmedAt, timer), false)
+  assert.equal(s.confirmAwaitingWait("awaiting", "session-a", 99, "fence-a", confirmedAt, timer), false)
+  assert.equal(s.confirmAwaitingWait("awaiting", "session-a", 0, "fence-a", confirmedAt, timer), true)
+  assert.deepEqual(
+    (({ awaiting_fence_id, awaiting_confirmed_at, snoozed_until }) => ({ awaiting_fence_id, awaiting_confirmed_at, snoozed_until }))(s.getSession("awaiting")!),
+    { awaiting_fence_id: "fence-a", awaiting_confirmed_at: confirmedAt, snoozed_until: timer },
+  )
+  s.close()
+
+  s = createStorage(path)
+  assert.equal(s.getSession("awaiting")?.awaiting_fence_id, "fence-a", "confirmation survives restart")
+  assert.equal(s.clearAwaitingWaitIfCurrent("awaiting", "session-a", "other-fence"), false)
+  assert.equal(s.getSession("awaiting")?.awaiting_fence_id, "fence-a", "a stale scheduler cannot clear the current wait")
+  assert.equal(s.clearAwaitingWaitIfCurrent("awaiting", "session-a", "fence-a"), true)
+  assert.deepEqual(
+    (({ awaiting_fence_id, awaiting_confirmed_at, snoozed_until }) => ({ awaiting_fence_id, awaiting_confirmed_at, snoozed_until }))(s.getSession("awaiting")!),
+    { awaiting_fence_id: null, awaiting_confirmed_at: null, snoozed_until: null },
+  )
+
+  assert.equal(s.confirmAwaitingWait("awaiting", "session-a", 0, "fence-b", reconfirmedAt, null), true)
+  assert.equal(s.setSnoozedUntilIfCurrent("awaiting", "session-a", 99, timer), false)
+  assert.equal(s.setSnoozedUntilIfCurrent("awaiting", "session-a", 0, timer), true)
+  assert.equal(s.clearAwaitingWaitIfSession("awaiting", "session-a", 99), false)
+  assert.equal(s.clearAwaitingWaitIfSession("awaiting", "session-a", 0), true)
+  assert.equal(s.confirmAwaitingWait("awaiting", "session-a", 0, "fence-b", reconfirmedAt, null), true)
+  s.setState("awaiting", "archived")
+  assert.equal(s.getSession("awaiting")?.awaiting_fence_id, null, "archiving cancels the watcher")
+  s.setState("awaiting", "open")
+  assert.equal(s.confirmAwaitingWait("awaiting", "session-a", 0, "fence-c", reconfirmedAt, null), true)
+  assert.equal(s.beginRuntimeGeneration("awaiting", {
+    sessionId: "session-a", generation: 0, permissionPending: null, runtimeControl: null,
+  }, "2026-07-14T10:00:00.000Z"), 1)
+  assert.equal(s.getSession("awaiting")?.awaiting_fence_id, null, "resuming the owner cancels its parked wait")
+  assert.equal(s.confirmAwaitingWait("awaiting", "session-a", 1, "fence-d", reconfirmedAt, null), true)
+  s.upsertSession(row({ slug: "awaiting", session_id: "session-b", state: "open" }))
+  assert.equal(s.getSession("awaiting")?.awaiting_fence_id, null, "a replacement session cannot inherit a prior watcher")
+  s.close()
+  rmSync(dir, { recursive: true, force: true })
 })
 
 test("runtime generations make permission and queue commits compare-and-swap safe", () => {

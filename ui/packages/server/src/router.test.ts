@@ -24,9 +24,10 @@ import { createStorage, type AdoptionClaimRow, type SessionRow } from "./storage
 import type { AdoptionPaneLookup, PaneIdentity, PaneSnapshot } from "./tmux.ts"
 import type { AppContext } from "./context.ts"
 import type { Project } from "./project.ts"
-import type { Tailer } from "./tailer.ts"
+import type { SessionTelemetry, Tailer } from "./tailer.ts"
 import { createPermissionController } from "./permission-controller.ts"
 import { providerResumeCommand, shellQuote } from "./external-terminal.ts"
+import { awaitingFenceIdentity } from "./awaiting.ts"
 
 test("provider resume command is shell-safe", () => {
   assert.equal(shellQuote("fray's socket"), "'fray'\"'\"'s socket'")
@@ -110,6 +111,11 @@ function harness() {
   const dir = mkdtempSync(join(tmpdir(), "fray-router-permission-"))
   const project: Project = { dir, id: "router-permission", name: "test", label: "test", stateDir: dir, cwdSlug: "test" }
   const storage = createStorage(join(dir, "ui.db"))
+  const telemetry = new Map<string, SessionTelemetry>()
+  const tailer: Tailer = {
+    ...noopTailer,
+    get: (slug) => telemetry.get(slug),
+  }
   const snapshot: BoardSnapshot = {
     projectDir: dir,
     projectName: "test",
@@ -135,7 +141,7 @@ function harness() {
   const settings = { permissionMode: "auto" } as unknown as Settings
   const permissionController = createPermissionController({
     storage,
-    tailer: noopTailer,
+    tailer,
     board,
     terminal: {
       isLive: () => false,
@@ -146,16 +152,23 @@ function harness() {
     },
   })
   let adoptCalls = 0
+  let schedulerChanges = 0
   // createRouter is lazy: unrelated procedures do not read the omitted context fields. Keep this
   // focused on the permission route's real storage/board/backend dependencies.
   const ctx = {
     project,
     storage,
     board,
-    tailer: noopTailer,
+    tailer,
     backendFor: () => backend,
     getSettings: () => settings,
     permissionController,
+    scheduler: {
+      start: () => {},
+      stop: async () => {},
+      tick: async () => {},
+      waitChanged: () => { schedulerChanges++ },
+    },
     dispatcher: {
       dispatch: async () => ({ slug: "dispatched", sessionId: "sid-dispatched" }),
       adopt: async (slug: string) => {
@@ -187,7 +200,10 @@ function harness() {
       kind: "session",
       foreign: false,
     } satisfies ThreadView)
-  return { dir, storage, board, snapshot, router: createRouter(ctx), addExitedThread, refreshes: () => refreshes, adoptCalls: () => adoptCalls }
+  return {
+    dir, storage, board, snapshot, telemetry, router: createRouter(ctx), addExitedThread,
+    refreshes: () => refreshes, adoptCalls: () => adoptCalls, schedulerChanges: () => schedulerChanges,
+  }
 }
 
 test("threadTerminalCommand offers the verified provider resume command in every runtime state", async () => {
@@ -294,14 +310,14 @@ test("auto-titled sessions never read or mutate a same-slug legacy file through 
     assert.deepEqual(await h.router.threadBody.handler({ input: { slug: "auto-file" } }), { markdown: "" })
     assert.deepEqual(await h.router.threadBody.handler({ input: { slug: "auto-link" } }), { markdown: "" })
 
-    await h.router.archiveThread.handler({ input: { slug: "auto-file" } })
     for (const mutation of [
+      () => h.router.archiveThread.handler({ input: { slug: "auto-file" } }),
       () => h.router.markComplete.handler({ input: { slug: "auto-file" } }),
       () => h.router.setThreadStatus.handler({ input: { slug: "auto-file", status: "done" } }),
       () => h.router.dismissThread.handler({ input: { slug: "auto-file" } }),
       () => h.router.repairThread.handler({ input: { file: "auto-repair.md" } }),
     ]) {
-      await assert.rejects(mutation, /session-first auto-titled threads do not own a legacy thread file/)
+      await assert.rejects(mutation, /session-first threads do not own a legacy thread file/)
     }
 
     assert.equal(readFileSync(regular, "utf8"), regularBody)
@@ -408,28 +424,156 @@ test("setThreadSnooze RPC validates canonical future UTC and persists any owned 
   thread.needsYou = true // ordinary clean rest is queue-worthy but still snoozable
   thread.crashed = false
   const proc = h.router.setThreadSnooze
+  const sessionId = `sid-${slug}`
   for (const until of ["tomorrow", "2026-07-14T08:45:00Z", "2026-07-14 08:45:00.000Z", "2026-07-14T08:45:00.000+00:00", "2099-02-31T08:45:00.000Z"]) {
-    assert.equal(proc.input.safeParse({ slug, until }).success, false, until)
+    assert.equal(proc.input.safeParse({ slug, sessionId, until }).success, false, until)
   }
-  assert.equal(proc.input.safeParse({ slug, until: "2099-07-14T08:45:00.000Z", extra: true }).success, false)
+  assert.equal(proc.input.safeParse({ slug, sessionId, until: "2099-07-14T08:45:00.000Z", extra: true }).success, false)
   await assert.rejects(
-    proc.handler({ input: { slug, until: "2000-01-01T00:00:00.000Z" } }),
+    proc.handler({ input: { slug, sessionId, until: "2000-01-01T00:00:00.000Z" } }),
     /future/,
   )
 
   const exact = "2099-07-14T08:45:00.000Z"
-  await proc.handler({ input: { slug, until: exact } })
+  await proc.handler({ input: { slug, sessionId, until: exact } })
   assert.equal(h.storage.getSession(slug)?.snoozed_until, exact)
   assert.equal(h.refreshes(), 1)
 
   thread.pendingQuestion = true
   const replacement = "2099-07-15T08:45:00.000Z"
-  await proc.handler({ input: { slug, until: replacement } })
+  await proc.handler({ input: { slug, sessionId, until: replacement } })
   assert.equal(h.storage.getSession(slug)?.snoozed_until, replacement, "an unresolved question remains explicitly snoozable")
 
-  await proc.handler({ input: { slug, until: null } })
+  await proc.handler({ input: { slug, sessionId, until: null } })
   assert.equal(h.storage.getSession(slug)?.snoozed_until, null, "wake-now remains available with the same validation contract")
   h.storage.close()
+})
+
+test("confirmAwaiting RPC arms only the exact current final-message generation", async () => {
+  const h = harness()
+  const reviewSlug = "confirm-review"
+  const timerSlug = "confirm-timer"
+  const reviewAt = "2099-07-14T08:00:00.000Z"
+  const timerAt = "2099-07-14T08:05:00.000Z"
+  const review = { kind: "github-review" as const, value: "acme/app#391" }
+  const timer = { kind: "timer" as const, value: "2099-07-15T08:45:00.000Z" }
+  for (const slug of [reviewSlug, timerSlug]) h.storage.upsertSession(row(slug))
+  h.addExitedThread(timerSlug)
+  h.telemetry.set(reviewSlug, {
+    turn: "idle", permPrompt: false, subAgents: [], bgShells: [], pendingQuestion: false,
+    lastFence: { kind: "awaiting", body: "Waiting for review.", hint: review, at: reviewAt },
+    lastAssistantAt: reviewAt,
+    lastActivityAt: "2099-07-14T08:01:00.000Z",
+  })
+  h.telemetry.set(timerSlug, {
+    turn: "idle", permPrompt: false, subAgents: [], bgShells: [], pendingQuestion: false,
+    lastFence: { kind: "awaiting", body: "Re-check later.", hint: timer, at: timerAt },
+    lastAssistantAt: timerAt,
+    lastActivityAt: "2099-07-14T08:06:00.000Z",
+  })
+
+  const proc = h.router.confirmAwaiting
+  assert.equal(proc.input.safeParse({ slug: reviewSlug, sessionId: `sid-${reviewSlug}`, fenceAt: reviewAt }).success, false)
+  assert.equal(proc.input.safeParse({ slug: reviewSlug, sessionId: `sid-${reviewSlug}`, fenceAt: reviewAt, hint: review, extra: true }).success, false)
+
+  await proc.handler({ input: { slug: reviewSlug, sessionId: `sid-${reviewSlug}`, fenceAt: reviewAt, hint: review } })
+  const reviewRow = h.storage.getSession(reviewSlug)!
+  assert.equal(reviewRow.awaiting_fence_id, awaitingFenceIdentity(review, reviewAt))
+  assert.ok(reviewRow.awaiting_confirmed_at)
+  assert.equal(reviewRow.snoozed_until, null, "a review watcher is activity-based, not a synthetic timer")
+
+  await proc.handler({ input: { slug: timerSlug, sessionId: `sid-${timerSlug}`, fenceAt: timerAt, hint: timer } })
+  const timerRow = h.storage.getSession(timerSlug)!
+  assert.equal(timerRow.awaiting_fence_id, awaitingFenceIdentity(timer, timerAt))
+  assert.ok(timerRow.awaiting_confirmed_at)
+  assert.equal(timerRow.snoozed_until, timer.value, "a timer confirmation atomically parks to its exact instant")
+  assert.equal(h.refreshes(), 2)
+  assert.equal(h.schedulerChanges(), 2, "each confirmation immediately updates the scheduler")
+
+  await h.router.setThreadSnooze.handler({ input: { slug: timerSlug, sessionId: `sid-${timerSlug}`, until: null } })
+  const wokenRow = h.storage.getSession(timerSlug)!
+  assert.equal(wokenRow.snoozed_until, null)
+  assert.equal(wokenRow.awaiting_fence_id, null, "Wake now cancels the durable timer registration")
+  assert.equal(wokenRow.awaiting_confirmed_at, null)
+  assert.equal(h.refreshes(), 3)
+
+  h.storage.close()
+  rmSync(h.dir, { recursive: true, force: true })
+})
+
+test("confirmAwaiting RPC rejects stale cards, changed hints, busy turns, and elapsed timers", async () => {
+  const h = harness()
+  const slug = "confirm-stale"
+  const oldAt = "2099-07-14T08:00:00.000Z"
+  const currentAt = "2099-07-14T09:00:00.000Z"
+  const oldHint = { kind: "github-review" as const, value: "acme/app#390" }
+  const currentHint = { kind: "github-review" as const, value: "acme/app#391" }
+  h.storage.upsertSession(row(slug))
+  h.telemetry.set(slug, {
+    turn: "idle", permPrompt: false, subAgents: [], bgShells: [], pendingQuestion: false,
+    lastFence: { kind: "awaiting", body: "Current.", hint: currentHint, at: currentAt },
+    lastAssistantAt: currentAt,
+    lastActivityAt: currentAt,
+  })
+
+  await assert.rejects(
+    h.router.confirmAwaiting.handler({ input: { slug, sessionId: `sid-${slug}`, fenceAt: oldAt, hint: oldHint } }),
+    /changed before it could be confirmed/,
+  )
+  assert.equal(h.storage.getSession(slug)?.awaiting_fence_id, null, "a stale click must not arm the newer fence")
+
+  h.telemetry.get(slug)!.turn = "in-flight"
+  await assert.rejects(
+    h.router.confirmAwaiting.handler({ input: { slug, sessionId: `sid-${slug}`, fenceAt: currentAt, hint: currentHint } }),
+    /no longer current/,
+  )
+
+  const elapsed = { kind: "timer" as const, value: "2000-01-01T00:00:00.000Z" }
+  h.telemetry.set(slug, {
+    turn: "idle", permPrompt: false, subAgents: [], bgShells: [], pendingQuestion: false,
+    lastFence: { kind: "awaiting", body: "Too late.", hint: elapsed, at: currentAt },
+    lastAssistantAt: currentAt,
+    lastActivityAt: currentAt,
+  })
+  await assert.rejects(
+    h.router.confirmAwaiting.handler({ input: { slug, sessionId: `sid-${slug}`, fenceAt: currentAt, hint: elapsed } }),
+    /already passed/,
+  )
+  assert.equal(h.storage.getSession(slug)?.awaiting_fence_id, null)
+
+  h.storage.close()
+  rmSync(h.dir, { recursive: true, force: true })
+})
+
+test("session-scoped lifecycle and follow-up actions cannot mutate a same-slug replacement", async () => {
+  const h = harness()
+  const slug = "replaced-action"
+  h.storage.upsertSession({ ...row(slug), session_id: "current-session" })
+  h.addExitedThread(slug)
+  const stale = "old-session"
+
+  const actions = [
+    () => h.router.followUp.handler({ input: { slug, sessionId: stale, message: "stale steer" } }),
+    () => h.router.setThreadState.handler({ input: { slug, sessionId: stale, state: "archived" } }),
+    () => h.router.completeThread.handler({ input: { slug, sessionId: stale, terminateLive: false } }),
+    () => h.router.setThreadSnooze.handler({ input: { slug, sessionId: stale, until: "2099-07-14T08:45:00.000Z" } }),
+    () => h.router.confirmAwaiting.handler({
+      input: {
+        slug, sessionId: stale, fenceAt: "2099-07-14T08:00:00.000Z",
+        hint: { kind: "github-review", value: "acme/app#391" },
+      },
+    }),
+  ]
+  for (const action of actions) await assert.rejects(action, /thread was replaced/)
+
+  const current = h.storage.getSession(slug)!
+  assert.equal(current.session_id, "current-session")
+  assert.equal(current.state, "open")
+  assert.equal(current.snoozed_until, null)
+  assert.equal(current.awaiting_fence_id, null)
+  assert.equal(h.refreshes(), 0)
+  h.storage.close()
+  rmSync(h.dir, { recursive: true, force: true })
 })
 
 test("clearAmbiguousCodexInput RPC: explicitly removes only a timed-out submitted barrier", async () => {
