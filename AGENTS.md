@@ -18,6 +18,17 @@ Every Word (write "Confirm snooze", "Mark as done", "Fix queue focus" — not "C
 Done", "Fix Queue Focus"). Acronyms (PR, CI, API) keep their established casing. When an agent titles a
 thread, the same rule applies.
 
+# Project-local skills and tools are shared across agents
+
+Any project-local skill or tool lives in ONE agent-neutral copy that every agent configuration
+discovers — never a per-agent fork. Skills live canonically in `.agents/skills/<name>/` (Codex
+discovers this path natively); `.claude/skills/<name>` is a relative symlink into that canonical copy
+so Claude Code discovers the identical content. When adding a skill, create it under
+`.agents/skills/` and add the symlink; verified end-to-end 2026-07-21 with `adhoc-cdp` (Claude lists
+it through the symlink, `codex exec` resolves it at `.agents/skills/adhoc-cdp/SKILL.md`). Shared
+tooling scripts follow the same rule: one copy in an agent-neutral location (e.g. `ui/scripts/`),
+referenced from skills — never duplicated into agent-specific config trees.
+
 # Agent completion invariant
 
 Once spawned, an agent runs to its terminal return. Do not interrupt or cut off an active agent to

@@ -2,7 +2,6 @@ import type {
   Backend,
   CodexModel,
   DispatchPreferences,
-  PermissionMode,
   SetDispatchPreferenceInput,
 } from "@fray-ui/shared"
 import type { SelectGroup, SelectOption } from "../components/ui/Select.tsx"
@@ -12,7 +11,6 @@ import {
   EFFORT_OPTIONS,
   codexEffortOptions,
   modelGroups,
-  permValueFor,
 } from "./options.ts"
 
 const CLAUDE_EFFORT_OPTIONS = EFFORT_OPTIONS.filter((option) => option.value !== "")
@@ -21,7 +19,6 @@ export interface ResolvedDispatchPreferences {
   backend: Backend
   model: string
   effort: string
-  permissionMode: PermissionMode
   codexModel?: CodexModel
   modelAvailable: boolean
   effortAvailable: boolean
@@ -98,15 +95,10 @@ export function resolveDispatchPreferences(
   const effortOptions = effort && !effortAvailable
     ? [{ value: effort, label: `${effort} (unavailable)`, title: "Saved reasoning level is not available for this model" }, ...baseEfforts]
     : baseEfforts
-  const permissionMode = permValueFor(
-    backend,
-    profile.permissionMode ?? (backend === "claude" ? "auto" : "default"),
-  )
   return {
     backend,
     model,
     effort,
-    permissionMode,
     codexModel,
     modelAvailable,
     effortAvailable,

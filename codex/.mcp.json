@@ -9,7 +9,8 @@
         "--isolated",
         "--no-usage-statistics"
       ],
-      "startup_timeout_sec": 120
+      "startup_timeout_sec": 120,
+      "default_tools_approval_mode": "approve"
     }
   }
 }

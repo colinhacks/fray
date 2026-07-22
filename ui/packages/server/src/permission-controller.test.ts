@@ -223,7 +223,11 @@ test("an idle queued follow-up is pasted and submitted by one terminal operation
   h.setPane("", emptyComposer)
   const message = "Call the connector for fray-native-audit/restart-test and wait."
 
-  h.controller.queueFollowUp("wrapped-hyphen", message)
+  assert.throws(
+    () => h.controller.queueFollowUp("wrapped-hyphen", message, undefined, "replaced-session"),
+    /thread was replaced/,
+  )
+  h.controller.queueFollowUp("wrapped-hyphen", message, undefined, "sid-wrapped-hyphen")
   assert.deepEqual(h.sent, [`atomic:Enter:${message}`])
   assert.equal(JSON.parse(h.keyQueueSnapshots.at(-1) ?? "[]")[0].state, "submitted")
 })

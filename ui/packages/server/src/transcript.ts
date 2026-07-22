@@ -15,7 +15,7 @@ import type { Storage } from "./storage.ts"
 import type { AgentBackend, NormalizedEvent } from "./backend/types.ts"
 import { CODEX_FIRST_FINAL_TITLE_TRANSPORT, CODEX_LEGACY_FIRST_FINAL_TITLE_TRANSPORT, parseCodexLine, createCodexBackend, extractCodexFrayTitle } from "./backend/codex.ts"
 import { discoverTranscriptId, DISCOVERY_GRACE_MS } from "./discover.ts"
-import { isClaudeAuthErrorText } from "./tailer.ts"
+import { isClaudeAuthErrorText, parseSignalFence } from "./tailer.ts"
 import { redactCredentialStructure, redactCredentialSyntax } from "./credential-redaction.ts"
 
 // Parse a session JSONL into a renderable conversation — mechanically, no AI. Same defensive
@@ -305,6 +305,8 @@ export function projectClaudeTranscript(raw: string, identityPrefix = "claude"):
         }
         // thinking blocks are deliberately not rendered
       }
+      const signal = parseSignalFence(m.text)
+      m.signalAt = signal && typeof rec.timestamp === "string" ? rec.timestamp : undefined
       const rendered = Boolean(m.text) || m.tools.length > 0
       if (!target && rendered) out.push(m)
       // Only claim the merge anchor when this record actually became — or extended — out's tail. A
@@ -948,14 +950,18 @@ export function projectCodexTranscript(raw: string, identityPrefix = "codex"): T
           // before any tool call. Strip that transport from every phase. Legacy H1/comment syntax is
           // final-only so normal commentary headings remain ordinary prose.
           let text = extractCodexFrayTitle(ev.text, ev.final).text
+          let renderedMessage: TranscriptMessage | undefined
           if (text) {
             const m = openAssistant(ev.at, sourceId)
+            renderedMessage = m
             pushTextPart(m, text)
             m.text = m.text ? `${m.text}\n\n${text}` : text
           }
           if (ev.final) {
             lastFinalText = text
             sawFinalAnswer = true
+            const signal = parseSignalFence(text)
+            if (signal && renderedMessage && ev.at) renderedMessage.signalAt = ev.at
           }
           break
         }
@@ -1077,6 +1083,9 @@ export function projectCodexTranscript(raw: string, identityPrefix = "codex"): T
             pushTextPart(m, finalText!)
             m.text = m.text ? `${m.text}\n\n${finalText!}` : finalText!
             sawFinalAnswer = true
+            if (parseSignalFence(finalText!)) {
+              m.signalAt = ev.at
+            }
           }
           break
         }

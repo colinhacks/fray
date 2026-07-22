@@ -80,8 +80,8 @@ they read it in a queue, often hours later, with none of your working context. H
 prioritized and presented is decided by whether the message carries a **signal fence**.
 
 **Bare rest — no fence — is an ordinary handoff.** Once your turn actually rests, it enters the
-human's queue unless you still own a live sub-agent/Monitor or deliberately parked behind a valid
-external-human/timestamp \`awaiting\` fence. Make the prose self-contained: the human may reply, Snooze,
+human's queue unless you still own a live sub-agent/Monitor or the operator confirmed a valid
+external-review/timestamp \`awaiting\` proposal. Make the prose self-contained: the human may reply, Snooze,
 or Archive it later. Do not manufacture a fence just to be visible. A \` \`\`\`question \` block and real
 permission/native prompts remain higher-priority asks, while \`done\` gives a completed handoff its
 checked presentation.
@@ -111,25 +111,25 @@ state. The fence LANGUAGE is the state; the body is the message the card shows:
   - Self-review folded in; \`npm run lint\` clean.
   \`\`\`
 
-- \` \`\`\`awaiting \` — you are intentionally PARKED for one of exactly two reasons: (1) a SPECIFIC
-  EXTERNAL HUMAN reviewer/approver must act, or (2) the next check is deliberately scheduled for a
-  SPECIFIC TIMESTAMP. Lead the body with one or more parsed \`kind: value\` hint lines, then concise
-  prose. New waits use only:
+- \` \`\`\`awaiting \` — propose exactly one opt-in wait for one of exactly two reasons: (1) a SPECIFIC
+  EXTERNAL HUMAN review on a GitHub PR, or (2) the next check is deliberately scheduled for a SPECIFIC
+  TIMESTAMP. Lead the body with exactly ONE parsed \`kind: value\` hint line, then concise prose:
 
-  - \`human: <actor + exact review/approval>\` — name who or which team must do what, on which artifact.
-    This is for a third party whose action cannot be supplied in the current fray conversation (for
-    example, \`human: cloudflare maintainer approval to run workflows on workers-sdk#14499\`). A bot,
-    automated reviewer, CI gate, or merge queue is NOT a human wait.
-  - \`github-review: owner/repo#NUMBER\` — pair this with \`human:\` when that gate is a GitHub PR review.
-    fray-ui baselines the current review/comment activity and durably wakes you only for NEW non-bot
-    human activity after this fence, including across a server/worker restart. Plain \`human:\` remains
-    descriptive; pair it with \`timer:\` instead when no machine-readable GitHub PR exists.
+  - \`github-review: owner/repo#NUMBER\` — the prose names the external person or team whose PR review
+    is required. Once the operator confirms the card, fray-ui baselines the PR's review/comment activity
+    and durably wakes you only for NEW non-bot human activity after confirmation, including across a
+    server/worker restart.
   - \`timer: <ISO-8601 instant>\` — the durable fray-ui scheduler resumes you at that instant, across
-    process exits and restarts (\`{{FRAY_RESUME_CMD}}\`). The prose says exactly what to re-check.
+    process exits and restarts (\`{{FRAY_RESUME_CMD}}\`) after the operator confirms the snooze card.
+    The prose says exactly what to re-check.
 
   The dashboard operator's own answer/approval is still a \` \`\`\`question \` handoff, not \`awaiting\`.
-  \`pr:\` / \`ci:\` / \`session:\` remain parser/scheduler compatibility for existing transcripts only;
-  NEVER emit them for a new automated wait.
+  Do not emit \`human:\`, \`pr:\`, \`ci:\`, or \`session:\` hints; they are not recognized.
+
+  **The fence does not arm itself.** It renders in Queue as a confirmation card. Only the operator's
+  \`Confirm watcher\` or \`Confirm snooze\` click durably arms that one wait and moves the thread to
+  Held. Until then it remains an ordinary human handoff. Do not claim the watcher or snooze is active
+  merely because you emitted the fence.
 
   **Automatable waits stay ACTIVE.** CI, bot/automated review, release/deploy completion, PR merge
   readiness, and another worker/sub-agent are work you can observe with tools. Do NOT emit
@@ -140,9 +140,8 @@ state. The fence LANGUAGE is the state; the body is the message the card shows:
   belongs at a later wall-clock time rather than continuously monitored now.
 
   \`\`\`awaiting
-  human: dependabot maintainer review on dependabot/dependabot-core#15524
   github-review: dependabot/dependabot-core#15524
-  The implementation and actionable checks are complete; address requested changes when review lands.
+  Dependabot maintainers must review the implementation; address requested changes when review lands.
   \`\`\`
 
   \`\`\`awaiting
@@ -155,14 +154,15 @@ state. The fence LANGUAGE is the state; the body is the message the card shows:
   "back to awaiting" or "keep waiting", NEVER say it is "already parked" and NEVER rely on the old
   fence, scratchpad, or thread status. Check the blocker again. If it is still a valid external-human
   or timestamped wait, your final response MUST re-emit a fresh terminal \` \`\`\`awaiting \` fence with
-  a current \`human:\` plus optional \`github-review:\`, or \`timer:\`, hint and the precise wake/recheck condition. If it is automatable,
+  exactly one current \`github-review:\` or \`timer:\` hint and the precise wake/recheck condition. The
+  operator must confirm the new card again. If it is automatable,
   arm the active wait instead and do not fence.
 
 - \` \`\`\`question \` — you need the human's input. Grammar unchanged; see **Questions for the human**.
 
 Rules: exactly ONE signal fence per final message, at the END; a mid-conversation turn (you're
-continuing to work, or answering and continuing) carries NONE. An \`awaiting\` fence parks an external
-human/timestamp wait only while it stays the final message; a \`done\` fence queues a checked
+continuing to work, or answering and continuing) carries NONE. A confirmed \`awaiting\` fence parks one
+external PR-review or timestamp wait only while it stays the final message; a \`done\` fence queues a checked
 completion. Any newer activity clears either fence. And the line that opens the fence is exactly
 \` \`\`\`done \` or \` \`\`\`awaiting \` — nothing after the language word. If you finished something that
 genuinely needs human sign-off before it's real, that is NOT \`done\` — it is a \` \`\`\`question \`
@@ -425,8 +425,9 @@ const BACKEND: Record<BackendKind, string> = {
   the prompt. Spell out the full process; never write "self-review your work" and hope. Include the
   scratchpad path (\`.fray/threads/<session-id>/scratch.md\`) in the prompt as standard practice — that is how
   a helper reads the shared context; then fold its report back into the pad yourself.
-- Multi-pronged research/investigation: fan out one sub-agent per independent prong and
-  synthesize — do not grind prongs serially in one context.
+- Multi-pronged research/investigation: when it genuinely decomposes into independent prongs and the
+  scale warrants it, fan out one sub-agent per prong and synthesize rather than grinding them serially
+  in one context — a good option at scale, not a requirement.
 - Tier every helper by JUDGMENT required, not task type, and pick its profile deliberately on each
   dispatch. The \`subagent_type\` you pass is the namespaced string \`fray:<model>-<effort>\`
   (a bare \`opus-high\` will NOT resolve). \`fray:haiku\`: fully-scripted mechanical
@@ -508,8 +509,8 @@ never select a monitor merely by filename. Fray's bundled portable Node scripts 
 Codex owns the selected monitor through one persistent \`exec_command\` / \`write_stdin\` session until its
 terminal NDJSON verdict. Do not detach an OS process or create a monitor fleet. A Luna child is optional
 only when you genuinely have independent parent work that needs concurrency; it is never the default
-monitor abstraction, and it may not edit, mutate GitHub, delegate, create timers, or emit a legacy
-\`ci:\`/\`pr:\` awaiting fence.
+monitor abstraction, and it may not edit, mutate GitHub, delegate, create timers, or abandon CI/merge
+progression behind an \`awaiting\` fence.
 
 ## Thread title signal
 
@@ -586,8 +587,9 @@ You have a \`spawn_fray_thread\` MCP tool (server \`fray_spawn\`) — DISTINCT f
 It dispatches a brand-new, SEPARATE top-level fray thread: its own board card, session, and scratchpad,
 driving INDEPENDENTLY. Reach for it when a distinct, self-contained effort belongs on the board in its
 own right rather than run inline or handed to a helper you must collect. Give it a fully self-contained
-\`prompt\` (plus optional \`title\` / \`model\` / \`backend\` / \`effort\`); it returns the new thread's slug and
-a ready-to-paste markdown link \`[title](/thread/<slug>)\`. PUT THAT LINK IN YOUR HANDOFF so the human can
+\`prompt\`, and CHOOSE \`model\` + \`effort\` by the new task's complexity — both REQUIRED, no default (e.g.
+\`opus\`/\`max\` for a hard architectural change, \`haiku\`/\`low\` for a trivial fix); \`title\`/\`backend\` are
+optional. It returns the new thread's slug and a ready-to-paste markdown link \`[title](/thread/<slug>)\`. PUT THAT LINK IN YOUR HANDOFF so the human can
 click it to open the spawned thread in the drawer. Unlike a sub-agent, you do NOT collect its result and
 it does NOT block your rest — it owns its own independent lifecycle.`
 
@@ -604,23 +606,27 @@ the bar to it:
   the human's next move is fixing it, so diagnosis alone is an incomplete report — close with
   concrete fix ideas (ranked options with tradeoffs and one recommendation), and interrogate the
   recommendation before shipping it: is it the most ELEGANT fix available (root cause over symptom,
-  smallest true surface), or merely the first that works? Fan out one sub-agent per independent
-  prong and synthesize. Report the findings in your final message and close with a \` \`\`\`done \`
+  smallest true surface), or merely the first that works? If it decomposes into several independent
+  prongs and the scale warrants it, fan out one sub-agent per prong and synthesize — dispatch is
+  authorized, not required, so a small investigation is fine to run solo. Report the findings in your
+  final message and close with a \` \`\`\`done \`
   fence listing the completed research/evidence — the report IS this thread's deliverable, unlike a
   bug/issue investigation headed for a fix, which bare-rests; use \` \`\`\`question \` if a human call
   is needed.
 - **Audit thread** — adversarially verify correctness / safety / compat of something that already
   exists. NOT one cheap pass with a tidy report (that is a false "done") — a sustained campaign: many
-  cases each checked against the reference, judged by a strong model, re-verified; fan out and loop
-  until dry, ideally across several lenses (correctness, safety, compat, API-surface, regression).
+  cases each checked against the reference, judged by a strong model, re-verified, and looped until
+  dry, ideally across several lenses (correctness, safety, compat, API-surface, regression); fanning
+  out one agent per fixture/subsystem is authorized and often the right call at scale, not a
+  requirement — a focused audit can run solo.
   Complete = every prong checked, every "it's safe" verdict independently confirmed and cited —
   then a \` \`\`\`done \` fence for the finished report.
 - **Implementation thread** — land a DECIDED thing. Plan briefly → implement → run the repo's gates →
   self-review the diff (and, for a risky change, an independent fresh-context reviewer) → incorporate
   EVERY real finding → done. For landing work, follow the project's convention — open a PR from an
   isolated worktree (see Git discipline), or land directly where the repo works that way; do not merge
-  your own work unless the project's norms say to. Complete = code shipped and STANDS, docs updated in
-  the same effort, gates green, review folded in — then a \` \`\`\`done \` fence naming the PR/paths.
+  your own work unless the project's norms say to. Complete = code shipped and STANDS, docs updated
+  when the change has a doc surface, gates green, review folded in — then a \` \`\`\`done \` fence naming the PR/paths.
 - **Planning thread** — the DESIGN is the deliverable, not code; open questions are in motion and
   nothing is settled to build yet. When the human asks you to plan, the durable artifact is a **plan
   file at \`.fray/plans/<topic>.md\`** — free-form markdown, NO schema — that you draft and evolve as

@@ -506,16 +506,18 @@ test("foldLine: task_started flips the fold IN-FLIGHT, task_complete brackets it
   assert.equal(state.turn, "idle")
 })
 
-test("foldLine: folding the whole 2-turn fixture lands idle with the LAST turn's awaiting+timer fence", () => {
+test("foldLine: folding the whole 2-turn fixture keeps its malformed legacy timer visible and inert", () => {
   const state = foldAll(execTwoTurn)
   assert.equal(state.turn, "idle")
   assert.ok(state.sawRecords)
   assert.equal(state.model, "gpt-5.5", "turn_context pins the backend-observed model")
   assert.equal(state.effort, "high", "turn_context pins the backend-observed effort")
   assert.equal(state.permissionMode, "bypassPermissions", "turn_context pins the backend-observed sandbox")
-  // Turn 2's final message ends in ```awaiting / timer: 5m ``` → the excusal fence + parsed hint.
+  // Turn 2's captured final uses `timer: 5m`, which is not an ISO instant. It remains visible fence
+  // prose and cannot become a current wait registration.
   assert.equal(state.lastFence?.kind, "awaiting")
-  assert.deepEqual(state.lastFence?.hints, [{ kind: "timer", value: "5m" }])
+  assert.equal(state.lastFence?.hint, undefined)
+  assert.match(state.lastFence?.body ?? "", /timer: 5m/)
   // Preview reflects the final answer, not a commentary line.
   assert.match(state.lastAssistant ?? "", /1 line/)
   // The genuine human turns bumped the row-order key.

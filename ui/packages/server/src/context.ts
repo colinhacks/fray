@@ -35,6 +35,7 @@ import {
   adoptionRuntimeBinding,
   reconcileAdoptionClaims,
 } from "./adoption-recovery.ts"
+import { startOrphanReaper } from "./orphan-reaper.ts"
 import {
   createRetryableCleanup,
   createShutdownBarrier,
@@ -113,8 +114,8 @@ export interface AppContext {
   // unknown kind, so every existing session and all current behavior are unchanged until a dispatch
   // explicitly selects codex. Shared by the dispatcher, the tailer, and every resumeThread call.
   backendFor: (kind?: string) => AgentBackend
-  // Durable timer scheduler (plus legacy pr/ci compatibility): resumes a rested `awaiting` session
-  // on a witnessed transition. Human gates are descriptive. Started alongside the tailer; boot-safe.
+  // Durable confirmed-wait scheduler: resumes a rested `awaiting` session at its timer or when new
+  // non-bot human GitHub review activity appears. Started alongside the tailer; boot-safe.
   scheduler: Scheduler
   // Per-thread permission changes. Idle standalone TUIs are reopened on the same persisted
   // conversation with backend-native launch flags; busy/ambiguous states fail explicitly.
@@ -375,6 +376,17 @@ function createContextUnchecked(opts: ContextOptions, resources: PartialContextR
   }, ADOPTION_RECONCILE_INTERVAL_MS)
   adoptionReconcileTimer.unref?.()
   contextUnsubscribers.push(() => clearInterval(adoptionReconcileTimer))
+
+  // Reap this machine's leaked worker aux — verification browsers (agent-browser/chrome-devtools/
+  // puppeteer) and MCP/dev servers that daemonized out of a stopped worker's tmux tree, so nothing
+  // else ever collects them. A sweep on startup clears accumulated leaks; the interval catches new
+  // orphans (a stopped/crashed thread's browsers) within a bounded window. Reaps ONLY processes
+  // whose FRAY_UI_THREAD slug has no live claude/codex root; never a session/tmux/self process.
+  // FRAY_ORPHAN_REAPER_OFF disables it for disposable adhoc/test stacks (mirrors FRAY_WAKERS_OFF) so a
+  // throwaway instance never reaps the real machine's processes.
+  if (!process.env.FRAY_ORPHAN_REAPER_OFF) {
+    contextUnsubscribers.push(startOrphanReaper({ log: (m) => console.log(`[fray-ui] ${m}`) }))
+  }
   reconcileSessions(storage)
   opts.startup?.afterPhase?.("subscriptions")
 
@@ -478,26 +490,32 @@ function createContextUnchecked(opts: ContextOptions, resources: PartialContextR
         : readClaudeAuthStatusCli({ claudeBin: opts.claudeBin, cwd: project.dir }),
   })
 
-  // Durable timer waker + legacy pr/ci compatibility. Reuses the SAME resume path as followUp;
-  // boot-safe because it only fires on a condition it witnesses cross.
+  // Confirmed timer / external-review waits reuse the same durable resume path as follow-up. Merely
+  // writing an awaiting fence never arms this scheduler; the operator confirmation in SQLite does.
   const scheduler = createScheduler({
     storage,
     tailer,
-    resume: (slug, message, deliveryId) => {
+    resume: (slug, message, deliveryId, expectedSessionId) => {
       const deliveryMessage = `${message}\n\n${wakeDeliveryToken(deliveryId)}`
       const row = storage.getSession(slug)
-      if (row?.backend === "codex") {
+      if (row?.session_id === expectedSessionId && row.backend === "codex") {
         const binding = adoptionRuntimeBinding(storage, row)
         const live = binding.kind === "unbound"
           ? tmux.isLive(slug)
           : binding.kind === "bound" && tmux.findExpectedAdoptionPane(binding.claim).kind === "found"
         if (live) {
-          permissionController.queueFollowUp(slug, deliveryMessage, deliveryId)
+          permissionController.queueFollowUp(slug, deliveryMessage, deliveryId, expectedSessionId)
           return
         }
       }
-      resumeThread({ project, storage, board, getSettings: () => getSettings(storage), backendFor }, slug, deliveryMessage)
+      resumeThread(
+        { project, storage, board, getSettings: () => getSettings(storage), backendFor },
+        slug,
+        deliveryMessage,
+        expectedSessionId,
+      )
     },
+    onWaitChange: () => board.refresh(),
   })
   resources.scheduler = scheduler
   opts.startup?.afterPhase?.("wake scheduler")

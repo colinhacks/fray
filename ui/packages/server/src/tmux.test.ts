@@ -20,6 +20,7 @@ import {
   findExpectedAdoptionPane,
   captureExpectedAdoptionPane,
   crossSocketLiveOwner,
+  sendTextToCompatibleLegacyWorker,
   sendTextWithKey,
   sendTextWithKeyToExpectedAdoptionPane,
   sendTextToExpectedAdoptionPane,
@@ -29,6 +30,7 @@ import {
   socketName,
   spawn,
   spawnWithRunner,
+  pasteText,
   TmuxSpawnError,
 } from "./tmux.ts"
 
@@ -40,6 +42,117 @@ const tmuxAvailable = (() => {
     return false
   }
 })()
+
+const bracketedPasteConsumer = [
+  "process.stdin.setRawMode(true)",
+  "process.stdin.resume()",
+  "let input = Buffer.alloc(0)",
+  "process.stdout.write('\\u001b[?2004hREADY\\n')",
+  "process.stdin.on('data', chunk => {",
+  "  input = Buffer.concat([input, chunk])",
+  "  if (input.includes(Buffer.from('\\u001b[201~'))) process.stdout.write('\\nINPUT:' + input.toString('hex') + '\\n')",
+  "})",
+].join(";\n")
+
+async function waitForBracketedPaste(target: string, activeSocket = socketName()): Promise<void> {
+  const readyBy = Date.now() + 2_000
+  while (Date.now() < readyBy) {
+    const flag = execFileSync("tmux", ["-L", activeSocket, "display-message", "-p", "-t", target, "#{bracket_paste_flag}"], { encoding: "utf8" }).trim()
+    if (flag === "1") return
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  assert.fail("the test consumer did not enable bracketed-paste mode")
+}
+
+async function captureBracketedInput(target: string, message: string, activeSocket = socketName()): Promise<string> {
+  const expected = Buffer.from(`\u001b[200~${message.replaceAll("\n", "\r")}\u001b[201~`).toString("hex")
+  const deliveredBy = Date.now() + 2_000
+  let pane = ""
+  while (Date.now() < deliveredBy) {
+    pane = execFileSync("tmux", ["-L", activeSocket, "capture-pane", "-p", "-t", target], { encoding: "utf8" })
+    if (pane.includes(`INPUT:${expected}`)) return pane
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  assert.fail(`the bracketed payload was not delivered; pane: ${pane}`)
+}
+
+async function waitForChildMarker(read: () => string, marker: string): Promise<void> {
+  // Separate process startup from the transport assertion. Under the full parallel suite a child can
+  // take longer than the transport's own 2s boundary to start; once READY is observed, that boundary
+  // remains strict and measures only the operation under test.
+  const readyBy = Date.now() + 10_000
+  while (Date.now() < readyBy) {
+    if (read().includes(marker)) return
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  assert.fail(`the transport child never emitted ${marker}; output: ${read()}`)
+}
+
+test("pasteText keeps a multiline follow-up inside one bracketed-paste payload", { skip: !tmuxAvailable }, async () => {
+  const originalSocket = socketName()
+  const slug = `bracketed-paste-${process.pid}`
+  setSocket(`fray-bracketed-paste-test-${process.pid}`)
+  try {
+    spawn(slug, [process.execPath, "-e", bracketedPasteConsumer], process.cwd())
+
+    const target = tmuxSessionName(slug)
+    await waitForBracketedPaste(target)
+
+    const message = "Answers:\n2. A. Leave it to your normal release flow"
+    pasteText(slug, message)
+    await captureBracketedInput(target, message)
+  } finally {
+    killSession(slug)
+    setSocket(originalSocket)
+  }
+})
+
+test("exact adopted-pane sends keep multiline follow-ups inside bracketed-paste framing", { skip: !tmuxAvailable }, async () => {
+  const originalSocket = socketName()
+  const slug = `bracketed-adoption-${process.pid}`
+  const token = randomUUID()
+  setSocket(`fray-bracketed-adoption-test-${process.pid}`)
+  try {
+    const exact = spawn(slug, [process.execPath, "-e", bracketedPasteConsumer], process.cwd(), undefined, {
+      adoptionAttemptToken: token,
+    })
+    await waitForBracketedPaste(exact.paneId)
+
+    const message = "Answers:\n2. A. Leave it to your normal release flow"
+    assert.equal(sendTextToExpectedAdoptionPane({
+      attempt_token: token,
+      pane_id: exact.paneId,
+      pane_pid: exact.panePid,
+      session_created: exact.sessionCreated,
+    }, message, true), true)
+    await captureBracketedInput(exact.paneId, message)
+  } finally {
+    killSession(slug)
+    setSocket(originalSocket)
+  }
+})
+
+test("compatible legacy sends keep multiline follow-ups inside bracketed-paste framing", { skip: !tmuxAvailable }, async () => {
+  const originalSocket = socketName()
+  const slug = `bracketed-legacy-${process.pid}`
+  setSocket(`fray-bracketed-legacy-test-${process.pid}`)
+  try {
+    const exact = spawn(slug, [process.execPath, "-e", bracketedPasteConsumer], process.cwd())
+    await waitForBracketedPaste(exact.paneId)
+
+    const message = "Answers:\n2. A. Leave it to your normal release flow"
+    assert.equal(sendTextToCompatibleLegacyWorker({
+      socket: socketName(),
+      paneId: exact.paneId,
+      panePid: exact.panePid,
+      sessionCreated: exact.sessionCreated,
+    }, message), true)
+    await captureBracketedInput(exact.paneId, message)
+  } finally {
+    killSession(slug)
+    setSocket(originalSocket)
+  }
+})
 
 test("deriveSocket: per-project socket name from the stable project id", () => {
   // UUIDs retain all 128 bits; the historical first-eight mapping could collide.
@@ -424,6 +537,7 @@ test("a pane replaced during the paste settle boundary receives no delayed key a
   const slug = `local-settle-race-${process.pid}`
   const holder = `local-settle-holder-${process.pid}`
   const testSocket = `fray-local-settle-race-test-${process.pid}`
+  const settleGate = join(tmpdir(), `fray-tmux-settle-${randomUUID()}`)
   setSocket(testSocket)
   const buffers = (): string => {
     try {
@@ -441,14 +555,19 @@ test("a pane replaced during the paste settle boundary receives no delayed key a
     const moduleUrl = new URL("./tmux.ts", import.meta.url).href
     let output = ""
     const child = spawnChild(process.execPath, ["--input-type=module", "-e", `
-      import { setSocket, sendTextWithKey } from ${JSON.stringify(moduleUrl)};
+      import { setSocket, setInputSettleGateForTests, sendTextWithKey } from ${JSON.stringify(moduleUrl)};
       setSocket(${JSON.stringify(testSocket)});
+      setInputSettleGateForTests(${JSON.stringify(settleGate)});
       process.stdout.write("FRAY_SETTLE_READY\\n");
+      await new Promise(resolve => process.stdin.once("data", resolve));
       const result = sendTextWithKey(${JSON.stringify(slug)}, "MUST_NOT_REACH_REPLACEMENT", "Enter");
       process.stdout.write("RESULT:" + result + "\\n");
-    `], { stdio: ["ignore", "pipe", "pipe"] })
+    `], { stdio: ["pipe", "pipe", "pipe"] })
+    const childClosed = new Promise<number | null>((resolve) => child.once("close", resolve))
     child.stdout.on("data", (chunk) => { output += String(chunk) })
 
+    await waitForChildMarker(() => output, "FRAY_SETTLE_READY")
+    child.stdin.end("start\\n")
     const bufferDeadline = Date.now() + 2_000
     while (Date.now() < bufferDeadline && !buffers().includes("fray-input-")) {
       await new Promise((resolve) => setTimeout(resolve, 1))
@@ -457,7 +576,8 @@ test("a pane replaced during the paste settle boundary receives no delayed key a
 
     killSession(slug)
     spawn(slug, [process.execPath, "-e", "process.stdin.on('data', d => process.stdout.write('COMPETITOR:' + d))"], process.cwd())
-    const code = await new Promise<number | null>((resolve) => child.once("close", resolve))
+    writeFileSync(settleGate, "release")
+    const code = await childClosed
     assert.equal(code, 0)
     assert.match(output, /RESULT:false/)
     assert.doesNotMatch(buffers(), /fray-input-/)
@@ -469,6 +589,8 @@ test("a pane replaced during the paste settle boundary receives no delayed key a
     )
     assert.doesNotMatch(competitor, /MUST_NOT_REACH_REPLACEMENT|COMPETITOR:/)
   } finally {
+    try { writeFileSync(settleGate, "release") } catch {}
+    rmSync(settleGate, { force: true })
     killSession(slug)
     killSession(holder)
     setSocket(originalSocket)
@@ -482,6 +604,7 @@ test("an exact adopted pane replaced during settle receives no delayed key and s
   const token = randomUUID()
   const competitorToken = randomUUID()
   const testSocket = `fray-exact-settle-race-test-${process.pid}`
+  const settleGate = join(tmpdir(), `fray-tmux-settle-${randomUUID()}`)
   setSocket(testSocket)
   const buffers = (): string => {
     try {
@@ -508,18 +631,23 @@ test("an exact adopted pane replaced during settle receives no delayed key and s
     const moduleUrl = new URL("./tmux.ts", import.meta.url).href
     let output = ""
     const child = spawnChild(process.execPath, ["--input-type=module", "-e", `
-      import { setSocket, sendTextWithKeyToExpectedAdoptionPane } from ${JSON.stringify(moduleUrl)};
+      import { setSocket, setInputSettleGateForTests, sendTextWithKeyToExpectedAdoptionPane } from ${JSON.stringify(moduleUrl)};
       setSocket(${JSON.stringify(testSocket)});
+      setInputSettleGateForTests(${JSON.stringify(settleGate)});
       process.stdout.write("FRAY_EXACT_SETTLE_READY\\n");
+      await new Promise(resolve => process.stdin.once("data", resolve));
       const result = sendTextWithKeyToExpectedAdoptionPane(
         ${JSON.stringify(expected)},
         "MUST_NOT_REACH_EXACT_REPLACEMENT",
         "Enter",
       );
       process.stdout.write("RESULT:" + result + "\\n");
-    `], { stdio: ["ignore", "pipe", "pipe"] })
+    `], { stdio: ["pipe", "pipe", "pipe"] })
+    const childClosed = new Promise<number | null>((resolve) => child.once("close", resolve))
     child.stdout.on("data", (chunk) => { output += String(chunk) })
 
+    await waitForChildMarker(() => output, "FRAY_EXACT_SETTLE_READY")
+    child.stdin.end("start\\n")
     const bufferDeadline = Date.now() + 2_000
     while (Date.now() < bufferDeadline && !buffers().includes("fray-exact-")) {
       await new Promise((resolve) => setTimeout(resolve, 1))
@@ -535,7 +663,8 @@ test("an exact adopted pane replaced during settle receives no delayed key and s
       undefined,
       { adoptionAttemptToken: competitorToken },
     )
-    const code = await new Promise<number | null>((resolve) => child.once("close", resolve))
+    writeFileSync(settleGate, "release")
+    const code = await childClosed
     assert.equal(code, 0)
     assert.match(output, /RESULT:false/)
     assert.doesNotMatch(buffers(), /fray-exact-/)
@@ -547,6 +676,8 @@ test("an exact adopted pane replaced during settle receives no delayed key and s
     )
     assert.doesNotMatch(competitor, /MUST_NOT_REACH_EXACT_REPLACEMENT|COMPETITOR:/)
   } finally {
+    try { writeFileSync(settleGate, "release") } catch {}
+    rmSync(settleGate, { force: true })
     if (exact) killPane(exact)
     killSession(slug)
     killSession(holder)

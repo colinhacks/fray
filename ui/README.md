@@ -144,7 +144,7 @@ Everything the UI deliberately does NOT know lives in **Settings** (gear icon): 
 orchestration wisdom (sub-agent discipline, git hygiene, the stop criterion). It ships from
 [`DEFAULT_PREAMBLE.md`](./DEFAULT_PREAMBLE.md); edit it per project and use **Reset preamble to
 default** to clear your overrides back to the shipped defaults. Settings also carry the default
-permission mode, model, effort, and a desktop-notifications toggle (which requests browser
+model, effort, and a desktop-notifications toggle (which requests browser
 permission and only fires when the Fray tab or window is hidden).
 
 ## `FRAY.md` — a repo's own worker norms

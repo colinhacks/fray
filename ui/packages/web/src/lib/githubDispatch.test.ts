@@ -29,23 +29,22 @@ function resolved(overrides: Partial<ResolvedDispatchPreferences> = {}): Resolve
   }
 }
 
-test("prompt-box capture preserves the exact current provider, atomic pair, and permission", () => {
+test("prompt-box capture preserves the exact current provider and atomic pair (no permission)", () => {
   const first = captureDispatchProfile(resolved())
   assert.deepEqual(first, {
     ok: true,
-    profile: { backend: "claude", model: "opus", effort: "high", permissionMode: "acceptEdits" },
+    profile: { backend: "claude", model: "opus", effort: "high" },
   })
 
   const changed = captureDispatchProfile(resolved({
     backend: "codex",
     model: codexModel.slug,
     effort: "ultra",
-    permissionMode: "bypassPermissions",
     codexModel,
   }))
   assert.deepEqual(changed, {
     ok: true,
-    profile: { backend: "codex", model: "gpt-5.6-sol", effort: "ultra", permissionMode: "bypassPermissions" },
+    profile: { backend: "codex", model: "gpt-5.6-sol", effort: "ultra" },
   })
 })
 
@@ -64,7 +63,7 @@ test("capture and final validation reject unavailable or invalid model/effort pa
 })
 
 test("multi-select builds one exact RPC payload with the captured tuple for every item", () => {
-  const profile = { backend: "codex", model: codexModel.slug, effort: "ultra", permissionMode: "plan" } as const
+  const profile = { backend: "codex", model: codexModel.slug, effort: "ultra" } as const
   const input = buildGithubBatchInput(profile, [
     { kind: "issue", number: 17 },
     { kind: "issue", number: 23 },
@@ -74,7 +73,6 @@ test("multi-select builds one exact RPC payload with the captured tuple for ever
     backend: "codex",
     model: "gpt-5.6-sol",
     effort: "ultra",
-    permissionMode: "plan",
   })
   assert.deepEqual(GithubBatchInput.parse(input), input)
   assert.throws(() => GithubBatchInput.parse({ ...input, backend: undefined }), /backend/)

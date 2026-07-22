@@ -6,7 +6,7 @@ const source = readFileSync(new URL("./SettingsDrawer.tsx", import.meta.url), "u
 const tooltipSource = readFileSync(new URL("./Tooltip.tsx", import.meta.url), "utf8")
 
 test("settings maps each contextual explanation to a help control", () => {
-  for (const key of ["model", "permission", "sandbox", "effort", "font", "compact", "notifications", "subagentInstructions"]) {
+  for (const key of ["model", "effort", "font", "compact", "notifications", "subagentInstructions"]) {
     assert.match(source, new RegExp(`\\b${key}:`), `missing settings help mapping: ${key}`)
   }
   assert.match(source, /<SettingsField label="Model" help=\{SETTINGS_HELP\.model\}/)

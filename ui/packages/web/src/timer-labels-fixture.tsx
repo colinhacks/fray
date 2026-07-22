@@ -21,7 +21,8 @@ const thread = {
   state: "active",
   mechanism: "timer",
   needsYou: false,
-  lastFence: { kind: "awaiting", body: "The next check is scheduled automatically.", hints: [{ kind: "timer", value: timer }] },
+  lastFence: { kind: "awaiting", body: "The next check is scheduled automatically.", hint: { kind: "timer", value: timer } },
+  awaitingWaitConfirmed: true,
 } as unknown as ThreadView
 
 function Surface({ title, dense }: { title: string; dense?: boolean }) {

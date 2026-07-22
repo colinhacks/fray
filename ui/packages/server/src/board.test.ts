@@ -10,6 +10,7 @@ import { createStorage } from "./storage.ts"
 import type { Project } from "./project.ts"
 import type { SessionRow } from "./storage.ts"
 import type { SessionTelemetry, Tailer } from "./tailer.ts"
+import { awaitingFenceIdentity } from "./awaiting.ts"
 
 // The QUEUE DEFINITION is deriveNeedsYou — the single server-side source of truth for "this thread
 // needs the human, put it on the stack." These tests pin every queue-worthy state, because a hole
@@ -397,21 +398,27 @@ test("deriveNeedsYou: a ```question MID-TURN does not queue (ask text hasn't lan
 })
 
 test("deriveNeedsYou: a checked ```done fence at rest queues until archived, even if seen", () => {
-  const done = tele({ lastFence: { kind: "done", body: "shipped", hints: [] }, lastActivityAt: LATER })
+  const done = tele({ lastFence: { kind: "done", body: "shipped" }, lastActivityAt: LATER })
   assert.equal(deriveNeedsYou(row({ seen_at: LATER }), done, "turn-idle"), true)
   assert.equal(deriveNeedsYou(row({ seen_at: LATER }), done, "exited"), true)
   // A stale final fence never queues during a newer in-flight turn.
   assert.equal(deriveNeedsYou(row({ seen_at: T0 }), done, "running"), false)
 })
 
-test("deriveNeedsYou: a parked human/timestamp awaiting fence stays out of the operator queue", () => {
-  const human = tele({ lastFence: { kind: "awaiting", body: "", hints: [{ kind: "human", value: "Alice must approve" }] }, lastActivityAt: LATER })
-  const timer = tele({ lastFence: { kind: "awaiting", body: "", hints: [{ kind: "timer", value: "2099-07-15T17:00:00Z" }] }, lastActivityAt: LATER })
-  assert.equal(deriveNeedsYou(row({ seen_at: T0 }), human, "turn-idle"), false)
-  assert.equal(deriveNeedsYou(row({ seen_at: T0 }), timer, "turn-idle"), false)
-  // ...but a pending QUESTION overrides a parked fence (a specific ask beats the park).
-  const both = tele({ pendingQuestion: true, lastFence: { kind: "awaiting", body: "", hints: [{ kind: "human", value: "Alice must approve" }] } })
-  assert.equal(deriveNeedsYou(row({ seen_at: LATER }), both, "turn-idle"), true)
+test("deriveNeedsYou: an awaiting proposal queues until its exact wait is confirmed", () => {
+  const hint = { kind: "github-review" as const, value: "owner/repo#1" }
+  const waiting = tele({ lastFence: { kind: "awaiting", body: "Await Alice's review.", hint, at: LATER }, lastActivityAt: LATER, lastAssistantAt: LATER })
+  assert.equal(deriveNeedsYou(row(), waiting, "turn-idle"), true, "a transcript proposal alone stays queued")
+  const confirmed = row({
+    awaiting_fence_id: awaitingFenceIdentity(hint, LATER),
+    awaiting_confirmed_at: T0,
+  })
+  assert.equal(deriveNeedsYou(confirmed, waiting, "turn-idle"), false)
+  assert.equal(
+    deriveNeedsYou(confirmed, tele({ ...waiting, pendingQuestion: true }), "turn-idle"),
+    true,
+    "a concrete question overrides a confirmed wait",
+  )
 })
 
 test("deriveNeedsYou: every owned bare rest queues; live child/Monitor work remains in flight", () => {
@@ -493,7 +500,7 @@ test("deriveNeedsYou: manual snooze suppresses every queue reason until its exac
   const now = Date.parse("2026-07-13T12:00:00.000Z")
   const snoozed = row({ snoozed_until: "2026-07-14T12:00:00.000Z" })
   assert.equal(deriveNeedsYou(snoozed, tele(), "turn-idle", false, now), false)
-  assert.equal(deriveNeedsYou(snoozed, tele({ lastFence: { kind: "done", body: "done", hints: [] } }), "turn-idle", false, now), false)
+  assert.equal(deriveNeedsYou(snoozed, tele({ lastFence: { kind: "done", body: "done" } }), "turn-idle", false, now), false)
   assert.equal(deriveNeedsYou(snoozed, tele({ pendingQuestion: true }), "turn-idle", false, now), false)
   assert.equal(deriveNeedsYou(snoozed, tele({ pendingAsk: { id: "ask", questions: [] } }), "turn-idle", false, now), false)
   assert.equal(deriveNeedsYou(snoozed, tele({ nativeInputRequired: { kind: "permission", title: "Permission required" } }), "turn-idle", false, now), false)
@@ -503,16 +510,18 @@ test("deriveNeedsYou: manual snooze suppresses every queue reason until its exac
   assert.equal(deriveNeedsYou(snoozed, tele(), "turn-idle", false, Date.parse("2026-07-14T12:00:00.001Z")), true, "due snooze requeues")
 })
 
-test("deriveNeedsYou: only truthful human/future-timer waits excuse rest; machine and elapsed waits queue", () => {
+test("deriveNeedsYou: only an exact confirmed current review/future-timer wait excuses rest", () => {
   const now = Date.parse("2026-07-13T12:00:00.000Z")
-  const waiting = (kind: "human" | "github-review" | "timer" | "pr" | "ci" | "session", value: string) =>
-    tele({ lastFence: { kind: "awaiting", body: "", hints: [{ kind, value }] } })
-  assert.equal(deriveNeedsYou(row(), waiting("human", "Alice review"), "turn-idle", false, now), false)
-  assert.equal(deriveNeedsYou(row(), waiting("github-review", "owner/repo#1"), "turn-idle", false, now), false)
-  assert.equal(deriveNeedsYou(row(), waiting("timer", "2026-07-14T12:00:00Z"), "turn-idle", false, now), false)
-  assert.equal(deriveNeedsYou(row(), waiting("timer", "2026-07-12T12:00:00Z"), "turn-idle", false, now), true)
-  assert.equal(deriveNeedsYou(row(), waiting("ci", "build"), "turn-idle", false, now), true)
-  assert.equal(deriveNeedsYou(row(), tele({ lastFence: { kind: "awaiting", body: "", hints: [] } }), "turn-idle", false, now), true)
+  const waiting = (hint?: { kind: "github-review" | "timer"; value: string }) =>
+    tele({ lastFence: { kind: "awaiting", body: "", ...(hint ? { hint } : {}), at: LATER }, lastActivityAt: LATER, lastAssistantAt: LATER })
+  const review = { kind: "github-review" as const, value: "owner/repo#1" }
+  const future = { kind: "timer" as const, value: "2026-07-14T12:00:00Z" }
+  const elapsed = { kind: "timer" as const, value: "2026-07-12T12:00:00Z" }
+  assert.equal(deriveNeedsYou(row(), waiting(review), "turn-idle", false, now), true)
+  assert.equal(deriveNeedsYou(row({ awaiting_fence_id: awaitingFenceIdentity(review, LATER), awaiting_confirmed_at: T0 }), waiting(review), "turn-idle", false, now), false)
+  assert.equal(deriveNeedsYou(row({ awaiting_fence_id: awaitingFenceIdentity(future, LATER), awaiting_confirmed_at: T0 }), waiting(future), "turn-idle", false, now), false)
+  assert.equal(deriveNeedsYou(row({ awaiting_fence_id: awaitingFenceIdentity(elapsed, LATER), awaiting_confirmed_at: T0 }), waiting(elapsed), "turn-idle", false, now), true)
+  assert.equal(deriveNeedsYou(row(), waiting(), "turn-idle", false, now), true)
 })
 
 test("board arms the exact durable snooze deadline, clears it, and requeues ordinary rest without browser activity", async () => {
@@ -771,8 +780,8 @@ test("board provenance excludes legacy files and foreign transcripts while regis
   storage.setBackend("ui-codex", "codex")
   storage.setBackend("migrated-ui-done", "future-provider")
   const telemetry = new Map<string, SessionTelemetry>([
-    ["ui-claude", tele({ lastFence: { kind: "done", body: "complete", hints: [] } })],
-    ["foreign-terminal-origin", tele({ lastFence: { kind: "done", body: "foreign", hints: [] } })],
+    ["ui-claude", tele({ lastFence: { kind: "done", body: "complete" } })],
+    ["foreign-terminal-origin", tele({ lastFence: { kind: "done", body: "foreign" } })],
   ])
   const tailer = {
     get: (slug: string) => telemetry.get(slug),

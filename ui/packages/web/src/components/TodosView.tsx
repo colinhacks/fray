@@ -13,7 +13,7 @@ import { Message, NativeInputRequiredCard, PermPromptBanner, PendingAskCard, Sti
 import { prefs } from "../lib/prefs.ts"
 import { Composer } from "./Composer.tsx"
 import { useThreadComposerControls } from "../hooks/useThreadComposerControls.tsx"
-import { BackgroundOpsStrip, ThreadSlugContext } from "./ChatView.tsx"
+import { BackgroundOpsStrip, ThreadSlugContext, QueueDismissContext } from "./ChatView.tsx"
 import { HeaderActions } from "./HeaderActions.tsx"
 import { ThreadLifecycleFooter } from "./ThreadLifecycleFooter.tsx"
 import { DispatchForm } from "./NewThreadModal.tsx"
@@ -118,8 +118,8 @@ function resumeNativeAnchoring(): void {
 export function TodosView() {
   const board = useBoard()
   // The queue is EXACTLY the server-derived Needs-you session threads (t.needsYou) — legacy .fray rows
-  // never card anymore. Concrete unresolved asks/crashes lead passive rest/done handoffs, with
-  // interaction recency providing deterministic order inside each priority band.
+  // never card anymore. One strictly time-ordered list (no priority band): every card orders by
+  // last-active alone, FIFO (oldest-first) by default or LIFO per the queueOrder preference.
   const items = orderQueue(asThreads(board?.threads ?? []).filter(queued), useSnapshot(prefs).queueOrder)
   const itemKey = items.map((i) => i.id).join(",")
 
@@ -850,10 +850,17 @@ const QueueCard = memo(function QueueCard({ thread, leaving, onResolve }: { thre
     })
   }
 
+  // Dismiss THIS card through the same user-initiated auto-scroll exit the footer/header/answer paths
+  // use, exposed to the in-transcript fence buttons (done Mark-as-done, awaiting park) via context so
+  // EVERY card-dismissing control lands the next card at the viewport top — not just the ones that can
+  // reach onResolve directly. Stable identity (onResolve is a []-useCallback, thread.id is fixed per card).
+  const dismissThisCard = useCallback(() => onResolve(thread.id), [onResolve, thread.id])
+
   return (
     // Provide the thread slug so this card's transcript matches the thread view: sub-agent blocks go
     // live (spinner + drill-in) and a done/awaiting fence card resolves its thread to show the confirm button.
     <ThreadSlugContext.Provider value={thread.id}>
+    <QueueDismissContext.Provider value={dismissThisCard}>
     {/* NO overflow-hidden: it would clip the sticky header out of stickiness. The header carries
         rounded-t so the card's top corners still look clipped; the root's rounded-lg handles the bottom. */}
     <div
@@ -1102,6 +1109,7 @@ const QueueCard = memo(function QueueCard({ thread, leaving, onResolve }: { thre
         onSnoozed={() => onResolve(thread.id)}
       />
     </div>
+    </QueueDismissContext.Provider>
     </ThreadSlugContext.Provider>
   )
 }, queueCardPropsEqual)

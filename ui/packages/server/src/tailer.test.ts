@@ -123,7 +123,7 @@ test("applyEvent: a full codex-style turn folds to idle with the final preview +
   assert.equal(s.turn, "idle") // bracketed closed by turn-end, no stop_reason heuristic
   assert.equal(s.lastActivityAt, "2026-07-01T00:00:05.000Z") // latest event's timestamp
   assert.equal(s.lastAssistant, "All set — shipped it. ```done read the file ```") // final preview (whitespace-collapsed)
-  assert.deepEqual(s.lastFence, { kind: "done", body: "read the file", hints: [] }) // parsed off the FINAL message
+  assert.deepEqual(s.lastFence, { kind: "done", body: "read the file", at: "2026-07-01T00:00:04.000Z" }) // parsed off the FINAL message
   assert.equal(s.lastAssistantHasQuestion, false)
   assert.equal(pendingQuestion(s), false)
   assert.equal(s.lastUserAt, undefined) // no human turn in this sequence
@@ -145,7 +145,7 @@ test("applyEvent: turn-end.finalText derives the fence when the backend brackets
   // No assistant-text{final} — the final message rides task_complete.last_agent_message instead.
   applyEvent(s, { kind: "turn-end", at: "2026-07-01T00:00:02.000Z", finalText: "Need your call.\n\n```awaiting\npr: owner/repo#7\nshould I merge?\n```" })
   assert.equal(s.turn, "idle")
-  assert.deepEqual(s.lastFence, { kind: "awaiting", body: "should I merge?", hints: [{ kind: "pr", value: "owner/repo#7" }] })
+  assert.deepEqual(s.lastFence, { kind: "awaiting", body: "pr: owner/repo#7\nshould I merge?", at: "2026-07-01T00:00:02.000Z" })
   assert.equal(s.lastAssistant, "Need your call. ```awaiting pr: owner/repo#7 should I merge? ```")
 })
 
@@ -178,7 +178,7 @@ test("applyEvent: a later user-message clears a prior excusal fence + pending qu
   applyEvent(s, { kind: "turn-start", at: "2026-07-01T00:00:00.000Z" })
   applyEvent(s, { kind: "assistant-text", at: "2026-07-01T00:00:01.000Z", text: "Done.\n\n```done\nshipped\n```", final: true })
   applyEvent(s, { kind: "turn-end", at: "2026-07-01T00:00:02.000Z" })
-  assert.deepEqual(s.lastFence, { kind: "done", body: "shipped", hints: [] })
+  assert.deepEqual(s.lastFence, { kind: "done", body: "shipped", at: "2026-07-01T00:00:01.000Z" })
   // A fresh human turn supersedes the fence (it only signals while it is the final message).
   applyEvent(s, { kind: "user-message", at: "2026-07-01T00:00:03.000Z", text: "one more thing", synthetic: false })
   assert.equal(s.lastFence, undefined)
@@ -1438,44 +1438,54 @@ test("tailer: sniffs perm-prompt only when an in-flight turn goes quiet; clears 
 
 // ---- signal-fence grammar (done/awaiting excusal fences) ----
 
-test("parseSignalFence: a done fence captures the trimmed body, no hints", () => {
-  assert.deepEqual(parseSignalFence("intro line\n\n```done\nShipped and merged.\n```"), { kind: "done", body: "Shipped and merged.", hints: [] })
+test("parseSignalFence: a done fence captures the trimmed body", () => {
+  assert.deepEqual(parseSignalFence("intro line\n\n```done\nShipped and merged.\n```"), { kind: "done", body: "Shipped and merged." })
 })
 
 test("parseSignalFence: END-ANCHORED — a fence with prose after it is quoted/explanatory, never an excusal", () => {
   // A worker EXPLAINING the protocol must not silently drop out of the Needs-you queue.
   assert.equal(parseSignalFence("```done\nexample fence\n```\n\nSo: should I use this format going forward?"), undefined)
   // Trailing whitespace after the closing fence is fine.
-  assert.deepEqual(parseSignalFence("all done\n\n```done\nShipped.\n```\n  \n"), { kind: "done", body: "Shipped.", hints: [] })
+  assert.deepEqual(parseSignalFence("all done\n\n```done\nShipped.\n```\n  \n"), { kind: "done", body: "Shipped." })
 })
 
-test("parseSignalFence: an awaiting fence parses current human/timer and legacy pr/ci/session hints", () => {
-  const f = parseSignalFence("```awaiting\nhuman: repo maintainer must approve fork CI\ntimer: 2026-07-02T00:00:00Z\npr: 391\nci: build #42\nsession: abc-123\nWaiting on a named gate.\n```")
-  assert.equal(f?.kind, "awaiting")
-  assert.equal(f?.body, "Waiting on a named gate.")
-  assert.deepEqual(f?.hints, [
-    { kind: "human", value: "repo maintainer must approve fork CI" },
-    { kind: "timer", value: "2026-07-02T00:00:00Z" },
-    { kind: "pr", value: "391" },
-    { kind: "ci", value: "build #42" },
-    { kind: "session", value: "abc-123" },
-  ])
+test("parseSignalFence: an awaiting fence parses exactly one current wait hint", () => {
+  const f = parseSignalFence("```awaiting\ngithub-review: owner/repo#391\nAlice must review the PR.\n```")
+  assert.deepEqual(f, {
+    kind: "awaiting",
+    body: "Alice must review the PR.",
+    hint: { kind: "github-review", value: "owner/repo#391" },
+  })
 })
 
-test("parseSignalFence: hint kind is case-insensitive, lowercased on output; hints-only body is empty", () => {
-  const f = parseSignalFence("```awaiting\nHUMAN: Alice must approve\nTiMeR: 2026-07-15T17:00:00Z\nPR: 391\nCi: green\n```")
-  assert.deepEqual(f?.hints, [
-    { kind: "human", value: "Alice must approve" },
-    { kind: "timer", value: "2026-07-15T17:00:00Z" },
-    { kind: "pr", value: "391" },
-    { kind: "ci", value: "green" },
-  ])
-  assert.equal(f?.body, "")
+test("parseSignalFence: hint kind is case-insensitive and lowercased", () => {
+  assert.deepEqual(parseSignalFence("```awaiting\nTiMeR: 2026-07-15T17:00:00Z\n```"), {
+    kind: "awaiting",
+    body: "",
+    hint: { kind: "timer", value: "2026-07-15T17:00:00Z" },
+  })
+})
+
+test("parseSignalFence: multiple current hints are visible prose and never become a wait", () => {
+  const body = "github-review: owner/repo#391\ntimer: 2026-07-15T17:00:00Z\nChoose one."
+  assert.deepEqual(parseSignalFence(`\`\`\`awaiting\n${body}\n\`\`\``), { kind: "awaiting", body })
+})
+
+test("parseSignalFence: a malformed current hint stays visible and never becomes a wait", () => {
+  const body = "timer: 10m\nUse a real ISO instant."
+  assert.deepEqual(parseSignalFence(`\`\`\`awaiting\n${body}\n\`\`\``), { kind: "awaiting", body })
+  const impossible = "timer: 2099-02-31T08:45:00Z\nThis date does not exist."
+  assert.deepEqual(parseSignalFence(`\`\`\`awaiting\n${impossible}\n\`\`\``), { kind: "awaiting", body: impossible })
+})
+
+test("parseSignalFence: removed hint names stay prose and do not arm anything", () => {
+  const body = "human: Alice\npr: owner/repo#1\nci: build\nsession: sibling"
+  assert.deepEqual(parseSignalFence(`\`\`\`awaiting\n${body}\n\`\`\``), { kind: "awaiting", body })
 })
 
 test("parseSignalFence: the LAST signal fence in a text wins", () => {
   const f = parseSignalFence("```awaiting\npr: 1\n```\n\nnever mind\n\n```done\nactually finished\n```")
-  assert.deepEqual(f, { kind: "done", body: "actually finished", hints: [] })
+  assert.deepEqual(f, { kind: "done", body: "actually finished" })
 })
 
 test("parseSignalFence: an unclosed / mis-worded / trailing-junk fence is ignored", () => {
@@ -1490,7 +1500,7 @@ test("parseSignalFence: a ```question fence is NOT a signal fence", () => {
 })
 
 test("parseSignalFence: tolerates CRLF line endings", () => {
-  assert.deepEqual(parseSignalFence("```done\r\nWindows body\r\n```"), { kind: "done", body: "Windows body", hints: [] })
+  assert.deepEqual(parseSignalFence("```done\r\nWindows body\r\n```"), { kind: "done", body: "Windows body" })
 })
 
 test("parseSignalFence: the body is capped at 500 chars with a trailing ellipsis", () => {
@@ -1504,7 +1514,7 @@ test("parseSignalFence: the body is capped at 500 chars with a trailing ellipsis
 test("applyRecord: a signal fence is set by the final assistant text and cleared by a later user record", () => {
   const s = newTailState("t", "s", "/x")
   applyRecord(s, { type: "assistant", timestamp: "2026-07-01T00:00:01.000Z", message: { stop_reason: "end_turn", content: [{ type: "text", text: "shipped it\n\n```done\nMerged PR 391\n```" }] } })
-  assert.deepEqual(s.lastFence, { kind: "done", body: "Merged PR 391", hints: [] })
+  assert.deepEqual(s.lastFence, { kind: "done", body: "Merged PR 391", at: "2026-07-01T00:00:01.000Z" })
   applyRecord(s, { type: "user", timestamp: "2026-07-01T00:00:20.000Z", message: { content: "thanks, next task" } })
   assert.equal(s.lastFence, undefined, "a newer user record clears the excusal fence")
 })
@@ -1531,11 +1541,11 @@ test("applyRecord: an assistant record with no text block leaves the fence intac
 test("tailer: surfaces a signal fence through get()", () => {
   const h = harness()
   h.storage.upsertSession(row())
-  const FENCED = JSON.stringify({ type: "assistant", timestamp: "2026-07-01T00:00:02.000Z", message: { stop_reason: "end_turn", content: [{ type: "text", text: "```awaiting\npr: 391\nWaiting on CI.\n```" }] } })
+  const FENCED = JSON.stringify({ type: "assistant", timestamp: "2026-07-01T00:00:02.000Z", message: { stop_reason: "end_turn", content: [{ type: "text", text: "```awaiting\ngithub-review: owner/repo#391\nWaiting on Alice's review.\n```" }] } })
   fixture(h.logDir, "sid", [IN_FLIGHT, FENCED])
   const t = makeTailer(h)
   t.tick()
-  assert.deepEqual(t.get("t")?.lastFence, { kind: "awaiting", body: "Waiting on CI.", hints: [{ kind: "pr", value: "391" }] })
+  assert.deepEqual(t.get("t")?.lastFence, { kind: "awaiting", body: "Waiting on Alice's review.", hint: { kind: "github-review", value: "owner/repo#391" }, at: "2026-07-01T00:00:02.000Z" })
 })
 
 // ---- whole-directory FOREIGN session discovery (maintainer terminals: read-only threads) ----
@@ -1975,7 +1985,7 @@ test("tailer: a codex rollout primes to in-flight, then transitions to idle+fenc
   const tele = t.get("t")
   // THE REGRESSION: without the patch computeTurn clobbers this back to "in-flight".
   assert.equal(tele?.turn, "idle", "task_complete's explicit bracket survives the tick's computeTurn")
-  assert.deepEqual(tele?.lastFence, { kind: "done", body: "wired", hints: [] }, "the done fence is derived from the final message")
+  assert.deepEqual(tele?.lastFence, { kind: "done", body: "wired", at: "2026-07-10T21:59:00.000Z" }, "the done fence is derived from the final message")
   assert.equal(tele?.lastAssistant, "All wired. ```done wired ```", "the final answer is the preview")
   const notifies = h.events.filter((e) => e.type === "notify")
   assert.equal(notifies.length, 1, "the in-flight→idle transition fires exactly one turn-done notify")

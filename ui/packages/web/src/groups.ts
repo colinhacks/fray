@@ -203,43 +203,23 @@ export function orderByInteraction(threads: readonly ThreadView[]): ThreadView[]
   })
 }
 
-// Queue cards have two deliberately small priority bands. A concrete unresolved request or failure
-// comes before an ordinary bare-rest/done handoff, even when that passive handoff was touched more
-// recently. Within a band, the queue orders FIFO (see orderQueue) so the human cycles through all
-// waiting work instead of re-triaging whatever rested most recently.
-// `pendingInteraction` is intentionally absent: a response still awaiting provider acknowledgement
-// remains readable, but only `actionableInteraction` means the human still owes a decision.
-export type QueuePriority = 0 | 1
-
-export function queuePriority(t: ThreadView): QueuePriority {
-  const hardAttention = Boolean(
-    t.actionableInteraction ||
-      t.pendingAsk ||
-      t.nativeInputRequired ||
-      t.pendingQuestion ||
-      t.runtime === "perm-prompt" ||
-      t.crashed ||
-      t.humanBlocked ||
-      t.status === "needs-human",
-  )
-  return hardAttention ? 0 : 1
-}
-
-// Within each priority band, order by DIRECTION (a per-browser view preference — see lib/prefs.ts):
+// The queue is a SINGLE strictly time-ordered list — no priority band. Every waiting card orders by
+// DIRECTION (a per-browser view preference — see lib/prefs.ts) alone, so the visible "oldest first"
+// rule is literally true across every card, attention and passive alike (maintainer 2026-07-21:
+// removed the hidden hard-attention band — "too confusing"; a fresh crash/permission-prompt no longer
+// floats above an older done card):
 //   • FIFO (default): the thread gone LONGEST without activity surfaces first (oldest lastActiveAt =
 //     ascending), so answering it sends it to the BACK of the line and the next-oldest rises — the
 //     human cycles through every waiting item instead of endlessly re-triaging whatever rested most
 //     recently (maintainer 2026-07-15: "first in first out is a better system… you are not constantly
 //     cycling through all of the tasks").
 //   • LIFO: the most-recently-active first (descending) — the older last-in-first-out feel.
-// The hard-attention band always leads regardless. lastActiveAt keys off when an AT-REST thread came
-// to rest (matching its "Last active" label) and off the stable user-interaction time for a running
-// row, so agent tool churn never reorders a card. id-tiebroken for a stable order among equal-age rows.
+// lastActiveAt keys off when an AT-REST thread came to rest (matching its "Last active" label) and off
+// the stable user-interaction time for a running row, so agent tool churn never reorders a card.
+// id-tiebroken for a stable order among equal-age rows.
 export function orderQueue(threads: readonly ThreadView[], direction: QueueDirection = "fifo"): ThreadView[] {
   const dir = direction === "lifo" ? -1 : 1
   return [...threads].sort((a, b) => {
-    const priority = queuePriority(a) - queuePriority(b)
-    if (priority !== 0) return priority
     const age = (lastActiveAt(a) - lastActiveAt(b)) * dir
     return age !== 0 ? age : a.id.localeCompare(b.id)
   })
@@ -271,10 +251,9 @@ export function foreignThreads(threads: readonly ThreadView[]): ThreadView[] {
 // row lands in exactly one of these; the Plans section is separate (from board.plans, not threads).
 //   • active           — open session work: running, needs-you, bare rest, done-fenced, OR owning a
 //                        live sub-agent/background shell/Monitor. Never dimmed as a band.
-//   • held             — open, AT REST behind ANY declared ```awaiting fence (or the canonical
-//                        blocked+timer status) AND no live background op. Its own DIMMED band between
-//                        Active and Inactive. The glyph and section share isHeld(), so a row can never
-//                        show a clock/hourglass while remaining in Active.
+//   • held             — open, AT REST behind one confirmed review/timer wait and no live background
+//                        op. Its own DIMMED band between Active and Inactive. The glyph and section
+//                        share isHeld(), so a row can never show an hourglass while remaining Active.
 //   • inactive         — state === "archived" (the only archiver is an explicit Archive / done-card button).
 //   • legacy           — kind !== "session": vestigial .fray-file rows, hidden entirely (null).
 // A FOREIGN session row (a maintainer terminal — no registry row, so no state/needsYou) is dropped
@@ -288,14 +267,6 @@ export const SECTION_ORDER: readonly SectionKey[] = ["active", "held", "inactive
 // an awaiting excusal needs (a mid-turn worker is still working, never awaiting).
 function atRest(t: ThreadView): boolean {
   return t.runtime === "turn-idle" || t.runtime === "exited"
-}
-
-// DECLARED PARK: at rest behind an ```awaiting fence — the thread ITSELF declared it is parked, not
-// still working. The current contract reserves this for a human gate/timer; legacy hints remain readable. The
-// RAW signal; the banding below refines it into external-vs-internal. NB: this requires the worker to
-// actually emit the fence — a thread that rests bare (prose only) reads as idle/waiting, not declared.
-function isDeclaredAwaiting(t: ThreadView): boolean {
-  return atRest(t) && t.lastFence?.kind === "awaiting"
 }
 
 // INTERNAL WORK: a thread with a LIVE sub-agent is awaiting its OWN dispatched child — not an external
@@ -315,16 +286,10 @@ function hasLiveOps(t: ThreadView): boolean {
   return hasLiveSubAgents(t) || hasLiveBackgroundOps(t)
 }
 
-// The wait kinds that truthfully earn the parked/hourglass presentation. A timer is only a park while
-// its valid scheduler instant is still in the future; malformed or elapsed timer prose must not
-// advertise a durable future wake. github-review is an external HUMAN gate with a durable GitHub
-// activity cursor. Legacy machine waits (pr/ci/session) intentionally do not qualify.
-export function parkedAwaitingHint(hints: readonly AwaitingHint[], nowMs = Date.now()): AwaitingHint | undefined {
-  return (
-    hints.find((h) => h.kind === "human") ??
-    hints.find((h) => h.kind === "github-review") ??
-    hints.find((h) => h.kind === "timer" && isValidAwaitingTimer(h.value) && Date.parse(h.value) > nowMs)
-  )
+export function parkedAwaitingHint(hint: AwaitingHint | undefined, nowMs = Date.now()): AwaitingHint | undefined {
+  if (hint?.kind === "github-review") return hint
+  if (hint?.kind === "timer" && isValidAwaitingTimer(hint.value) && Date.parse(hint.value) > nowMs) return hint
+  return undefined
 }
 
 export function futureSnoozedUntil(
@@ -335,12 +300,10 @@ export function futureSnoozedUntil(
   return Number.isFinite(at) && at > nowMs ? t.snoozedUntil : undefined
 }
 
-// HELD: one semantic predicate owns both classification and presentation. Only a specific external
-// human/review gate or a valid FUTURE timestamp belongs in the dimmed Held band. Legacy automated
-// waits (pr/ci/session), malformed/elapsed timers, and hintless fences stay Active so they cannot hide
-// work an agent should own through an in-band watcher. A canonical blocked+timer status remains a
-// compatibility path only when it carries the same explicit future ISO instant. A live child/Monitor
-// wins, and archived rows remain Inactive/done.
+// HELD: one semantic predicate owns both classification and presentation. Only a confirmed review
+// watcher, a confirmed future timer, or an explicit manual snooze belongs in the dimmed Held band.
+// Malformed, elapsed, hintless, and merely proposed waits stay Active. A live child/Monitor wins, and
+// archived rows remain Inactive/done.
 export function isHeld(t: ThreadView, nowMs = Date.now()): boolean {
   const userSnooze = futureSnoozedUntil(t, nowMs) !== undefined
   if (t.state === "archived" || hasLiveOps(t)) return false
@@ -349,18 +312,14 @@ export function isHeld(t: ThreadView, nowMs = Date.now()): boolean {
   // snooze merely parks their presentation until then. Mid-turn work keeps running in Active, while
   // a provider permission prompt is itself parked and may therefore move to Held.
   if (userSnooze) return t.runtime !== "running" && t.runtime !== "spawning"
-  // Without an explicit user snooze, higher-priority attention states render ?, !, or a native
-  // prompt—not a wait glyph—so a stale awaiting fence cannot demote them out of Queue.
+  // Without a confirmed wait, higher-priority attention states render ?, !, or the awaiting proposal
+  // card itself. A transcript fence alone never demotes the thread out of Queue.
   if (t.needsYou || t.pendingAsk || t.runtime === "perm-prompt") return false
   if (!atRest(t)) return false
-  const declaredWait = t.lastFence?.kind === "awaiting" && parkedAwaitingHint(t.lastFence.hints, nowMs) !== undefined
-  const timedStatus =
-    t.status === "blocked" &&
-    t.mechanism === "timer" &&
-    typeof t.revalidate === "string" &&
-    isValidAwaitingTimer(t.revalidate) &&
-    Date.parse(t.revalidate) > nowMs
-  return userSnooze || declaredWait || timedStatus
+  const declaredWait = t.awaitingWaitConfirmed === true &&
+    t.lastFence?.kind === "awaiting" &&
+    parkedAwaitingHint(t.lastFence.hint, nowMs) !== undefined
+  return declaredWait
 }
 
 // ACTIVELY RUNNING: a live session with work in flight — exactly the states the sidebar renders with a
@@ -416,9 +375,9 @@ export function sectionOf(t: ThreadView): SectionKey | null {
   // to Inactive only once it comes to rest still-archived. (A user BUMP un-archives it for good via
   // resume; this is the display safety net for a running-yet-archived session.)
   if (t.state === "archived" && !isActivelyRunning(t)) return "inactive"
-  // Only truthful human/future-timer waiters split into the labeled, dimmed Held band.
-  // Everything else open — running, needs-you, bare rest, done-fenced, awaiting-its-own-subs, or an
-  // awaiting `session`/hintless wait — is Active.
+  // Only confirmed review/future-timer waiters split into the labeled, dimmed Held band.
+  // Everything else open — running, needs-you, bare rest, done-fenced, awaiting-its-own-subs, or a
+  // hintless/invalid proposal — is Active.
   if (isHeld(t)) return "held"
   return "active"
 }

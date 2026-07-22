@@ -146,6 +146,20 @@ export interface SpawnThreadMcp {
   stateDir: string
 }
 
+// The ONE canonical Chrome DevTools MCP server spec both backends inject into every worker they
+// spawn — the runtime release gate requires driving a real browser, and neither backend can assume
+// the operator configured a browser MCP themselves. Claude mounts it via inline `--mcp-config` JSON
+// (+ a server-level `--allowedTools mcp__chrome-devtools` pre-approval); codex mounts it via `-c`
+// TOML overrides (+ `default_tools_approval_mode="approve"`). Deriving both from this constant is
+// what keeps the two backends' browser tooling in lockstep — edit HERE, never in one backend alone.
+// `--isolated` gives each worker a disposable browser profile (never the operator's own Chrome).
+export const CHROME_DEVTOOLS_MCP = {
+  name: "chrome-devtools",
+  command: "npx",
+  args: ["-y", "chrome-devtools-mcp@latest", "--experimentalPageIdRouting", "--isolated", "--no-usage-statistics"],
+  startupTimeoutSec: 120,
+} as const
+
 export interface SpawnOpts {
   sessionId: string // claude: pinned via --session-id. codex: advisory (id is discovered post-spawn)
   cwd: string

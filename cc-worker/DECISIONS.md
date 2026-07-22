@@ -386,24 +386,25 @@ the seed hook NAMES that concrete path to the worker, so dispatch must keep pinn
 scope (not editable here), but it now CONTRADICTS the v2 WORKER_PROMPT and must be rewritten to the
 fence/scratchpad model (or dropped) by the dispatch owner. Flagged to server-core.
 
-## 2026-07-12: awaiting reversal — park only human/timestamp gates; keep automation active
+## 2026-07-21: awaiting is a single opt-in PR-review or timer wait
 
-The v2 rule above made `awaiting` a broad machine-wait bucket. In practice workers emitted a fence
-for CI, bots, releases, and merge progression, then returned with no process actually owning the
-next transition. The rail's hourglass therefore implied a watcher that often did not exist. The
-contract is now narrower:
+The broad machine-wait bucket produced cards whose mixed metadata looked like several watchers and
+made it unclear what the operator was consenting to. The contract is now narrow and explicit:
 
-- `awaiting` is a deliberate PARK for either `human: <actor + exact external review/approval>` or
-  `timer: <ISO-8601 instant>`. The dashboard operator's own decision remains `question`.
+- One `awaiting` fence proposes exactly one wait: `github-review: owner/repo#NUMBER` for new non-bot
+  human activity on an external PR, or `timer: <ISO-8601 instant>` for one scheduled recheck. The
+  prose names the human and exact review/action. The dashboard operator's own decision remains
+  `question`.
+- A proposal remains in Queue and does nothing until the operator confirms its card. Confirmation
+  durably arms that exact final-message generation and moves it to Held. A later follow-up or fence
+  invalidates the registration.
 - CI, automated review, releases/deploys, merge queues, and already-authorized merge progression
   stay ACTIVE. Claude workers use a background `Bash` one-shot or `Monitor`; Codex workers keep a
   blocking exec session alive and poll it. Their completion/event re-invokes the worker.
-- `pr:` / `ci:` / `session:` continue to parse so old transcripts do not break. The existing PR/CI
-  waker remains a compatibility bridge, but workers must not create new waits with those hints.
-  `timer:` remains the durable scheduler path across process/session restart. `human:` is descriptive
-  and intentionally not auto-fired.
+- No `human:`, `pr:`, `ci:`, or `session:` hint is recognized. Multiple recognized hints also fail
+  closed as visible prose, with no confirmation action or scheduler registration.
 - Every follow-up clears the old fence. “Back to awaiting” requires a fresh check: re-emit a current
-  human/timer fence, or re-arm automation and remain active.
+  single review/timer proposal, or re-arm automation and remain active.
 
 Claude Code 2.1.207 was audited before teaching this. fray-ui does not pass `--tools`,
 `--allowedTools`, or `--disallowedTools`, and its helper profiles only select model/effort, so wait
@@ -422,8 +423,8 @@ triages. Queue membership is now server-derived from process rest, not dependent
 signaling:
 
 - Every owned, open session whose top-level turn is genuinely at rest enters Queue by default.
-- A live child/Monitor still counts as in-flight work. A truthful external-human or future-timer
-  `awaiting` fence remains dimmed in Held. Legacy CI/PR/session and hintless waits do not excuse rest.
+- A live child/Monitor still counts as in-flight work. A confirmed external-review or future-timer
+  `awaiting` fence remains dimmed in Held. Unsupported and hintless proposals do not excuse rest.
 - A human may durably Snooze an ordinary handoff (default one day, presets/custom exact instant) or
   Archive it. Due snoozes automatically re-enter Queue; Archive never does.
 - Questions, permissions/native approvals, typed interactions, and crashes break through Snooze so a
@@ -451,3 +452,18 @@ changes may skip CDP/independent review, while uncertainty applies the gate. Thi
 all four delivered surfaces, and the Claude expansion golden changes intentionally. The Codex addendum
 no longer mislabels an author's inline second read as independent review: use delegation when available,
 or report the gate unmet.
+
+## 2026-07-21: Plugin slim-down — one contract copy, gh is the only injected skill
+
+The plugin stops shipping three of its four skills. `skills/worker` is DELETED: it was a second copy
+of the worker contract whose single source is `ui/packages/server/src/workerPrompt.ts` (the system
+prompt, rebuilt on every dispatch/resume and compaction-immune) — every contract edit had to be made
+twice, and the copies drifted. The session-seed pointer sentences that said "Load the `fray:worker`
+skill for the full contract" now point at the system-prompt contract only, and the contract tests pin
+the two backend prompts (not a skill copy). `skills/dialectic` is dropped from the plugin (generic
+methodology nobody wired into the seed or prompt; workers on other people's projects never asked for
+it). `skills/adhoc-cdp` MOVED to the fray repo's own `.agents/skills/adhoc-cdp` (agent-neutral; `.claude/skills/adhoc-cdp` is a symlink to it so Claude and Codex share one copy) — its content is
+fray-ui-specific (adhoc-stack.mjs / shot.mjs), so it is a project skill, not global plugin cargo; the
+generic "verify in a real browser" principle already lives in the prompt's runtime-gate section.
+`skills/gh` remains the ONE injected skill: bulky, conditionally relevant, and its pointer is already
+auth-gated in the seed — exactly the on-demand shape skills are for.

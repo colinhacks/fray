@@ -35,6 +35,10 @@ export interface SessionRow {
   // from an agent fence. Optional keeps old fixtures/source-compatible; SQLite always returns null or
   // a concrete value after the additive migration.
   snoozed_until?: string | null
+  // Operator confirmation for one exact final ```awaiting fence generation. The scheduler ignores a
+  // transcript proposal until these fields match its current fence identity.
+  awaiting_fence_id?: string | null
+  awaiting_confirmed_at?: string | null
   meta: string | null // JSON blob for future annotations (unparsed here)
   seen_at: string | null // ISO8601 — interaction clearance: recorded when the human opens the thread
   plan_path: string | null // project-relative .fray/plans/*.md this thread was dispatched from
@@ -289,6 +293,17 @@ export interface Storage {
     state: "open" | "archived",
   ): boolean
   setSnoozedUntil(slug: string, until: string | null): void
+  setSnoozedUntilIfCurrent(slug: string, sessionId: string, generation: number, until: string | null): boolean
+  confirmAwaitingWait(
+    slug: string,
+    sessionId: string,
+    generation: number,
+    fenceId: string,
+    confirmedAt: string,
+    snoozedUntil: string | null,
+  ): boolean
+  clearAwaitingWaitIfSession(slug: string, sessionId: string, generation: number): boolean
+  clearAwaitingWaitIfCurrent(slug: string, sessionId: string, fenceId: string): boolean
   // Clears elapsed values atomically and returns the number changed. The board calls this at each
   // refresh and at its exact wake timer so restart/reload cannot leave a stale Held marker behind.
   clearExpiredSnoozes(now: string): number
@@ -458,6 +473,8 @@ export function createStorage(dbPath: string): Storage {
     "title TEXT",
     "state TEXT",
     "snoozed_until TEXT",
+    "awaiting_fence_id TEXT",
+    "awaiting_confirmed_at TEXT",
     "meta TEXT",
     "seen_at TEXT",
     "plan_path TEXT",
@@ -506,8 +523,8 @@ export function createStorage(dbPath: string): Storage {
   const selOne = db.prepare<[string], SessionRow>("SELECT * FROM session WHERE slug = ?")
   const selAll = db.prepare<[], SessionRow>("SELECT * FROM session")
   const upsertStmt = db.prepare(`
-    INSERT INTO session (slug, session_id, tmux_name, spawned_at, last_read_at, unread, exited, title_auto, title, state, snoozed_until, meta, seen_at, plan_path, transcript_id, model, effort, profile_pending_model, profile_pending_effort, profile_revision, profile_handoff, permission_mode, permission_pending, codex_input_queue, control_error, runtime_generation, runtime_control, runtime_control_revision)
-    VALUES (@slug, @session_id, @tmux_name, @spawned_at, @last_read_at, @unread, @exited, @title_auto, @title, @state, @snoozed_until, @meta, @seen_at, @plan_path, @transcript_id, @model, @effort, @profile_pending_model, @profile_pending_effort, @profile_revision, @profile_handoff, @permission_mode, @permission_pending, @codex_input_queue, @control_error, @runtime_generation, @runtime_control, @runtime_control_revision)
+    INSERT INTO session (slug, session_id, tmux_name, spawned_at, last_read_at, unread, exited, title_auto, title, state, snoozed_until, awaiting_fence_id, awaiting_confirmed_at, meta, seen_at, plan_path, transcript_id, model, effort, profile_pending_model, profile_pending_effort, profile_revision, profile_handoff, permission_mode, permission_pending, codex_input_queue, control_error, runtime_generation, runtime_control, runtime_control_revision)
+    VALUES (@slug, @session_id, @tmux_name, @spawned_at, @last_read_at, @unread, @exited, @title_auto, @title, @state, @snoozed_until, @awaiting_fence_id, @awaiting_confirmed_at, @meta, @seen_at, @plan_path, @transcript_id, @model, @effort, @profile_pending_model, @profile_pending_effort, @profile_revision, @profile_handoff, @permission_mode, @permission_pending, @codex_input_queue, @control_error, @runtime_generation, @runtime_control, @runtime_control_revision)
     ON CONFLICT(slug) DO UPDATE SET
       session_id = excluded.session_id,
       tmux_name  = excluded.tmux_name,
@@ -518,6 +535,14 @@ export function createStorage(dbPath: string): Storage {
       title_auto = excluded.title_auto,
       title = excluded.title,
       snoozed_until = excluded.snoozed_until,
+      awaiting_fence_id = CASE
+        WHEN session.session_id = excluded.session_id THEN excluded.awaiting_fence_id
+        ELSE NULL
+      END,
+      awaiting_confirmed_at = CASE
+        WHEN session.session_id = excluded.session_id THEN excluded.awaiting_confirmed_at
+        ELSE NULL
+      END,
       plan_path = excluded.plan_path,
       model = excluded.model,
       effort = excluded.effort,
@@ -544,14 +569,16 @@ export function createStorage(dbPath: string): Storage {
   const insertSessionIfAbsentStmt = db.prepare(`
     INSERT INTO session (
       slug, session_id, tmux_name, spawned_at, last_read_at, unread, exited, archived, rested_at,
-      title_auto, title, transcript_id, state, snoozed_until, meta, seen_at, plan_path, backend, agent_session_id,
+      title_auto, title, transcript_id, state, snoozed_until, awaiting_fence_id, awaiting_confirmed_at,
+      meta, seen_at, plan_path, backend, agent_session_id,
       model, effort, profile_pending_model, profile_pending_effort, profile_revision, profile_handoff,
       permission_mode, permission_pending, codex_input_queue, control_error,
       runtime_generation, runtime_control, runtime_control_revision
     )
     VALUES (
       @slug, @session_id, @tmux_name, @spawned_at, @last_read_at, @unread, @exited, @archived,
-      @rested_at, @title_auto, @title, @transcript_id, @state, @snoozed_until, @meta, @seen_at, @plan_path,
+      @rested_at, @title_auto, @title, @transcript_id, @state, @snoozed_until,
+      @awaiting_fence_id, @awaiting_confirmed_at, @meta, @seen_at, @plan_path,
       @backend, @agent_session_id, @model, @effort, @profile_pending_model,
       @profile_pending_effort, @profile_revision, @profile_handoff, @permission_mode, @permission_pending,
       @codex_input_queue, @control_error, @runtime_generation, @runtime_control,
@@ -690,10 +717,11 @@ export function createStorage(dbPath: string): Storage {
   `)
   const completeIfCurrentStmt = db.prepare(`
     UPDATE session
-    SET exited = 1, state = 'archived', archived = 1, unread = 0, snoozed_until = NULL
+    SET exited = 1, state = 'archived', archived = 1, unread = 0, snoozed_until = NULL,
+        awaiting_fence_id = NULL, awaiting_confirmed_at = NULL
     WHERE slug = ? AND session_id = ? AND runtime_generation = ?
   `)
-  const archivedStmt = db.prepare("UPDATE session SET archived = ?, unread = CASE WHEN ? = 1 THEN 0 ELSE unread END, snoozed_until = CASE WHEN ? = 1 THEN NULL ELSE snoozed_until END WHERE slug = ?")
+  const archivedStmt = db.prepare("UPDATE session SET archived = ?, unread = CASE WHEN ? = 1 THEN 0 ELSE unread END, snoozed_until = CASE WHEN ? = 1 THEN NULL ELSE snoozed_until END, awaiting_fence_id = CASE WHEN ? = 1 THEN NULL ELSE awaiting_fence_id END, awaiting_confirmed_at = CASE WHEN ? = 1 THEN NULL ELSE awaiting_confirmed_at END WHERE slug = ?")
   const restedStmt = db.prepare("UPDATE session SET rested_at = ? WHERE slug = ?")
   const restedIfCurrentStmt = db.prepare(`
     UPDATE session SET rested_at = ?
@@ -706,15 +734,37 @@ export function createStorage(dbPath: string): Storage {
     WHERE slug = ? AND session_id = ? AND runtime_generation = ?
   `)
   const stateStmt = db.prepare(
-    "UPDATE session SET state = ?, archived = ?, unread = CASE WHEN ? = 1 THEN 0 ELSE unread END, snoozed_until = CASE WHEN ? = 1 THEN NULL ELSE snoozed_until END WHERE slug = ?",
+    "UPDATE session SET state = ?, archived = ?, unread = CASE WHEN ? = 1 THEN 0 ELSE unread END, snoozed_until = CASE WHEN ? = 1 THEN NULL ELSE snoozed_until END, awaiting_fence_id = CASE WHEN ? = 1 THEN NULL ELSE awaiting_fence_id END, awaiting_confirmed_at = CASE WHEN ? = 1 THEN NULL ELSE awaiting_confirmed_at END WHERE slug = ?",
   )
   const stateIfCurrentStmt = db.prepare(`
     UPDATE session SET state = ?, archived = ?,
       unread = CASE WHEN ? = 1 THEN 0 ELSE unread END,
       snoozed_until = CASE WHEN ? = 1 THEN NULL ELSE snoozed_until END
+      , awaiting_fence_id = CASE WHEN ? = 1 THEN NULL ELSE awaiting_fence_id END
+      , awaiting_confirmed_at = CASE WHEN ? = 1 THEN NULL ELSE awaiting_confirmed_at END
     WHERE slug = ? AND session_id = ? AND runtime_generation = ?
   `)
   const snoozedUntilStmt = db.prepare("UPDATE session SET snoozed_until = ? WHERE slug = ?")
+  const snoozedUntilIfCurrentStmt = db.prepare(`
+    UPDATE session SET snoozed_until = ?
+    WHERE slug = ? AND session_id = ? AND runtime_generation = ?
+  `)
+  const confirmAwaitingWaitStmt = db.prepare(`
+    UPDATE session
+    SET awaiting_fence_id = ?, awaiting_confirmed_at = ?, snoozed_until = ?
+    WHERE slug = ? AND session_id = ? AND runtime_generation = ?
+      AND archived = 0 AND COALESCE(state, 'open') = 'open'
+  `)
+  const clearAwaitingWaitIfSessionStmt = db.prepare(`
+    UPDATE session
+    SET awaiting_fence_id = NULL, awaiting_confirmed_at = NULL, snoozed_until = NULL
+    WHERE slug = ? AND session_id = ? AND runtime_generation = ?
+  `)
+  const clearAwaitingWaitIfCurrentStmt = db.prepare(`
+    UPDATE session
+    SET awaiting_fence_id = NULL, awaiting_confirmed_at = NULL, snoozed_until = NULL
+    WHERE slug = ? AND session_id = ? AND awaiting_fence_id = ?
+  `)
   const clearExpiredSnoozesStmt = db.prepare(`
     UPDATE session SET snoozed_until = NULL
     WHERE snoozed_until IS NOT NULL AND snoozed_until <= ?
@@ -871,7 +921,8 @@ export function createStorage(dbPath: string): Storage {
   `)
   const beginRuntimeGenerationStmt = db.prepare(`
     UPDATE session
-    SET runtime_generation = runtime_generation + 1, spawned_at = ?, exited = 0
+    SET runtime_generation = runtime_generation + 1, spawned_at = ?, exited = 0,
+        snoozed_until = NULL, awaiting_fence_id = NULL, awaiting_confirmed_at = NULL
     WHERE slug = ? AND session_id = ? AND runtime_generation = ? AND permission_pending IS ?
       AND runtime_control IS ?
   `)
@@ -916,6 +967,8 @@ export function createStorage(dbPath: string): Storage {
     permission_mode: row.permission_mode ?? null,
     permission_pending: row.permission_pending ?? null,
     snoozed_until: row.snoozed_until ?? null,
+    awaiting_fence_id: row.awaiting_fence_id ?? null,
+    awaiting_confirmed_at: row.awaiting_confirmed_at ?? null,
     codex_input_queue: row.codex_input_queue ?? null,
     control_error: row.control_error ?? null,
     runtime_generation: row.runtime_generation ?? 0,
@@ -1249,7 +1302,7 @@ export function createStorage(dbPath: string): Storage {
       exitedIfCurrentStmt.run(exited ? 1 : 0, slug, sessionId, generation).changes === 1,
     completeIfCurrent: (slug, sessionId, generation) =>
       completeIfCurrentStmt.run(slug, sessionId, generation).changes === 1,
-    setArchived: (slug, archived) => void archivedStmt.run(archived ? 1 : 0, archived ? 1 : 0, archived ? 1 : 0, slug),
+    setArchived: (slug, archived) => void archivedStmt.run(archived ? 1 : 0, archived ? 1 : 0, archived ? 1 : 0, archived ? 1 : 0, archived ? 1 : 0, slug),
     setRestedAt: (slug, at) => void restedStmt.run(at, slug),
     setRestedAtIfCurrent: (slug, sessionId, generation, at) =>
       restedIfCurrentStmt.run(at, slug, sessionId, generation).changes === 1,
@@ -1257,10 +1310,12 @@ export function createStorage(dbPath: string): Storage {
     setTranscriptId: (slug, transcriptId) => void transcriptIdStmt.run(transcriptId, slug),
     setTranscriptIdIfCurrent: (slug, sessionId, generation, transcriptId) =>
       transcriptIdIfCurrentStmt.run(transcriptId, slug, sessionId, generation).changes === 1,
-    setState: (slug, state) => void stateStmt.run(state, state === "archived" ? 1 : 0, state === "archived" ? 1 : 0, state === "archived" ? 1 : 0, slug),
+    setState: (slug, state) => void stateStmt.run(state, state === "archived" ? 1 : 0, state === "archived" ? 1 : 0, state === "archived" ? 1 : 0, state === "archived" ? 1 : 0, state === "archived" ? 1 : 0, slug),
     setStateIfCurrent: (slug, sessionId, generation, state) =>
       stateIfCurrentStmt.run(
         state,
+        state === "archived" ? 1 : 0,
+        state === "archived" ? 1 : 0,
         state === "archived" ? 1 : 0,
         state === "archived" ? 1 : 0,
         state === "archived" ? 1 : 0,
@@ -1269,6 +1324,14 @@ export function createStorage(dbPath: string): Storage {
         generation,
       ).changes === 1,
     setSnoozedUntil: (slug, until) => void snoozedUntilStmt.run(until, slug),
+    setSnoozedUntilIfCurrent: (slug, sessionId, generation, until) =>
+      snoozedUntilIfCurrentStmt.run(until, slug, sessionId, generation).changes === 1,
+    confirmAwaitingWait: (slug, sessionId, generation, fenceId, confirmedAt, snoozedUntil) =>
+      confirmAwaitingWaitStmt.run(fenceId, confirmedAt, snoozedUntil, slug, sessionId, generation).changes === 1,
+    clearAwaitingWaitIfSession: (slug, sessionId, generation) =>
+      clearAwaitingWaitIfSessionStmt.run(slug, sessionId, generation).changes === 1,
+    clearAwaitingWaitIfCurrent: (slug, sessionId, fenceId) =>
+      clearAwaitingWaitIfCurrentStmt.run(slug, sessionId, fenceId).changes === 1,
     clearExpiredSnoozes: (now) => clearExpiredSnoozesStmt.run(now).changes,
     setTitle: (slug, title) => void titleStmt.run(title, slug),
     setTitleIfCurrent: (slug, title, expected) =>

@@ -3,9 +3,9 @@ import { useSnapshot } from "valtio"
 import * as RadixTabs from "@radix-ui/react-tabs"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useVirtualizer } from "@tanstack/react-virtual"
-import { AlertTriangle, ArrowDown, ArrowLeft, ArrowUpRight, Check, ChevronRight, Clock, FileText, HelpCircle, KeyRound, ListChecks, Loader2, ShieldCheck, Sparkles, X } from "lucide-react"
+import { AlertTriangle, ArrowDown, ArrowLeft, ArrowUpRight, Bell, Check, ChevronRight, FileText, HelpCircle, KeyRound, ListChecks, Loader2, ShieldCheck, Sparkles, X } from "lucide-react"
 import type { AwaitingHint, NativeInputRequired as NativeInputRequiredData, PendingAsk, ThreadView as ThreadViewData, TranscriptEdit, TranscriptMessage, TranscriptToolCall } from "@fray-ui/shared"
-import { isValidAwaitingTimer } from "@fray-ui/shared"
+import { isValidAwaitingTimer, isValidGithubReviewTarget } from "@fray-ui/shared"
 import { store, threadBySlug, pushDrawer, pushSubAgentDrawer, showToast } from "../store.ts"
 import { useBoard, useTranscript, useSocketTranscripts, type ChatMessage, type TranscriptData } from "../hooks.ts"
 import { rpc } from "../api/rpc.ts"
@@ -20,7 +20,8 @@ import { useLiveAnswering, type LiveAnswering } from "../lib/answering.ts"
 import { useLocalFileCodeLinks } from "../lib/localFileCode.ts"
 import { shouldSubmitComposerEnter } from "../lib/composerKeyboard.ts"
 import { messagePresentationText } from "../lib/messagePresentation.ts"
-import { formatSnoozedUntil, snoozePresetInstant, formatSnoozeWake } from "../lib/snooze.ts"
+import { formatSnoozeWake } from "../lib/snooze.ts"
+import { awaitingCalloutPresentation } from "../lib/awaitingPresentation.ts"
 import { prefs } from "../lib/prefs.ts"
 import { canAdoptThread } from "../lib/adoption.ts"
 import { THREAD_TITLE_MAX_LENGTH, aiRenameAvailability, manualThreadTitleSeed, threadTitleToCommit } from "../lib/threadTitle.ts"
@@ -32,7 +33,7 @@ import { threadLifecycleAvailability } from "../lib/threadLifecycle.ts"
 import { Tooltip } from "./Tooltip.tsx"
 import { ToolDisclosureHeader } from "./ToolDisclosureHeader.ts"
 import { hasRunningToolIndicator, isRunningOperation, liveBackgroundOperationState } from "../lib/operationIndicators.ts"
-import { formatCountdownSeconds, formatElapsedMinutes, formatFixedDuration, formatToolDuration } from "../lib/durationLabels.ts"
+import { formatElapsedMinutes, formatFixedDuration, formatToolDuration } from "../lib/durationLabels.ts"
 import { TRANSCRIPT_META_LABEL_CLASS } from "../lib/transcriptMetaLabels.ts"
 import { InteractionStack } from "./InteractionCards.tsx"
 import { LastActive } from "./LastActive.tsx"
@@ -54,6 +55,14 @@ export type { BlockAnswer, MessageAnswering }
 // card also provides this now (maintainer 2026-07-15): its sub-agent blocks go live (spinner +
 // drill-in) AND its done/awaiting fence cards resolve their thread to show the confirm button.
 export const ThreadSlugContext = createContext<string | null>(null)
+
+// A QUEUE card provides this so any in-transcript dismissal control — the ```done fence's Mark-as-done
+// button, the ```awaiting fence's park button — routes its OWN card through the queue's user-initiated
+// exit (fade → auto-scroll the next card to the viewport top) instead of the passive board-departure
+// "hold a neighbour in place" path. It is exactly the card's `onResolve(slug)`, reached without
+// threading it through the fence renderer. Null off the queue (the thread drawer), where there is no
+// queue to scroll — there the fence buttons behave as before (archive/snooze, no scroll).
+export const QueueDismissContext = createContext<(() => void) | null>(null)
 
 // The default thread surface: the session transcript (parsed server-side from the JSONL) rendered
 // as a conversation — assistant prose as markdown, tool calls as compact one-liners, a spinner
@@ -270,7 +279,14 @@ function ChatView({ slug, onTab, virtualized }: { slug: string; onTab: (t: Threa
       <div className="flex min-h-full flex-col px-6 py-5">
         {count === 0 ? (
           <div className="flex-1 flex items-center justify-center text-sm text-muted">
-            {running ? (
+            {q.isPending ? (
+              // The transcript hasn't loaded YET — `count` is 0 only because `q.data` is still
+              // undefined, not because the session is empty. For a long-running chat the initial
+              // fetch/parse of a large transcript can take a beat, and claiming "Session starting…"
+              // there is wrong (it may have been running for hours). Show a neutral load state until
+              // the query resolves and we actually know whether there are messages.
+              <span className="flex items-center gap-2"><Dots /> Loading…</span>
+            ) : running ? (
               <span className="flex items-center gap-2"><Dots /> Session starting…</span>
             ) : canAdoptThread(thread) ? (
               // A thread fray-ui never originated (pre-existing .fray board): no session, no
@@ -334,6 +350,7 @@ function ChatView({ slug, onTab, virtualized }: { slug: string; onTab: (t: Threa
             {thread?.providerFault && !thread.foreign ? (
               <ProviderFaultCard
                 slug={slug}
+                sessionId={thread.sessionId}
                 fault={thread.providerFault}
                 retryText={lastUserIdx >= 0 ? messages[lastUserIdx]?.text : undefined}
               />
@@ -690,7 +707,7 @@ function VirtualizedThreadTranscript({
             ) : row.kind === "runtime-status" ? (
               <div className="px-6" style={{ paddingTop: STEP }}>
                 {thread?.providerFault && !thread.foreign ? (
-                  <ProviderFaultCard slug={slug} fault={thread.providerFault} retryText={lastUserIdx >= 0 ? messages[lastUserIdx]?.text : undefined} />
+                  <ProviderFaultCard slug={slug} sessionId={thread.sessionId} fault={thread.providerFault} retryText={lastUserIdx >= 0 ? messages[lastUserIdx]?.text : undefined} />
                 ) : thread?.pendingAsk ? (
                   <PendingAskCard ask={thread.pendingAsk} onTerminal={copyTerminalCommand} />
                 ) : nativeInputRequired ? (
@@ -1184,6 +1201,12 @@ function shortenTarget(detail: string): string {
 // activity doesn't dwarf the prose it belongs to.
 const COLLAPSE_AT = 4
 
+function toolCallsForSurface(tools: CollapsedTool[], dense?: boolean): CollapsedTool[] {
+  // Queue cards already render live children once, as borderless QueueSubAgentLines below the reply.
+  // Keep Agent prompt history in the full transcript instead of nesting another bordered card here.
+  return dense ? tools.filter((tool) => !tool.prompt) : tools
+}
+
 function ToolCalls({ tools, dense }: { tools: CollapsedTool[]; dense?: boolean }) {
   const [expanded, setExpanded] = useState(false)
   const cardsId = useId()
@@ -1670,7 +1693,7 @@ export function AgentBlock({
   }
 
   return (
-    <div className="fray-bash">
+    <div className="fray-bash" data-agent-tool-card>
       <ToolDisclosureHeader
         className="fray-bash-header"
         controls={bodyId}
@@ -1923,8 +1946,8 @@ function UserBubble({ text, queued, sticky }: { text: string; queued?: boolean; 
 // a per-message component deliberately doesn't get). Memo-friendly by construction: it's null (a stable
 // primitive) for every ordinary message, so only actual answers-messages ever see a prop change.
 // undefined (a consumer that doesn't precompute, e.g. the sub-agent sheet) → internal unpaired fallback.
-// Lifecycle controls never belong to a transcript message: every Done card stays presentation-only,
-// while the owning thread surface renders one stable footer.
+// Only the current final signal message may expose a lifecycle/confirmation action. Historical fences
+// remain readable cards but cannot archive a thread or arm a later identical wait.
 export const Message = memo(function Message({ m, answering, dense, paired, sticky, textOnly, showSendButton }: { m: ChatMessage; answering?: MessageAnswering; dense?: boolean; paired?: PairedAnswer[] | null; sticky?: boolean; textOnly?: boolean; showSendButton?: boolean }) {
   // An event line (a sub-agent completion) is transcript PUNCTUATION — a quiet full-width line, not a
   // bubble or a tool band. Rendered before the role branches (its role field is nominal).
@@ -1955,6 +1978,8 @@ export const Message = memo(function Message({ m, answering, dense, paired, stic
   // controller (which numbers ```question blocks over the flat text, same order) lines up.
   const blocks: ReactNode[] = []
   const qi = { n: -1 }
+  const signalFenceCount = splitFenceBlocks(m.text).filter((segment) => segment.kind === "fence").length
+  let renderedSignalFences = 0
   const renderText = (text: string, keyBase: string) => {
     // Split SIGNAL fences (```done / ```awaiting) out first — each renders as a card in place of the
     // raw block — then run the remaining prose runs through the question/image pipeline. Fences never
@@ -1962,13 +1987,15 @@ export const Message = memo(function Message({ m, answering, dense, paired, stic
     // controller (which numbers ```question blocks over the flat text in the same order).
     for (const [fi, fseg] of splitFenceBlocks(text).entries()) {
       if (fseg.kind === "fence") {
+        renderedSignalFences++
         blocks.push(
           <FenceCard
             key={`${keyBase}-f${fi}`}
             fenceKind={fseg.fenceKind}
             body={fseg.body}
-            hints={fseg.hints}
+            hint={fseg.hint}
             wrap={dense}
+            signalAt={renderedSignalFences === signalFenceCount ? m.signalAt : undefined}
           />,
         )
         continue
@@ -2009,7 +2036,7 @@ export const Message = memo(function Message({ m, answering, dense, paired, stic
         // textOnly (the queue card's first/last agent message): the batched tool band is dropped so only
         // the agent's prose remains — its calls live inside the collapsed intermediate bar instead.
         if (textOnly) return
-        const collapsed = collapseTools(part.tools)
+        const collapsed = toolCallsForSurface(collapseTools(part.tools), dense)
         if (collapsed.length) blocks.push(<ToolCalls key={`t${pi}`} tools={collapsed} dense={dense} />)
       } else {
         renderText(part.text, `x${pi}`)
@@ -2019,7 +2046,7 @@ export const Message = memo(function Message({ m, answering, dense, paired, stic
     // LEGACY fallback (a pre-restart server ships no `parts`): the old flat layout — tool band first,
     // then all prose. Degrades to today's (order-lossy) rendering until the server bounce.
     if (!textOnly) {
-      const collapsed = collapseTools(m.tools)
+      const collapsed = toolCallsForSurface(collapseTools(m.tools), dense)
       if (collapsed.length > 0) blocks.push(<ToolCalls key="tools" tools={collapsed} dense={dense} />)
     }
     renderText(m.text, "leg")
@@ -2321,13 +2348,23 @@ export function QuestionBlockCard({
 
 // A SIGNAL fence rendered as a card in place of the raw ```done / ```awaiting block (the fence
 // language IS the state; the body is the message). `done` → a compact presentation-only success card;
-// its thread's Archive lives in the stable lifecycle footer. `awaiting` → a quiet parked-wait card:
-// body prose plus parsed hint chips (human/timer, with legacy pr/ci/session support).
-export function FenceCard({ fenceKind, body, hints, wrap }: { fenceKind: FenceKind; body: string; hints: AwaitingHint[]; wrap?: boolean }) {
+// its thread's Archive lives in the stable lifecycle footer. `awaiting` → one compact callout:
+// a short semantic subtitle, plain-English detail, and one confirmation action for a valid proposal.
+export function FenceCard({ fenceKind, body, hint, wrap, signalAt }: { fenceKind: FenceKind; body: string; hint?: AwaitingHint; wrap?: boolean; signalAt?: string }) {
   const html = useMemo(() => (body ? mdToHtml(body) : ""), [body])
+  const awaitingCallout = awaitingCalloutPresentation(body, hint)
+  const awaitingLeadHtml = useMemo(() => mdInlineToHtml(awaitingCallout.lead), [awaitingCallout.lead])
+  const awaitingDescriptionHtml = useMemo(
+    () => (awaitingCallout.description ? mdInlineToHtml(awaitingCallout.description) : ""),
+    [awaitingCallout.description],
+  )
   // The owning thread's slug — set by the thread view AND the queue card — so the confirm button
   // resolves its thread and renders on both surfaces (null in a sub-agent's own transcript → no button).
   const slug = useContext(ThreadSlugContext)
+  // On the queue this dismisses THIS card through the user-initiated auto-scroll exit; null in the
+  // drawer. Wired into both fence actions so Mark-as-done / park scroll the next card up, exactly like
+  // the footer's Mark-as-done and Snooze do (maintainer 2026-07-21: every card-dismissing control must).
+  const queueDismiss = useContext(QueueDismissContext)
   const board = useBoard()
   // Resolve the owning thread + whether whole-thread lifecycle actions are applicable (session, not
   // foreign). Shared by both branches: the done card's Mark-as-done button and the awaiting card's
@@ -2335,7 +2372,13 @@ export function FenceCard({ fenceKind, body, hints, wrap }: { fenceKind: FenceKi
   // sub-agent transcript, where there's no ThreadSlugContext → the fence renders card-only).
   const fenceThread = slug ? threadBySlug(board, slug) : undefined
   const lifecycle = fenceThread ? threadLifecycleAvailability(fenceThread) : undefined
-  const canAct = !!(fenceThread && lifecycle?.footer)
+  const currentFence = fenceThread?.lastFence
+  const sameHint = currentFence?.hint?.kind === hint?.kind && currentFence?.hint?.value === hint?.value
+  const ownsCurrentSignal = Boolean(
+    signalAt && currentFence?.at === signalAt && currentFence.kind === fenceKind &&
+    (fenceKind === "done" || sameHint),
+  )
+  const canAct = ownsCurrentSignal && !!(fenceThread && lifecycle?.footer)
   // Once the Mark-as-done button has appeared, KEEP it mounted through completion. Clicking it flips
   // the thread to archived (canAct → false); unmounting the button there shrank the card — a layout
   // shift, and in the queue that resize also fed the passive scroll-anchor churn. StateButton latches
@@ -2362,6 +2405,7 @@ export function FenceCard({ fenceKind, body, hints, wrap }: { fenceKind: FenceKi
             <StateButton
               thread={doneThread}
               className="bg-fg px-2.5 py-1 text-bg hover:opacity-90"
+              onArchived={queueDismiss ?? undefined}
             />
           </div>
         )}
@@ -2369,75 +2413,72 @@ export function FenceCard({ fenceKind, body, hints, wrap }: { fenceKind: FenceKi
     )
   }
   return (
-    <div className="rounded-lg border border-border-strong bg-panel-2 px-4 py-3">
-      <div className="mb-1.5 flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-muted/70">
-        <Clock size={12} className="shrink-0" /> Awaiting
-      </div>
-      {html && <div className={`md-body${wrap ? ` ${QUEUE_WRAP}` : ""}`} dangerouslySetInnerHTML={{ __html: html }} />}
-      {hints.length > 0 && (
-        <div className="mt-2 flex flex-wrap gap-1.5">
-          {hints.map((h, i) => {
-            const timerLabel = h.kind === "timer" ? formatSnoozedUntil(h.value) : null
-            return (
-            <span key={i} className="flex min-w-0 items-center gap-1 rounded-md border border-border bg-panel px-2 py-0.5 text-[11px] text-fg/80">
-              {/* petite-caps sit on the baseline → ~1px low under items-center (see styles.css); lift the
-                  label onto the value's optical midline so "ci"/"pr" and the ref read on one line. */}
-              <span className="petite-caps relative -top-px text-[9.5px] text-muted/60">{h.kind}</span>
-              <span className={h.kind === "timer" ? "min-w-0 break-words" : "font-mono-keep"}>{timerLabel ?? (h.kind === "timer" ? "Schedule unavailable" : h.value)}</span>
-              {/* A live countdown to a timer wait — fray-ui owns this durable wake (it resumes the session when
-                  this fires), so the card shows the human exactly when that happens. */}
-              {/* The timestamp remains the primary information on a narrow queue card; hide the
-                  auxiliary live countdown there so neither value truncates or wraps awkwardly. */}
-              {h.kind === "timer" && <span className="hidden sm:inline"><TimerCountdown iso={h.value} /></span>}
-            </span>
-            )
-          })}
+    <div data-awaiting-callout className="min-w-0 overflow-hidden rounded-lg border border-border-strong bg-panel-2">
+      <div data-awaiting-callout-body className={`flex min-w-0 items-start gap-2.5 px-3 py-2 text-[12px] leading-5 text-fg/80${wrap ? ` ${QUEUE_WRAP}` : ""}`}>
+        <Bell aria-hidden="true" size={13} className="mt-[3px] shrink-0 text-muted/65" />
+        <div className="min-w-0">
+          <strong className="md-inline font-semibold text-fg/90" dangerouslySetInnerHTML={{ __html: awaitingLeadHtml }} />
+          {awaitingDescriptionHtml && (
+            <>
+              <span aria-hidden="true"> — </span>
+              <span className="md-inline" dangerouslySetInnerHTML={{ __html: awaitingDescriptionHtml }} />
+            </>
+          )}
         </div>
-      )}
-      {canAct && fenceThread && <AwaitingParkButton thread={fenceThread} hints={hints} />}
+      </div>
+      {canAct && fenceThread && <AwaitingConfirmButton thread={fenceThread} hint={hint} />}
     </div>
   )
 }
 
-// The awaiting card's white HUMAN-IN-THE-LOOP park button. The worker's ```awaiting fence already
-// auto-arms the durable wake (a `timer` fires at its instant; a `github-review` watcher wakes on new
-// non-bot PR activity) AND already files the thread into the dimmed Held band — this button lets the
-// human EXPLICITLY commit a USER-OWNED snooze on top, so the park carries a concrete wake time and is
-// durable across fence changes. It NEVER suppresses the auto-armed wake: a user snooze is a
-// board-presentation concern only (board.ts), independent of the scheduler. Kind → label + snooze
-// target: a future `timer` → "Confirm snooze" until that exact instant; `github-review` → "Confirm
-// watcher" (its own verb — the watcher is activity-based, so there is no instant to show); a plain
-// `human` gate → "Confirm snooze". For github-review/human there's no declared time, so we park for
-// the user's default snooze preset (a "remind me if it's still quiet" fallback; the watcher still
-// wakes on activity). Returns null when no hint is parkable (legacy pr/ci/session, or an
-// elapsed/malformed timer) — there's nothing to confirm.
-function awaitingParkAction(
-  hints: readonly AwaitingHint[],
+// An awaiting fence proposes exactly one dormant wait. A future timer becomes a snooze at its declared
+// instant; a GitHub review target becomes a human-activity watcher. The server arms neither until the
+// operator confirms this exact final-message generation.
+function awaitingWaitAction(
+  hint: AwaitingHint | undefined,
   nowMs = Date.now(),
-): { label: string; toastVerb: string; timerUntil: string | null } | null {
-  const timer = hints.find((h) => h.kind === "timer" && isValidAwaitingTimer(h.value) && Date.parse(h.value) > nowMs)
-  if (timer) return { label: "Confirm snooze", toastVerb: "Snoozed", timerUntil: timer.value }
-  if (hints.some((h) => h.kind === "github-review")) return { label: "Confirm watcher", toastVerb: "Parked", timerUntil: null }
-  if (hints.some((h) => h.kind === "human")) return { label: "Confirm snooze", toastVerb: "Snoozed", timerUntil: null }
+): { label: string; activeLabel: string; toast: string } | null {
+  if (hint?.kind === "timer" && isValidAwaitingTimer(hint.value) && Date.parse(hint.value) > nowMs) {
+    return { label: "Confirm snooze", activeLabel: "Snoozed", toast: `Snoozed · ${formatSnoozeWake(hint.value)}` }
+  }
+  if (hint?.kind === "github-review" && isValidGithubReviewTarget(hint.value)) {
+    return { label: "Confirm watcher", activeLabel: "Watcher active", toast: `Watching ${hint.value}` }
+  }
   return null
 }
 
-function AwaitingParkButton({ thread, hints }: { thread: ThreadViewData; hints: readonly AwaitingHint[] }) {
+function AwaitingConfirmButton({ thread, hint }: { thread: ThreadViewData; hint?: AwaitingHint }) {
   const [busy, setBusy] = useState(false)
-  const action = awaitingParkAction(hints)
+  // On the queue, confirming the park dismisses THIS card through the user-initiated auto-scroll exit
+  // (like Snooze); null in the drawer, where the card just leaves the board.
+  const queueDismiss = useContext(QueueDismissContext)
+  const action = awaitingWaitAction(hint)
   if (!action) return null
+  if (thread.awaitingWaitConfirmed) {
+    return (
+      <div className="flex shrink-0 items-center justify-end border-l border-border px-3 py-1.5 text-[11px] font-medium text-muted/75">
+        {action.activeLabel}
+      </div>
+    )
+  }
   const apply = () => {
-    // A future timer snoozes to its exact instant; kinds without a declared time use the default preset.
-    const until = action.timerUntil ?? snoozePresetInstant(prefs.snoozePreset)
+    const fenceAt = thread.lastFence?.at
+    if (!fenceAt || !hint || !thread.sessionId) {
+      showToast("Couldn’t confirm wait: this proposal has no stable generation")
+      return
+    }
     setBusy(true)
     rpc
-      .setThreadSnooze({ slug: thread.id, until })
-      .then(() => showToast(`${action.toastVerb} · ${formatSnoozeWake(until)}`))
-      .catch((error) => showToast(`Couldn’t snooze: ${(error as Error).message.slice(0, 80)}`))
+      .confirmAwaiting({ slug: thread.id, sessionId: thread.sessionId, fenceAt, hint })
+      .then(() => {
+        showToast(action.toast)
+        queueDismiss?.()
+      })
+      .catch((error) => showToast(`Couldn’t confirm wait: ${(error as Error).message.slice(0, 80)}`))
       .finally(() => setBusy(false))
   }
   return (
-    <div className="mt-3">
+    <div data-awaiting-callout-footer className="flex items-center justify-end border-t border-border bg-panel px-2.5 py-1">
       <button
         type="button"
         onClick={apply}
@@ -2445,9 +2486,9 @@ function AwaitingParkButton({ thread, hints }: { thread: ThreadViewData; hints: 
         aria-label={action.label}
         title={action.label}
         onMouseDown={(e) => e.preventDefault()}
-        className="flex items-center gap-1.5 rounded-md bg-fg px-2.5 py-1 text-[12px] font-medium text-bg outline-none transition-opacity hover:opacity-90 focus-visible:ring-1 focus-visible:ring-fg/60 disabled:opacity-45"
+        className="relative flex items-center gap-1 whitespace-nowrap rounded-md bg-fg px-2 py-0.5 text-[10px] font-medium leading-4 text-bg outline-none after:absolute after:-inset-0.5 after:content-[''] focus-visible:ring-1 focus-visible:ring-fg/60 disabled:cursor-wait disabled:opacity-100"
       >
-        {busy ? <Loader2 size={12} className="animate-spin" /> : <Clock size={12} />}
+        {busy && <Loader2 size={10} className="animate-spin" />}
         {action.label}
       </button>
     </div>
@@ -2466,17 +2507,22 @@ function AwaitingParkButton({ thread, hints }: { thread: ThreadViewData; hints: 
 // action — a prompt is never replayed automatically after login.
 export function ProviderFaultCard({
   slug,
+  sessionId,
   fault,
   retryText,
 }: {
   slug: string
+  sessionId?: string
   fault: NonNullable<ThreadViewData["providerFault"]>
   retryText?: string
 }) {
   const [signIn, setSignIn] = useState(false)
   const label = PROVIDER_LABEL[fault.backend]
   const retry = useMutation({
-    mutationFn: (message: string) => rpc.followUp({ slug, message }),
+    mutationFn: (message: string) => {
+      if (!sessionId) throw new Error("This session changed; refresh before retrying")
+      return rpc.followUp({ slug, sessionId, message })
+    },
     onSuccess: () => showToast("Retrying with the previous message…"),
     onError: (e) => showToast(`Retry failed: ${(e as Error).message.slice(0, 80)}`),
   })
@@ -2697,25 +2743,6 @@ export function PendingAskCard({ ask, onTerminal }: { ask: PendingAsk; onTermina
       </button>
     </div>
   )
-}
-
-// A live countdown to a timer wait's ISO instant, rendered inside the awaiting card's `timer` chip.
-// fray-ui's wakers scheduler OWNS this wake — it resumes the session when `now >= iso` — so the human
-// sees exactly how long until that happens. Ticks once a second (cheap; unmounts with the card). Past
-// due → "firing…" (the scheduler resumes within a tick; the fence then clears and this card vanishes).
-function TimerCountdown({ iso }: { iso: string }) {
-  const target = useMemo(() => Date.parse(iso), [iso])
-  const [now, setNow] = useState(() => Date.now())
-  useEffect(() => {
-    if (!Number.isFinite(target)) return
-    const id = setInterval(() => setNow(Date.now()), 1000)
-    return () => clearInterval(id)
-  }, [target])
-  if (!Number.isFinite(target)) return null
-  const remain = Math.floor((target - now) / 1000)
-  if (remain <= 0) return <span className="ml-0.5 text-[10px] text-muted/60 italic">firing…</span>
-  const label = formatCountdownSeconds(remain)
-  return <span className="ml-0.5 tabular-nums text-[10px] text-muted/60">in {label}</span>
 }
 
 // Human-friendly elapsed since an ISO timestamp: "just now", "12m", "1h 3m". Empty when unparseable.

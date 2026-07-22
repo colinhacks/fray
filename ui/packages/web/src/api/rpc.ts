@@ -14,6 +14,7 @@ import type {
   SetThreadProfileInput,
   SetThreadProfileResult,
   SetThreadSnoozeInput,
+  ConfirmAwaitingInput,
   SubmitCodexDraftInput,
   SubmitCodexDraftResult,
   PrepareCodexDraftReplacementInput,
@@ -89,11 +90,12 @@ export interface Api {
   // never cleared by viewing a resting thread. No-op for a foreign thread (no registry row).
   threadSeen(input: { slug: string }): Promise<void>
   // The ONLY writer of a session thread's open|archived lifecycle (the done fence mutates nothing).
-  setThreadState(input: { slug: string; state: "open" | "archived" }): Promise<void>
+  setThreadState(input: { slug: string; sessionId: string; state: "open" | "archived" }): Promise<void>
   // Completes an inactive session immediately. A live provider shell reports that confirmation is
   // required; the caller must opt into its termination before the row can move to Done.
-  completeThread(input: { slug: string; terminateLive?: boolean }): Promise<{ needsConfirmation: boolean }>
+  completeThread(input: { slug: string; sessionId: string; terminateLive?: boolean }): Promise<{ needsConfirmation: boolean }>
   setThreadSnooze(input: SetThreadSnoozeInput): Promise<void>
+  confirmAwaiting(input: ConfirmAwaitingInput): Promise<void>
   // Hard-delete a stalled/exited session (the Dismiss verb): removes the row + tombstones its transcript
   // so it stays gone across a rescan. Server-gated to non-live rows; rejects a running/idle session.
   forgetThread(input: { slug: string }): Promise<void>
@@ -177,6 +179,7 @@ const PROCEDURES: Record<keyof Api, ProcType> = {
   setThreadState: "mutation",
   completeThread: "mutation",
   setThreadSnooze: "mutation",
+  confirmAwaiting: "mutation",
   forgetThread: "mutation",
   planBody: "query",
   planDelete: "mutation",

@@ -1,7 +1,7 @@
 import { statSync, openSync, readSync, closeSync, readdirSync, mkdirSync, writeFileSync, readFileSync } from "node:fs"
 import { join } from "node:path"
 import { homedir, tmpdir } from "node:os"
-import { PermissionMode } from "@fray-ui/shared"
+import { isValidAwaitingTimer, isValidGithubReviewTarget, PermissionMode } from "@fray-ui/shared"
 import type { Bus } from "./bus.ts"
 import { permMarkerPath, type Project } from "./project.ts"
 import type { Storage, SessionRow } from "./storage.ts"
@@ -92,12 +92,14 @@ export interface SubAgentView {
 
 // A signal fence parsed from the FINAL assistant message (mirrors @fray-ui/shared ThreadFence; kept
 // as a local shape so the tailer's telemetry stays decoupled from the wire schema). The fence
-// language IS the state, the body is the message; `hints` are `<kind>: <value>` lines parsed from an
-// awaiting body. Only meaningful while it is the final message — any newer user record clears it.
+// language IS the state, the body is the message; `hint` is the one supported `<kind>: <value>` line
+// parsed from an awaiting body. Only meaningful while it is the final message — any newer activity
+// changes its generation identity.
 export interface FenceView {
   kind: "done" | "awaiting"
   body: string
-  hints: { kind: "human" | "github-review" | "timer" | "pr" | "ci" | "session"; value: string }[]
+  hint?: { kind: "github-review" | "timer"; value: string }
+  at?: string
 }
 
 // Per-session derived telemetry surfaced to the board overlay. Structurally a NormalizedTail (the
@@ -433,10 +435,9 @@ export function hasQuestionBlock(text: string | undefined): boolean {
 // ```question fence keeps its own separate machinery (hasQuestionBlock) — it is NOT a signal fence.
 const SIGNAL_FENCE_RE = /^```(done|awaiting)[ \t]*\n([\s\S]*?)\n```[ \t]*$/gm
 // An awaiting-body hint line: `<kind>: <value>`. Kind is case-insensitive (lowercased on output); the
-// value must start with a non-space char (a bare `pr:` with nothing after is prose, not a hint).
-const AWAITING_HINT_RE = /^(human|github-review|timer|pr|ci|session):\s*(\S.*)$/i
+// value must start with a non-space char (a bare hint name with nothing after stays prose).
+const AWAITING_HINT_RE = /^(github-review|timer):\s*(\S.*)$/i
 const FENCE_BODY_MAX = 500 // defensive: never let a worker's fence body fatten the snapshot
-const HINT_MAX = 8 // defensive cap on parsed hint lines
 const HINT_VALUE_MAX = 200 // defensive cap on a single hint value
 
 function capFenceBody(s: string): string {
@@ -445,8 +446,8 @@ function capFenceBody(s: string): string {
 
 // Parse the done/awaiting signal fence out of an assistant text, or undefined if none. Pure and
 // defensive (never throws) so it is unit-testable and degrades on any surprise. For `awaiting`,
-// `<kind>: <value>` lines become `hints` in file order and the remaining lines are the prose `body`;
-// for `done`, the whole body is the message and hints are empty.
+// exactly one supported `<kind>: <value>` line becomes `hint` and is removed from `body`. Zero or
+// multiple supported lines are intentionally non-signaling and remain visible as prose.
 export function parseSignalFence(text: string | undefined): FenceView | undefined {
   if (typeof text !== "string") return undefined
   const norm = text.replace(/\r\n/g, "\n")
@@ -464,23 +465,26 @@ export function parseSignalFence(text: string | undefined): FenceView | undefine
   // End-anchor: the fence only signals when it closes the message (trailing whitespace tolerated).
   // Prose after the last fence means it was quoted/explanatory, not a signal — no excusal.
   if (norm.slice(end).trim() !== "") return undefined
-  if (kind === "done") return { kind, body: capFenceBody(raw.trim()), hints: [] }
-  // awaiting: peel `<kind>: <value>` hint lines out; the remaining lines are the prose body.
-  const hints: FenceView["hints"] = []
+  if (kind === "done") return { kind, body: capFenceBody(raw.trim()) }
+  const candidates: NonNullable<FenceView["hint"]>[] = []
   const rest: string[] = []
   for (const line of raw.split("\n")) {
     const hm = line.match(AWAITING_HINT_RE)
-    const k = hm?.[1].toLowerCase()
-    // Only real hint kinds become hints; any other `word:` line is prose (a stray colon-line
-    // like "note: …" must not mint a phantom hint that then glosses as leaked internals). 2026-07-10.
-    if (hm && (k === "human" || k === "github-review" || k === "timer" || k === "pr" || k === "ci" || k === "session")) {
+    if (hm) {
+      const k = hm[1].toLowerCase() as NonNullable<FenceView["hint"]>["kind"]
       const value = hm[2].trim()
-      hints.push({ kind: k, value: value.length > HINT_VALUE_MAX ? value.slice(0, HINT_VALUE_MAX) : value })
+      candidates.push({ kind: k, value: value.length > HINT_VALUE_MAX ? value.slice(0, HINT_VALUE_MAX) : value })
     } else {
       rest.push(line)
     }
   }
-  return { kind, body: capFenceBody(rest.join("\n").trim()), hints: hints.slice(0, HINT_MAX) }
+  if (candidates.length !== 1) return { kind, body: capFenceBody(raw.trim()) }
+  const candidate = candidates[0]
+  if (
+    (candidate.kind === "timer" && !isValidAwaitingTimer(candidate.value)) ||
+    (candidate.kind === "github-review" && !isValidGithubReviewTarget(candidate.value))
+  ) return { kind, body: capFenceBody(raw.trim()) }
+  return { kind, body: capFenceBody(rest.join("\n").trim()), hint: candidate }
 }
 
 // A user record is a REAL user interaction (a typed prompt / answer / steer / dispatch) rather than a
@@ -856,7 +860,8 @@ export function applyRecord(state: TailState, rec: Record): void {
       // Recompute the done/awaiting signal fence from THIS text — an assistant text with no fence
       // clears it (the fence only signals while it is the final message). Same lifecycle as the
       // question flag: set per assistant text, cleared by any user record below.
-      state.lastFence = parseSignalFence(raw)
+      const fence = parseSignalFence(raw)
+      state.lastFence = fence && typeof rec.timestamp === "string" ? { ...fence, at: rec.timestamp } : fence
     }
     trackDispatches(state, rec) // register any background Agent dispatches + background shells
     trackAsk(state, rec) // capture a pending native AskUserQuestion (frozen at a TUI dialog)
@@ -909,7 +914,8 @@ function applyFinalText(state: FoldState, text: string): void {
   const preview = previewText(text)
   if (preview !== undefined) state.lastAssistant = preview
   state.lastAssistantHasQuestion = hasQuestionBlock(text)
-  state.lastFence = parseSignalFence(text)
+  const fence = parseSignalFence(text)
+  state.lastFence = fence && state.lastAssistantAt ? { ...fence, at: state.lastAssistantAt } : fence
 }
 
 // Fold one NORMALIZED event into the backend-neutral accumulator — the codex-facing counterpart to

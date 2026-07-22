@@ -705,6 +705,22 @@ test("codex turn-end: the ordinary case never double-renders the final answer ec
   assert.equal(a.text, "the answer") // exactly once
 })
 
+test("Codex signal generation stays on the final-answer event, not its later task-complete echo", () => {
+  const fence = "```awaiting\ngithub-review: owner/repo#9\nReview.\n```"
+  const raw = [
+    { timestamp: "2026-07-11T00:00:01.000Z", type: "event_msg", payload: { type: "agent_message", phase: "final_answer", message: fence } },
+    { timestamp: "2026-07-11T00:00:02.000Z", type: "event_msg", payload: { type: "task_complete", last_agent_message: fence } },
+    { timestamp: "2026-07-11T00:00:03.000Z", type: "event_msg", payload: { type: "user_message", message: "Keep waiting." } },
+    { timestamp: "2026-07-11T00:00:04.000Z", type: "event_msg", payload: { type: "agent_message", phase: "final_answer", message: fence } },
+    { timestamp: "2026-07-11T00:00:05.000Z", type: "event_msg", payload: { type: "task_complete", last_agent_message: fence } },
+  ].map((record) => JSON.stringify(record)).join("\n")
+  const signals = projectCodexTranscript(raw).filter((message) => message.role === "assistant")
+  assert.deepEqual(signals.map((message) => message.signalAt), [
+    "2026-07-11T00:00:01.000Z",
+    "2026-07-11T00:00:04.000Z",
+  ])
+})
+
 test("codex parser is defensive: empty input, blank/malformed lines, and sidecar-only records → no throw", () => {
   assert.deepEqual(parseCodexTranscript(""), [])
   assert.deepEqual(parseCodexTranscript("\n  \nnot json\n{bad"), [])

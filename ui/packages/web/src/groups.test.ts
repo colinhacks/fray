@@ -1,7 +1,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import type { ThreadView } from "@fray-ui/shared"
-import { needsAction, queued, queuePriority, orderQueue, partitionActive, sectionOf, sectionThreads, isHeld, sessionIndicatorKind, titleIsProvisional, displayTitle, lastActiveLabelAt, SPINNING_UP_TITLE, UNTITLED_THREAD_TITLE } from "./groups.ts"
+import { needsAction, queued, orderQueue, partitionActive, sectionOf, sectionThreads, isHeld, sessionIndicatorKind, titleIsProvisional, displayTitle, lastActiveLabelAt, SPINNING_UP_TITLE, UNTITLED_THREAD_TITLE } from "./groups.ts"
 
 // Minimal ThreadView fixture — the same shape board-delta.test.ts uses, defaulting to a live/active
 // thread; each case overrides only the fields under test.
@@ -110,7 +110,7 @@ test("queued: a server-marked checked/done thread cards and keeps its active che
     kind: "session",
     needsYou: true,
     state: "open",
-    lastFence: { kind: "done", body: "shipped", hints: [] },
+    lastFence: { kind: "done", body: "shipped" },
   })
   assert.equal(queued(done), true)
   assert.equal(sectionOf(done), "active")
@@ -145,30 +145,24 @@ test("queued: pre-restart snapshot (no kind/needsYou) degrades to an empty queue
   assert.equal(queued(thread({})), false)
 })
 
-test("queuePriority: only unresolved asks, prompts, permissions, and crashes outrank passive handoffs", () => {
-  assert.equal(queuePriority(thread({ actionableInteraction: true })), 0)
-  assert.equal(queuePriority(thread({ pendingAsk: { questions: [] } })), 0)
-  assert.equal(queuePriority(thread({ nativeInputRequired: { kind: "permission", title: "Permission required" } })), 0)
-  assert.equal(queuePriority(thread({ pendingQuestion: true })), 0)
-  assert.equal(queuePriority(thread({ runtime: "perm-prompt" })), 0)
-  assert.equal(queuePriority(thread({ crashed: true })), 0)
-  assert.equal(queuePriority(thread({ status: "needs-human", humanBlocked: true })), 0)
-  assert.equal(queuePriority(thread({ pendingInteraction: true, actionableInteraction: false })), 1, "answered provider delivery remains readable, not actionable")
-  assert.equal(queuePriority(thread({ lastFence: { kind: "done", body: "shipped", hints: [] } })), 1)
-  assert.equal(queuePriority(thread()), 1)
-})
-
-test("orderQueue: hard attention leads; FIFO (oldest-waiting first) and id order each band", () => {
-  const queue = orderQueue([
-    thread({ id: "done-new", lastUserAt: "2026-07-13T12:00:00.000Z", lastFence: { kind: "done", body: "shipped", hints: [] } }),
-    thread({ id: "hard-b", lastUserAt: "2026-07-11T12:00:00.000Z", pendingQuestion: true }),
-    thread({ id: "rest-newer", lastUserAt: "2026-07-14T12:00:00.000Z" }),
-    thread({ id: "hard-a", lastUserAt: "2026-07-11T12:00:00.000Z", actionableInteraction: true }),
-    thread({ id: "hard-older", lastUserAt: "2026-07-10T12:00:00.000Z", crashed: true }),
-  ])
-  // Hard band FIFO (oldest first): hard-older (07-10) leads; hard-a/hard-b share 07-11 so id breaks the
-  // tie (a<b). Rest band FIFO: done-new (07-13) before rest-newer (07-14). Bands never interleave.
-  assert.deepEqual(queue.map((item) => item.id), ["hard-older", "hard-a", "hard-b", "done-new", "rest-newer"])
+test("orderQueue: NO priority band — one strict time order across attention + passive alike", () => {
+  // The hidden hard-attention band is gone (maintainer 2026-07-21: "too confusing"). Order is
+  // last-active alone; kind (crash/question vs done/rest) never lifts a card into a separate tier.
+  // The timestamps deliberately INTERLEAVE attention and passive rows so BOTH directions differ from
+  // the old banded order — proving band removal, not just re-proving FIFO:
+  //   crash-newest 07-14 (hard) · done-newer 07-13 (passive) · question-older 07-11 (hard) · rest-oldest 07-10 (passive)
+  // Old banded FIFO would be [question-older, crash-newest, rest-oldest, done-newer]; old banded LIFO
+  // [crash-newest, question-older, done-newer, rest-oldest]. Both differ from the strict orders below.
+  const rows = () => [
+    thread({ id: "crash-newest", lastUserAt: "2026-07-14T12:00:00.000Z", crashed: true }),
+    thread({ id: "done-newer", lastUserAt: "2026-07-13T12:00:00.000Z", lastFence: { kind: "done", body: "shipped" } }),
+    thread({ id: "question-older", lastUserAt: "2026-07-11T12:00:00.000Z", pendingQuestion: true }),
+    thread({ id: "rest-oldest", lastUserAt: "2026-07-10T12:00:00.000Z" }),
+  ]
+  // FIFO oldest-first: the fresh CRASH sinks to the BOTTOM under an older done card — the accepted tradeoff.
+  assert.deepEqual(orderQueue(rows()).map((item) => item.id), ["rest-oldest", "question-older", "done-newer", "crash-newest"])
+  // LIFO newest-first: a newer DONE card outranks an older question — impossible under the old band.
+  assert.deepEqual(orderQueue(rows(), "lifo").map((item) => item.id), ["crash-newest", "done-newer", "question-older", "rest-oldest"])
 })
 
 test("orderQueue: AT-REST rows key on REST TIME (lastAssistantAt), not lastActivityAt; direction flips it", () => {
@@ -239,8 +233,8 @@ test("sectionOf: running/needs-you stay Active; only truthful human/future-timer
   assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "running" })), "active")
   assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle" })), "active")
   assert.equal(sectionOf(thread({ kind: "session", state: "open", needsYou: true })), "active")
-  assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle", lastFence: { kind: "done", body: "shipped", hints: [] } })), "active")
-  assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle", lastFence: { kind: "awaiting", body: "", hints: [] } })), "active")
+  assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle", lastFence: { kind: "done", body: "shipped" } })), "active")
+  assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle", lastFence: { kind: "awaiting", body: "" } })), "active")
   // Archive wins over a lingering needsYou.
   assert.equal(sectionOf(thread({ kind: "session", state: "archived" })), "inactive")
   assert.equal(sectionOf(thread({ kind: "session", needsYou: true, state: "archived" })), "inactive")
@@ -298,30 +292,21 @@ test("partitionActive: splits an ordered Active list into running/rested; queued
 
 // ---- isHeld: every rendered wait glyph belongs to the labeled dimmed Held band ----
 
-const awaitingHuman = { kind: "awaiting" as const, body: "", hints: [{ kind: "human" as const, value: "Cloudflare maintainer must approve fork CI" }] }
-const awaitingGithubReview = { kind: "awaiting" as const, body: "", hints: [{ kind: "github-review" as const, value: "owner/repo#12" }] }
-const awaitingTimer = { kind: "awaiting" as const, body: "", hints: [{ kind: "timer" as const, value: "2099-07-15T17:00:00Z" }] }
-const awaitingElapsedTimer = { kind: "awaiting" as const, body: "", hints: [{ kind: "timer" as const, value: "2020-07-15T17:00:00Z" }] }
-const awaitingBadTimer = { kind: "awaiting" as const, body: "", hints: [{ kind: "timer" as const, value: "tomorrow-ish" }] }
-const awaitingPr = { kind: "awaiting" as const, body: "", hints: [{ kind: "pr" as const, value: "owner/repo#12" }] }
-const awaitingCi = { kind: "awaiting" as const, body: "", hints: [{ kind: "ci" as const, value: "build #4821" }] }
+const awaitingGithubReview = { kind: "awaiting" as const, body: "", hint: { kind: "github-review" as const, value: "owner/repo#12" } }
+const awaitingTimer = { kind: "awaiting" as const, body: "", hint: { kind: "timer" as const, value: "2099-07-15T17:00:00Z" } }
+const awaitingElapsedTimer = { kind: "awaiting" as const, body: "", hint: { kind: "timer" as const, value: "2020-07-15T17:00:00Z" } }
+const awaitingBadTimer = { kind: "awaiting" as const, body: "", hint: { kind: "timer" as const, value: "tomorrow-ish" } }
 const liveSub = [{ label: "x", startedAt: "2026-07-10T00:00:00.000Z", state: "running" as const, id: "a1" }]
 const liveShell = [{ label: "Watch CI", startedAt: "2026-07-10T00:00:00.000Z", state: "running" as const }]
 
-test("isHeld: only current human/review/future-timer fences and canonical timed status are held", () => {
-  assert.equal(isHeld(thread({ runtime: "turn-idle", lastFence: awaitingHuman })), true)
-  assert.equal(isHeld(thread({ runtime: "exited", lastFence: awaitingHuman })), true)
-  assert.equal(isHeld(thread({ runtime: "turn-idle", lastFence: awaitingTimer })), true)
-  assert.equal(isHeld(thread({ runtime: "turn-idle", lastFence: awaitingGithubReview })), true)
-  assert.equal(isHeld(thread({ runtime: "turn-idle", lastFence: awaitingBadTimer })), false)
-  assert.equal(isHeld(thread({ runtime: "turn-idle", lastFence: awaitingElapsedTimer })), false)
-  assert.equal(isHeld(thread({ runtime: "turn-idle", lastFence: awaitingPr })), false)
-  assert.equal(isHeld(thread({ runtime: "turn-idle", lastFence: awaitingCi })), false)
-  assert.equal(isHeld(thread({ runtime: "turn-idle", lastFence: { kind: "awaiting", body: "", hints: [{ kind: "session", value: "s1" }] } })), false)
-  assert.equal(isHeld(thread({ runtime: "turn-idle", lastFence: { kind: "awaiting", body: "", hints: [] } })), false)
-  assert.equal(isHeld(thread({ status: "blocked", mechanism: "timer", revalidate: "2099-07-15T17:00:00Z", runtime: "turn-idle" })), true, "pre-session canonical future timer status")
-  assert.equal(isHeld(thread({ status: "blocked", mechanism: "timer", runtime: "turn-idle" })), false, "a timestamp-less timer cannot claim a durable wake")
-  assert.equal(isHeld(thread({ status: "blocked", mechanism: "timer", revalidate: "2020-07-15T17:00:00Z", runtime: "turn-idle" })), false, "an elapsed timer is no longer Held")
+test("isHeld: only confirmed current review/future-timer waits are held", () => {
+  assert.equal(isHeld(thread({ runtime: "turn-idle", lastFence: awaitingTimer })), false, "proposal stays in Queue")
+  assert.equal(isHeld(thread({ runtime: "turn-idle", lastFence: awaitingGithubReview })), false, "proposal stays in Queue")
+  assert.equal(isHeld(thread({ runtime: "turn-idle", lastFence: awaitingTimer, awaitingWaitConfirmed: true })), true)
+  assert.equal(isHeld(thread({ runtime: "exited", lastFence: awaitingGithubReview, awaitingWaitConfirmed: true })), true)
+  assert.equal(isHeld(thread({ runtime: "turn-idle", lastFence: awaitingBadTimer, awaitingWaitConfirmed: true })), false)
+  assert.equal(isHeld(thread({ runtime: "turn-idle", lastFence: awaitingElapsedTimer, awaitingWaitConfirmed: true })), false)
+  assert.equal(isHeld(thread({ runtime: "turn-idle", lastFence: { kind: "awaiting", body: "" }, awaitingWaitConfirmed: true })), false)
 })
 
 test("manual snooze: every parked queue reason is Held until the exact deadline", () => {
@@ -343,50 +328,44 @@ test("manual snooze: every parked queue reason is Held until the exact deadline"
 
 test("isHeld: live work, mid-turn, settled, bare, archived, and non-timer blocked states are not held", () => {
   // Awaiting its own child or background Bash/Monitor is live work, even with a stale wait fence.
-  assert.equal(isHeld(thread({ runtime: "turn-idle", lastFence: awaitingHuman, subAgents: liveSub })), false)
-  assert.equal(isHeld(thread({ runtime: "turn-idle", lastFence: awaitingTimer, bgShells: liveShell })), false)
-  // Mid-turn (still working) never awaits externally, even with a stale human fence.
-  assert.equal(isHeld(thread({ runtime: "running", lastFence: awaitingHuman })), false)
+  assert.equal(isHeld(thread({ runtime: "turn-idle", lastFence: awaitingGithubReview, awaitingWaitConfirmed: true, subAgents: liveSub })), false)
+  assert.equal(isHeld(thread({ runtime: "turn-idle", lastFence: awaitingTimer, awaitingWaitConfirmed: true, bgShells: liveShell })), false)
+  assert.equal(isHeld(thread({ runtime: "running", lastFence: awaitingGithubReview, awaitingWaitConfirmed: true })), false)
   // A done fence or a bare rest is NOT awaiting-external (those read as done/idle).
-  assert.equal(isHeld(thread({ runtime: "turn-idle", lastFence: { kind: "done", body: "x", hints: [] } })), false)
+  assert.equal(isHeld(thread({ runtime: "turn-idle", lastFence: { kind: "done", body: "x" } })), false)
   assert.equal(isHeld(thread({ runtime: "turn-idle" })), false)
   assert.equal(isHeld(thread({ runtime: "turn-idle", state: "archived", lastFence: awaitingTimer })), false)
   assert.equal(isHeld(thread({ status: "blocked", mechanism: "threads", runtime: "turn-idle" })), false)
   assert.equal(isHeld(thread({ needsYou: true, runtime: "exited", lastFence: awaitingTimer })), false, "attention beats a stale wait fence")
-  assert.equal(isHeld(thread({ pendingAsk: { questions: [] }, runtime: "turn-idle", lastFence: awaitingHuman })), false)
+  assert.equal(isHeld(thread({ pendingAsk: { questions: [] }, runtime: "turn-idle", lastFence: awaitingGithubReview, awaitingWaitConfirmed: true })), false)
 })
 
-test("sectionOf: human/future-timer waits and canonical timers are Held; machine waits stay Active", () => {
-  assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingHuman })), "held")
-  assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingTimer })), "held")
-  assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingPr })), "active")
-  assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingCi })), "active")
-  assert.equal(sectionOf(thread({ kind: "session", state: "open", status: "blocked", mechanism: "timer", revalidate: "2099-07-15T17:00:00Z", runtime: "turn-idle" })), "held")
-  assert.equal(sectionOf(thread({ kind: "session", state: "open", needsYou: true, runtime: "exited", lastFence: awaitingTimer })), "active")
+test("sectionOf: confirmed review/timer waits are Held; proposals stay Active", () => {
+  assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingGithubReview, awaitingWaitConfirmed: true })), "held")
+  assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingTimer, awaitingWaitConfirmed: true })), "held")
+  assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingGithubReview })), "active")
+  assert.equal(sectionOf(thread({ kind: "session", state: "open", needsYou: true, runtime: "exited", lastFence: awaitingTimer, awaitingWaitConfirmed: true })), "active")
   // A live child/background watcher wins over a stale parked fence.
-  assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingHuman, subAgents: liveSub })), "active")
-  assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingTimer, bgShells: liveShell })), "active")
-  // Session-hint / hintless / elapsed timer waits remain Active, like bare rest.
-  assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle", lastFence: { kind: "awaiting", body: "", hints: [{ kind: "session", value: "s1" }] } })), "active")
-  assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle", lastFence: { kind: "awaiting", body: "", hints: [] } })), "active")
+  assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingGithubReview, awaitingWaitConfirmed: true, subAgents: liveSub })), "active")
+  assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingTimer, awaitingWaitConfirmed: true, bgShells: liveShell })), "active")
+  assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle", lastFence: { kind: "awaiting", body: "" } })), "active")
   assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingElapsedTimer })), "active")
   assert.equal(sectionOf(thread({ kind: "session", state: "open", runtime: "turn-idle" })), "active")
   // Archive wins over an external wait.
-  assert.equal(sectionOf(thread({ kind: "session", state: "archived", runtime: "turn-idle", lastFence: awaitingHuman })), "inactive")
+  assert.equal(sectionOf(thread({ kind: "session", state: "archived", runtime: "turn-idle", lastFence: awaitingGithubReview, awaitingWaitConfirmed: true })), "inactive")
 })
 
-test("sectionThreads: only human/future-timer waits partition into Held; live and machine waits stay Active", () => {
+test("sectionThreads: only confirmed waits partition into Held; live work and proposals stay Active", () => {
   const s = sectionThreads([
-    thread({ id: "human-new", kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingHuman, lastUserAt: "2026-07-09T05:00:00.000Z" }),
+    thread({ id: "review-new", kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingGithubReview, awaitingWaitConfirmed: true, lastUserAt: "2026-07-09T05:00:00.000Z" }),
     thread({ id: "live-old", kind: "session", state: "open", runtime: "running", lastUserAt: "2026-07-08T01:00:00.000Z" }),
-    thread({ id: "timer-old", kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingTimer, lastUserAt: "2026-07-08T05:00:00.000Z" }),
-    thread({ id: "sub-wait", kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingHuman, subAgents: liveSub, lastUserAt: "2026-07-09T01:00:00.000Z" }),
-    thread({ id: "shell-wait", kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingTimer, bgShells: liveShell, lastUserAt: "2026-07-09T02:00:00.000Z" }),
-    thread({ id: "legacy-pr", kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingPr, lastUserAt: "2026-07-09T03:00:00.000Z" }),
+    thread({ id: "timer-old", kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingTimer, awaitingWaitConfirmed: true, lastUserAt: "2026-07-08T05:00:00.000Z" }),
+    thread({ id: "sub-wait", kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingGithubReview, awaitingWaitConfirmed: true, subAgents: liveSub, lastUserAt: "2026-07-09T01:00:00.000Z" }),
+    thread({ id: "shell-wait", kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingTimer, awaitingWaitConfirmed: true, bgShells: liveShell, lastUserAt: "2026-07-09T02:00:00.000Z" }),
+    thread({ id: "proposal", kind: "session", state: "open", runtime: "turn-idle", lastFence: awaitingGithubReview, lastUserAt: "2026-07-09T03:00:00.000Z" }),
   ])
-  // Running band (live-old + the two live-op waiters) leads by recency; the legacy-pr rest sits below.
-  assert.deepEqual(s.active.map((t) => t.id), ["shell-wait", "sub-wait", "live-old", "legacy-pr"])
-  assert.deepEqual(s.held.map((t) => t.id), ["human-new", "timer-old"])
+  assert.deepEqual(s.active.map((t) => t.id), ["shell-wait", "sub-wait", "live-old", "proposal"])
+  assert.deepEqual(s.held.map((t) => t.id), ["review-new", "timer-old"])
 })
 
 test("displayTitle: an explicit human title wins over stale backend AI-title and slug fallbacks", () => {
@@ -408,10 +387,10 @@ test("displayTitle: a machine-generated session slug is never presented as a suc
   )
 })
 
-test("a legacy session/hintless declared wait remains Active", () => {
-  const sessWait = { kind: "awaiting" as const, body: "", hints: [{ kind: "session" as const, value: "s1" }] }
+test("a hintless awaiting handoff remains Active", () => {
+  const hintlessWait = { kind: "awaiting" as const, body: "Waiting without a supported registration." }
   const s = sectionThreads([
-    thread({ id: "wait-new", kind: "session", state: "open", runtime: "turn-idle", lastFence: sessWait, lastUserAt: "2026-07-09T05:00:00.000Z" }),
+    thread({ id: "wait-new", kind: "session", state: "open", runtime: "turn-idle", lastFence: hintlessWait, lastUserAt: "2026-07-09T05:00:00.000Z" }),
     thread({ id: "live-old", kind: "session", state: "open", runtime: "running", lastUserAt: "2026-07-08T01:00:00.000Z" }),
   ])
   // live-old is running → running band on top; the hintless-wait rest (wait-new) files below it.

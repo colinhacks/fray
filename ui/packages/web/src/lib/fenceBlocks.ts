@@ -5,16 +5,16 @@
 // body, then a closing ``` line. Pure string logic, no DOM — unit-testable.
 //
 // The signal fence LANGUAGE is the state: `done` = a presentation-only success card (thread lifecycle
-// actions live in a stable footer), `awaiting` = a parked human/timer card with hint chips. Distinct
+// actions live in a stable footer), `awaiting` = one proposed PR-review or timer handoff. Distinct
 // from ```question blocks (their own machinery in questionBlocks.ts) — those never match here.
 
-import type { AwaitingHint } from "@fray-ui/shared"
+import { isValidAwaitingTimer, isValidGithubReviewTarget, type AwaitingHint } from "@fray-ui/shared"
 
 export type FenceKind = "done" | "awaiting"
 
 export type FenceSegment =
   | { kind: "prose"; text: string }
-  | { kind: "fence"; fenceKind: FenceKind; body: string; hints: AwaitingHint[] }
+  | { kind: "fence"; fenceKind: FenceKind; body: string; hint?: AwaitingHint }
 
 // Opening fence begins a line: ```done or ```awaiting (NO info-string — the language alone is the
 // state), a newline, then the body non-greedily to the next line that is exactly ``` (optional trailing
@@ -23,29 +23,29 @@ export type FenceSegment =
 // can't match the (done|awaiting) alternation, so question blocks are left entirely to questionBlocks.ts.
 const FENCE_BLOCK = /^```(done|awaiting)[ \t]*\r?\n([\s\S]*?)\r?\n```[ \t]*$/gm
 
-// A parked-wait hint line inside an ```awaiting body. `human`/`github-review`/`timer` are current; the
-// other three remain parseable for legacy transcripts. Case-insensitive; everything else is prose.
-const HINT_RE = /^(human|github-review|timer|pr|ci|session):\s*(\S.*)$/i
+const HINT_RE = /^(github-review|timer):\s*(\S.*)$/i
 
-// Split the body of a fence into its prose (hint lines removed) and its parsed hints. `done` fences
-// carry no hints — the whole body is prose.
-// Defensive caps matching the server's lastFence parser (tailer.ts): 8 hints, 200-char values — so a
-// pathological body can't render a divergent chip row between the sidebar gloss (server-parsed) and
-// the in-chat card (client-parsed).
-const HINT_MAX = 8
+// Exactly one supported hint is actionable and removed from the prose. A malformed or multi-hint
+// fence stays visible verbatim and cannot accidentally offer two waits from one card.
 const HINT_VALUE_MAX = 200
 
-export function parseFenceBody(raw: string, kind: FenceKind): { body: string; hints: AwaitingHint[] } {
-  if (kind === "done") return { body: raw.trim(), hints: [] }
-  const hints: AwaitingHint[] = []
+export function parseFenceBody(raw: string, kind: FenceKind): { body: string; hint?: AwaitingHint } {
+  if (kind === "done") return { body: raw.trim() }
+  const candidates: AwaitingHint[] = []
   const prose: string[] = []
   for (const line of raw.split("\n")) {
     const l = line.replace(/\r$/, "")
     const m = l.match(HINT_RE)
-    if (m) hints.push({ kind: m[1].toLowerCase() as AwaitingHint["kind"], value: m[2].trim().slice(0, HINT_VALUE_MAX) })
+    if (m) candidates.push({ kind: m[1].toLowerCase() as AwaitingHint["kind"], value: m[2].trim().slice(0, HINT_VALUE_MAX) })
     else prose.push(l)
   }
-  return { body: prose.join("\n").trim(), hints: hints.slice(0, HINT_MAX) }
+  if (candidates.length !== 1) return { body: raw.trim() }
+  const candidate = candidates[0]
+  if (
+    (candidate.kind === "timer" && !isValidAwaitingTimer(candidate.value)) ||
+    (candidate.kind === "github-review" && !isValidGithubReviewTarget(candidate.value))
+  ) return { body: raw.trim() }
+  return { body: prose.join("\n").trim(), hint: candidate }
 }
 
 // Split an assistant message's markdown into prose runs and signal-fence blocks, in document order.
@@ -58,8 +58,8 @@ export function splitFenceBlocks(text: string): FenceSegment[] {
     const prose = text.slice(lastIndex, m.index)
     if (prose.trim()) segments.push({ kind: "prose", text: prose })
     const fenceKind = m[1] as FenceKind
-    const { body, hints } = parseFenceBody(m[2], fenceKind)
-    segments.push({ kind: "fence", fenceKind, body, hints })
+    const { body, hint } = parseFenceBody(m[2], fenceKind)
+    segments.push({ kind: "fence", fenceKind, body, ...(hint ? { hint } : {}) })
     lastIndex = m.index + m[0].length
   }
   const rest = text.slice(lastIndex)

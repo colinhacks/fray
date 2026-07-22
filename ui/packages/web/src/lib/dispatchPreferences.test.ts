@@ -14,12 +14,11 @@ const preferences: DispatchPreferences = {
   codex: { model: "gpt-5.5", effort: "xhigh", permissionMode: "plan" },
 }
 
-test("provider switching restores each runtime's exact model, effort, and permission profile", () => {
+test("provider switching restores each runtime's exact model and effort profile", () => {
   assert.deepEqual(resolveDispatchPreferences(preferences, models), {
     backend: "claude",
     model: "sonnet",
     effort: "max",
-    permissionMode: "acceptEdits",
     codexModel: undefined,
     modelAvailable: true,
     effortAvailable: true,
@@ -35,7 +34,6 @@ test("provider switching restores each runtime's exact model, effort, and permis
   const resolved = resolveDispatchPreferences(codex, models)
   assert.equal(resolved.model, "gpt-5.5")
   assert.equal(resolved.effort, "xhigh")
-  assert.equal(resolved.permissionMode, "plan")
   assert.deepEqual(codex.claude, preferences.claude, "switching provider leaves Claude intent untouched")
 })
 

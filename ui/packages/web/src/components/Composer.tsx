@@ -137,6 +137,8 @@ export function Composer({
     // would plant an orphan chip that silently rides along with the user's NEXT, unrelated message.
     // Discard with a toast instead. (Enter/Send inside this box are gated on `uploading`, but a
     // surface can still clear the draft externally — the queue card's "Send answers" button.)
+    // Best-effort heuristic, not airtight: typing NEW text after such an external clear makes the
+    // draft non-empty again before the upload lands, and the path then joins that newer draft.
     const baseValue = valueRef.current
     setUploading(true)
     const paths: string[] = []

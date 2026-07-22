@@ -5,7 +5,7 @@ import type { DispatchProfileSnapshot, GithubBatchInput, GithubItem } from "@fra
 import { rpc } from "../api/rpc.ts"
 import { showToast } from "../store.ts"
 import { Overlay } from "./NewThreadModal.tsx"
-import { EFFORT_LABEL, PERMISSION_COLOR, permOptionsFor } from "../lib/options.ts"
+import { EFFORT_LABEL } from "../lib/options.ts"
 import { buildGithubBatchInput, dispatchProfileError } from "../lib/githubDispatch.ts"
 
 type Kind = "issues" | "prs"
@@ -91,7 +91,6 @@ export function GithubPickerModal({
     ? codexModels.data?.find((model) => model.slug === profile.model)?.displayName ?? profile.model
     : profile.model.charAt(0).toUpperCase() + profile.model.slice(1)
   const effortLabel = EFFORT_LABEL[profile.effort] ?? profile.effort
-  const permissionLabel = permOptionsFor(profile.backend).find((option) => option.value === profile.permissionMode)?.label ?? profile.permissionMode
 
   function startDispatch() {
     if (profileError) {
@@ -173,7 +172,6 @@ export function GithubPickerModal({
               <span className="truncate text-muted" title={`${profile.backend} · ${profile.model} · ${profile.effort}`}>
                 {profile.backend === "codex" ? "Codex" : "Claude Code"} · {modelLabel} / {effortLabel}
               </span>
-              <span className={`petite-caps ${PERMISSION_COLOR[profile.permissionMode]}`}>{permissionLabel}</span>
             </div>
             {profileError && <p className="mt-1 max-w-[430px] text-[10.5px] text-red-400">{profileError}</p>}
           </div>

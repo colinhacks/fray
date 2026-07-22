@@ -5,6 +5,7 @@ import { tmpdir } from "node:os"
 import { join, dirname } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { buildClaudeCommand, loadWorkerPrompt, composePrompt, resolveWorkerPluginDir, scratchpadOrientation, scratchpadContent, workerPluginDir, frayConfigBlock } from "./dispatch.ts"
+import { CHROME_DEVTOOLS_MCP } from "./backend/types.ts"
 
 // ---- Backend-aware worker contract (worker-contract-backend-aware) ----
 // loadWorkerPrompt(kind) delegates to buildWorkerPrompt in workerPrompt.ts (a single compiled-in TS
@@ -19,7 +20,6 @@ const here = dirname(fileURLToPath(import.meta.url))
 // before making the byte-for-byte comparison of the actual prompt content.
 const CLAUDE_GOLDEN = readFileSync(join(here, "WORKER_PROMPT.claude.golden.txt"), "utf8").trimEnd()
 const CODEX_GOLDEN = readFileSync(join(here, "WORKER_PROMPT.codex.golden.txt"), "utf8").trimEnd()
-const WORKER_SKILL = readFileSync(join(here, "../../../../cc-worker/skills/worker/SKILL.md"), "utf8")
 const SESSION_SEED = readFileSync(join(here, "../../../../cc-worker/hooks/session-seed.mjs"), "utf8")
 
 test("loadWorkerPrompt: default kind is claude", () => {
@@ -40,7 +40,7 @@ test("Claude dispatch supplies the discovered worker plugin via --plugin-dir", (
   assert.deepEqual(argv.slice(argv.indexOf("--plugin-dir"), argv.indexOf("--plugin-dir") + 2), ["--plugin-dir", plugin])
 })
 
-test("Claude dispatch mounts the spawn-thread MCP server + pre-approves its tool when the descriptor is present", () => {
+test("Claude dispatch mounts chrome-devtools + the spawn-thread MCP server and pre-approves both", () => {
   const argv = buildClaudeCommand({
     sessionId: "mcp-dispatch",
     permissionMode: "auto",
@@ -51,24 +51,30 @@ test("Claude dispatch mounts the spawn-thread MCP server + pre-approves its tool
   const cfgRaw = argv[argv.indexOf("--mcp-config") + 1]
   assert.ok(cfgRaw, "argv must carry an inline --mcp-config")
   const cfg = JSON.parse(cfgRaw)
+  // Chrome DevTools rides EVERY dispatch (runtime-gate browser QA, parity with the codex `-c`
+  // injection — both derive from the canonical CHROME_DEVTOOLS_MCP spec).
+  assert.deepEqual(cfg.mcpServers[CHROME_DEVTOOLS_MCP.name], {
+    command: CHROME_DEVTOOLS_MCP.command,
+    args: [...CHROME_DEVTOOLS_MCP.args],
+  })
   assert.deepEqual(cfg.mcpServers.fray_spawn, {
     command: process.execPath, // absolute node path, not bare "node" (worker PATH-independence)
     args: ["/abs/plugin/bin/spawn-thread-mcp.mjs"],
     env: { FRAY_STATE_DIR: "/home/.fray/projects/pid" },
   })
-  // The tool is pre-approved so a headless worker never blocks on a permission prompt.
-  assert.deepEqual(
-    argv.slice(argv.indexOf("--allowedTools"), argv.indexOf("--allowedTools") + 2),
-    ["--allowedTools", "mcp__fray_spawn__spawn_fray_thread"],
-  )
+  // Tools are pre-approved so a headless worker never blocks on a permission prompt. One comma-joined
+  // EQUALS-form token: --allowedTools is variadic, so a space-separated value could swallow a
+  // following positional (the prompt) — the equals form binds exactly one token.
+  assert.ok(argv.includes("--allowedTools=mcp__chrome-devtools,mcp__fray_spawn__spawn_fray_thread"))
   // The prompt stays the trailing positional (flags never displace it).
   assert.equal(argv[argv.length - 1], "test")
 })
 
-test("Claude dispatch omits all MCP flags when no spawn-thread descriptor is supplied", () => {
+test("Claude dispatch still mounts + pre-approves chrome-devtools when no spawn-thread descriptor is supplied", () => {
   const argv = buildClaudeCommand({ sessionId: "no-mcp", permissionMode: "auto", prompt: "test", workerPrompt: "" })
-  assert.ok(!argv.includes("--mcp-config"))
-  assert.ok(!argv.includes("--allowedTools"))
+  const cfg = JSON.parse(argv[argv.indexOf("--mcp-config") + 1])
+  assert.deepEqual(Object.keys(cfg.mcpServers), [CHROME_DEVTOOLS_MCP.name])
+  assert.ok(argv.includes("--allowedTools=mcp__chrome-devtools"))
 })
 
 test("Claude worker surfaces share the canonical per-session scratchpad path", () => {
@@ -77,8 +83,7 @@ test("Claude worker surfaces share the canonical per-session scratchpad path", (
   assert.match(composePrompt(sessionId, "task", "", "claude"), new RegExp(canonical.replaceAll("/", "\\/")))
   assert.match(scratchpadOrientation(sessionId, null, "claude"), new RegExp(canonical.replaceAll("/", "\\/")))
   assert.match(SESSION_SEED, /\.fray\/threads\/.*scratch\.md/)
-  assert.match(WORKER_SKILL, /\.fray\/threads\/<session-id>\/scratch\.md/)
-  assert.doesNotMatch(SESSION_SEED + WORKER_SKILL, /\.fray\/scratch\//)
+  assert.doesNotMatch(SESSION_SEED, /\.fray\/scratch\//)
 })
 
 // ---- FRAY.md project-config injection (defer-to-project-norms) ----
@@ -260,9 +265,10 @@ test("loadWorkerPrompt: the backend-AGNOSTIC core is present in BOTH contracts",
     assert.match(c, /## Git discipline/)
     assert.match(c, /## Quality bar/)
     assert.match(c, /## The stop criterion/)
-    assert.match(c, /human: <actor \+ exact review\/approval>/) // current awaiting grammar
+    assert.match(c, /github-review: owner\/repo#NUMBER/) // current awaiting grammar
     assert.match(c, /timer: <ISO-8601 instant>/)
-    assert.match(c, /`pr:` \/ `ci:` \/ `session:` remain/) // legacy readability is explicit
+    assert.match(c, /Do not emit `human:`, `pr:`, `ci:`, or `session:` hints; they are not recognized/)
+    assert.match(c, /fence does not arm itself/i)
     assert.match(c, /## Agent completion invariant/)
     assert.match(c, /let it run to its terminal return/)
     assert.match(c, /partially applied edits, tests, and owned processes/)
@@ -273,22 +279,23 @@ test("loadWorkerPrompt: the backend-AGNOSTIC core is present in BOTH contracts",
 })
 
 test("awaiting re-entry: every worker-contract surface requires a fresh fence after a follow-up", () => {
-  // This is deliberately pinned across the shipped backend contracts AND the on-demand fray:worker skill
-  // (session-seed is a slim pointer now — see its own test). A
+  // This is deliberately pinned across the shipped backend contracts (the single source — the former
+  // fray:worker skill copy was deleted; session-seed is a slim pointer, see its own test). A
   // human turn clears lastFence in the tailer, so merely saying "already parked" cannot restore the
-  // state: the worker must make a fresh decision, then repeat a current human/timer fence or re-arm
+  // state: the worker must make a fresh decision, then repeat a current review/timer fence or re-arm
   // the active backend wait for an automatable condition.
-  for (const c of [loadWorkerPrompt("claude"), loadWorkerPrompt("codex"), WORKER_SKILL]) {
+  for (const c of [loadWorkerPrompt("claude"), loadWorkerPrompt("codex")]) {
     assert.match(c, /back to awaiting/)
     assert.match(c, /already parked/)
     assert.match(c, /re-emit/)
-    assert.match(c, /human:[^\n]*timer:/)
+    assert.match(c, /exactly one current `github-review:` or `timer:` hint/)
+    assert.match(c, /confirm the new card again/)
     assert.match(c, /automatable[\s\S]{0,100}(?:arm|re-arm)/i)
   }
 })
 
-test("end-state contract: bare rest queues, done checks, awaiting parks human/timer only", () => {
-  for (const c of [loadWorkerPrompt("claude"), loadWorkerPrompt("codex"), WORKER_SKILL]) {
+test("end-state contract: bare rest queues, done checks, and one confirmed awaiting wait parks", () => {
+  for (const c of [loadWorkerPrompt("claude"), loadWorkerPrompt("codex")]) {
     assert.match(c, /bare rest[^\n]*(?:ordinary handoff|queues)/i)
     assert.match(c, /(?:enters|enter)[\s\S]{0,80}queue/i)
     assert.match(c, /(?:question|permission)[\s\S]{0,100}higher.priority/i)
@@ -299,25 +306,24 @@ test("end-state contract: bare rest queues, done checks, awaiting parks human/ti
     assert.match(c, /COMPLETED\s+the effort's real work/)
     assert.match(c, /investigat(?:ed|ing|ion)[\s\S]{0,300}NOT `?done`?/i)
     assert.match(c, /research or audit EFFORT[\s\S]{0,200}earns `done`/)
-    assert.match(c, /awaiting[\s\S]{0,140}(?:human|timestamp)/i)
+    assert.match(c, /awaiting[\s\S]{0,180}(?:PR|timestamp)/i)
+    assert.match(c, /Confirm watcher[\s\S]{0,40}Confirm snooze/)
     assert.match(c, /(?:CI|automatable)[\s\S]{0,180}(?:stay active|active wait|live operation)/i)
   }
-  assert.doesNotMatch(WORKER_SKILL, /Bare rest[^\n]*quiet/i)
   assert.doesNotMatch(SESSION_SEED, /BARE REST[^\n]*quiet/i)
-  assert.doesNotMatch(WORKER_SKILL, /only excuses you from the queue/)
-  assert.doesNotMatch(WORKER_SKILL, /The fence excuses you/)
   assert.doesNotMatch(SESSION_SEED, /```done \/ ```awaiting excuse/)
-  assert.match(SESSION_SEED, /```done queues a checked completion until Archive \(completed work only[^)]*\); ```awaiting parks only a human:\/timer: gate/)
+  assert.match(SESSION_SEED, /```done queues a checked completion until Archive \(completed work only[^)]*\); ```awaiting proposes one opt-in github-review:\/timer: wait that the operator must confirm/)
   assert.match(SESSION_SEED, /real work is COMPLETE/)
 })
 
 test("session-seed is a SLIM runtime pointer, not a fourth full contract copy", () => {
-  // The full contract lives ONCE in the system prompt (loadWorkerPrompt) plus the on-demand fray:worker
-  // skill. The SessionStart hook only re-grounds: it points at the system prompt, carries the runtime
+  // The full contract lives ONCE in the system prompt (loadWorkerPrompt) — the on-demand fray:worker
+  // skill copy was deleted. The SessionStart hook only re-grounds: it points at the system prompt, carries the runtime
   // scratchpad path + a signal-at-rest anchor, and must NOT re-duplicate the gate / re-entry drill /
   // browser-QA checklist (that duplication is exactly what drifted and what this slim removes).
   assert.match(SESSION_SEED, /lives in your SYSTEM PROMPT/i)
-  assert.match(SESSION_SEED, /Load the `fray:worker` skill for the full contract/)
+  // The worker-skill copy is GONE — the seed must not tell workers to load a skill that no longer exists.
+  assert.doesNotMatch(SESSION_SEED, /fray:worker/)
   assert.match(SESSION_SEED, /\.fray\/threads\/.*scratch\.md/)
   for (const fence of [/```done/, /```awaiting/, /```question/]) assert.match(SESSION_SEED, fence)
   assert.doesNotMatch(SESSION_SEED, /RUNTIME RELEASE GATE:/)
@@ -330,7 +336,7 @@ test("runtime release gate: every worker surface carries the generalized, any-re
   // read the same across all four delivery surfaces. loadWorkerPrompt defaults runtimeGate=on. Whitespace
   // is normalized so a phrase wrapped across a newline in WORKER_PROMPT.md still matches the single-line
   // session-seed/skill copies.
-  for (const raw of [loadWorkerPrompt("claude"), loadWorkerPrompt("codex"), WORKER_SKILL]) {
+  for (const raw of [loadWorkerPrompt("claude"), loadWorkerPrompt("codex")]) {
     const c = raw.replace(/\s+/g, " ")
     assert.match(c, /INCOMPLETE/)
     assert.match(c, /whatever repo you are working in/i)
@@ -376,7 +382,7 @@ test("runtime release gate: the settings toggle includes or excises the whole mo
 })
 
 test("visual-evidence handoffs: provider contracts keep embeds safe, useful, and interpretable", () => {
-  for (const c of [loadWorkerPrompt("claude"), loadWorkerPrompt("codex"), WORKER_SKILL]) {
+  for (const c of [loadWorkerPrompt("claude"), loadWorkerPrompt("codex")]) {
     assert.match(c, /meaningful alt text/i)
     assert.match(c, /eligible workspace[\s\S]{0,80}allowlisted image files/i)
     assert.match(c, /outside that safe boundary[\s\S]{0,80}non-navigable/i)
